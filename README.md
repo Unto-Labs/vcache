@@ -23,6 +23,22 @@ $ cd /tmp/checkout-two  && vcache g++ -g -O2 -c -I include src/lib.cc -o lib.o
 Building vcache itself from two unrelated directories: **25 of 25 objects served
 from cache, and the linked binaries are byte-identical** (4.5s → 0.77s).
 
+## What the v stands for
+
+Either, depending on how generous you are feeling:
+
+- **V**lad's cache. This is the honest one.
+- **V**irtuous **C**ompile **A**voidance, **C**onscientiously **H**ashing
+  **E**verything. This is the one that fits on a slide.
+
+The backronym is a joke that turns out to describe the design. Avoiding a
+compile is the entire point, and vcache is conscientious to a fault about
+earning it: it never trusts an mtime, it re-hashes every file a cached
+dependency scan claims to have read, and it checksums every entry so a corrupt
+one reads as a miss instead of a bad object. That costs a preprocessor run on
+every lookup, which is why a vcache hit is slower than a ccache hit — and why it
+is a hit at all when a ccache hit would not have been.
+
 ## Documentation
 
 | | |

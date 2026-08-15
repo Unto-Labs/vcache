@@ -1,0 +1,14 @@
+# Build output
+/build/
+/bin/
+
+# Downloaded third-party sources. gperftools is fetched by third-party/fetch.sh;
+# the full Boost tree is scratch space for regen-boost-subset.sh. The minimal
+# Boost subset in third-party/boost/ *is* committed.
+/third-party/.dl/
+/third-party/boost-full-*/
+/third-party/gperftools/
+
+*.o
+*.d
+*.a

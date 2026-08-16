@@ -626,6 +626,55 @@ except Exception: sys.exit(1)
       "$VCACHE" g++ -O0 -c -I include src/lib.cc -o "$WORK/s4.o" ) 2>/dev/null
   rc=$?
   check "build succeeds when s3 is unreachable" "$rc" "0"
+
+  # --- media failures are warned about, and can be made fatal ---------------
+  #
+  # The server is dead at this point, so every s3 request is a real transport
+  # failure rather than a miss.
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O1 -c -I include src/lib.cc -o "$WORK/m1.o" ) 2>"$WORK/m1.err"
+  rc=$?
+  check "a broken cache layer still exits 0 by default" "$rc" "0"
+  if grep -q 'warning: cache layer failed' "$WORK/m1.err"; then
+    ok "and warns on stderr rather than failing silently"
+  else
+    bad "and warns on stderr rather than failing silently"
+  fi
+  # Both the lookup and the store should have been reported.
+  check "media failures are counted" \
+    "$([[ "$(stat_of 'cache media errors')" -ge 2 ]] && echo yes)" "yes"
+  check "the object is still produced" "$([[ -s "$WORK/m1.o" ]] && echo yes)" "yes"
+
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" --error-on-cache-media-failure \
+      g++ -O1 -c -I include src/lib.cc -o "$WORK/m2.o" ) 2>/dev/null
+  check "--error-on-cache-media-failure exits 90" "$?" "90"
+  check "and still leaves a usable object behind" \
+    "$([[ -s "$WORK/m2.o" ]] && echo yes)" "yes"
+
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE=1 \
+      "$VCACHE" g++ -O1 -c -I include src/lib.cc -o "$WORK/m3.o" ) 2>/dev/null
+  check "the environment variable has the same effect" "$?" "90"
+
+  # A cold cache must not be mistaken for a broken one: same flag, no s3.
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      VCACHE_S3_BUCKET= AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY= \
+      "$VCACHE" --error-on-cache-media-failure \
+      g++ -O1 -c -I include src/lib.cc -o "$WORK/m4.o" ) 2>/dev/null
+  check "a plain miss is not a media failure" "$?" "0"
+
+  # A compile that genuinely fails must keep reporting the compiler's status,
+  # not vcache's, even with the flag on and s3 down.
+  printf 'int main(){ return notdefined; }\n' > "$WORK/broken.c"
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" --error-on-cache-media-failure \
+      g++ -c "$WORK/broken.c" -o "$WORK/m5.o" ) 2>/dev/null
+  check "a compiler error still wins over the cache status" "$([[ $? -ne 0 && $? -ne 90 ]] && echo yes)" "yes"
   check "object still produced with s3 down" "$([[ -s "$WORK/s4.o" ]] && echo yes)" "yes"
 
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \

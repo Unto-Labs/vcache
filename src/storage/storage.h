@@ -22,6 +22,7 @@ class Storage {
 
   // Reads the blob for `key`. Returns false on miss and on any error; a
   // backend failure must look like a miss so the build still proceeds.
+  // A failure additionally records why, via last_error() below.
   virtual bool Get(const std::string& key, std::string* value) = 0;
 
   // Stores the blob. Returns false if it was not durably written.
@@ -32,6 +33,22 @@ class Storage {
   // Frees space according to the backend's own policy. No-op where the
   // backend has no local size budget.
   virtual void Trim() {}
+
+  // Why the most recent Get/Put returned false, when the reason was the
+  // backend rather than the entry.
+  //
+  // An absent entry is *not* an error, and the distinction is the whole point:
+  // both make a build recompile, but only one means the cache is broken. Every
+  // Get/Put clears this first, so it always describes the last operation.
+  const std::string& last_error() const { return last_error_; }
+  bool failed() const { return !last_error_.empty(); }
+
+ protected:
+  void ClearError() { last_error_.clear(); }
+  void SetError(std::string detail) { last_error_ = std::move(detail); }
+
+ private:
+  std::string last_error_;
 };
 
 // Container format for the blob. Sections are optional and order-independent,

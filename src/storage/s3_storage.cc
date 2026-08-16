@@ -346,7 +346,10 @@ bool S3Storage::Request(const std::string& method,
                         const std::string& query, const std::string& payload,
                         std::string* response_body,
                         std::time_t* last_modified) {
-  if (curl_ == nullptr) return false;  // libcurl unavailable; behave as a miss
+  if (curl_ == nullptr) {  // libcurl unavailable; behave as a miss
+    SetError("libcurl is not available: " + load_error_);
+    return false;
+  }
 
   std::string host, url, canonical_uri;
   ResolveEndpoint(canonical_uri_path, &host, &url, &canonical_uri);
@@ -412,23 +415,33 @@ bool S3Storage::Request(const std::string& method,
   curl_->easy_cleanup(curl);
 
   if (rc != CURLE_OK) {
-    VCACHE_LOG("s3: " + method + " " + canonical_uri_path + " transport error: " +
-               curl_->easy_strerror(rc));
+    const std::string detail = method + " " + canonical_uri_path + ": " +
+                               curl_->easy_strerror(rc);
+    SetError(detail);
+    VCACHE_LOG("s3: " + detail);
     return false;
   }
   if (status == 404 || status == 403) {
-    // 403 shows up instead of 404 on buckets without ListBucket permission.
+    // A plain miss. 403 is lumped in here because S3 answers a missing key
+    // that way on buckets without ListBucket permission, so it cannot be
+    // told apart from a genuine permission problem by status alone -- which
+    // means a real credential failure reads as a cold cache rather than as a
+    // media error. Documented rather than guessed at.
     return false;
   }
   if (status < 200 || status >= 300) {
-    VCACHE_LOG("s3: " + method + " " + canonical_uri_path + " HTTP " +
-               std::to_string(status) + ": " + response_body->substr(0, 512));
+    const std::string detail = method + " " + canonical_uri_path + ": HTTP " +
+                               std::to_string(status) + ": " +
+                               response_body->substr(0, 200);
+    SetError(detail);
+    VCACHE_LOG("s3: " + detail);
     return false;
   }
   return true;
 }
 
 bool S3Storage::Get(const std::string& key, std::string* value) {
+  ClearError();
   std::string body;
   std::time_t last_modified = 0;
   if (!ObjectRequest("GET", key, "", &body, &last_modified)) return false;
@@ -456,6 +469,7 @@ bool S3Storage::Get(const std::string& key, std::string* value) {
 }
 
 bool S3Storage::Put(const std::string& key, const std::string& value) {
+  ClearError();
   if (read_only_) return false;
   std::string response;
   return ObjectRequest("PUT", key, value, &response, nullptr);

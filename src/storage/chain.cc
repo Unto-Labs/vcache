@@ -147,7 +147,14 @@ GetResult CacheChain::Get(const std::string& key) {
   GetResult result;
   for (size_t i = 0; i < layers_.size(); ++i) {
     std::string value;
-    if (!layers_[i]->Get(key, &value)) continue;
+    if (!layers_[i]->Get(key, &value)) {
+      // A layer that is broken rather than merely cold still lets the lookup
+      // fall through to the next one; the build must not stop for it here.
+      if (layers_[i]->failed()) {
+        result.errors.push_back(layers_[i]->Name() + ": " + layers_[i]->last_error());
+      }
+      continue;
+    }
 
     result.hit = true;
     result.value = std::move(value);
@@ -158,6 +165,8 @@ GetResult CacheChain::Get(const std::string& key) {
       if (!layers_[j]->writable()) continue;
       if (layers_[j]->Put(key, result.value)) {
         VCACHE_LOG("backfilled " + layers_[j]->Name() + " from " + result.layer);
+      } else if (layers_[j]->failed()) {
+        result.errors.push_back(layers_[j]->Name() + ": " + layers_[j]->last_error());
       }
     }
     return result;
@@ -165,17 +174,20 @@ GetResult CacheChain::Get(const std::string& key) {
   return result;
 }
 
-bool CacheChain::Put(const std::string& key, const std::string& value) {
-  bool any = false;
+PutResult CacheChain::Put(const std::string& key, const std::string& value) {
+  PutResult result;
   for (auto& layer : layers_) {
     if (!layer->writable()) continue;
     if (layer->Put(key, value)) {
-      any = true;
+      result.stored = true;
     } else {
       VCACHE_LOG("store failed on layer " + layer->Name());
+      if (layer->failed()) {
+        result.errors.push_back(layer->Name() + ": " + layer->last_error());
+      }
     }
   }
-  return any;
+  return result;
 }
 
 std::vector<std::string> CacheChain::LayerNames() const {

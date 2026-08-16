@@ -30,7 +30,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "vcache 0.3.0";
+constexpr const char* kVersion = "vcache 0.4.0";
 
 void PrintUsage() {
   std::printf(
@@ -48,6 +48,9 @@ void PrintUsage() {
       "  -C, --clear           delete all cached entries\n"
       "      --show-config     show the effective configuration\n"
       "      --show-roots      show the root mapping for the current directory\n"
+      "      --error-on-cache-media-failure\n"
+      "                        exit non-zero if a cache layer is broken (as\n"
+      "                        opposed to merely cold); off by default\n"
       "      --trim            evict entries until the cache is under its limit\n"
       "                        (disk; also expires and caps s3 when configured)\n"
       "\n"
@@ -73,6 +76,7 @@ void PrintUsage() {
       "Environment:\n"
       "  VCACHE_DIR, VCACHE_CACHE_SIZE, VCACHE_ROOTS, VCACHE_MAP_CWD,\n"
       "  VCACHE_DISABLE, VCACHE_READONLY, VCACHE_RECACHE, VCACHE_LOG,\n"
+      "  VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE,\n"
       "  VCACHE_COMPILER_CHECK, VCACHE_S3_BUCKET, VCACHE_S3_REGION,\n"
       "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, VCACHE_S3_TTL_DAYS,\n"
       "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n"
@@ -119,6 +123,9 @@ struct FrontOptions {
   // Command-line override for the incoming-prefix-map policy; takes precedence
   // over both the config file and the environment.
   std::optional<vcache::core::IncomingMapPolicy> incoming_map_policy;
+  // Command line only ever turns this on; leaving it off is what the config
+  // file and environment are for, so there is no --no- form to reason about.
+  bool error_on_cache_media_failure = false;
   std::vector<std::string> errors;
   size_t consumed = 1;  // index into argv where the compiler command starts
 };
@@ -159,6 +166,10 @@ FrontOptions ParseFrontOptions(int argc, char** argv) {
     // vcache replace them.
     if (arg == "--vcache-allow-prefix-maps") {
       opts.incoming_map_policy = vcache::core::IncomingMapPolicy::kStrip;
+      continue;
+    }
+    if (arg == "--error-on-cache-media-failure") {
+      opts.error_on_cache_media_failure = true;
       continue;
     }
     break;
@@ -293,6 +304,9 @@ int main(int argc, char** argv) {
     }
     for (std::string& spec : front.root_specs) {
       config.root_specs.push_back(std::move(spec));
+    }
+    if (front.error_on_cache_media_failure) {
+      config.error_on_cache_media_failure = true;
     }
     if (front.incoming_map_policy.has_value()) {
       config.incoming_map_policy = *front.incoming_map_policy;

@@ -512,9 +512,17 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // Two steps: fetch the manifest for this command line, then find the entry
   // whose recorded file contents still match what is on disk.
 
+  bool media_failed = false;
+  const auto media_fail_exit = [&]() {
+    return (media_failed && config.error_on_cache_media_failure)
+               ? kCacheMediaFailureExit
+               : 0;
+  };
+
   std::vector<DepManifestEntry> entries;
   if (cache != nullptr) {
     storage::GetResult got = cache->Get(key);
+    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     storage::Blob manifest_blob;
     if (got.hit && storage::DeserializeBlob(got.value, &manifest_blob) &&
         manifest_blob.has_dep_manifest) {
@@ -529,6 +537,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     for (const DepManifestEntry& entry : entries) {
       if (!ManifestStillHolds(entry.files, roots)) continue;
       storage::GetResult result = cache->Get(entry.result_key);
+      media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
       storage::Blob blob;
       if (!result.hit || !storage::DeserializeBlob(result.value, &blob) ||
           !blob.has_depfile) {
@@ -542,7 +551,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
       VCACHE_LOG("dep scan hit on " + result.layer);
       RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
                                                     : Counter::kHitDisk);
-      return 0;
+      return media_fail_exit();
     }
   }
   RecordCounter(cache_dir, Counter::kMiss);
@@ -594,7 +603,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     VCACHE_LOG("dep scan: output did not parse; passing it through unstored");
     if (!EmitDepOutput(parsed.depfile, *text)) return RunPassthrough(argv);
     RecordCounter(cache_dir, Counter::kStoreFailed);
-    return 0;
+    return media_fail_exit();
   }
 
   // Emit the re-rendered form, not the compiler's, so that what lands on disk
@@ -608,7 +617,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   // ---- store --------------------------------------------------------------
 
-  if (config.read_only || cache == nullptr) return 0;
+  if (config.read_only || cache == nullptr) return media_fail_exit();
 
   // Every prerequisite becomes a manifest entry. -MP's phony rules carry no
   // prerequisites and contribute nothing, which is correct: they name the same
@@ -620,7 +629,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
       if (!digest) {
         VCACHE_LOG("dep scan: cannot hash prerequisite " + prereq + "; not storing");
         RecordCounter(cache_dir, Counter::kStoreFailed);
-        return 0;
+        return media_fail_exit();
       }
       files.emplace_back(roots.Canonicalize(prereq), *digest);
     }
@@ -646,9 +655,12 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   result.meta = "dependency scan\ncompiler: " + compiler_id.description + "\n" +
                 "files: " + std::to_string(files.size()) + "\n";
 
-  if (!cache->Put(result_key, storage::SerializeBlob(result))) {
+  const storage::PutResult result_put =
+      cache->Put(result_key, storage::SerializeBlob(result));
+  media_failed |= ReportCacheMediaErrors(result_put.errors, cache_dir);
+  if (!result_put.stored) {
     RecordCounter(cache_dir, Counter::kStoreFailed);
-    return 0;
+    return media_fail_exit();
   }
 
   // Newest first, so the states in active use stay ahead of the tail that gets
@@ -671,12 +683,24 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   manifest_blob.meta = "dependency-scan manifest\nstates: " +
                        std::to_string(updated.size()) + "\n";
 
-  if (cache->Put(key, storage::SerializeBlob(manifest_blob))) {
+  const storage::PutResult manifest_put =
+      cache->Put(key, storage::SerializeBlob(manifest_blob));
+  media_failed |= ReportCacheMediaErrors(manifest_put.errors, cache_dir);
+  if (manifest_put.stored) {
     RecordCounter(cache_dir, Counter::kStored);
   } else {
     RecordCounter(cache_dir, Counter::kStoreFailed);
   }
-  return 0;
+  return media_fail_exit();
+}
+
+bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
+                            const std::string& cache_dir) {
+  for (const std::string& e : errors) {
+    ::fprintf(stderr, "vcache: warning: cache layer failed: %s\n", e.c_str());
+    RecordCounter(cache_dir, Counter::kCacheMediaError);
+  }
+  return !errors.empty();
 }
 
 RootMap BuildRootMap(const Config& config, std::vector<std::string>* warnings) {
@@ -801,8 +825,13 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   // ---- lookup -------------------------------------------------------------
 
+  // Tracks whether any layer was broken, as opposed to cold, across this whole
+  // invocation. A hit does not clear it: the media still failed.
+  bool media_failed = false;
+
   if (!config.recache && cache != nullptr) {
     storage::GetResult got = cache->Get(key);
+    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
       storage::Blob blob;
       if (storage::DeserializeBlob(got.value, &blob) &&
@@ -810,6 +839,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("hit on " + got.layer);
         RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
                                                    : Counter::kHitDisk);
+        if (media_failed && config.error_on_cache_media_failure) {
+          return kCacheMediaFailureExit;
+        }
         return 0;
       }
       VCACHE_LOG("hit on " + got.layer + " but entry was unusable; recompiling");
@@ -867,7 +899,13 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   // ---- store --------------------------------------------------------------
 
-  if (config.read_only || cache == nullptr) return compiled.exit_code;
+  if (config.read_only || cache == nullptr) {
+    if (media_failed && config.error_on_cache_media_failure &&
+        compiled.exit_code == 0) {
+      return kCacheMediaFailureExit;
+    }
+    return compiled.exit_code;
+  }
 
   auto object_bytes = util::ReadFile(tmp_output);
   if (!object_bytes) {
@@ -891,10 +929,19 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
               "language: " + args::LanguageName(parsed.language) + "\n" +
               "roots:\n" + roots.DebugString();
 
-  if (cache->Put(key, storage::SerializeBlob(blob))) {
+  const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  media_failed |= ReportCacheMediaErrors(put.errors, cache_dir);
+  if (put.stored) {
     RecordCounter(cache_dir, Counter::kStored);
   } else {
     RecordCounter(cache_dir, Counter::kStoreFailed);
+  }
+  // Only override a successful compile. A real compiler failure is the more
+  // useful exit code to propagate, and the object is already in place either
+  // way, so this reports the cache fault without hiding the build result.
+  if (media_failed && config.error_on_cache_media_failure &&
+      compiled.exit_code == 0) {
+    return kCacheMediaFailureExit;
   }
   return compiled.exit_code;
 }

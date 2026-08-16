@@ -5,7 +5,9 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 
 #include "util/fs.h"
@@ -36,10 +38,19 @@ std::string DiskStorage::PathForKey(const std::string& key) const {
 }
 
 bool DiskStorage::Get(const std::string& key, std::string* value) {
+  ClearError();
   if (key.size() < 3) return false;
   const std::string path = PathForKey(key);
   auto data = util::ReadFile(path);
-  if (!data) return false;
+  if (!data) {
+    // An absent entry is an ordinary miss. Anything else -- permissions, a
+    // truncated read, a filesystem in trouble -- means this layer is broken
+    // and the caller may want to hear about it.
+    if (errno != ENOENT) {
+      SetError("read " + path + ": " + std::strerror(errno));
+    }
+    return false;
+  }
   *value = std::move(*data);
   // The mtime doubles as the LRU timestamp: relatime makes atime unreliable,
   // so refresh mtime explicitly on every hit.
@@ -48,13 +59,16 @@ bool DiskStorage::Get(const std::string& key, std::string* value) {
 }
 
 bool DiskStorage::Put(const std::string& key, const std::string& value) {
+  ClearError();
   if (read_only_ || key.size() < 3) return false;
   const std::string shard = ShardDir(key);
   if (!util::MakeDirs(shard)) {
+    SetError("create shard directory " + shard + ": " + std::strerror(errno));
     VCACHE_LOG("disk: cannot create shard directory " + shard);
     return false;
   }
   if (!util::WriteFileAtomic(PathForKey(key), value)) {
+    SetError("write " + PathForKey(key) + ": " + std::strerror(errno));
     VCACHE_LOG("disk: write failed for " + PathForKey(key));
     return false;
   }

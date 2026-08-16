@@ -20,6 +20,7 @@ constexpr const char* kNames[] = {
     "cache hit (disk)", "cache hit (s3)",   "cache miss",
     "uncacheable",      "compile failed",   "entries stored",
     "store failed",     "preprocess failed",
+    "cache media errors",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                   static_cast<size_t>(Counter::kCount),

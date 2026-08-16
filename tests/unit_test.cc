@@ -327,15 +327,24 @@ class FakeStorage : public storage::Storage {
 
   bool Get(const std::string& key, std::string* value) override {
     ++gets;
+    ClearError();
+    if (fail_) {
+      SetError("simulated read failure");
+      return false;
+    }
     auto it = entries_.find(key);
-    if (it == entries_.end()) return false;
+    if (it == entries_.end()) return false;  // a plain miss: not an error
     *value = it->second;
     return true;
   }
 
   bool Put(const std::string& key, const std::string& value) override {
     ++puts;
-    if (fail_) return false;
+    ClearError();
+    if (fail_) {
+      SetError("simulated write failure");
+      return false;
+    }
     entries_[key] = value;
     return true;
   }
@@ -373,7 +382,7 @@ void TestCacheChain() {
     chain.AddLayer(std::move(disk));
     chain.AddLayer(std::move(s3));
 
-    Check(chain.Put("abcdef", "blob"), "a store that reaches a layer succeeds");
+    Check(chain.Put("abcdef", "blob").stored, "a store that reaches a layer succeeds");
     Check(disk_ptr->Has("abcdef"), "the store reaches the local layer");
     Check(s3_ptr->Has("abcdef"), "the same store reaches the remote layer");
   }
@@ -390,7 +399,11 @@ void TestCacheChain() {
     chain.AddLayer(std::move(disk));
     chain.AddLayer(std::move(s3));
 
-    Check(chain.Put("abcdef", "blob"), "a partial store still reports success");
+    const storage::PutResult partial = chain.Put("abcdef", "blob");
+    Check(partial.stored, "a partial store still reports success");
+    Check(partial.errors.size() == 1, "and still reports the broken layer");
+    Check(!partial.errors.empty() && partial.errors[0].find("s3:") == 0,
+          "the error names the layer that failed");
     Check(disk_ptr->Has("abcdef"), "the working layer is written anyway");
     Check(s3_ptr->puts == 1, "the failing layer was still attempted");
   }
@@ -400,7 +413,7 @@ void TestCacheChain() {
     auto disk = std::make_unique<FakeStorage>("disk", /*writable=*/true, /*fail=*/true);
     storage::CacheChain chain;
     chain.AddLayer(std::move(disk));
-    Check(!chain.Put("abcdef", "blob"), "a store that reaches no layer fails");
+    Check(!chain.Put("abcdef", "blob").stored, "a store that reaches no layer fails");
   }
 
   // A read-only layer is skipped before Put is even called -- the shape both
@@ -415,7 +428,9 @@ void TestCacheChain() {
     chain.AddLayer(std::move(disk));
     chain.AddLayer(std::move(s3));
 
-    Check(chain.Put("abcdef", "blob"), "a store with one read-only layer succeeds");
+    const storage::PutResult ro = chain.Put("abcdef", "blob");
+    Check(ro.stored, "a store with one read-only layer succeeds");
+    Check(ro.errors.empty(), "a skipped read-only layer is not an error");
     Check(disk_ptr->Has("abcdef"), "the writable layer is still written");
     Check(s3_ptr->puts == 0, "a read-only layer is never asked to store");
   }
@@ -472,6 +487,25 @@ void TestCacheChain() {
     Check(disk_ptr->puts == 0, "backfill skips a read-only faster layer");
   }
 
+  // The distinction the whole feature rests on: a cold layer reports nothing,
+  // a broken one reports an error, and both still fall through to the next.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk", /*writable=*/true, /*fail=*/true);
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    s3->Seed("abcdef", "blob");
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    storage::GetResult got = chain.Get("abcdef");
+    Check(got.hit, "a broken faster layer does not stop the lookup");
+    CheckEq(got.layer, "s3", "the working layer still serves");
+    Check(got.errors.size() >= 1, "the broken layer is reported");
+    Check(!got.errors.empty() && got.errors[0].find("disk:") == 0,
+          "the read error names the layer");
+  }
+
   // A miss everywhere reports no layer.
   {
     storage::CacheChain chain;
@@ -480,6 +514,7 @@ void TestCacheChain() {
     storage::GetResult got = chain.Get("abcdef");
     Check(!got.hit, "an entry in no layer is a miss");
     Check(got.layer.empty(), "a miss names no serving layer");
+    Check(got.errors.empty(), "a miss is not a media error");
   }
 }
 

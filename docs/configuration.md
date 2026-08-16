@@ -89,6 +89,7 @@ timeout        = 30                # seconds
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
+| `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
 | `vcache.hash_env_vars` | `VCACHE_HASH_ENV_VARS` | — | none |
 | `cache.disk.enabled` | `VCACHE_DISK` | — | `true` |
 | `cache.disk.dir` | `VCACHE_DIR` | — | `$XDG_CACHE_HOME/vcache`, else `~/.cache/vcache` |
@@ -113,6 +114,53 @@ timeout        = 30                # seconds
 | — | `VCACHE_LOG` | — | off |
 
 `cache.s3.timeout` is the only setting with no environment override.
+
+## When a cache layer breaks
+
+A broken cache and a cold cache both make a build recompile, and by default
+vcache treats them the same way as far as the build is concerned: it warns and
+carries on. An unreachable shared cache should slow a build down, never break
+one.
+
+What changed is that it now *says so*. Previously a failed S3 upload was
+invisible — `CacheChain::Put` reported success as long as the local layer took
+the entry, so a bucket that rejected every write looked like a healthy cache
+with disappointing hit rates. Both directions are now reported:
+
+```console
+vcache: warning: cache layer failed: s3: PUT /vcache/ab/cdef: HTTP 403: ...
+```
+
+and counted, so `--show-stats` shows the aggregate across a whole build rather
+than one line per compile buried in the log:
+
+```
+cache media errors  1843
+```
+
+Set `--error-on-cache-media-failure` (or the equivalent config/environment
+setting) to make that fatal instead. vcache then exits **90** — chosen to sit
+outside the range compilers use, so a build log can tell "the cache is broken"
+apart from "the code does not compile". This is for CI that is *supposed* to
+have a working shared cache, where a silent fallback to local-only is a
+regression that would otherwise go unnoticed for weeks.
+
+Three things it deliberately does not do:
+
+- **A miss is never a media failure.** An absent object, an empty cache and a
+  first-ever build all report nothing, with or without the flag.
+- **It does not override a compiler failure.** If the compile itself failed,
+  that exit status is propagated; the cache fault is still warned about. The
+  compiler's diagnosis is the more useful one.
+- **The output is still produced.** The object is in place before the exit
+  status is decided, so a build re-run without the flag needs no cleanup.
+
+One caveat, because it cannot be fixed without guessing. S3 answers a missing
+key with **403** rather than 404 on buckets that do not grant `ListBucket`, so
+a genuine credential or permission failure is indistinguishable from a cold
+cache by status alone. vcache treats both as a miss. If credentials are wrong,
+the symptom is a cache that never hits rather than an error — check
+`--show-config` and the bucket policy before assuming the cache is merely cold.
 
 ## Root mapping
 

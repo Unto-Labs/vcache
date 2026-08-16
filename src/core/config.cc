@@ -150,6 +150,9 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlBool(*vc, "map_cwd")) config->map_cwd = *v;
     if (auto v = TomlString(*vc, "cwd_name")) config->cwd_canonical_name = *v;
     if (auto v = TomlBool(*vc, "read_only")) config->read_only = *v;
+    if (auto v = TomlBool(*vc, "error_on_cache_media_failure")) {
+      config->error_on_cache_media_failure = *v;
+    }
     for (std::string& name :
          TomlStringArray(*vc, "hash_env_vars", &config->warnings)) {
       config->extra_env_vars.push_back(std::move(name));
@@ -240,6 +243,9 @@ void ApplyEnvironment(Config* config) {
 
   config->disabled = EnvBool("VCACHE_DISABLE", config->disabled);
   config->read_only = EnvBool("VCACHE_READONLY", config->read_only);
+  config->error_on_cache_media_failure =
+      EnvBool("VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE",
+              config->error_on_cache_media_failure);
   config->recache = EnvBool("VCACHE_RECACHE", config->recache);
 
   if (auto v = Env("VCACHE_INCOMING_PREFIX_MAPS")) {
@@ -366,6 +372,8 @@ std::string DescribeConfig(const Config& config) {
       << "\n";
   out << "dependency scans: " << DepScanPolicyName(config.dep_scan_policy) << "\n";
   out << "read only:        " << (config.read_only ? "yes" : "no") << "\n";
+  out << "error on media failure: "
+      << (config.error_on_cache_media_failure ? "yes" : "no") << "\n";
   out << "disabled:         " << (config.disabled ? "yes" : "no") << "\n";
   if (!config.extra_env_vars.empty()) {
     out << "hashed env vars:  " << util::Join(config.extra_env_vars, ", ") << "\n";

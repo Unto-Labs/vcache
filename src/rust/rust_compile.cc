@@ -7,6 +7,7 @@
 #include <filesystem>
 
 #include "args/rustc_args.h"
+#include "core/compile.h"
 #include "core/depfile.h"
 #include "core/stats.h"
 #include "hash/hasher.h"
@@ -312,8 +313,12 @@ int RunRustCompile(const std::vector<std::string>& argv,
     return RunPassthrough(argv);
   }
 
+  // Tracks whether any layer was broken, as opposed to cold, for this run.
+  bool media_failed = false;
+
   if (!config.recache && cache != nullptr) {
     storage::GetResult got = cache->Get(key);
+    media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
       storage::Blob blob;
       if (storage::DeserializeBlob(got.value, &blob) && !blob.files.empty() &&
@@ -376,7 +381,13 @@ int RunRustCompile(const std::vector<std::string>& argv,
     ::fflush(stderr);
   }
 
-  if (config.read_only || cache == nullptr) return compiled.exit_code;
+  if (config.read_only || cache == nullptr) {
+    if (media_failed && config.error_on_cache_media_failure &&
+        compiled.exit_code == 0) {
+      return core::kCacheMediaFailureExit;
+    }
+    return compiled.exit_code;
+  }
 
   storage::Blob blob;
   blob.files = std::move(files);
@@ -384,10 +395,16 @@ int RunRustCompile(const std::vector<std::string>& argv,
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
 
-  if (cache->Put(key, storage::SerializeBlob(blob))) {
+  const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
+  if (put.stored) {
     core::RecordCounter(cache_dir, Counter::kStored);
   } else {
     core::RecordCounter(cache_dir, Counter::kStoreFailed);
+  }
+  if (media_failed && config.error_on_cache_media_failure &&
+      compiled.exit_code == 0) {
+    return core::kCacheMediaFailureExit;
   }
   return compiled.exit_code;
 }

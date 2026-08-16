@@ -21,6 +21,7 @@ enum class Counter {
   kStored,
   kStoreFailed,
   kPreprocessFailed,
+  kCacheMediaError,
   kCount,  // sentinel
 };
 

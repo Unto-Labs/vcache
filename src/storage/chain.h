@@ -20,6 +20,16 @@ struct GetResult {
   bool hit = false;
   std::string value;
   std::string layer;  // name of the layer that served the hit
+
+  // One entry per layer that failed for a reason other than the entry being
+  // absent, formatted "<layer>: <detail>". A miss contributes nothing here:
+  // the point is to tell a cold cache apart from a broken one.
+  std::vector<std::string> errors;
+};
+
+struct PutResult {
+  bool stored = false;  // at least one writable layer took it
+  std::vector<std::string> errors;
 };
 
 class CacheChain {
@@ -31,8 +41,11 @@ class CacheChain {
 
   GetResult Get(const std::string& key);
 
-  // Writes to every writable layer. Returns true if at least one succeeded.
-  bool Put(const std::string& key, const std::string& value);
+  // Writes to every writable layer. Reports success if at least one took it,
+  // and separately reports every layer that failed -- a store that reached
+  // disk but not S3 is a success for the build and still a fault worth
+  // surfacing, which a single bool cannot say.
+  PutResult Put(const std::string& key, const std::string& value);
 
   std::vector<std::string> LayerNames() const;
 

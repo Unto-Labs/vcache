@@ -33,6 +33,20 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 // current directory when it would otherwise be left unmapped.
 RootMap BuildRootMap(const Config& config, std::vector<std::string>* warnings);
 
+// Exit status used when error_on_cache_media_failure is set and a layer was
+// broken. Deliberately outside the range compilers use, so a build log can
+// tell "the cache is broken" apart from "the code does not compile".
+constexpr int kCacheMediaFailureExit = 90;
+
+// Handles the failures a cache lookup or store reported. Warns on stderr --
+// unconditionally, because a silently degraded cache is the failure mode this
+// exists to prevent -- and counts them. Returns true if any were reported, so
+// the caller can fail the invocation when configured to.
+//
+// Note that this is about the *media*, not the entry: a miss reports nothing.
+bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
+                            const std::string& cache_dir);
+
 // Runs one compilation. `argv` starts at the compiler. Returns the exit code to
 // propagate. Falls back to executing the compiler unchanged whenever caching is
 // impossible, so the build always makes progress.

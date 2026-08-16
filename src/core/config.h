@@ -109,6 +109,13 @@ struct Config {
   bool read_only = false;  // look up but never store
   bool recache = false;    // ignore hits, recompile and overwrite
 
+  // Fail the invocation when a cache layer is broken, as opposed to cold.
+  // Off by default: a cache that cannot be reached should slow a build down,
+  // never break one. On, it turns a silent degradation into a hard error,
+  // which is what a CI job that is *supposed* to have a working shared cache
+  // wants -- otherwise a misconfigured bucket just looks like poor hit rates.
+  bool error_on_cache_media_failure = false;
+
   // Extra environment variable names to mix into the cache key, for builds
   // where a variable affects codegen (SOURCE_DATE_EPOCH, for example).
   std::vector<std::string> extra_env_vars;

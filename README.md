@@ -3,7 +3,7 @@
 A compilation cache for C, C++ and Rust that solves the cross-directory problem
 head-on.
 
-`ccache` and `sccache` both cache well when you build the same tree, from the
+`ccache` and `sccache` work well when you build the same tree, from the
 same directory, twice. Move the checkout — a second worktree, a CI runner, a
 colleague's machine — and the hit rate collapses, because absolute paths are
 baked into preprocessed output, `__FILE__`, and debug info. Their documented
@@ -31,7 +31,7 @@ Either:
 - **V**irtuous **C**ompile **A**voidance, **C**onscientiously **H**ashing
   **E**verything.
   
-The backronym is a joke that turns out to describe the design. Avoiding a
+The backronym describes the actual design. Avoiding a
 compile is the entire point, and vcache is conscientious to a fault about
 earning it: it never trusts an mtime, it re-hashes every file a cached
 dependency scan claims to have read, and it checksums every entry so a corrupt

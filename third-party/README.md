@@ -12,7 +12,7 @@ directory is unused: every file is compiled on at least one supported target.
 
 **None of this is under vcache's GPL.** Each component stays under the licence
 above, and the licence text in each directory travels with it. vcache itself is
-GPL-3.0-or-later; these terms permit inclusion in such a work, which is what
+GPL-3.0-only; these terms permit inclusion in such a work, which is what
 makes the combination distributable, but that is a one-way relationship and
 nothing here becomes GPL by sitting in this tree.
 

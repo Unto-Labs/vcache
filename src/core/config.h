@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Configuration, layered the way sccache does it: a TOML file supplies the
 // defaults and environment variables override individual settings, so a CI job
 // can point at a different bucket without rewriting the file.

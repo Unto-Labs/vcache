@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Parsing of rustc command lines.
 //
 // Rust has no preprocessor, so the C/C++ strategy of hashing preprocessed text

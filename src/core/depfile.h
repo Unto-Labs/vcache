@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Dependency-file (.d) handling.
 //
 // gcc deliberately does *not* apply -ffile-prefix-map to dependency output --

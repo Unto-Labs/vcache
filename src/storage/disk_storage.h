@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Local filesystem cache.
 //
 // Entries live at <dir>/<xx>/<rest-of-key>, sharded on the first byte of the

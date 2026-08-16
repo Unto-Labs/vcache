@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Persistent hit/miss counters.
 //
 // Kept in a single file under the cache directory, updated under an advisory

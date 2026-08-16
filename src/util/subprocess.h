@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Process execution. vcache never goes through a shell: argv vectors are passed
 // straight to execvp so paths containing spaces or quotes cannot be misparsed.
 #pragma once

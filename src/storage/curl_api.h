@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Lazily loaded libcurl bindings.
 //
 // vcache runs once per compilation, so every DT_NEEDED entry is a library the

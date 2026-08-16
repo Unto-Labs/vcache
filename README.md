@@ -325,16 +325,16 @@ reference implementation.
 ## Licence
 
 vcache is free software: you can redistribute it and/or modify it under the
-terms of the **GNU General Public License, version 3 or (at your option) any
-later version**, as published by the Free Software Foundation. The full text is
-in [LICENSE](LICENSE). It is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-FITNESS FOR A PARTICULAR PURPOSE.
+terms of **version 3 of the GNU General Public License** as published by the
+Free Software Foundation. Version 3 only — not "or any later version". The full
+text is in [LICENSE](LICENSE). It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
 Every first-party source file carries
-`SPDX-License-Identifier: GPL-3.0-or-later`, because this tree deliberately
-mixes licences and the top-level `LICENSE` alone would not say which file is
-under which.
+`SPDX-License-Identifier: GPL-3.0-only`, because this tree deliberately mixes
+licences and the top-level `LICENSE` alone would not say which file is under
+which.
 
 ### Third-party components keep their own terms
 

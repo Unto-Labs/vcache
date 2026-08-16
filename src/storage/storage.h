@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // Cache storage abstraction.
 //
 // A cache entry is a single opaque blob keyed by a hex digest, which keeps the

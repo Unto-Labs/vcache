@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 #include "core/depfile.h"
 
 #include <boost/fusion/include/adapt_struct.hpp>

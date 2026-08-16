@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 // vcache entry point.
 //
 // Two invocation styles, matching ccache and sccache:
@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
       std::printf(
           "%s\n"
           "Copyright (C) 2026 Vlad Petric\n"
-          "License GPLv3+: GNU GPL version 3 or later "
-          "<https://gnu.org/licenses/gpl.html>.\n"
+          "License GPLv3: GNU GPL version 3 "
+          "<https://gnu.org/licenses/gpl-3.0.html>.\n"
           "This is free software: you are free to change and redistribute it.\n"
           "There is NO WARRANTY, to the extent permitted by law.\n"
           "\n"

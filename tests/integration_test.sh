@@ -973,5 +973,166 @@ check "and still writes the dependency file" "$([[ -s "$WORK/off.d" ]] && echo y
 check "a scan of a missing source fails" "$?" "1"
 
 # --------------------------------------------------------------------------
+section "15. flags that write a second output file are declined"
+
+# The dangerous shape: the object comes back correct from the cache and the
+# companion file silently never appears, so the failure surfaces later and
+# somewhere else. Driven with gcc because it is always present; the parser
+# tests cover the clang-only spellings.
+
+reset_cache
+mkdir -p "$WORK/side"
+printf 'int f(void){return 1;}\n' > "$WORK/side/s.c"
+
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc --coverage -c s.c -o cov.o ) 2>/dev/null
+check "--coverage is not cached" "$(uncacheable)" "1"
+check "and the .gcno is produced" "$([[ -f "$WORK/side/cov.gcno" ]] && echo yes)" "yes"
+
+# The real regression guard: compile again, and the .gcno must come back even
+# though an entry for this source now exists. A cached object with no .gcno is
+# exactly the silent breakage this section exists to prevent.
+rm -f "$WORK/side/cov.gcno"
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc --coverage -c s.c -o cov.o ) 2>/dev/null
+check "a second --coverage compile still produces the .gcno" \
+  "$([[ -f "$WORK/side/cov.gcno" ]] && echo yes)" "yes"
+check "and is still counted uncacheable" "$(uncacheable)" "2"
+
+reset_cache
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc -fstack-usage -c s.c -o su.o ) 2>/dev/null
+check "-fstack-usage is not cached" "$(uncacheable)" "1"
+check "and the .su is produced" "$([[ -f "$WORK/side/su.su" ]] && echo yes)" "yes"
+
+# Without such a flag the same source caches normally, so the check above is
+# about the flag and not about this file being unusual.
+reset_cache
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc -c s.c -o plain.o ) 2>/dev/null
+check "the same source without those flags is cached" "$(misses)" "1"
+check "and is not counted uncacheable" "$(uncacheable)" "0"
+
+# --------------------------------------------------------------------------
+section "16. clang"
+
+if command -v clang >/dev/null 2>&1; then
+  make_project "$WORK/clang-a"
+  make_project "$WORK/clang-b"
+
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -g -O2 -c -I include src/lib.cc -o "$WORK/ca.o" ) 2>/dev/null
+  check "clang compile is a miss" "$(misses)" "1"
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -g -O2 -c -I include src/lib.cc -o "$WORK/cb.o" ) 2>/dev/null
+  check "clang hits across checkouts" "$(hits)" "1"
+  if cmp -s "$WORK/ca.o" "$WORK/cb.o"; then
+    ok "clang objects are byte-identical across checkouts"
+  else
+    bad "clang objects are byte-identical across checkouts"
+  fi
+
+  # clang and gcc must not share an entry: same source, same flags, different
+  # code generator.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O2 -c -I include src/lib.cc -o "$WORK/cc1.o" ) 2>/dev/null
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/gg1.o" ) 2>/dev/null
+  check "clang and gcc do not share an entry" "$(misses)" "2"
+
+  # The Firedancer sequence sccache could not cache. It must cache here, and
+  # still hit from a different directory.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O2 -c -I include src/lib.cc -o "$WORK/fq1.o" \
+      -Xclang -target-feature -Xclang +fast-vector-fsqrt ) 2>/dev/null
+  check "an -Xclang target-feature compile is cacheable" "$(uncacheable)" "0"
+  check "and is a miss the first time" "$(misses)" "1"
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -O2 -c -I include src/lib.cc -o "$WORK/fq2.o" \
+      -Xclang -target-feature -Xclang +fast-vector-fsqrt ) 2>/dev/null
+  check "and hits from another checkout" "$(hits)" "1"
+  if cmp -s "$WORK/fq1.o" "$WORK/fq2.o"; then
+    ok "-Xclang objects are byte-identical across checkouts"
+  else
+    bad "-Xclang objects are byte-identical across checkouts"
+  fi
+
+  # A different -Xclang value must be a different entry, or the flag would be
+  # silently dropped from the key.
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O2 -c -I include src/lib.cc -o "$WORK/fq3.o" \
+      -Xclang -target-feature -Xclang +avx2 ) 2>/dev/null
+  check "a different -Xclang value is a separate entry" "$(misses)" "2"
+
+  # clang diagnostics must replay on a hit, with local paths.
+  reset_cache
+  printf 'int unused_thing(void){int x; return 0;}\n' > "$WORK/clang-a/src/warn.c"
+  cp "$WORK/clang-a/src/warn.c" "$WORK/clang-b/src/warn.c"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -Wall -c src/warn.c -o "$WORK/w1.o" ) 2>"$WORK/w1.err"
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -Wall -c src/warn.c -o "$WORK/w2.o" ) 2>"$WORK/w2.err"
+  check "the warning compile hits on the second checkout" "$(hits)" "1"
+  if grep -q 'unused' "$WORK/w2.err"; then
+    ok "clang diagnostics are replayed on a hit"
+  else
+    bad "clang diagnostics are replayed on a hit"
+  fi
+  if grep -q 'clang-a' "$WORK/w2.err"; then
+    bad "replayed clang diagnostics leak the other checkout's path"
+  else
+    ok "replayed clang diagnostics carry no foreign path"
+  fi
+
+  # Dependency files, which clang formats slightly differently from gcc.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -MMD -MF "$WORK/cd1.d" -c -I include src/lib.cc \
+      -o "$WORK/cd1.o" ) 2>/dev/null
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -MMD -MF "$WORK/cd2.d" -c -I include src/lib.cc \
+      -o "$WORK/cd2.o" ) 2>/dev/null
+  check "clang -MMD hits across checkouts" "$(hits)" "1"
+  if grep -q '/vcache/proj' "$WORK/cd2.d"; then
+    bad "replayed clang depfile leaked canonical paths"
+  else
+    ok "replayed clang depfile contains no canonical paths"
+  fi
+
+  # Split DWARF writes the debug info to a companion .dwo. Caching the object
+  # alone leaves it referencing debug info that was never written -- and the
+  # object still links, so nothing complains until someone opens a debugger.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -g -gsplit-dwarf -c src/warn.c -o "$WORK/sd1.o" ) 2>/dev/null
+  check "clang -gsplit-dwarf is not cached" "$(uncacheable)" "1"
+  rm -f "$WORK/sd1.dwo" "$WORK/clang-a/warn.dwo"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -g -gsplit-dwarf -c src/warn.c -o "$WORK/sd1.o" ) 2>/dev/null
+  check "and a second compile still writes the .dwo" \
+    "$([[ -f "$WORK/sd1.dwo" || -f "$WORK/clang-a/warn.dwo" ]] && echo yes)" "yes"
+
+  # The embedding variant has no companion file, so it must stay cacheable.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -g -gsplit-dwarf=single -c src/warn.c -o "$WORK/sd2.o" ) 2>/dev/null
+  check "clang -gsplit-dwarf=single is still cached" "$(uncacheable)" "0"
+  check "and is a normal miss" "$(misses)" "1"
+
+  # Side-output flags, in clang's own spellings.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -c src/warn.c -o "$WORK/tt.o" -MJ "$WORK/frag.json" ) 2>/dev/null
+  check "clang -MJ is not cached" "$(uncacheable)" "1"
+  check "and the fragment is produced" \
+    "$([[ -f "$WORK/frag.json" ]] && echo yes)" "yes"
+else
+  printf '  \033[33mSKIP\033[0m clang not installed\n'
+fi
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

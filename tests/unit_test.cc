@@ -814,6 +814,77 @@ void TestCompilerArgs() {
         "detects -g");
 }
 
+void TestClangArgs() {
+  Section("args::CompilerArgs (clang specifics)");
+
+  // clang passes options through to -cc1 in -Xclang pairs. Both halves must be
+  // consumed as a unit, or the value looks like a source file. This exact
+  // sequence comes from Firedancer, and sccache declines to cache it.
+  auto fsqrt = args::Parse({"clang", "-c", "-O2", "a.c", "-o", "a.o", "-Xclang",
+                            "-target-feature", "-Xclang", "+fast-vector-fsqrt"});
+  Check(fsqrt.cacheable(), "-Xclang pairs stay cacheable");
+  CheckEq(fsqrt.source, "a.c", "the -Xclang value is not mistaken for a source");
+  CheckEq(fsqrt.output, "a.o", "the output is still found after -Xclang pairs");
+
+  // Two invocations differing only inside -Xclang must not collide: the value
+  // reaches code generation, so it has to reach the key.
+  auto other = args::Parse({"clang", "-c", "-O2", "a.c", "-o", "a.o", "-Xclang",
+                            "-target-feature", "-Xclang", "+avx2"});
+  Check(fsqrt.key_args != other.key_args,
+        "the -Xclang value is part of the key");
+
+  // --target changes code generation and must be keyed; it is also the flag a
+  // cross build differs by, so a collision here would be silent and severe.
+  auto host = args::Parse({"clang", "-c", "a.c", "-o", "a.o"});
+  auto cross = args::Parse({"clang", "-c", "a.c", "-o", "a.o", "-target",
+                            "aarch64-linux-gnu"});
+  Check(host.key_args != cross.key_args, "-target is part of the key");
+
+  // Flags that write a second file alongside the object. Caching these would
+  // return the object and silently omit the companion, so each must decline.
+  struct Case {
+    std::vector<std::string> extra;
+    const char* what;
+  };
+  const std::vector<Case> side_outputs = {
+      {{"--coverage"}, "--coverage (.gcno)"},
+      {{"-ftest-coverage"}, "-ftest-coverage (.gcno)"},
+      {{"-fprofile-arcs"}, "-fprofile-arcs (.gcno)"},
+      {{"-fstack-usage"}, "-fstack-usage (.su)"},
+      {{"-ftime-trace"}, "-ftime-trace (.json)"},
+      {{"-fsave-optimization-record"}, "-fsave-optimization-record (.opt.yaml)"},
+      {{"-fdump-tree-all"}, "-fdump-tree-all"},
+      {{"-MJ", "frag.json"}, "-MJ (compilation database fragment)"},
+      {{"-serialize-diagnostics", "a.dia"}, "-serialize-diagnostics (.dia)"},
+      {{"-gen-cdb-fragment-path", "/tmp/cdb"}, "-gen-cdb-fragment-path"},
+      {{"-gsplit-dwarf"}, "-gsplit-dwarf (.dwo)"},
+      {{"-gsplit-dwarf=split"}, "-gsplit-dwarf=split (.dwo)"},
+  };
+  for (const Case& c : side_outputs) {
+    std::vector<std::string> argv = {"clang", "-c", "a.c", "-o", "a.o"};
+    argv.insert(argv.end(), c.extra.begin(), c.extra.end());
+    auto parsed = args::Parse(argv);
+    Check(!parsed.cacheable(), std::string("declines ") + c.what);
+  }
+
+  // The value-taking forms must have their value consumed, or it is read as a
+  // second input and the parse describes the wrong command.
+  auto mj = args::Parse({"clang", "-c", "a.c", "-o", "a.o", "-MJ", "frag.json"});
+  CheckEq(mj.source, "a.c", "-MJ's value is not treated as a source file");
+
+  // -gsplit-dwarf=single keeps the debug sections inside the object, so there
+  // is no companion file and no reason to decline it. Verified against clang
+  // rather than assumed from the flag's name.
+  auto single = args::Parse(
+      {"clang", "-g", "-gsplit-dwarf=single", "-c", "a.c", "-o", "a.o"});
+  Check(single.cacheable(), "-gsplit-dwarf=single stays cacheable");
+
+  // A plain clang compile with none of the above is still perfectly cacheable;
+  // the checks above must not have made clang uncacheable in general.
+  auto plain = args::Parse({"clang", "-c", "-O2", "-Wall", "a.c", "-o", "a.o"});
+  Check(plain.cacheable(), "an ordinary clang compile is still cacheable");
+}
+
 void TestRustcArgs() {
   Section("args::RustcArgs");
 
@@ -1012,6 +1083,7 @@ int main() {
   TestHasher();
   TestSha256();
   TestCompilerArgs();
+  TestClangArgs();
   TestRustcArgs();
   TestSigV4();
   TestS3ResponseParsing();

@@ -34,6 +34,54 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
   return *kSet;
 }
 
+// Flags that make the compiler write a file besides the object.
+//
+// gcc and clang both have them, and they are the one class of flag where
+// caching is actively harmful rather than merely imprecise: the object comes
+// back correct and the companion file is simply missing, so a coverage run
+// reports no data and a compilation database ends up with holes, long after
+// the compile that "succeeded".
+bool IsSideOutputFlag(std::string_view arg) {
+  // Coverage instrumentation writes a .gcno next to the object (both drivers).
+  if (arg == "--coverage" || arg == "-ftest-coverage" || arg == "-fprofile-arcs" ||
+      StartsWith(arg, "-fprofile-note=")) {
+    return true;
+  }
+  // -fstack-usage writes .su, -fcallgraph-info writes .ci (gcc; clang has the
+  // former). -fdump-* covers gcc's tree/ipa/rtl dump family.
+  if (arg == "-fstack-usage" || StartsWith(arg, "-fcallgraph-info") ||
+      StartsWith(arg, "-fdump-")) {
+    return true;
+  }
+  // Split DWARF puts the debug info in a companion .dwo, so a replayed object
+  // would reference debug info that was never written. Only the splitting
+  // forms: -gsplit-dwarf=single keeps the sections inside the object and is
+  // perfectly cacheable, which is verified rather than assumed.
+  if (arg == "-gsplit-dwarf" || arg == "-gsplit-dwarf=split") return true;
+  // clang: -ftime-trace writes <output>.json, and the optimization-record
+  // flags write a .opt.yaml.
+  if (arg == "-ftime-trace" || StartsWith(arg, "-ftime-trace=") ||
+      StartsWith(arg, "-ftime-trace-granularity=") ||
+      arg == "-fsave-optimization-record" ||
+      StartsWith(arg, "-fsave-optimization-record=") ||
+      StartsWith(arg, "-foptimization-record-file=")) {
+    return true;
+  }
+  // clang, value-taking: a compilation-database fragment, a serialized
+  // diagnostics file, and a directory of cdb fragments.
+  if (arg == "-MJ" || arg == "-serialize-diagnostics" ||
+      arg == "--serialize-diagnostics" || arg == "-gen-cdb-fragment-path") {
+    return true;
+  }
+  return false;
+}
+
+// Which of the above take their value as the following argument.
+bool SideOutputFlagTakesValue(std::string_view arg) {
+  return arg == "-MJ" || arg == "-serialize-diagnostics" ||
+         arg == "--serialize-diagnostics" || arg == "-gen-cdb-fragment-path";
+}
+
 // Preprocessor-facing options whose entire effect is already visible in the
 // preprocessed output. Hashing them would break cross-directory hits, because
 // -I/home/a/proj/inc and -I/work/b/proj/inc differ textually while producing
@@ -370,6 +418,29 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
         StartsWith(arg, "-fprofile-instr-use")) {
       pending_uncacheable.push_back("unsupported flag " + arg);
       result.base_args.push_back(arg);
+      continue;
+    }
+
+    // Flags that write a *second* file besides the object. A cache entry holds
+    // the object and the dependency file and nothing else, so replaying one of
+    // these would leave the build looking successful while the extra output --
+    // a .gcno, a .su, a compilation-database fragment -- silently never
+    // appeared. That is worse than not caching, because the failure surfaces
+    // later and somewhere else, so decline the entry instead.
+    //
+    // Split by which compiler emits them only for the reader's benefit; the
+    // check does not care, and neither driver rejects the other's spelling
+    // reliably enough to make the distinction load-bearing.
+    if (IsSideOutputFlag(arg)) {
+      pending_uncacheable.push_back("flag writes a second output file: " + arg);
+      result.base_args.push_back(arg);
+      // Value-taking forms must have their value consumed too, or it gets
+      // mistaken for a source file and changes what the parse thinks it is
+      // looking at. The invocation is uncacheable either way, but the parse
+      // should still describe it accurately.
+      if (SideOutputFlagTakesValue(arg) && i + 1 < result.argv.size()) {
+        result.base_args.push_back(result.argv[++i]);
+      }
       continue;
     }
 

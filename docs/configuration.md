@@ -194,6 +194,35 @@ With it set, a wrong-credentials bucket looks like a cache that never hits
 rather than an error — check `--show-config` and the bucket policy before
 concluding the cache is merely cold.
 
+## Flags that write a second output file
+
+A cache entry holds the object and the dependency file, and nothing else. Some
+flags make the compiler write a *companion* file next to the object — coverage
+notes, split debug info, a compilation-database fragment — and replaying such
+an entry would return a correct object while that companion silently never
+appeared. The build looks successful; the breakage shows up later and somewhere
+else, when gcov finds no data or a debugger cannot resolve any DWARF.
+
+vcache therefore declines to cache them, reporting `flag writes a second output
+file` as the uncacheable reason:
+
+| Flag | Companion file |
+| --- | --- |
+| `--coverage`, `-ftest-coverage`, `-fprofile-arcs` | `.gcno` |
+| `-gsplit-dwarf`, `-gsplit-dwarf=split` | `.dwo` |
+| `-fstack-usage` | `.su` |
+| `-fcallgraph-info` | `.ci` |
+| `-fdump-*` | gcc dump files |
+| `-ftime-trace` | `.json` |
+| `-fsave-optimization-record`, `-foptimization-record-file=` | `.opt.yaml` |
+| `-MJ FILE` | compilation-database fragment |
+| `-serialize-diagnostics FILE` | `.dia` |
+| `-gen-cdb-fragment-path DIR` | cdb fragments |
+
+`-gsplit-dwarf=single` is deliberately **not** in that list: it keeps the debug
+sections inside the object, so there is no companion file and nothing to lose.
+That is checked against clang rather than inferred from the flag's name.
+
 ## Root mapping
 
 This is the setting that makes vcache worth using. Everything else is

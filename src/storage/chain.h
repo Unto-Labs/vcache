@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Multi-level cache chain, following sccache's layering idea: a fast local
 // layer in front of a shared remote one.
 //

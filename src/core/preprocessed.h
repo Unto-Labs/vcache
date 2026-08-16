@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Normalisation of preprocessed output before hashing.
 //
 // -ffile-prefix-map covers __FILE__ expansions and the paths recorded in debug

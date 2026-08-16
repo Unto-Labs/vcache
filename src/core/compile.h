@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // The C/C++ compile pipeline: parse, canonicalise, hash, look up, and either
 // replay a cached result or compile and store one.
 #pragma once

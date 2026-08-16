@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Debug logging, off unless VCACHE_LOG is set. The log is the primary tool for
 // diagnosing "why did this miss", so every cache decision writes a line.
 #pragma once

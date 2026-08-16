@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # End-to-end tests for vcache.
 #
 # The central claim under test is that the same source compiled from two

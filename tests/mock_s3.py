@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """A minimal S3-compatible object store, used to exercise vcache's S3 layer.
 
 It implements just enough for the cache: PUT and GET of a single object, plus

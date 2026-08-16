@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Parsing of gcc/clang command lines.
 //
 // The parse has three jobs:

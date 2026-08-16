@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // The rustc compile pipeline.
 //
 // Structure mirrors the C/C++ path, but the "what did this compilation read"

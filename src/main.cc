@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // vcache entry point.
 //
 // Two invocation styles, matching ccache and sccache:
@@ -213,7 +214,21 @@ int main(int argc, char** argv) {
 
     if (first == "-h" || first == "--help") { PrintUsage(); return 0; }
     if (first == "-V" || first == "--version") {
-      std::printf("%s\n", kVersion);
+      // The notice GPLv3's "How to Apply These Terms" asks for, in the shape
+      // GNU tools use it.
+      std::printf(
+          "%s\n"
+          "Copyright (C) 2026 Vlad Petric\n"
+          "License GPLv3+: GNU GPL version 3 or later "
+          "<https://gnu.org/licenses/gpl.html>.\n"
+          "This is free software: you are free to change and redistribute it.\n"
+          "There is NO WARRANTY, to the extent permitted by law.\n"
+          "\n"
+          "Vendored components under third-party/ keep their own licences:\n"
+          "BLAKE3 (Apache 2.0 with LLVM exception), toml++ (MIT), Boost "
+          "(BSL-1.0),\n"
+          "gperftools (BSD 3-clause).\n",
+          kVersion);
       return 0;
     }
     if (first == "-s" || first == "--show-stats") return ShowStats(config);

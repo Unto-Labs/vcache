@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "args/rustc_args.h"
 
 #include <unordered_set>

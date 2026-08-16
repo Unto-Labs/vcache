@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 

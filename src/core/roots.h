@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Path canonicalisation -- the core of vcache's answer to the preprocessor
 // problem.
 //

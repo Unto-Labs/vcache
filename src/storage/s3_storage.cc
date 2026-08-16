@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/s3_storage.h"
 
 #include <algorithm>

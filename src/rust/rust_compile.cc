@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "rust/rust_compile.h"
 
 #include <algorithm>

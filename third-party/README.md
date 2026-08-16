@@ -3,12 +3,18 @@
 Four libraries, three of them committed here in full or in part. Nothing in this
 directory is unused: every file is compiled on at least one supported target.
 
-| Directory | Version | Committed? | Size | Used for |
-| --- | --- | --- | --- | --- |
-| `blake3/` | 1.5.4 | yes | 418 KB | cache-key hashing |
-| `tomlplusplus/` | 3.4.0 | yes | 477 KB | config-file parsing |
-| `boost/` | 1.86.0 subset | yes | 4.2 MB | Spirit X3, for dependency-file parsing |
-| `gperftools/` | 2.16 | no — fetched | 13 MB | tcmalloc |
+| Directory | Version | Licence | Committed? | Size | Used for |
+| --- | --- | --- | --- | --- | --- |
+| `blake3/` | 1.5.4 | Apache 2.0 w/ LLVM exception | yes | 418 KB | cache-key hashing |
+| `tomlplusplus/` | 3.4.0 | MIT | yes | 477 KB | config-file parsing |
+| `boost/` | 1.86.0 subset | BSL-1.0 | yes | 4.2 MB | Spirit X3, for dependency-file parsing |
+| `gperftools/` | 2.16 | BSD 3-clause | no — fetched | 13 MB | tcmalloc |
+
+**None of this is under vcache's GPL.** Each component stays under the licence
+above, and the licence text in each directory travels with it. vcache itself is
+GPL-3.0-or-later; these terms permit inclusion in such a work, which is what
+makes the combination distributable, but that is a one-way relationship and
+nothing here becomes GPL by sitting in this tree.
 
 Each directory carries its upstream licence and a `PROVENANCE.md` (or `README.md`
 for the Boost subset) recording the version, where it came from, and what was

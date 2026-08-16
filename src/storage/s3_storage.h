@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // S3 cache layer.
 //
 // Requests are signed with AWS Signature Version 4 over libcurl. Only GET and

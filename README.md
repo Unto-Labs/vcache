@@ -315,8 +315,42 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
 $ make test
 ```
 
-129 unit tests and 48 integration tests, covering cross-directory hits,
+169 unit tests and 95 integration tests, covering cross-directory hits,
 out-of-tree builds, dependency-file replay, diagnostics replay, uncacheable
-fallback, masquerade mode, Rust, cache management, and the S3 layer against a
-mock object store. SigV4 is checked against AWS's documented signing-key vector
-and an independent reference implementation.
+fallback, masquerade mode, Rust, cache management, `-march=native` resolution,
+dependency-scan manifests, and the S3 layer against a mock object store. SigV4
+is checked against AWS's documented signing-key vector and an independent
+reference implementation.
+
+## Licence
+
+vcache is free software: you can redistribute it and/or modify it under the
+terms of the **GNU General Public License, version 3 or (at your option) any
+later version**, as published by the Free Software Foundation. The full text is
+in [LICENSE](LICENSE). It is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.
+
+Every first-party source file carries
+`SPDX-License-Identifier: GPL-3.0-or-later`, because this tree deliberately
+mixes licences and the top-level `LICENSE` alone would not say which file is
+under which.
+
+### Third-party components keep their own terms
+
+Nothing under `third-party/` is covered by the GPL. Each component remains under
+the licence it was published with, and each directory carries that licence text
+verbatim:
+
+| Component | Licence | Text |
+| --- | --- | --- |
+| BLAKE3 1.5.4 | Apache 2.0 with LLVM exception | [third-party/blake3/LICENSE_A2](third-party/blake3/LICENSE_A2) |
+| toml++ 3.4.0 | MIT | [third-party/tomlplusplus/LICENSE](third-party/tomlplusplus/LICENSE) |
+| Boost 1.86.0 subset | Boost Software License 1.0 | [third-party/boost/LICENSE](third-party/boost/LICENSE) |
+| gperftools 2.16 | BSD 3-clause | fetched at build time, not committed; licence ships in the tarball |
+
+All four are one-way compatible with the GPL, which is what the combination
+requires: their terms permit inclusion in a GPL-licensed work, and the combined
+binary is distributed under the GPL. The reverse does not hold and is not
+claimed — vendoring a file here does not place it under the GPL, and the notices
+in `third-party/` must survive any redistribution.

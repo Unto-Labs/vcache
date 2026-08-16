@@ -530,6 +530,95 @@ except Exception: sys.exit(1)
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s3.o" ) 2>/dev/null
   check "backfilled entry now serves from disk" "$(hits)" "1"
 
+  # --- ttl ------------------------------------------------------------------
+  #
+  # Age is taken from the object's Last-Modified, so backdating the stored file
+  # is what an expired entry looks like from vcache's side.
+  backdate() { find "$S3DIR" -type f -exec touch -d "$1" {} +; }
+
+  reset_cache
+  backdate "40 days ago"
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
+      "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s5.o" ) 2>/dev/null
+  check "an entry past its ttl is not served" "$(stat_of 'cache hit (s3)')" "0"
+  check "and is counted as a miss instead" "$(misses)" "1"
+
+  # The same object inside the window still serves, so the previous check is
+  # about age and not about the object having become unreadable.
+  reset_cache
+  backdate "2 days ago"
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
+      "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s6.o" ) 2>/dev/null
+  check "an entry inside the ttl still serves" "$(stat_of 'cache hit (s3)')" "1"
+
+  # A ttl of zero disables the check rather than expiring everything.
+  reset_cache
+  backdate "400 days ago"
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
+      VCACHE_S3_TTL_DAYS=0 \
+      "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s7.o" ) 2>/dev/null
+  check "ttl=0 disables expiry" "$(stat_of 'cache hit (s3)')" "1"
+
+  # --- trim -----------------------------------------------------------------
+
+  before=$(find "$S3DIR" -type f | wc -l)
+  check "one object present before trimming" "$before" "1"
+
+  # Nothing to enforce: no ttl and no cap must leave the bucket alone.
+  VCACHE_S3_TTL_DAYS=0 "$VCACHE" --trim >/dev/null 2>&1
+  check "trim with nothing configured deletes nothing" "$(find "$S3DIR" -type f | wc -l)" "1"
+
+  # Expired by age.
+  backdate "40 days ago"
+  "$VCACHE" --trim > "$WORK/trim.out" 2>&1
+  check "trim deletes an expired object" "$(find "$S3DIR" -type f | wc -l)" "0"
+  if grep -q 'deleted 1 expired' "$WORK/trim.out"; then
+    ok "trim reports what it deleted"
+  else
+    bad "trim reports what it deleted"
+  fi
+
+  # Evicted by the byte budget, oldest first, and across a paged listing:
+  # MOCK_S3_PAGE_SIZE=1 forces vcache to follow continuation tokens.
+  reset_cache
+  for n in 1 2 3; do
+    ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+        "$VCACHE" g++ -g -O$n -c -I include src/lib.cc -o "$WORK/t$n.o" ) 2>/dev/null
+    # Distinct ages so eviction order is well defined.
+    find "$S3DIR" -type f -newermt "-1 minute" -exec touch -d "$((4 - n)) days ago" {} +
+  done
+  check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l)" "3"
+
+  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  MOCK_S3_PAGE_SIZE=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
+  # A cap just under the total forces at least one eviction; the 80% target
+  # means it keeps going past the cap itself.
+  total_bytes=$(find "$S3DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s}')
+  VCACHE_S3_TTL_DAYS=0 VCACHE_S3_CACHE_SIZE="$((total_bytes - 1))" \
+    "$VCACHE" --trim > "$WORK/trim2.out" 2>&1
+  after=$(find "$S3DIR" -type f | wc -l)
+  if [[ "$after" -lt 3 && "$after" -ge 1 ]]; then
+    ok "trim evicts down to the byte budget across a paged listing"
+  else
+    bad "trim evicts down to the byte budget across a paged listing (left $after of 3)"
+  fi
+  if grep -qE 'listed 3 objects' "$WORK/trim2.out"; then
+    ok "trim followed the continuation tokens to see every object"
+  else
+    bad "trim followed the continuation tokens to see every object"
+  fi
+
   # An unreachable remote must degrade to a miss, never break the build.
   kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
   rm -rf "$VCACHE_DIR"

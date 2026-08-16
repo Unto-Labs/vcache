@@ -30,7 +30,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "vcache 0.2.1";
+constexpr const char* kVersion = "vcache 0.3.0";
 
 void PrintUsage() {
   std::printf(
@@ -49,6 +49,7 @@ void PrintUsage() {
       "      --show-config     show the effective configuration\n"
       "      --show-roots      show the root mapping for the current directory\n"
       "      --trim            evict entries until the cache is under its limit\n"
+      "                        (disk; also expires and caps s3 when configured)\n"
       "\n"
       "Root mapping (the point of vcache):\n"
       "  --vcache-root=PATH[=TARGET]   repeatable; may also be given as\n"
@@ -73,8 +74,8 @@ void PrintUsage() {
       "  VCACHE_DIR, VCACHE_CACHE_SIZE, VCACHE_ROOTS, VCACHE_MAP_CWD,\n"
       "  VCACHE_DISABLE, VCACHE_READONLY, VCACHE_RECACHE, VCACHE_LOG,\n"
       "  VCACHE_COMPILER_CHECK, VCACHE_S3_BUCKET, VCACHE_S3_REGION,\n"
-      "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, AWS_ACCESS_KEY_ID,\n"
-      "  AWS_SECRET_ACCESS_KEY\n"
+      "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, VCACHE_S3_TTL_DAYS,\n"
+      "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n"
       "\n"
       "Config file: $VCACHE_CONFIG, ~/.config/vcache/config.toml, or\n"
       "             /etc/vcache/config.toml\n",
@@ -251,6 +252,35 @@ int main(int argc, char** argv) {
       vcache::storage::DiskStorage disk(config.disk.dir, config.disk.max_size, false);
       disk.Trim();
       std::printf("trimmed cache at %s\n", config.disk.dir.c_str());
+
+      // The S3 layer is trimmed only here, never during a compile: it costs a
+      // bucket listing, and on a shared bucket evicting another machine's
+      // entries is not a decision an ordinary build should be taking.
+      if (config.s3.enabled) {
+        auto s3 = std::make_unique<vcache::storage::S3Storage>(config.s3);
+        if (!s3->available()) {
+          ::fprintf(stderr, "vcache: warning: s3 not trimmed: %s\n",
+                    s3->load_error().c_str());
+          return 1;
+        }
+        if (config.read_only) s3->set_read_only(true);
+        s3->Trim();
+        const auto& t = s3->last_trim();
+        if (!t.ran) {
+          std::printf("s3: nothing to enforce (no ttl, no size cap)\n");
+        } else {
+          std::printf(
+              "s3: listed %llu objects (%llu bytes), deleted %llu expired and "
+              "%llu over budget (%llu bytes)%s\n",
+              static_cast<unsigned long long>(t.listed),
+              static_cast<unsigned long long>(t.bytes_before),
+              static_cast<unsigned long long>(t.expired),
+              static_cast<unsigned long long>(t.evicted),
+              static_cast<unsigned long long>(t.bytes_deleted),
+              t.complete ? "" : " -- INCOMPLETE, see log");
+          if (!t.complete) return 1;
+        }
+      }
       return 0;
     }
 

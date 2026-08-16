@@ -35,6 +35,19 @@ struct S3CacheConfig {
   bool no_credentials = false;   // anonymous, read-only public buckets
   int timeout_seconds = 30;
 
+  // Entries older than this are refused on read and deleted by --trim. Zero
+  // disables expiry. This is vcache's own ceiling, deliberately independent of
+  // any bucket lifecycle rule: a rule that is missing, mis-scoped or newly
+  // changed must not be able to hand a build a six-month-old object.
+  int ttl_days = 30;
+
+  // Byte budget for this layer, enforced only by --trim. Zero means no cap,
+  // which is the default *because* the bucket is usually shared: a cap that
+  // every client enforced would let one machine's small setting evict work the
+  // rest of the fleet is still using. The disk layer can default to a budget
+  // because that cache belongs to one machine; this one usually does not.
+  uint64_t max_size = 0;
+
   // Resolved from the environment (AWS_*) at load time.
   std::string access_key;
   std::string secret_key;

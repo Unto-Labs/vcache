@@ -101,6 +101,8 @@ timeout        = 30                # seconds
 | `cache.s3.path_style` | `VCACHE_S3_PATH_STYLE` | — | `false` |
 | `cache.s3.no_credentials` | `VCACHE_S3_NO_CREDENTIALS` | — | `false` |
 | `cache.s3.timeout` | *(none)* | — | `30` |
+| `cache.s3.ttl_days` | `VCACHE_S3_TTL_DAYS` | — | `30` |
+| `cache.s3.size` | `VCACHE_S3_CACHE_SIZE` | — | `0` (uncapped) |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -290,8 +292,11 @@ Credentials come from the standard `AWS_ACCESS_KEY_ID`,
 for profile files or IMDS; export the variables, or use `no_credentials` for a
 public read-only bucket.
 
-Requests are signed with AWS Signature Version 4. Only `GET` and `PUT` of a
-single object are used — no SDK, no bucket listing.
+Requests are signed with AWS Signature Version 4, with no SDK. A compile only
+ever issues `GET` and `PUT` of a single object. `vcache --trim` additionally
+uses `ListObjectsV2` and `DELETE`, so a role that only ever compiles needs
+`s3:GetObject` and `s3:PutObject`, while a role that also trims needs
+`s3:ListBucket` and `s3:DeleteObject`.
 
 ### Non-AWS endpoints
 
@@ -320,6 +325,43 @@ missing key.
 libcurl is loaded with `dlopen` the first time an S3 layer is constructed, so a
 disk-only build never maps it. If S3 is configured and libcurl is not
 installed, vcache prints one warning and continues with the local cache.
+
+### Expiry and size
+
+```toml
+[cache.s3]
+ttl_days = 30      # 0 disables expiry
+size     = "500G"  # 0, the default, means no cap
+```
+
+`ttl_days` is enforced **on read**, not only by `--trim`: an object older than
+the window is treated as a miss even if nothing has trimmed the bucket and no
+lifecycle rule exists. That deliberately does not depend on anyone remembering
+to trim, or on a bucket rule being present and correctly scoped. Age comes from
+the object's `Last-Modified`; if that header is missing or unparseable the entry
+is served rather than refused, because losing a good cache to a header quirk is
+worse than serving something slightly stale.
+
+`size` is a byte budget for this layer, and unlike the disk budget it is
+enforced **only** by `vcache --trim`, never during a compile. Two reasons:
+enforcing it inline would mean a bucket listing per compilation, and the bucket
+is usually shared, where evicting other machines' entries is not a decision an
+ordinary build should be making. For the same reason it defaults to *uncapped* —
+a cap that every client enforced would let one machine's small setting evict
+work the rest of the fleet is still using. The disk layer can default to a
+budget because that cache belongs to one machine.
+
+`vcache --trim` lists every object under the prefix, deletes those past the
+TTL, and then — if a cap is set and the remainder is still over it — deletes
+oldest-first down to 80% of the budget, the same overshoot the disk layer uses
+so the next trim is not triggered by a single store. It reports what it did and
+exits non-zero if the listing or any delete failed, so a scheduled trim that is
+quietly doing nothing is visible.
+
+A bucket lifecycle rule remains the better primary mechanism where you control
+the bucket: it costs nothing, runs server-side, and cannot be skipped. vcache's
+TTL is the belt to that braces — it bounds what a build can be handed
+regardless of what the bucket is configured to do.
 
 ### Auto-disable rules
 

@@ -2,10 +2,13 @@
 #include "storage/s3_storage.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "hash/sha256.h"
 #include "storage/curl_api.h"
@@ -48,6 +51,7 @@ std::string UriEncode(const std::string& input, bool keep_slash) {
 
 std::string BuildAuthorization(const std::string& method,
                                const std::string& canonical_uri,
+                               const std::string& query,
                                const std::string& host,
                                const std::string& amz_date,
                                const std::string& date_stamp,
@@ -67,8 +71,11 @@ std::string BuildAuthorization(const std::string& method,
     signed_headers += ";x-amz-security-token";
   }
 
+  // The canonical query string must already be sorted by key and encoded; the
+  // only caller that passes a non-empty one is the listing, which builds it
+  // that way deliberately.
   const std::string canonical_request = method + "\n" + canonical_uri + "\n" +
-                                        /*query=*/"" + "\n" + canonical_headers +
+                                        query + "\n" + canonical_headers +
                                         "\n" + signed_headers + "\n" + payload_hash;
 
   const std::string scope = date_stamp + "/" + region + "/s3/aws4_request";
@@ -111,6 +118,64 @@ size_t ReadCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
   return n;
 }
 
+size_t HeaderCallback(char* ptr, size_t size, size_t nitems, void* userdata) {
+  const size_t n = size * nitems;
+  auto* out = static_cast<std::time_t*>(userdata);
+  // Header names are case-insensitive; S3 sends "Last-Modified" but a gateway
+  // in front of it need not.
+  static constexpr std::string_view kName = "last-modified:";
+  std::string line(ptr, n);
+  std::string lower = line.substr(0, std::min(n, kName.size()));
+  for (char& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+  if (lower == kName) {
+    std::string value = line.substr(kName.size());
+    // Trim surrounding whitespace and the trailing CRLF.
+    const size_t first = value.find_first_not_of(" \t");
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    if (first != std::string::npos && last != std::string::npos && first <= last) {
+      std::time_t parsed = 0;
+      if (ParseHttpDate(value.substr(first, last - first + 1), &parsed)) {
+        *out = parsed;
+      }
+    }
+  }
+  return n;
+}
+
+const char* const kMonths[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+// timegm() is a GNU extension but present everywhere vcache builds; the
+// alternative is mktime() plus a timezone dance, which is worse.
+std::time_t FromUtcParts(int year, int month, int day, int hour, int minute,
+                         int second) {
+  struct tm tm_utc = {};
+  tm_utc.tm_year = year - 1900;
+  tm_utc.tm_mon = month - 1;
+  tm_utc.tm_mday = day;
+  tm_utc.tm_hour = hour;
+  tm_utc.tm_min = minute;
+  tm_utc.tm_sec = second;
+  return ::timegm(&tm_utc);
+}
+
+// Extracts the text between the first <tag> and its closing </tag> at or after
+// `pos`. Sufficient for ListObjectsV2, whose fields carry no attributes and no
+// nested markup; anything richer would want a real parser.
+bool ElementText(const std::string& xml, const std::string& tag, size_t* pos,
+                 std::string* out) {
+  const std::string open = "<" + tag + ">";
+  const std::string close = "</" + tag + ">";
+  const size_t start = xml.find(open, *pos);
+  if (start == std::string::npos) return false;
+  const size_t from = start + open.size();
+  const size_t end = xml.find(close, from);
+  if (end == std::string::npos) return false;
+  *out = xml.substr(from, end - from);
+  *pos = end + close.size();
+  return true;
+}
+
 void FormatTimes(std::string* amz_date, std::string* date_stamp) {
   const std::time_t now = std::time(nullptr);
   struct tm tm_utc;
@@ -123,6 +188,86 @@ void FormatTimes(std::string* amz_date, std::string* date_stamp) {
 }
 
 }  // namespace
+
+bool ParseHttpDate(const std::string& value, std::time_t* out) {
+  // "Sun, 06 Nov 1994 08:49:37 GMT" -- fixed width, so scan rather than parse.
+  if (value.size() < 29) return false;
+  char mon[4] = {0};
+  int day = 0, year = 0, hour = 0, minute = 0, second = 0;
+  if (std::sscanf(value.c_str() + 5, "%2d %3s %4d %2d:%2d:%2d", &day, mon, &year,
+                  &hour, &minute, &second) != 6) {
+    return false;
+  }
+  int month = 0;
+  for (int i = 0; i < 12; ++i) {
+    if (std::strcmp(mon, kMonths[i]) == 0) {
+      month = i + 1;
+      break;
+    }
+  }
+  if (month == 0) return false;
+  *out = FromUtcParts(year, month, day, hour, minute, second);
+  return true;
+}
+
+bool ParseIso8601(const std::string& value, std::time_t* out) {
+  // "1994-11-06T08:49:37.000Z". Fractional seconds are ignored: this is used
+  // for eviction ordering, where sub-second resolution buys nothing.
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  if (std::sscanf(value.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month, &day,
+                  &hour, &minute, &second) != 6) {
+    return false;
+  }
+  if (month < 1 || month > 12) return false;
+  *out = FromUtcParts(year, month, day, hour, minute, second);
+  return true;
+}
+
+bool ParseListObjectsV2(const std::string& xml, std::vector<S3Object>* out,
+                        std::string* next_token) {
+  next_token->clear();
+  if (xml.find("<ListBucketResult") == std::string::npos) return false;
+
+  size_t pos = 0;
+  while (true) {
+    const size_t contents = xml.find("<Contents>", pos);
+    if (contents == std::string::npos) break;
+    size_t cursor = contents;
+
+    S3Object obj;
+    std::string key, size, modified;
+    if (!ElementText(xml, "Key", &cursor, &key)) break;
+    obj.key = key;
+    // Size and LastModified are both optional in the sense that a malformed
+    // page should not abort the whole trim; an entry missing either is kept
+    // but cannot be evicted on that axis.
+    size_t probe = cursor;
+    if (ElementText(xml, "LastModified", &probe, &modified)) {
+      ParseIso8601(modified, &obj.last_modified);
+    }
+    probe = cursor;
+    if (ElementText(xml, "Size", &probe, &size)) {
+      obj.size = std::strtoull(size.c_str(), nullptr, 10);
+    }
+    out->push_back(std::move(obj));
+
+    const size_t close = xml.find("</Contents>", contents);
+    if (close == std::string::npos) break;
+    pos = close + 1;
+  }
+
+  size_t token_pos = 0;
+  std::string truncated;
+  if (ElementText(xml, "IsTruncated", &token_pos, &truncated) &&
+      truncated == "true") {
+    token_pos = 0;
+    std::string token;
+    if (ElementText(xml, "NextContinuationToken", &token_pos, &token)) {
+      *next_token = token;
+    }
+  }
+  return true;
+}
 
 S3Storage::S3Storage(core::S3CacheConfig config) : config_(std::move(config)) {
   // Opening libcurl here rather than at link time keeps roughly thirty shared
@@ -144,6 +289,10 @@ void S3Storage::ResolveEndpoint(const std::string& object_key, std::string* host
                                 std::string* url,
                                 std::string* canonical_uri) const {
   const std::string encoded_key = sigv4::UriEncode(object_key, /*keep_slash=*/true);
+  // An empty key addresses the bucket itself, which is what a listing needs.
+  // Path style then stops at "/<bucket>" with no trailing slash, because a
+  // trailing slash is a different canonical URI and would not verify.
+  const std::string path_suffix = encoded_key.empty() ? "" : "/" + encoded_key;
 
   if (!config_.endpoint.empty()) {
     // Custom endpoint (MinIO, Ceph, an S3 gateway). Path style unless the
@@ -164,10 +313,10 @@ void S3Storage::ResolveEndpoint(const std::string& object_key, std::string* host
                                          : scheme_stripped.substr(0, slash);
 
     if (config_.use_path_style) {
-      *canonical_uri = "/" + config_.bucket + "/" + encoded_key;
+      *canonical_uri = "/" + config_.bucket + path_suffix;
     } else {
       *host = config_.bucket + "." + *host;
-      *canonical_uri = "/" + encoded_key;
+      *canonical_uri = encoded_key.empty() ? "/" : "/" + encoded_key;
       base = base.substr(0, base.find("://") + 3) + *host;
     }
     *url = base + *canonical_uri;
@@ -176,21 +325,32 @@ void S3Storage::ResolveEndpoint(const std::string& object_key, std::string* host
 
   if (config_.use_path_style) {
     *host = "s3." + config_.region + ".amazonaws.com";
-    *canonical_uri = "/" + config_.bucket + "/" + encoded_key;
+    *canonical_uri = "/" + config_.bucket + path_suffix;
   } else {
     *host = config_.bucket + ".s3." + config_.region + ".amazonaws.com";
-    *canonical_uri = "/" + encoded_key;
+    *canonical_uri = encoded_key.empty() ? "/" : "/" + encoded_key;
   }
   *url = "https://" + *host + *canonical_uri;
 }
 
-bool S3Storage::Request(const std::string& method, const std::string& key,
-                        const std::string& payload, std::string* response_body) {
+bool S3Storage::ObjectRequest(const std::string& method, const std::string& key,
+                              const std::string& payload,
+                              std::string* response_body,
+                              std::time_t* last_modified) {
+  return Request(method, ObjectKey(key), /*query=*/"", payload, response_body,
+                 last_modified);
+}
+
+bool S3Storage::Request(const std::string& method,
+                        const std::string& canonical_uri_path,
+                        const std::string& query, const std::string& payload,
+                        std::string* response_body,
+                        std::time_t* last_modified) {
   if (curl_ == nullptr) return false;  // libcurl unavailable; behave as a miss
 
-  const std::string object_key = ObjectKey(key);
   std::string host, url, canonical_uri;
-  ResolveEndpoint(object_key, &host, &url, &canonical_uri);
+  ResolveEndpoint(canonical_uri_path, &host, &url, &canonical_uri);
+  if (!query.empty()) url += "?" + query;
 
   std::string amz_date, date_stamp;
   FormatTimes(&amz_date, &date_stamp);
@@ -209,7 +369,7 @@ bool S3Storage::Request(const std::string& method, const std::string& key,
   }
   if (!config_.no_credentials) {
     const std::string authorization = sigv4::BuildAuthorization(
-        method, canonical_uri, host, amz_date, date_stamp, payload_hash,
+        method, canonical_uri, query, host, amz_date, date_stamp, payload_hash,
         config_.session_token, config_.region, config_.access_key,
         config_.secret_key);
     headers = curl_->slist_append(headers, ("Authorization: " + authorization).c_str());
@@ -225,6 +385,16 @@ bool S3Storage::Request(const std::string& method, const std::string& key,
   curl_->easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
   curl_->easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_->easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+  if (last_modified != nullptr) {
+    *last_modified = 0;
+    curl_->easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_->easy_setopt(curl, CURLOPT_HEADERDATA, last_modified);
+  }
+
+  if (method == "DELETE") {
+    curl_->easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+  }
 
   ReadContext read_ctx{&payload, 0};
   if (method == "PUT") {
@@ -242,7 +412,7 @@ bool S3Storage::Request(const std::string& method, const std::string& key,
   curl_->easy_cleanup(curl);
 
   if (rc != CURLE_OK) {
-    VCACHE_LOG("s3: " + method + " " + object_key + " transport error: " +
+    VCACHE_LOG("s3: " + method + " " + canonical_uri_path + " transport error: " +
                curl_->easy_strerror(rc));
     return false;
   }
@@ -251,7 +421,7 @@ bool S3Storage::Request(const std::string& method, const std::string& key,
     return false;
   }
   if (status < 200 || status >= 300) {
-    VCACHE_LOG("s3: " + method + " " + object_key + " HTTP " +
+    VCACHE_LOG("s3: " + method + " " + canonical_uri_path + " HTTP " +
                std::to_string(status) + ": " + response_body->substr(0, 512));
     return false;
   }
@@ -260,7 +430,27 @@ bool S3Storage::Request(const std::string& method, const std::string& key,
 
 bool S3Storage::Get(const std::string& key, std::string* value) {
   std::string body;
-  if (!Request("GET", key, "", &body)) return false;
+  std::time_t last_modified = 0;
+  if (!ObjectRequest("GET", key, "", &body, &last_modified)) return false;
+
+  // Age is checked on read as well as in Trim() so that expiry does not depend
+  // on anyone remembering to trim, or on a bucket lifecycle rule being present
+  // and correctly scoped. A last_modified of 0 means the header was missing or
+  // unparseable, which is treated as "unknown age" and allowed through: losing
+  // a good cache to a header quirk would be a worse failure than serving an
+  // entry slightly past its window.
+  if (config_.ttl_days > 0 && last_modified > 0) {
+    const std::time_t age = std::time(nullptr) - last_modified;
+    const std::time_t ttl =
+        static_cast<std::time_t>(config_.ttl_days) * 24 * 60 * 60;
+    if (age > ttl) {
+      VCACHE_LOG("s3: " + ObjectKey(key) + " is " + std::to_string(age / 86400) +
+                 " days old, past the " + std::to_string(config_.ttl_days) +
+                 "-day ttl; treating as a miss");
+      return false;
+    }
+  }
+
   *value = std::move(body);
   return true;
 }
@@ -268,7 +458,115 @@ bool S3Storage::Get(const std::string& key, std::string* value) {
 bool S3Storage::Put(const std::string& key, const std::string& value) {
   if (read_only_) return false;
   std::string response;
-  return Request("PUT", key, value, &response);
+  return ObjectRequest("PUT", key, value, &response, nullptr);
+}
+
+bool S3Storage::DeleteObject(const std::string& object_key) {
+  std::string response;
+  return Request("DELETE", object_key, /*query=*/"", /*payload=*/"", &response,
+                 nullptr);
+}
+
+bool S3Storage::ListAll(std::vector<S3Object>* out) {
+  std::string token;
+  // A bucket shared with anything else could be enormous; the bound stops a
+  // misconfigured prefix from turning a trim into an unbounded walk.
+  constexpr int kMaxPages = 10000;
+  for (int page = 0; page < kMaxPages; ++page) {
+    // Canonical query strings must be sorted by key name, so build in that
+    // order: continuation-token, list-type, prefix.
+    std::string query;
+    if (!token.empty()) {
+      query += "continuation-token=" + sigv4::UriEncode(token, /*keep_slash=*/false);
+      query += "&";
+    }
+    query += "list-type=2";
+    if (!config_.prefix.empty()) {
+      query += "&prefix=" + sigv4::UriEncode(config_.prefix, /*keep_slash=*/false);
+    }
+
+    // The listing is a bucket-level operation, so the path is the bucket root
+    // rather than an object.
+    std::string body;
+    if (!Request("GET", /*canonical_uri_path=*/"", query, /*payload=*/"", &body,
+                 nullptr)) {
+      VCACHE_LOG("s3: listing failed; trim is incomplete");
+      return false;
+    }
+    if (!ParseListObjectsV2(body, out, &token)) {
+      VCACHE_LOG("s3: listing response was not a ListBucketResult");
+      return false;
+    }
+    if (token.empty()) return true;
+  }
+  VCACHE_LOG("s3: listing exceeded the page bound; trim is incomplete");
+  return false;
+}
+
+void S3Storage::Trim() {
+  last_trim_ = TrimResult{};
+  if (curl_ == nullptr || read_only_) return;
+  if (config_.ttl_days <= 0 && config_.max_size == 0) return;  // nothing to enforce
+  last_trim_.ran = true;
+
+  std::vector<S3Object> objects;
+  const bool listed_all = ListAll(&objects);
+  last_trim_.listed = objects.size();
+  for (const S3Object& o : objects) last_trim_.bytes_before += o.size;
+
+  const std::time_t now = std::time(nullptr);
+  const std::time_t ttl =
+      static_cast<std::time_t>(config_.ttl_days) * 24 * 60 * 60;
+
+  // Oldest first: expiry walks the front of this order and the byte budget
+  // evicts from it, so one sort serves both.
+  std::sort(objects.begin(), objects.end(),
+            [](const S3Object& a, const S3Object& b) {
+              return a.last_modified < b.last_modified;
+            });
+
+  bool all_deletes_ok = true;
+  uint64_t remaining = last_trim_.bytes_before;
+  std::vector<const S3Object*> survivors;
+  survivors.reserve(objects.size());
+
+  for (const S3Object& o : objects) {
+    const bool expired = config_.ttl_days > 0 && o.last_modified > 0 &&
+                         (now - o.last_modified) > ttl;
+    if (!expired) {
+      survivors.push_back(&o);
+      continue;
+    }
+    if (DeleteObject(o.key)) {
+      ++last_trim_.expired;
+      last_trim_.bytes_deleted += o.size;
+      remaining -= o.size;
+    } else {
+      all_deletes_ok = false;
+      survivors.push_back(&o);
+    }
+  }
+
+  // Evict down to 80% of the budget rather than exactly to it, so the next
+  // trim is not triggered by a single store. Same reasoning as the disk layer.
+  if (config_.max_size > 0 && remaining > config_.max_size) {
+    const auto target = static_cast<uint64_t>(config_.max_size * 0.8);
+    for (const S3Object* o : survivors) {
+      if (remaining <= target) break;
+      if (DeleteObject(o->key)) {
+        ++last_trim_.evicted;
+        last_trim_.bytes_deleted += o->size;
+        remaining -= o->size;
+      } else {
+        all_deletes_ok = false;
+      }
+    }
+  }
+
+  last_trim_.complete = listed_all && all_deletes_ok;
+  VCACHE_LOG("s3: trim listed " + std::to_string(last_trim_.listed) +
+             " objects, deleted " + std::to_string(last_trim_.expired) +
+             " expired and " + std::to_string(last_trim_.evicted) + " over budget");
 }
 
 }  // namespace vcache::storage

@@ -128,6 +128,19 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlInt(*s3, "timeout")) {
       if (*v > 0) config->s3.timeout_seconds = static_cast<int>(*v);
     }
+    if (auto v = TomlInt(*s3, "ttl_days")) {
+      if (*v >= 0) config->s3.ttl_days = static_cast<int>(*v);
+    }
+    if (auto v = TomlString(*s3, "size")) {
+      uint64_t bytes = 0;
+      if (util::ParseSize(*v, &bytes)) {
+        config->s3.max_size = bytes;
+      } else {
+        config->warnings.push_back("cache.s3.size: unparseable size '" + *v + "'");
+      }
+    } else if (auto n = TomlInt(*s3, "size")) {
+      if (*n >= 0) config->s3.max_size = static_cast<uint64_t>(*n);
+    }
   }
 
   if (auto vc = root["vcache"].as_table()) {
@@ -185,6 +198,23 @@ void ApplyEnvironment(Config* config) {
   config->s3.use_path_style = EnvBool("VCACHE_S3_PATH_STYLE", config->s3.use_path_style);
   config->s3.no_credentials =
       EnvBool("VCACHE_S3_NO_CREDENTIALS", config->s3.no_credentials);
+  if (auto v = Env("VCACHE_S3_TTL_DAYS")) {
+    char* end = nullptr;
+    const long days = std::strtol(v->c_str(), &end, 10);
+    if (end != v->c_str() && *end == '\0' && days >= 0) {
+      config->s3.ttl_days = static_cast<int>(days);
+    } else {
+      config->warnings.push_back("VCACHE_S3_TTL_DAYS: not a day count '" + *v + "'");
+    }
+  }
+  if (auto v = Env("VCACHE_S3_CACHE_SIZE")) {
+    uint64_t bytes = 0;
+    if (util::ParseSize(*v, &bytes)) {
+      config->s3.max_size = bytes;
+    } else {
+      config->warnings.push_back("VCACHE_S3_CACHE_SIZE: unparseable size '" + *v + "'");
+    }
+  }
 
   // Standard AWS variables, so existing credential setups work unchanged.
   if (auto v = Env("AWS_ACCESS_KEY_ID")) config->s3.access_key = *v;
@@ -314,6 +344,18 @@ std::string DescribeConfig(const Config& config) {
     out << "  path style:     " << (config.s3.use_path_style ? "yes" : "no") << "\n";
     out << "  credentials:    "
         << (config.s3.no_credentials ? "anonymous" : "from environment") << "\n";
+    out << "  ttl:            ";
+    if (config.s3.ttl_days > 0) {
+      out << config.s3.ttl_days << " days\n";
+    } else {
+      out << "none\n";
+    }
+    out << "  max size:       ";
+    if (config.s3.max_size > 0) {
+      out << config.s3.max_size << " bytes (enforced by --trim)\n";
+    } else {
+      out << "uncapped\n";
+    }
   }
   out << "roots:            "
       << (config.root_specs.empty() ? "(none)" : util::Join(config.root_specs, ", ")) << "\n";

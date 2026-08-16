@@ -870,7 +870,7 @@ void TestSigV4() {
           "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5",
           "payload hash");
   const std::string auth = BuildAuthorization(
-      "PUT", "/vcache/ab/cdef", "bkt.s3.us-east-1.amazonaws.com",
+      "PUT", "/vcache/ab/cdef", /*query=*/"", "bkt.s3.us-east-1.amazonaws.com",
       "20150830T123600Z", "20150830", payload_hash, /*session_token=*/"",
       "us-east-1", "AKIDEXAMPLE", secret);
   Check(auth.find("Signature=6a89ab420d95da1c11102e64cd1c0c95942eff50b1b5efa666e12e5383701605") !=
@@ -885,10 +885,83 @@ void TestSigV4() {
 
   // A session token must join the signed header set.
   const std::string with_token = BuildAuthorization(
-      "GET", "/k", "h", "20150830T123600Z", "20150830", Sha256Hex(""), "TOKEN",
-      "us-east-1", "AKIDEXAMPLE", secret);
+      "GET", "/k", /*query=*/"", "h", "20150830T123600Z", "20150830",
+      Sha256Hex(""), "TOKEN", "us-east-1", "AKIDEXAMPLE", secret);
   Check(with_token.find("x-amz-security-token") != std::string::npos,
         "session token is included in SignedHeaders");
+
+  // The canonical query string is part of the signed request, so a listing and
+  // a bare GET of the same path must not produce the same signature.
+  const std::string unqueried = BuildAuthorization(
+      "GET", "/bkt", /*query=*/"", "h", "20150830T123600Z", "20150830",
+      Sha256Hex(""), "", "us-east-1", "AKIDEXAMPLE", secret);
+  const std::string queried = BuildAuthorization(
+      "GET", "/bkt", "list-type=2", "h", "20150830T123600Z", "20150830",
+      Sha256Hex(""), "", "us-east-1", "AKIDEXAMPLE", secret);
+  Check(unqueried != queried, "the query string is covered by the signature");
+}
+
+void TestS3ResponseParsing() {
+  Section("storage::S3 response parsing");
+
+  std::time_t when = 0;
+  Check(storage::ParseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT", &when),
+        "parses an IMF-fixdate");
+  CheckEq(std::to_string(when), "784111777", "IMF-fixdate is interpreted as UTC");
+
+  when = 0;
+  Check(storage::ParseIso8601("1994-11-06T08:49:37.000Z", &when),
+        "parses an ISO-8601 instant");
+  CheckEq(std::to_string(when), "784111777", "both formats agree on the instant");
+
+  // A header vcache cannot read must not be mistaken for an expired entry.
+  Check(!storage::ParseHttpDate("not a date", &when), "rejects a non-date");
+  Check(!storage::ParseHttpDate("", &when), "rejects an empty date");
+  Check(!storage::ParseHttpDate("Sun, 06 Xxx 1994 08:49:37 GMT", &when),
+        "rejects an unknown month");
+
+  const std::string listing =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+      "<IsTruncated>true</IsTruncated>"
+      "<Contents><Key>vcache/ab/cdef</Key>"
+      "<LastModified>2026-01-02T03:04:05.000Z</LastModified>"
+      "<Size>1234</Size></Contents>"
+      "<Contents><Key>vcache/12/3456</Key>"
+      "<LastModified>2026-01-03T03:04:05.000Z</LastModified>"
+      "<Size>9</Size></Contents>"
+      "<NextContinuationToken>tok</NextContinuationToken>"
+      "</ListBucketResult>";
+
+  std::vector<storage::S3Object> objects;
+  std::string token;
+  Check(storage::ParseListObjectsV2(listing, &objects, &token), "parses a listing");
+  Check(objects.size() == 2, "finds every Contents entry");
+  if (objects.size() == 2) {
+    CheckEq(objects[0].key, "vcache/ab/cdef", "reads the key");
+    CheckEq(std::to_string(objects[0].size), "1234", "reads the size");
+    CheckEq(objects[1].key, "vcache/12/3456", "reads the second key");
+    Check(objects[0].last_modified < objects[1].last_modified,
+          "reads timestamps in a comparable order");
+  }
+  CheckEq(token, "tok", "reports the continuation token");
+
+  // A complete listing must not look truncated, or Trim would loop.
+  const std::string last_page =
+      "<ListBucketResult><IsTruncated>false</IsTruncated>"
+      "<Contents><Key>k</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>"
+      "<Size>1</Size></Contents></ListBucketResult>";
+  objects.clear();
+  Check(storage::ParseListObjectsV2(last_page, &objects, &token),
+        "parses a final page");
+  Check(token.empty(), "a complete listing yields no continuation token");
+
+  // An error document returned with a 200 must not read as an empty bucket,
+  // which Trim would otherwise treat as "nothing to delete" and report clean.
+  objects.clear();
+  Check(!storage::ParseListObjectsV2("<Error><Code>AccessDenied</Code></Error>",
+                                     &objects, &token),
+        "rejects a body that is not a listing");
 }
 
 }  // namespace
@@ -905,6 +978,7 @@ int main() {
   TestCompilerArgs();
   TestRustcArgs();
   TestSigV4();
+  TestS3ResponseParsing();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

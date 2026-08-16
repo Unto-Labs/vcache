@@ -324,6 +324,8 @@ reference implementation.
 
 ## Licence
 
+Copyright © 2026 Unto Labs.
+
 vcache is free software: you can redistribute it and/or modify it under the
 terms of **version 3 of the GNU General Public License** as published by the
 Free Software Foundation. Version 3 only — not "or any later version". The full
@@ -331,10 +333,11 @@ text is in [LICENSE](LICENSE). It is distributed in the hope that it will be
 useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
-Every first-party source file carries
+Every first-party source file carries both
+`SPDX-FileCopyrightText: 2026 Unto Labs` and
 `SPDX-License-Identifier: GPL-3.0-only`, because this tree deliberately mixes
 licences and the top-level `LICENSE` alone would not say which file is under
-which.
+which, or who holds it.
 
 ### Third-party components keep their own terms
 

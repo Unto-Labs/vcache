@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Unto Labs
 // SPDX-License-Identifier: GPL-3.0-only
 // Configuration, layered the way sccache does it: a TOML file supplies the
 // defaults and environment variables override individual settings, so a CI job

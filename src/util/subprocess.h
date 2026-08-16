@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Unto Labs
 // SPDX-License-Identifier: GPL-3.0-only
 // Process execution. vcache never goes through a shell: argv vectors are passed
 // straight to execvp so paths containing spaces or quotes cannot be misparsed.

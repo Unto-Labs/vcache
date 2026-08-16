@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Unto Labs
 // SPDX-License-Identifier: GPL-3.0-only
 // SHA-256 and HMAC-SHA256 (FIPS 180-4, RFC 2104).
 //

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Unto Labs
 # SPDX-License-Identifier: GPL-3.0-only
 # End-to-end tests for vcache.
 #

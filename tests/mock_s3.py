@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Unto Labs
 # SPDX-License-Identifier: GPL-3.0-only
 """A minimal S3-compatible object store, used to exercise vcache's S3 layer.
 

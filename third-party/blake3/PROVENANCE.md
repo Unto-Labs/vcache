@@ -25,6 +25,12 @@ subdirectory. Used for cache keys (`src/hash/hasher.cc`).
   which is correct but slower. Restore this file and wire up `BLAKE3_USE_NEON`
   if ARM throughput ever matters.
 
+  Because this file is absent, the Makefile **must** pass `-DBLAKE3_USE_NEON=0`
+  on aarch64. `blake3_impl.h` autodetects that macro to `1` there, and
+  `blake3_dispatch.c` then calls `blake3_hash_many_neon` unconditionally, so
+  omitting the define does not select the portable path — it fails the link on
+  undefined references.
+
 Everything kept here is compiled on at least one supported target. Nothing here
 is dead.
 

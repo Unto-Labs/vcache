@@ -54,11 +54,18 @@ ifeq ($(BLAKE3_ARCH),x86_64)
   BLAKE3_DEFS :=
 else
   BLAKE3_S    :=
+  # BLAKE3_USE_NEON=0 is not optional on aarch64: upstream's blake3_impl.h
+  # autodetects it to 1 there, and blake3_dispatch.c then calls
+  # blake3_hash_many_neon, which lives in blake3_neon.c -- a file this subset
+  # does not vendor. Without this the link fails on undefined references
+  # rather than falling back to the portable path. See third-party/blake3/
+  # PROVENANCE.md if ARM hashing throughput ever justifies vendoring it.
+  #
   # -Wno-unused-variable: with every SIMD path disabled, upstream's
   # blake3_dispatch.c computes a cpu_feature value it then never consults.
   # Upstream code, so suppressed rather than patched.
   BLAKE3_DEFS := -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 \
-                 -DBLAKE3_NO_AVX512 -Wno-unused-variable
+                 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -Wno-unused-variable
 endif
 
 # ---- flags ------------------------------------------------------------------

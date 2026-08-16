@@ -109,7 +109,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_headers(b""):
             return
+        no_list = os.environ.get("MOCK_S3_NO_LISTBUCKET") == "1"
         if "list-type=2" in urlparse(self.path).query:
+            # A bucket without s3:ListBucket denies the listing itself.
+            if no_list:
+                self.send_error(403, "AccessDenied")
+                return
             body = self._listing()
             self.send_response(200)
             self.send_header("Content-Type", "application/xml")
@@ -119,7 +124,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self._object_path()
         if path is None or not os.path.exists(path):
-            self.send_error(404, "not found")
+            # Real S3 answers a missing key with 403 rather than 404 when the
+            # caller lacks ListBucket. That ambiguity is what the diagnostic in
+            # S3Storage::DiagnoseDenial exists to resolve.
+            self.send_error(403 if no_list else 404, "not found")
             return
         with open(path, "rb") as f:
             data = f.read()

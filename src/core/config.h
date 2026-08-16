@@ -41,6 +41,12 @@ struct S3CacheConfig {
   // changed must not be able to hand a build a six-month-old object.
   int ttl_days = 30;
 
+  // Set when the bucket is known not to grant ListBucket and that is accepted.
+  // Deliberately config-file only, with no environment or command-line form:
+  // it silences a correctness diagnostic, so it should be a recorded decision
+  // about a particular bucket rather than something a shell alias can set.
+  bool assume_no_list_bucket = false;
+
   // Byte budget for this layer, enforced only by --trim. Zero means no cap,
   // which is the default *because* the bucket is usually shared: a cap that
   // every client enforced would let one machine's small setting evict work the

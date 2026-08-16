@@ -128,6 +128,9 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlInt(*s3, "timeout")) {
       if (*v > 0) config->s3.timeout_seconds = static_cast<int>(*v);
     }
+    if (auto v = TomlBool(*s3, "assume_no_list_bucket")) {
+      config->s3.assume_no_list_bucket = *v;
+    }
     if (auto v = TomlInt(*s3, "ttl_days")) {
       if (*v >= 0) config->s3.ttl_days = static_cast<int>(*v);
     }

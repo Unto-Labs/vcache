@@ -88,6 +88,16 @@ class S3Storage : public Storage {
 
   bool DeleteObject(const std::string& object_key);
 
+  // Settles what a 403 on a lookup meant, at most once per process.
+  //
+  // S3 answers a missing key with 404 when the caller holds ListBucket and 403
+  // when it does not, so a 403 is either an ordinary miss on an under-permitted
+  // bucket or a real permission failure -- and the two want opposite handling.
+  // One max-keys=0 listing tells them apart. A bucket that grants ListBucket
+  // never reaches this, because its misses are 404s, so the cost falls only on
+  // the configuration this is trying to get fixed.
+  void DiagnoseDenial(const std::string& key);
+
   // Builds the object key, applying the configured prefix and sharding the
   // digest so a bucket listing stays navigable.
   std::string ObjectKey(const std::string& key) const;
@@ -100,6 +110,8 @@ class S3Storage : public Storage {
   const CurlApi* curl_ = nullptr;
   std::string load_error_;
   bool read_only_ = false;
+  long last_status_ = 0;
+  bool denial_diagnosed_ = false;
   TrimResult last_trim_;
 };
 

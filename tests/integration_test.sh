@@ -668,6 +668,82 @@ except Exception: sys.exit(1)
       g++ -O1 -c -I include src/lib.cc -o "$WORK/m4.o" ) 2>/dev/null
   check "a plain miss is not a media failure" "$?" "0"
 
+  # --- the ListBucket diagnostic -------------------------------------------
+  #
+  # Restart the mock as a bucket that denies both the listing and any missing
+  # object, which is how real S3 behaves without s3:ListBucket.
+  MOCK_S3_NO_LISTBUCKET=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/lb1.o" ) 2>"$WORK/lb1.err"
+  rc=$?
+  check "a bucket without ListBucket still builds" "$rc" "0"
+  if grep -q 'does not grant s3:ListBucket' "$WORK/lb1.err"; then
+    ok "and says so"
+  else
+    bad "and says so"
+  fi
+  if grep -q 'assume_no_list_bucket' "$WORK/lb1.err"; then
+    ok "and names the config key that silences it"
+  else
+    bad "and names the config key that silences it"
+  fi
+  # The 403 is still treated as an ordinary miss, not a media failure.
+  check "a denied lookup on such a bucket is a miss, not an error" \
+    "$(stat_of 'cache media errors')" "0"
+
+  # The config-file key suppresses both the warning and the extra probe.
+  cat > "$WORK/no-list.toml" <<TOML
+[cache.s3]
+assume_no_list_bucket = true
+TOML
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      VCACHE_CONFIG="$WORK/no-list.toml" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/lb2.o" ) 2>"$WORK/lb2.err"
+  if grep -q 'does not grant s3:ListBucket' "$WORK/lb2.err"; then
+    bad "assume_no_list_bucket silences the warning"
+  else
+    ok "assume_no_list_bucket silences the warning"
+  fi
+
+  # With ListBucket available, a 403 on the object means something really is
+  # wrong, and must be reported rather than filed as a miss. Deleting the
+  # object directory makes every GET a miss; the listing still succeeds.
+  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/lb3.o" ) 2>"$WORK/lb3.err"
+  if grep -q 'does not grant s3:ListBucket' "$WORK/lb3.err"; then
+    bad "a bucket that does grant ListBucket produces no warning"
+  else
+    ok "a bucket that does grant ListBucket produces no warning"
+  fi
+
+  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+
   # A compile that genuinely fails must keep reporting the compiler's status,
   # not vcache's, even with the flag on and s3 down.
   printf 'int main(){ return notdefined; }\n' > "$WORK/broken.c"

@@ -411,6 +411,7 @@ bool S3Storage::Request(const std::string& method,
   const CURLcode rc = curl_->easy_perform(curl);
   long status = 0;
   curl_->easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  last_status_ = status;
   curl_->slist_free_all(headers);
   curl_->easy_cleanup(curl);
 
@@ -444,7 +445,10 @@ bool S3Storage::Get(const std::string& key, std::string* value) {
   ClearError();
   std::string body;
   std::time_t last_modified = 0;
-  if (!ObjectRequest("GET", key, "", &body, &last_modified)) return false;
+  if (!ObjectRequest("GET", key, "", &body, &last_modified)) {
+    if (last_status_ == 403) DiagnoseDenial(key);
+    return false;
+  }
 
   // Age is checked on read as well as in Trim() so that expiry does not depend
   // on anyone remembering to trim, or on a bucket lifecycle rule being present
@@ -473,6 +477,48 @@ bool S3Storage::Put(const std::string& key, const std::string& value) {
   if (read_only_) return false;
   std::string response;
   return ObjectRequest("PUT", key, value, &response, nullptr);
+}
+
+void S3Storage::DiagnoseDenial(const std::string& key) {
+  // The operator has already accepted this bucket's permissions, so do not
+  // spend a request re-confirming it on every compile.
+  if (config_.assume_no_list_bucket) return;
+  if (denial_diagnosed_) return;
+  denial_diagnosed_ = true;
+
+  // max-keys=0 asks for no objects at all: the answer is purely whether the
+  // caller is allowed to ask. Canonical query strings are sorted by key name,
+  // so list-type sorts after max-keys.
+  std::string body;
+  std::string query = "list-type=2&max-keys=0";
+  if (!config_.prefix.empty()) {
+    query += "&prefix=" + sigv4::UriEncode(config_.prefix, /*keep_slash=*/false);
+  }
+  const bool can_list =
+      Request("GET", /*canonical_uri_path=*/"", query, /*payload=*/"", &body,
+              nullptr);
+
+  if (can_list) {
+    // ListBucket is granted, so a missing key would have been a 404. This 403
+    // is a real permission problem on the object itself -- no s3:GetObject, or
+    // a KMS key the caller cannot use -- and must not be filed as a miss.
+    SetError("GET " + ObjectKey(key) +
+             ": HTTP 403 while ListBucket is granted, so this is a permission "
+             "failure on the object rather than a miss");
+    return;
+  }
+
+  // Cannot list either, so the 403 is most likely an ordinary miss on a bucket
+  // that does not grant ListBucket. Say so once: from here on vcache cannot
+  // tell that case apart from wrong credentials, which is worth knowing before
+  // spending a week wondering why the hit rate is zero.
+  ::fprintf(stderr,
+            "vcache: warning: bucket %s does not grant s3:ListBucket, so a "
+            "missing object and a permission failure both answer 403 and "
+            "cannot be told apart. Grant s3:ListBucket, or set\n"
+            "  [cache.s3]\n  assume_no_list_bucket = true\n"
+            "in the config file to accept that and silence this.\n",
+            config_.bucket.c_str());
 }
 
 bool S3Storage::DeleteObject(const std::string& object_key) {

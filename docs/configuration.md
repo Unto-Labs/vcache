@@ -102,6 +102,7 @@ timeout        = 30                # seconds
 | `cache.s3.path_style` | `VCACHE_S3_PATH_STYLE` | — | `false` |
 | `cache.s3.no_credentials` | `VCACHE_S3_NO_CREDENTIALS` | — | `false` |
 | `cache.s3.timeout` | *(none)* | — | `30` |
+| `cache.s3.assume_no_list_bucket` | *(none)* | — | `false` |
 | `cache.s3.ttl_days` | `VCACHE_S3_TTL_DAYS` | — | `30` |
 | `cache.s3.size` | `VCACHE_S3_CACHE_SIZE` | — | `0` (uncapped) |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
@@ -155,12 +156,43 @@ Three things it deliberately does not do:
 - **The output is still produced.** The object is in place before the exit
   status is decided, so a build re-run without the flag needs no cleanup.
 
-One caveat, because it cannot be fixed without guessing. S3 answers a missing
-key with **403** rather than 404 on buckets that do not grant `ListBucket`, so
-a genuine credential or permission failure is indistinguishable from a cold
-cache by status alone. vcache treats both as a miss. If credentials are wrong,
-the symptom is a cache that never hits rather than an error — check
-`--show-config` and the bucket policy before assuming the cache is merely cold.
+### Buckets should grant ListBucket
+
+S3 answers a missing key with **404** when the caller holds `s3:ListBucket` and
+**403** when it does not. So on an under-permitted bucket an ordinary miss and a
+real permission failure look identical, and the two want opposite handling.
+
+vcache resolves that rather than guessing. The first time a lookup comes back
+403, it issues one `max-keys=0` listing — a request that fetches no objects and
+asks only whether the caller is allowed to ask:
+
+- **The listing succeeds.** `ListBucket` is granted, so a missing key would have
+  been a 404. This 403 is a genuine permission failure on the object — no
+  `s3:GetObject`, or a KMS key the caller cannot use — and is reported as a
+  media error rather than filed as a miss.
+- **The listing is denied too.** The 403 was most likely an ordinary miss, and
+  vcache warns once that this bucket cannot distinguish the two cases.
+
+The probe costs nothing on a correctly permitted bucket, because such a bucket
+answers misses with 404 and never reaches it. It runs at most once per
+invocation, and only on the configuration it is asking you to fix.
+
+Grant `s3:ListBucket` where you can — it is also what `--trim` needs. Where you
+cannot, accept it explicitly:
+
+```toml
+[cache.s3]
+assume_no_list_bucket = true
+```
+
+which silences the warning *and* skips the probe. That key is **config-file
+only**, with no environment variable or command-line form, on purpose: it
+silences a correctness diagnostic, so it should be a recorded decision about a
+particular bucket rather than something a shell alias can set on the way past.
+
+With it set, a wrong-credentials bucket looks like a cache that never hits
+rather than an error — check `--show-config` and the bucket policy before
+concluding the cache is merely cold.
 
 ## Root mapping
 

@@ -25,12 +25,12 @@ from cache, and the linked binaries are byte-identical** (4.5s → 0.77s).
 
 ## What the v stands for
 
-Either, depending on how generous you are feeling:
+Either:
 
-- **V**lad's cache. This is the honest one.
+- **V**lad's cache.
 - **V**irtuous **C**ompile **A**voidance, **C**onscientiously **H**ashing
-  **E**verything. This is the one that fits on a slide.
-
+  **E**verything.
+  
 The backronym is a joke that turns out to describe the design. Avoiding a
 compile is the entire point, and vcache is conscientious to a fault about
 earning it: it never trusts an mtime, it re-hashes every file a cached

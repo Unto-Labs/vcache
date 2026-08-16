@@ -31,6 +31,14 @@ misses() { stat_of "cache miss"; }
 uncacheable() { stat_of "uncacheable"; }
 reset_cache() { rm -rf "$VCACHE_DIR"; }
 
+# Counts entries in the local layer. Entries live in two-character shard
+# directories, which the "??" pattern picks out from the cache directory's other
+# contents: stats, compilers/ and native/.
+disk_entries() {
+  find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
+    2>/dev/null | wc -l
+}
+
 # Builds a small project tree at $1 whose contents are identical everywhere.
 make_project() {
   local root="$1"
@@ -501,6 +509,10 @@ except Exception: sys.exit(1)
   check "compile with s3 enabled is a miss" "$(misses)" "1"
   objects_written=$(find "$S3DIR" -type f 2>/dev/null | wc -l)
   check "entry was uploaded to s3" "$objects_written" "1"
+  # One store, both layers. Asserted before the local layer is wiped below,
+  # since that would otherwise destroy the only evidence -- and the disk hit
+  # further down proves backfill, which is a different path entirely.
+  check "the same store also wrote the local layer" "$(disk_entries)" "1"
 
   # Drop the local layer entirely: the next lookup must be served by S3.
   rm -rf "$VCACHE_DIR"

@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "args/compiler_args.h"
@@ -16,6 +19,7 @@
 #include "core/roots.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
+#include "storage/chain.h"
 #include "storage/s3_storage.h"
 #include "storage/storage.h"
 #include "util/str.h"
@@ -309,6 +313,174 @@ void TestBlob() {
         "detects truncation");
   Check(!storage::DeserializeBlob("garbage", &ignored), "rejects a bad magic");
   Check(!storage::DeserializeBlob("", &ignored), "rejects empty input");
+}
+
+// An in-memory layer, so the chain's fan-out and backfill rules can be checked
+// without a disk or a network. `fail` models a layer that is configured and
+// reachable but refuses the write -- an S3 PUT that times out, say.
+class FakeStorage : public storage::Storage {
+ public:
+  FakeStorage(std::string name, bool writable = true, bool fail = false)
+      : name_(std::move(name)), writable_(writable), fail_(fail) {}
+
+  std::string Name() const override { return name_; }
+
+  bool Get(const std::string& key, std::string* value) override {
+    ++gets;
+    auto it = entries_.find(key);
+    if (it == entries_.end()) return false;
+    *value = it->second;
+    return true;
+  }
+
+  bool Put(const std::string& key, const std::string& value) override {
+    ++puts;
+    if (fail_) return false;
+    entries_[key] = value;
+    return true;
+  }
+
+  bool writable() const override { return writable_; }
+
+  void Seed(const std::string& key, const std::string& value) {
+    entries_[key] = value;
+  }
+  bool Has(const std::string& key) const { return entries_.count(key) != 0; }
+
+  int gets = 0;
+  int puts = 0;
+
+ private:
+  std::string name_;
+  bool writable_;
+  bool fail_;
+  std::map<std::string, std::string> entries_;
+};
+
+void TestCacheChain() {
+  Section("storage::CacheChain");
+
+  // A store must reach every writable layer. This is what makes a compile on
+  // one machine visible to every other one: there is no later promotion step
+  // that would move a local-only entry up to the shared layer.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    FakeStorage* disk_ptr = disk.get();
+    FakeStorage* s3_ptr = s3.get();
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    Check(chain.Put("abcdef", "blob"), "a store that reaches a layer succeeds");
+    Check(disk_ptr->Has("abcdef"), "the store reaches the local layer");
+    Check(s3_ptr->Has("abcdef"), "the same store reaches the remote layer");
+  }
+
+  // One layer failing must not cost the other: a build with an unreachable
+  // shared cache still fills its local one.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3", /*writable=*/true, /*fail=*/true);
+    FakeStorage* disk_ptr = disk.get();
+    FakeStorage* s3_ptr = s3.get();
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    Check(chain.Put("abcdef", "blob"), "a partial store still reports success");
+    Check(disk_ptr->Has("abcdef"), "the working layer is written anyway");
+    Check(s3_ptr->puts == 1, "the failing layer was still attempted");
+  }
+
+  // Every layer failing is a genuine store failure.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk", /*writable=*/true, /*fail=*/true);
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    Check(!chain.Put("abcdef", "blob"), "a store that reaches no layer fails");
+  }
+
+  // A read-only layer is skipped before Put is even called -- the shape both
+  // `no_credentials` and global read-only mode produce.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3", /*writable=*/false);
+    FakeStorage* disk_ptr = disk.get();
+    FakeStorage* s3_ptr = s3.get();
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    Check(chain.Put("abcdef", "blob"), "a store with one read-only layer succeeds");
+    Check(disk_ptr->Has("abcdef"), "the writable layer is still written");
+    Check(s3_ptr->puts == 0, "a read-only layer is never asked to store");
+  }
+
+  // A hit in a slower layer is written back into every faster one it passed.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    FakeStorage* disk_ptr = disk.get();
+    s3->Seed("abcdef", "blob");
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    storage::GetResult got = chain.Get("abcdef");
+    Check(got.hit, "a remote-only entry is found");
+    CheckEq(got.value, "blob", "the remote value is returned");
+    CheckEq(got.layer, "s3", "the serving layer is reported");
+    Check(disk_ptr->Has("abcdef"), "a remote hit backfills the local layer");
+  }
+
+  // The inverse, and the reason S3 is only ever populated by a machine that
+  // actually compiled: backfill runs downward only. A local hit must not push
+  // the entry up to the shared layer, and must not even look there.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    disk->Seed("abcdef", "blob");
+    FakeStorage* s3_ptr = s3.get();
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    storage::GetResult got = chain.Get("abcdef");
+    CheckEq(got.layer, "disk", "the local layer serves the hit");
+    Check(s3_ptr->gets == 0, "a local hit stops the walk before the remote layer");
+    Check(s3_ptr->puts == 0, "a local hit is never written up to the remote layer");
+  }
+
+  // Backfill must respect a faster layer that cannot be written.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk", /*writable=*/false);
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    FakeStorage* disk_ptr = disk.get();
+    s3->Seed("abcdef", "blob");
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    Check(chain.Get("abcdef").hit, "a remote hit still serves with a read-only local layer");
+    Check(disk_ptr->puts == 0, "backfill skips a read-only faster layer");
+  }
+
+  // A miss everywhere reports no layer.
+  {
+    storage::CacheChain chain;
+    chain.AddLayer(std::make_unique<FakeStorage>("disk"));
+    chain.AddLayer(std::make_unique<FakeStorage>("s3"));
+    storage::GetResult got = chain.Get("abcdef");
+    Check(!got.hit, "an entry in no layer is a miss");
+    Check(got.layer.empty(), "a miss names no serving layer");
+  }
 }
 
 void TestHasher() {
@@ -727,6 +899,7 @@ int main() {
   TestDepFile();
   TestPreprocessedNormalization();
   TestBlob();
+  TestCacheChain();
   TestHasher();
   TestSha256();
   TestCompilerArgs();

@@ -326,24 +326,23 @@ reference implementation.
 
 Copyright © 2026 Unto Labs.
 
-vcache is free software: you can redistribute it and/or modify it under the
-terms of **version 3 of the GNU General Public License** as published by the
-Free Software Foundation. Version 3 only — not "or any later version". The full
-text is in [LICENSE](LICENSE). It is distributed in the hope that it will be
-useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+vcache is licensed under the **Apache License, Version 2.0**. The full text is
+in [LICENSE](LICENSE); you may also obtain it at
+<https://www.apache.org/licenses/LICENSE-2.0>. Unless required by applicable law
+or agreed to in writing, the software is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
 Every first-party source file carries both
 `SPDX-FileCopyrightText: 2026 Unto Labs` and
-`SPDX-License-Identifier: GPL-3.0-only`, because this tree deliberately mixes
+`SPDX-License-Identifier: Apache-2.0`, because this tree deliberately mixes
 licences and the top-level `LICENSE` alone would not say which file is under
 which, or who holds it.
 
 ### Third-party components keep their own terms
 
-Nothing under `third-party/` is covered by the GPL. Each component remains under
-the licence it was published with, and each directory carries that licence text
-verbatim:
+Nothing under `third-party/` is covered by the Apache licence above. Each
+component remains under the licence it was published with, and each directory
+carries that licence text verbatim:
 
 | Component | Licence | Text |
 | --- | --- | --- |
@@ -352,8 +351,9 @@ verbatim:
 | Boost 1.86.0 subset | Boost Software License 1.0 | [third-party/boost/LICENSE](third-party/boost/LICENSE) |
 | gperftools 2.16 | BSD 3-clause | fetched at build time, not committed; licence ships in the tarball |
 
-All four are one-way compatible with the GPL, which is what the combination
-requires: their terms permit inclusion in a GPL-licensed work, and the combined
-binary is distributed under the GPL. The reverse does not hold and is not
-claimed — vendoring a file here does not place it under the GPL, and the notices
-in `third-party/` must survive any redistribution.
+All four are permissive and impose no term Apache 2.0 does not already
+accommodate, which is what the combination requires: their notice-retention
+obligations sit comfortably inside Apache 2.0's own attribution rules, and the
+combined binary ships under Apache 2.0 with the vendored notices intact.
+Vendoring a file here does not place it under Apache 2.0 — it keeps its original
+terms, and the notices in `third-party/` must survive any redistribution.

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // SHA-256 and HMAC-SHA256 (FIPS 180-4, RFC 2104).
 //
 // vcache needs these for exactly one thing: AWS SigV4 request signing. Linking

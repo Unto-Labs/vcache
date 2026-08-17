@@ -1,0 +1,17 @@
+vcache
+Copyright 2026 Unto Labs
+
+This product includes software developed at Unto Labs, licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+Vendored third-party components under third-party/ are not covered by that
+licence and retain their own terms:
+
+  BLAKE3 1.5.4          Apache License 2.0 with LLVM exception
+                        third-party/blake3/LICENSE_A2
+  toml++ 3.4.0          MIT
+                        third-party/tomlplusplus/LICENSE
+  Boost 1.86.0 (subset) Boost Software License 1.0
+                        third-party/boost/LICENSE
+  gperftools 2.16       BSD 3-clause
+                        fetched at build time; licence ships in the tarball

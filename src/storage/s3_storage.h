@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // S3 cache layer.
 //
 // Requests are signed with AWS Signature Version 4 over libcurl, avoiding a

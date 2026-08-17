@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // vcache entry point.
 //
 // Two invocation styles, matching ccache and sccache:
@@ -227,15 +227,16 @@ int main(int argc, char** argv) {
 
     if (first == "-h" || first == "--help") { PrintUsage(); return 0; }
     if (first == "-V" || first == "--version") {
-      // The notice GPLv3's "How to Apply These Terms" asks for, in the shape
-      // GNU tools use it.
+      // The notice Apache 2.0's appendix asks for, in the shape GNU tools use
+      // it: copyright holder, licence, and the warranty disclaimer.
       std::printf(
           "%s\n"
-          "Copyright (C) 2026 Vlad Petric\n"
-          "License GPLv3: GNU GPL version 3 "
-          "<https://gnu.org/licenses/gpl-3.0.html>.\n"
-          "This is free software: you are free to change and redistribute it.\n"
-          "There is NO WARRANTY, to the extent permitted by law.\n"
+          "Copyright (C) 2026 Unto Labs\n"
+          "License Apache-2.0: Apache License, Version 2.0 "
+          "<https://www.apache.org/licenses/LICENSE-2.0>.\n"
+          "Distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS "
+          "OF ANY KIND,\n"
+          "either express or implied.\n"
           "\n"
           "Vendored components under third-party/ keep their own licences:\n"
           "BLAKE3 (Apache 2.0 with LLVM exception), toml++ (MIT), Boost "

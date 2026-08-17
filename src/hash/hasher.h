@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // BLAKE3-based hashing. Cache keys must be collision-resistant against
 // accidental collisions across millions of entries; BLAKE3 gives that at
 // several GB/s, which matters because preprocessor output is the bulk input.

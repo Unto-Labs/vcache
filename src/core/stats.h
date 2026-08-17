@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // Persistent hit/miss counters.
 //
 // Kept in a single file under the cache directory, updated under an advisory

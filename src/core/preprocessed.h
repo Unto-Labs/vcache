@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // Normalisation of preprocessed output before hashing.
 //
 // -ffile-prefix-map covers __FILE__ expansions and the paths recorded in debug

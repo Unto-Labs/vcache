@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 // Filesystem helpers. Everything here reports failure via bool/optional rather
 // than throwing, because vcache must degrade to "just run the compiler" on any
 // cache-side error instead of failing the user's build.

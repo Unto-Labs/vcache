@@ -3,10 +3,16 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,7 +29,10 @@
 #include "storage/chain.h"
 #include "storage/s3_storage.h"
 #include "storage/storage.h"
+#include "util/fs.h"
 #include "util/str.h"
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -1073,6 +1082,56 @@ void TestS3ResponseParsing() {
 
 }  // namespace
 
+// A replayed artifact has to be as readable as a compiled one. mkstemp creates
+// at 0600, so before this was fixed every cache hit produced an object only its
+// writer could read -- invisible on a developer laptop, and a hard failure the
+// moment a container builds as root and CI hashes the output as someone else.
+void TestWrittenFileMode() {
+  Section("written file permissions");
+
+  const std::string dir = "/tmp/vcache-mode-test";
+  fs::remove_all(dir);
+  const std::string path = dir + "/artifact.o";
+  const std::string strict_path = dir + "/strict.o";
+
+  // The umask is read once per process, which is right for a tool that lives
+  // for one compilation and wrong for a test that wants two umasks. Fork for
+  // the restrictive case, and do it before this process has written anything
+  // so the child is the first caller and initialises its own copy.
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::umask(077);
+    _exit(vcache::util::WriteFileAtomic(strict_path, "object bytes") ? 0 : 1);
+  }
+  int child_status = 0;
+  ::waitpid(child, &child_status, 0);
+  Check(child_status == 0, "WriteFileAtomic succeeds under a strict umask");
+
+  const mode_t previous = ::umask(022);
+  const bool wrote = vcache::util::WriteFileAtomic(path, "object bytes");
+  ::umask(previous);
+
+  Check(wrote, "WriteFileAtomic succeeds");
+
+  struct ::stat st {};
+  const bool statted = ::stat(path.c_str(), &st) == 0;
+  Check(statted, "the file exists");
+  const mode_t mode = st.st_mode & 07777;
+
+  Check(mode == 0644, "umask 022 yields 0644, not mkstemp's 0600");
+  Check((mode & S_IRGRP) != 0, "group can read it");
+  Check((mode & S_IROTH) != 0, "another uid can read it");
+  Check((mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0, "and it is not executable");
+
+  // umask is honoured rather than hardcoded, so a deliberately private build
+  // stays private.
+  struct ::stat strict_st {};
+  ::stat(strict_path.c_str(), &strict_st);
+  Check((strict_st.st_mode & 07777) == 0600, "umask 077 still yields 0600");
+
+  fs::remove_all(dir);
+}
+
 int main() {
   TestStringUtils();
   TestRootMap();
@@ -1087,6 +1146,7 @@ int main() {
   TestRustcArgs();
   TestSigV4();
   TestS3ResponseParsing();
+  TestWrittenFileMode();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

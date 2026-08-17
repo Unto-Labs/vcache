@@ -22,6 +22,20 @@ namespace fs = std::filesystem;
 namespace vcache::util {
 namespace {
 
+// The mode a normally-created file gets: 0666 masked by the process umask,
+// which is what fopen, gcc and rustc all end up with. Read once -- umask(2)
+// only reads by setting, so the value is restored immediately. vcache is
+// single-threaded and spawns the compiler well after this runs, so the brief
+// window cannot leak a zero umask into a child.
+mode_t DefaultFileMode() {
+  static const mode_t kMode = [] {
+    const mode_t previous = ::umask(0);
+    ::umask(previous);
+    return static_cast<mode_t>(0666 & ~previous);
+  }();
+  return kMode;
+}
+
 // std::filesystem throws on many operations; every call here goes through a
 // noexcept wrapper so a surprising errno never aborts the user's build.
 template <typename Fn>
@@ -75,6 +89,18 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents) {
   int fd = ::mkstemp(buf.data());
   if (fd < 0) return false;
   const std::string tmp_path(buf.data());
+
+  // mkstemp always creates at 0600, which is right for a private temp file and
+  // wrong for everything vcache goes on to rename into place: a replayed object
+  // must look exactly like one the compiler wrote, and the compiler writes at
+  // 0666 & ~umask. The difference is invisible while one uid both writes and
+  // reads, and breaks the moment they differ -- a container building as root
+  // and a CI user hashing the results afterwards is the case that found this.
+  if (::fchmod(fd, DefaultFileMode()) != 0) {
+    ::close(fd);
+    ::unlink(tmp_path.c_str());
+    return false;
+  }
 
   size_t written = 0;
   bool ok = true;

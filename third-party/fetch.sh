@@ -52,6 +52,14 @@ mkdir -p "$DL"
 if [[ $FORCE -eq 1 || ! -f "$GPERF_DIR/build/libtcmalloc_minimal.a" ]]; then
   download "$GPERF_URL" "$DL/gperftools.tar.gz"
   verify "$DL/gperftools.tar.gz" "$GPERF_SHA256"
+  # A path that exists but is not a directory -- a stray file, or a symlink
+  # whose target is not present here -- makes the mv below fail with a message
+  # that describes the symptom and not the cause. Clear it instead: nothing
+  # under this path is authored, it is all re-fetchable.
+  if [[ -e "$GPERF_DIR" || -L "$GPERF_DIR" ]] && [[ ! -d "$GPERF_DIR" ]]; then
+    log "replacing non-directory $GPERF_DIR"
+    rm -f "$GPERF_DIR"
+  fi
   if [[ ! -d "$GPERF_DIR" ]]; then
     log "extracting gperftools"
     tar xzf "$DL/gperftools.tar.gz" -C "$DL"

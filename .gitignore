@@ -7,7 +7,7 @@
 # Boost subset in third-party/boost/ *is* committed.
 /third-party/.dl/
 /third-party/boost-full-*/
-/third-party/gperftools/
+/third-party/gperftools
 
 *.o
 *.d

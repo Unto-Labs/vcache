@@ -478,6 +478,19 @@ reset_cache
 check "disabled compile still produces an object" "$([[ -f "$WORK/dis.o" ]] && echo yes)" "yes"
 check "disabled compile records no lookups" "$(misses)" "0"
 
+# A global cache budget must not behave like 256 independent tiny budgets.
+# Keep several entries concentrated in one shard and verify an explicit trim
+# leaves them alone while their aggregate size remains below the configured
+# global limit.
+reset_cache
+mkdir -p "$VCACHE_DIR/aa"
+for n in 1 2 3; do
+  dd if=/dev/zero of="$VCACHE_DIR/aa/entry$n" bs=1024 count=1 status=none
+done
+VCACHE_CACHE_SIZE=10K "$VCACHE" --trim >/dev/null
+check "global trim preserves a skewed shard below the total budget" \
+  "$(find "$VCACHE_DIR/aa" -type f | wc -l)" "3"
+
 # --------------------------------------------------------------------------
 section "11. S3 layer (against a mock object store)"
 

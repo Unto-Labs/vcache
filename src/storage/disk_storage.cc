@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include "util/fs.h"
 #include "util/log.h"
@@ -74,20 +75,32 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
     return false;
   }
 
-  // Only this shard can have grown, so bound the eviction work to it.
+  // Only this shard can have grown.  Use its even share as a cheap signal that
+  // the global cache might need enforcement, then make the eviction decision
+  // from the actual global size.
   const uint64_t shard_budget = std::max<uint64_t>(max_size_ / kShardCount, 1);
   uint64_t shard_size = 0;
   for (const auto& entry : util::ListFilesRecursive(shard)) shard_size += entry.size;
-  if (shard_size > shard_budget) {
-    TrimShard(shard, static_cast<uint64_t>(shard_budget * kTrimTargetFraction));
+  if (shard_size > shard_budget && TotalSize() > max_size_) {
+    TrimGlobal(static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
   }
   return true;
 }
 
-void DiskStorage::TrimShard(const std::string& shard_dir, uint64_t target_bytes) {
-  auto entries = util::ListFilesRecursive(shard_dir);
+void DiskStorage::TrimGlobal(uint64_t target_bytes) {
+  std::vector<util::FileEntry> entries;
   uint64_t total = 0;
-  for (const auto& entry : entries) total += entry.size;
+  for (int i = 0; i < kShardCount; ++i) {
+    char buf[3];
+    std::snprintf(buf, sizeof(buf), "%02x", i);
+    const std::string shard = dir_ + "/" + buf;
+    if (!util::IsDirectory(shard)) continue;
+    auto shard_entries = util::ListFilesRecursive(shard);
+    for (const auto& entry : shard_entries) total += entry.size;
+    entries.insert(entries.end(),
+                   std::make_move_iterator(shard_entries.begin()),
+                   std::make_move_iterator(shard_entries.end()));
+  }
   if (total <= target_bytes) return;
 
   // Oldest first.
@@ -105,21 +118,14 @@ void DiskStorage::TrimShard(const std::string& shard_dir, uint64_t target_bytes)
     }
   }
   if (removed > 0) {
-    VCACHE_LOG("disk: evicted " + std::to_string(removed) + " entries from " +
-               shard_dir);
+    VCACHE_LOG("disk: globally evicted " + std::to_string(removed) +
+               " entries");
   }
 }
 
 void DiskStorage::Trim() {
   if (read_only_) return;
-  const uint64_t shard_budget = std::max<uint64_t>(max_size_ / kShardCount, 1);
-  const auto target = static_cast<uint64_t>(shard_budget * kTrimTargetFraction);
-  for (int i = 0; i < kShardCount; ++i) {
-    char buf[3];
-    std::snprintf(buf, sizeof(buf), "%02x", i);
-    const std::string shard = dir_ + "/" + buf;
-    if (util::IsDirectory(shard)) TrimShard(shard, target);
-  }
+  TrimGlobal(static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
 }
 
 bool DiskStorage::Clear() {

@@ -3,9 +3,10 @@
 // Local filesystem cache.
 //
 // Entries live at <dir>/<xx>/<rest-of-key>, sharded on the first byte of the
-// key into 256 directories. Each shard carries its own size counter, so the
-// eviction scan only ever walks 1/256th of the cache and stays cheap enough to
-// run inline during a build.
+// key into 256 directories.  A shard crossing its even share of the global
+// budget triggers a global size check.  Eviction itself is global so a few
+// large objects that happen to hash into one shard cannot displace hot entries
+// while most of the configured cache is still empty.
 #pragma once
 
 #include <cstdint>
@@ -38,9 +39,9 @@ class DiskStorage : public Storage {
   std::string PathForKey(const std::string& key) const;
   std::string ShardDir(const std::string& key) const;
 
-  // Evicts least-recently-used entries in `shard_dir` until it is back under
+  // Evicts globally least-recently-used entries until the cache is back under
   // `target_bytes`.
-  void TrimShard(const std::string& shard_dir, uint64_t target_bytes);
+  void TrimGlobal(uint64_t target_bytes);
 
   std::string dir_;
   uint64_t max_size_;

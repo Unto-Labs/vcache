@@ -62,11 +62,18 @@ bool IsDirectory(const std::string& path) {
 }
 
 bool MakeDirs(const std::string& path) {
-  if (path.empty()) return false;
+  if (path.empty()) {
+    errno = EINVAL;
+    return false;
+  }
   if (IsDirectory(path)) return true;
   std::error_code ec;
   fs::create_directories(path, ec);
-  return IsDirectory(path);
+  if (IsDirectory(path)) return true;
+  // std::filesystem reports through the error_code, leaving errno to whatever
+  // ran last. Callers print strerror(errno), so translate before returning.
+  errno = ec ? ec.value() : ENOENT;
+  return false;
 }
 
 std::optional<std::string> ReadFile(const std::string& path) {
@@ -102,23 +109,38 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents) {
     return false;
   }
 
+  // Callers report std::strerror(errno) when this returns false, so every
+  // failure path must hand back the errno of the call that actually failed.
+  // close(), unlink() and rename() all run after the interesting failure and
+  // are free to overwrite it -- which is how a write that failed with EACCES
+  // came to be reported as ENOENT.
+  int saved_errno = 0;
   size_t written = 0;
   bool ok = true;
   while (written < contents.size()) {
     ssize_t n = ::write(fd, contents.data() + written, contents.size() - written);
     if (n <= 0) {
       if (errno == EINTR) continue;
+      saved_errno = errno;
       ok = false;
       break;
     }
     written += static_cast<size_t>(n);
   }
   // Cache entries must survive a crash intact, so flush before the rename.
-  if (ok && ::fsync(fd) != 0) ok = false;
+  if (ok && ::fsync(fd) != 0) {
+    saved_errno = errno;
+    ok = false;
+  }
   ::close(fd);
 
-  if (!ok || ::rename(tmp_path.c_str(), path.c_str()) != 0) {
+  if (ok && ::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    saved_errno = errno;
+    ok = false;
+  }
+  if (!ok) {
     ::unlink(tmp_path.c_str());
+    errno = saved_errno;
     return false;
   }
   return true;

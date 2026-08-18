@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 STORAGE = None
+TRANSIENT_PUTS = {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -162,6 +163,24 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         if not self._check_headers(body):
             return
+        # MOCK_S3_TRANSIENT_PUT_FAILURES=N makes the first N PUTs answer 503
+        # SlowDown, which is what a real bucket does when it is shedding load
+        # rather than rejecting the request. Counted per object so a test can
+        # assert the retry lands the entry rather than merely surviving.
+        budget = int(os.environ.get("MOCK_S3_TRANSIENT_PUT_FAILURES", "0"))
+        if budget:
+            key = self.path
+            seen = TRANSIENT_PUTS.get(key, 0)
+            if seen < budget:
+                TRANSIENT_PUTS[key] = seen + 1
+                payload = (b'<?xml version="1.0" encoding="UTF-8"?>'
+                           b"<Error><Code>SlowDown</Code>"
+                           b"<Message>Please reduce your request rate.</Message></Error>")
+                self.send_response(503)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
         path = self._object_path()
         if path is None:
             self.send_error(400, "bad key")

@@ -4,6 +4,8 @@
 // build to plain make, as the plan asks.
 
 #include <sys/stat.h>
+
+#include <cerrno>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1132,6 +1134,56 @@ void TestWrittenFileMode() {
   fs::remove_all(dir);
 }
 
+// Callers report std::strerror(errno) when a write fails, so errno has to
+// survive the failure. It did not: MakeDirs left whatever the probing stat()
+// set, and WriteFileAtomic ran close()/unlink() before returning. In CI this
+// showed up as "disk: write <entry>: No such file or directory" for what was
+// really a permission problem -- a diagnosis that sent the reader looking for
+// a missing directory that was never missing.
+void TestWriteErrnoIsPreserved() {
+  Section("write failures report their own errno");
+
+  const std::string dir = "/tmp/vcache-errno-test";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  const std::string locked = dir + "/locked";
+  fs::create_directories(locked);
+  ::chmod(locked.c_str(), 0555);
+
+  // Creating a shard below an unwritable directory. The failing call is
+  // mkdir(2) with EACCES; the last call before it is a stat(2) that failed
+  // with ENOENT, which is exactly the value that used to be reported.
+  errno = 0;
+  const bool made = vcache::util::MakeDirs(locked + "/shard");
+  const int made_errno = errno;
+  Check(!made, "MakeDirs fails below an unwritable directory");
+  Check(made_errno == EACCES,
+        "and reports EACCES, not the ENOENT its own stat() left behind");
+
+  // Same story one level up: the whole point is what the caller prints.
+  errno = 0;
+  const bool wrote = vcache::util::WriteFileAtomic(locked + "/shard/entry", "x");
+  const int wrote_errno = errno;
+  Check(!wrote, "WriteFileAtomic fails when the shard cannot be created");
+  Check(wrote_errno == EACCES, "and it too reports EACCES");
+
+  // A rename that cannot land: the target path is a directory. close() and
+  // unlink() run between the failure and the return, and must not speak over
+  // it.
+  const std::string occupied = dir + "/occupied";
+  fs::create_directories(occupied);
+  errno = 0;
+  const bool clobbered = vcache::util::WriteFileAtomic(occupied, "x");
+  const int clobbered_errno = errno;
+  Check(!clobbered, "WriteFileAtomic fails when the target is a directory");
+  Check(clobbered_errno == EISDIR || clobbered_errno == ENOTEMPTY,
+        "and reports the rename's errno, not the cleanup's");
+
+  ::chmod(locked.c_str(), 0755);
+  fs::remove_all(dir);
+}
+
 int main() {
   TestStringUtils();
   TestRootMap();
@@ -1147,6 +1199,7 @@ int main() {
   TestSigV4();
   TestS3ResponseParsing();
   TestWrittenFileMode();
+  TestWriteErrnoIsPreserved();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

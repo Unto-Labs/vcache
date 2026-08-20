@@ -1150,6 +1150,19 @@ if command -v clang >/dev/null 2>&1; then
   check "and the fragment is produced" \
     "$([[ -f "$WORK/frag.json" ]] && echo yes)" "yes"
 
+  # -Werror must not disable caching. vcache adds -fno-working-directory to the
+  # preprocessing run for gcc's benefit; clang has no use for it and says so,
+  # which under -Werror is an error, and every compile would quietly fall back
+  # to running the compiler.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -Werror -O1 -c -I include src/lib.cc -o "$WORK/we1.o" ) 2>/dev/null
+  check "clang -Werror still preprocesses" "$(stat_of 'preprocess failed')" "0"
+  check "and is cached" "$(misses)" "1"
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -Werror -O1 -c -I include src/lib.cc -o "$WORK/we2.o" ) 2>/dev/null
+  check "clang -Werror hits across checkouts" "$(hits)" "1"
+
   # A file named by a flag whose contents pick what code comes out. The
   # preprocessed text cannot stand in for it: clang reads the list in the middle
   # end, so both compiles below preprocess to exactly the same bytes.

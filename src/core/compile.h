@@ -19,6 +19,10 @@ namespace vcache::core {
 struct CompilerId {
   std::string fingerprint;
   std::string description;  // human-readable, for --show-stats and logs
+
+  // True when the driver is clang. It differs from gcc in ways that change the
+  // command line vcache builds, not just the key -- see BuildPreprocessCommand.
+  bool is_clang = false;
 };
 
 // `check_mode` is one of "version" (default), "content" or "mtime":

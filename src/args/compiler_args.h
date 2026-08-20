@@ -83,6 +83,13 @@ struct CompilerArgs {
   // knowledge of roots.
   std::vector<std::string> key_args;
 
+  // Files named by a flag whose *contents* select what code comes out, but
+  // which the preprocessor never reads: sanitizer ignore lists, sample
+  // profiles, plugins. The flag text alone is not enough -- editing one of
+  // these in place must change the key -- and the preprocessed output says
+  // nothing about them, so core/compile.cc hashes each file into the key.
+  std::vector<std::string> key_files;
+
   // The command line with the source, -o, dependency flags and incoming prefix
   // maps removed; vcache rebuilds the real invocation from this.
   std::vector<std::string> base_args;

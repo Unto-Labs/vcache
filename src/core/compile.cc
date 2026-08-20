@@ -201,6 +201,20 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     hasher.UpdateDelimited(roots.Canonicalize(arg));
   }
 
+  // Files the compiler reads after preprocessing -- sanitizer ignore lists,
+  // sample profiles, plugins. Their contents never reach the preprocessed text,
+  // so they are hashed here. Hashing to a digest first keeps the framing fixed
+  // width, so two adjacent files cannot run together. One that cannot be read
+  // means no key at all: running the compiler beats guessing at its input.
+  for (const std::string& path : parsed.key_files) {
+    auto digest = hash::HashFile(path);
+    if (!digest) {
+      VCACHE_LOG("cannot hash keyed input file " + path);
+      return "";
+    }
+    hasher.UpdateDelimited(*digest);
+  }
+
   for (const std::string& name : config.extra_env_vars) {
     const char* value = std::getenv(name.c_str());
     hasher.UpdateDelimited(name);

@@ -73,6 +73,12 @@ class S3Storage : public Storage {
   // `query` is the already-sorted canonical query string ("a=1&b=2"), empty for
   // ordinary object operations. When `last_modified` is non-null the response's
   // Last-Modified header is parsed into it, leaving it at 0 if absent.
+  // Request() retries transient S3 answers; RequestOnce() is a single
+  // round trip and is what the retry loop drives.
+  bool RequestOnce(const std::string& method,
+                   const std::string& canonical_uri_path,
+                   const std::string& query, const std::string& payload,
+                   std::string* response_body, std::time_t* last_modified);
   bool Request(const std::string& method, const std::string& canonical_uri_path,
                const std::string& query, const std::string& payload,
                std::string* response_body, std::time_t* last_modified);

@@ -3,10 +3,12 @@
 #include "storage/s3_storage.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <thread>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -342,11 +344,55 @@ bool S3Storage::ObjectRequest(const std::string& method, const std::string& key,
                  last_modified);
 }
 
+namespace {
+
+// S3 answers a healthy bucket with these when it is shedding load, not when
+// the request is wrong: SlowDown/503 in particular is routine under the
+// parallelism a CI build drives. Treating them as a hard failure turned a
+// throttle into a lost cache entry and a "cache media error" in the stats.
+bool IsTransientStatus(long status) {
+  return status == 429 || status == 500 || status == 502 || status == 503 ||
+         status == 504;
+}
+
+constexpr int kMaxAttempts = 3;
+constexpr int kFirstBackoffMs = 200;
+constexpr int kBackoffFactor = 3;
+
+}  // namespace
+
 bool S3Storage::Request(const std::string& method,
                         const std::string& canonical_uri_path,
                         const std::string& query, const std::string& payload,
                         std::string* response_body,
                         std::time_t* last_modified) {
+  int backoff_ms = kFirstBackoffMs;
+  for (int attempt = 1;; ++attempt) {
+    if (RequestOnce(method, canonical_uri_path, query, payload, response_body,
+                    last_modified)) {
+      return true;
+    }
+    // A 404/403 miss is not transient, and neither is a signing or connection
+    // error; only the throttle/5xx family is worth a second attempt.
+    if (attempt >= kMaxAttempts || !IsTransientStatus(last_status_)) return false;
+    VCACHE_LOG("s3: " + method + " " + canonical_uri_path + ": HTTP " +
+               std::to_string(last_status_) + "; retrying in " +
+               std::to_string(backoff_ms) + "ms (attempt " +
+               std::to_string(attempt) + "/" + std::to_string(kMaxAttempts) +
+               ")");
+    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+    backoff_ms *= kBackoffFactor;
+    // The write callback appends, so a partial error body from the failed
+    // attempt would otherwise be prefixed to the next response.
+    if (response_body != nullptr) response_body->clear();
+  }
+}
+
+bool S3Storage::RequestOnce(const std::string& method,
+                            const std::string& canonical_uri_path,
+                            const std::string& query, const std::string& payload,
+                            std::string* response_body,
+                            std::time_t* last_modified) {
   if (curl_ == nullptr) {  // libcurl unavailable; behave as a miss
     SetError("libcurl is not available: " + load_error_);
     return false;

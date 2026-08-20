@@ -745,6 +745,38 @@ except Exception: sys.exit(1)
 
   kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
 
+  # A bucket shedding load answers 503 SlowDown. That is not a failed store,
+  # it is a store to try again: without a retry the entry is lost, the compile
+  # is counted as a cache media error, and the next build recompiles it.
+  MOCK_S3_TRANSIENT_PUT_FAILURES=2 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  rm -rf "$S3DIR"; mkdir -p "$S3DIR"
+  reset_cache
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/slow1.o" ) 2>"$WORK/slow1.err"
+  check "a throttled store still produces the object" \
+        "$([[ -s "$WORK/slow1.o" ]] && echo yes)" "yes"
+  check "and reports no cache media error" \
+        "$("$VCACHE" --show-stats | awk '/^cache media errors[[:space:]]/ { print $NF }')" "0"
+  # The point of the retry: the entry actually reached the bucket, so a fresh
+  # local cache can still hit it.
+  reset_cache
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/slow2.o" ) 2>/dev/null
+  check "and the retried store is readable from s3 afterwards" \
+        "$("$VCACHE" --show-stats | awk '/^cache hit \(s3\)[[:space:]]/ { print $NF }')" "1"
+
+  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+
   # A compile that genuinely fails must keep reporting the compiler's status,
   # not vcache's, even with the flag on and s3 down.
   printf 'int main(){ return notdefined; }\n' > "$WORK/broken.c"

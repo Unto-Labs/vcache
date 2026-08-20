@@ -214,6 +214,18 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     hasher.UpdateDelimited(roots.Canonicalize(arg));
   }
 
+  // Linker-only flags change nothing about the object under -c, and gcc ignores
+  // them in silence, so they stay out of the key: a -L or -Wl,-rpath carrying a
+  // machine-specific path no longer forks the entry across machines. clang
+  // instead names the flag in an "unused" warning, which vcache stores and
+  // replays on a hit, so there the key has to keep them or the replayed text
+  // would report a flag the caller never passed.
+  if (compiler_id.is_clang) {
+    for (const std::string& arg : parsed.link_args) {
+      hasher.UpdateDelimited(roots.Canonicalize(arg));
+    }
+  }
+
   // Files the compiler reads after preprocessing -- sanitizer ignore lists,
   // sample profiles, plugins. Their contents never reach the preprocessed text,
   // so they are hashed here. Hashing to a digest first keeps the framing fixed
@@ -394,7 +406,8 @@ struct DepManifestEntry {
 // flags naming where the answer goes, since the answer's content does not
 // depend on them.
 std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
-                                        const RootMap& roots) {
+                                        const RootMap& roots,
+                                        bool keep_link_args) {
   std::vector<std::string> out;
   for (size_t i = 1; i < parsed.argv.size(); ++i) {
     const std::string& arg = parsed.argv[i];
@@ -403,6 +416,13 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
       continue;
     }
     if (util::StartsWith(arg, "-MF") && arg.size() > 3) continue;
+    // A dependency list is no more sensitive to linker flags than an object is;
+    // the driver split is the same one ComputeKey makes, and for the same
+    // reason -- this path stores clang's diagnostics too.
+    if (!keep_link_args && args::IsLinkOnlyFlag(arg)) {
+      if (args::LinkOnlyFlagTakesValue(arg) && i + 1 < parsed.argv.size()) ++i;
+      continue;
+    }
     if (arg == parsed.source) {
       // The path is irrelevant once canonicalised; the content is hashed below.
       out.push_back("--vcache-source");
@@ -529,7 +549,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   hasher.UpdateDelimited(native_target);
   hasher.UpdateDelimited(roots.Fingerprint());
   hasher.UpdateDelimited(*source_digest);
-  for (const std::string& arg : DepScanKeyArgs(parsed, roots)) {
+  for (const std::string& arg : DepScanKeyArgs(parsed, roots, compiler_id.is_clang)) {
     hasher.UpdateDelimited(arg);
   }
   for (const std::string& name : config.extra_env_vars) {

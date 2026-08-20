@@ -199,6 +199,30 @@ std::string DefaultOutputFor(const std::string& source, bool compile_only,
 
 }  // namespace
 
+bool IsLinkOnlyFlag(std::string_view arg) {
+  // Deliberately narrow. -static, -shared, -pie and -pthread read like link
+  // flags and are not reliably so: -shared implies PIC on some targets and
+  // -pthread defines _REENTRANT. A missed hit costs a compile; a wrong object
+  // costs a great deal more, so anything not provably linker-only stays keyed.
+  static constexpr std::string_view kExact[] = {
+      "-rdynamic",      "-s",             "-nostdlib",         "-nostdlib++",
+      "-nodefaultlibs", "-nostartfiles",  "-static-libgcc",    "-shared-libgcc",
+      "-static-libstdc++",
+  };
+  for (std::string_view f : kExact) {
+    if (arg == f) return true;
+  }
+  if (StartsWith(arg, "-Wl,")) return true;
+  // Joined -lm and -L/usr/lib; the bare spellings take the next argument.
+  if (arg.size() > 2 && (StartsWith(arg, "-l") || StartsWith(arg, "-L"))) return true;
+  return LinkOnlyFlagTakesValue(arg);
+}
+
+bool LinkOnlyFlagTakesValue(std::string_view arg) {
+  return arg == "-l" || arg == "-L" || arg == "-Xlinker" || arg == "-T" ||
+         arg == "-u" || arg == "-z" || arg == "-e";
+}
+
 std::string LanguageName(Language lang) {
   switch (lang) {
     case Language::kC: return "c";
@@ -495,6 +519,20 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       // should still describe it accurately.
       if (SideOutputFlagTakesValue(arg) && i + 1 < result.argv.size()) {
         result.base_args.push_back(result.argv[++i]);
+      }
+      continue;
+    }
+
+    // Linker-only flags. They stay on the command line, because the real
+    // compile must see what the caller passed, but are recorded apart from
+    // key_args so ComputeKey can decide whether they belong in the key.
+    if (IsLinkOnlyFlag(arg)) {
+      result.base_args.push_back(arg);
+      result.link_args.push_back(arg);
+      if (LinkOnlyFlagTakesValue(arg) && i + 1 < result.argv.size()) {
+        const std::string& value = result.argv[++i];
+        result.base_args.push_back(value);
+        result.link_args.push_back(value);
       }
       continue;
     }

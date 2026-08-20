@@ -1034,6 +1034,50 @@ check "the same source without those flags is cached" "$(misses)" "1"
 check "and is not counted uncacheable" "$(uncacheable)" "0"
 
 # --------------------------------------------------------------------------
+section "15b. linker-only flags do not fork the key"
+
+# Under -c the driver never hands these to the compiler proper, and gcc ignores
+# them without a word -- even under -Werror. Keying them costs hits for nothing,
+# and worst of all across machines: a -L or -Wl,-rpath holding a local path is
+# exactly the sort of difference the S3 layer exists to see through, and unlike
+# -I these are not canonicalised by any root mapping.
+
+reset_cache
+mkdir -p "$WORK/link"
+printf 'extern int ext(int);\nint fn(int x){ return ext(x) + 7; }\n' > "$WORK/link/l.c"
+
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -L/usr/lib -lm -c l.c -o "$WORK/l1.o" ) 2>/dev/null
+check "a compile with linker flags is a miss" "$(misses)" "1"
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -L/somewhere/else -Wl,-rpath,/opt -rdynamic -s \
+    -c l.c -o "$WORK/l2.o" ) 2>/dev/null
+check "different linker flags hit the same entry" "$(hits)" "1"
+
+# The served object has to be what the compiler would have produced, not merely
+# something: a key that drops too much is a wrong answer, not a slow one.
+( cd "$WORK/link" && gcc -O2 -L/somewhere/else -Wl,-rpath,/opt -rdynamic -s \
+    -c l.c -o "$WORK/lref.o" ) 2>/dev/null
+if cmp -s "$WORK/l2.o" "$WORK/lref.o"; then
+  ok "the served object matches an uncached compile"
+else
+  bad "the served object matches an uncached compile"
+fi
+
+# The other half of the bargain: flags that merely look like link flags must
+# still key. -shared implies PIC on some targets and -pthread defines
+# _REENTRANT, so neither is safe to drop however inert it looks here.
+reset_cache
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -c l.c -o "$WORK/p1.o" ) 2>/dev/null
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -pthread -c l.c -o "$WORK/p2.o" ) 2>/dev/null
+check "-pthread is still a separate entry" "$(misses)" "2"
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -static -c l.c -o "$WORK/p3.o" ) 2>/dev/null
+check "-static is still a separate entry" "$(misses)" "3"
+
+# --------------------------------------------------------------------------
 section "16. clang"
 
 if command -v clang >/dev/null 2>&1; then
@@ -1190,6 +1234,25 @@ if command -v clang >/dev/null 2>&1; then
     bad "an edited ignore list served the old object"
   else
     ok "an edited ignore list produced a different object"
+  fi
+
+  # clang is not silent about linker flags under -c: it names the offending flag
+  # in an "unused" warning, which vcache stores and replays. Sharing an entry
+  # between -lm and -lz would report a flag the caller never passed, so unlike
+  # gcc these have to stay in the key.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lm -c src/warn.c -o "$WORK/ln1.o" ) 2>/dev/null
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lz -c src/warn.c -o "$WORK/ln2.o" ) 2>/dev/null
+  check "clang keys linker flags" "$(misses)" "2"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lm -c src/warn.c -o "$WORK/ln3.o" ) 2>"$WORK/ln3.err"
+  check "and the repeat hits" "$(hits)" "1"
+  if grep -q -- '-lm' "$WORK/ln3.err" && ! grep -q -- '-lz' "$WORK/ln3.err"; then
+    ok "the replayed warning names the flag that was passed"
+  else
+    bad "the replayed warning names the flag that was passed"
   fi
 
   # Modules are declined rather than keyed: a .pcm names the modules it imports

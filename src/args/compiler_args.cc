@@ -67,6 +67,14 @@ bool IsSideOutputFlag(std::string_view arg) {
       StartsWith(arg, "-foptimization-record-file=")) {
     return true;
   }
+  // gcc: -fopt-info-<kind>=FILE writes the optimisation report to that file.
+  // Spelled without an `=` it goes to stderr instead, which vcache captures and
+  // replays on a hit, so only the file-writing forms are a problem.
+  if (StartsWith(arg, "-fopt-info") && arg.find('=') != std::string_view::npos) {
+    return true;
+  }
+  // gcc: -aux-info FILE writes a listing of every declaration seen.
+  if (arg == "-aux-info") return true;
   // clang, value-taking: a compilation-database fragment, a serialized
   // diagnostics file, and a directory of cdb fragments.
   if (arg == "-MJ" || arg == "-serialize-diagnostics" ||
@@ -79,7 +87,8 @@ bool IsSideOutputFlag(std::string_view arg) {
 // Which of the above take their value as the following argument.
 bool SideOutputFlagTakesValue(std::string_view arg) {
   return arg == "-MJ" || arg == "-serialize-diagnostics" ||
-         arg == "--serialize-diagnostics" || arg == "-gen-cdb-fragment-path";
+         arg == "--serialize-diagnostics" || arg == "-gen-cdb-fragment-path" ||
+         arg == "-aux-info";
 }
 
 // Preprocessor-facing options whose entire effect is already visible in the
@@ -105,6 +114,35 @@ bool IsPreprocessorOnlyJoined(std::string_view arg) {
     if (arg.size() > p.size() && StartsWith(arg, p)) return true;
   }
   return false;
+}
+
+// Flags of the form `-fxxx=FILE` where the *contents* of FILE decide what code
+// the compiler emits. The preprocessed text cannot stand in for them: clang
+// reads these files in the middle end, long after preprocessing has finished,
+// so two compiles that differ only in what the file says preprocess
+// identically. Returns the file part, or nullopt if `arg` is not one of them.
+//
+// A flag whose file may in turn name further files vcache cannot see does not
+// belong here -- see the module flags, which are declined instead.
+std::optional<std::string> KeyedFileFlagValue(std::string_view arg) {
+  static constexpr std::string_view kPrefixes[] = {
+      "-fsanitize-blacklist=",  // the pre-clang-13 spelling of the next one
+      "-fsanitize-ignorelist=",
+      "-fsanitize-system-ignorelist=",
+      "-fsanitize-coverage-allowlist=",
+      "-fsanitize-coverage-ignorelist=",
+      "-fprofile-list=",
+      "-fprofile-sample-use=",
+      "-fprofile-remapping-file=",
+      "-fxray-attr-list=",
+      "-fxray-always-instrument=",
+      "-fxray-never-instrument=",
+      "-fplugin=",
+  };
+  for (std::string_view p : kPrefixes) {
+    if (StartsWith(arg, p)) return std::string(arg.substr(p.size()));
+  }
+  return std::nullopt;
 }
 
 // Dependency-generation flags. They control side-channel output rather than
@@ -160,6 +198,30 @@ std::string DefaultOutputFor(const std::string& source, bool compile_only,
 }
 
 }  // namespace
+
+bool IsLinkOnlyFlag(std::string_view arg) {
+  // Deliberately narrow. -static, -shared, -pie and -pthread read like link
+  // flags and are not reliably so: -shared implies PIC on some targets and
+  // -pthread defines _REENTRANT. A missed hit costs a compile; a wrong object
+  // costs a great deal more, so anything not provably linker-only stays keyed.
+  static constexpr std::string_view kExact[] = {
+      "-rdynamic",      "-s",             "-nostdlib",         "-nostdlib++",
+      "-nodefaultlibs", "-nostartfiles",  "-static-libgcc",    "-shared-libgcc",
+      "-static-libstdc++",
+  };
+  for (std::string_view f : kExact) {
+    if (arg == f) return true;
+  }
+  if (StartsWith(arg, "-Wl,")) return true;
+  // Joined -lm and -L/usr/lib; the bare spellings take the next argument.
+  if (arg.size() > 2 && (StartsWith(arg, "-l") || StartsWith(arg, "-L"))) return true;
+  return LinkOnlyFlagTakesValue(arg);
+}
+
+bool LinkOnlyFlagTakesValue(std::string_view arg) {
+  return arg == "-l" || arg == "-L" || arg == "-Xlinker" || arg == "-T" ||
+         arg == "-u" || arg == "-z" || arg == "-e";
+}
 
 std::string LanguageName(Language lang) {
   switch (lang) {
@@ -409,12 +471,29 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       continue;
     }
 
+    // A flag naming a file the compiler reads after preprocessing. The flag
+    // stays on the command line and in the key; the file goes into the key too,
+    // so editing it in place cannot serve a stale object.
+    if (auto keyed_file = KeyedFileFlagValue(arg)) {
+      result.base_args.push_back(arg);
+      result.key_args.push_back(arg);
+      if (!keyed_file->empty()) result.key_files.push_back(*keyed_file);
+      continue;
+    }
+
     // Flags whose effect vcache cannot reproduce from a stored object.
+    //
+    // The module flags are here rather than in KeyedFileFlagValue because a
+    // .pcm records the paths of the modules *it* imports: hashing the one file
+    // named on the command line would not cover the transitive set, and the
+    // preprocessor does not expand `import` the way it expands `#include`.
     if (arg == "-save-temps" || StartsWith(arg, "-save-temps=") ||
         arg == "-fsyntax-only" || StartsWith(arg, "-specs=") ||
         StartsWith(arg, "-fprofile-generate") || StartsWith(arg, "-fprofile-use") ||
         StartsWith(arg, "-fauto-profile") || arg == "-frepo" ||
-        StartsWith(arg, "-fmodules") || StartsWith(arg, "-fsanitize-blacklist=") ||
+        StartsWith(arg, "-fmodules") || StartsWith(arg, "-fmodule-file=") ||
+        StartsWith(arg, "-fmodule-map-file=") ||
+        StartsWith(arg, "-fprebuilt-module-path=") ||
         StartsWith(arg, "-fprofile-instr-use")) {
       pending_uncacheable.push_back("unsupported flag " + arg);
       result.base_args.push_back(arg);
@@ -440,6 +519,20 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       // should still describe it accurately.
       if (SideOutputFlagTakesValue(arg) && i + 1 < result.argv.size()) {
         result.base_args.push_back(result.argv[++i]);
+      }
+      continue;
+    }
+
+    // Linker-only flags. They stay on the command line, because the real
+    // compile must see what the caller passed, but are recorded apart from
+    // key_args so ComputeKey can decide whether they belong in the key.
+    if (IsLinkOnlyFlag(arg)) {
+      result.base_args.push_back(arg);
+      result.link_args.push_back(arg);
+      if (LinkOnlyFlagTakesValue(arg) && i + 1 < result.argv.size()) {
+        const std::string& value = result.argv[++i];
+        result.base_args.push_back(value);
+        result.link_args.push_back(value);
       }
       continue;
     }

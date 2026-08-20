@@ -1037,6 +1037,26 @@ reset_cache
 check "-fstack-usage is not cached" "$(uncacheable)" "1"
 check "and the .su is produced" "$([[ -f "$WORK/side/su.su" ]] && echo yes)" "yes"
 
+# -fopt-info writes its report to a file only when spelled with an `=`; without
+# one it goes to stderr, which vcache captures and replays, so that form stays
+# cacheable and only the file-writing spelling is declined.
+reset_cache
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc -O2 -fopt-info-optimized=oi.txt -c s.c -o oi.o ) 2>/dev/null
+check "-fopt-info-optimized=FILE is not cached" "$(uncacheable)" "1"
+check "and the report is produced" "$([[ -f "$WORK/side/oi.txt" ]] && echo yes)" "yes"
+
+reset_cache
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc -O2 -fopt-info-optimized -c s.c -o oi2.o ) 2>/dev/null
+check "-fopt-info without a file is still cached" "$(uncacheable)" "0"
+
+reset_cache
+( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
+    "$VCACHE" gcc -aux-info aux.txt -c s.c -o ai.o ) 2>/dev/null
+check "-aux-info is not cached" "$(uncacheable)" "1"
+check "and the listing is produced" "$([[ -f "$WORK/side/aux.txt" ]] && echo yes)" "yes"
+
 # Without such a flag the same source caches normally, so the check above is
 # about the flag and not about this file being unusual.
 reset_cache
@@ -1044,6 +1064,50 @@ reset_cache
     "$VCACHE" gcc -c s.c -o plain.o ) 2>/dev/null
 check "the same source without those flags is cached" "$(misses)" "1"
 check "and is not counted uncacheable" "$(uncacheable)" "0"
+
+# --------------------------------------------------------------------------
+section "15b. linker-only flags do not fork the key"
+
+# Under -c the driver never hands these to the compiler proper, and gcc ignores
+# them without a word -- even under -Werror. Keying them costs hits for nothing,
+# and worst of all across machines: a -L or -Wl,-rpath holding a local path is
+# exactly the sort of difference the S3 layer exists to see through, and unlike
+# -I these are not canonicalised by any root mapping.
+
+reset_cache
+mkdir -p "$WORK/link"
+printf 'extern int ext(int);\nint fn(int x){ return ext(x) + 7; }\n' > "$WORK/link/l.c"
+
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -L/usr/lib -lm -c l.c -o "$WORK/l1.o" ) 2>/dev/null
+check "a compile with linker flags is a miss" "$(misses)" "1"
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -L/somewhere/else -Wl,-rpath,/opt -rdynamic -s \
+    -c l.c -o "$WORK/l2.o" ) 2>/dev/null
+check "different linker flags hit the same entry" "$(hits)" "1"
+
+# The served object has to be what the compiler would have produced, not merely
+# something: a key that drops too much is a wrong answer, not a slow one.
+( cd "$WORK/link" && gcc -O2 -L/somewhere/else -Wl,-rpath,/opt -rdynamic -s \
+    -c l.c -o "$WORK/lref.o" ) 2>/dev/null
+if cmp -s "$WORK/l2.o" "$WORK/lref.o"; then
+  ok "the served object matches an uncached compile"
+else
+  bad "the served object matches an uncached compile"
+fi
+
+# The other half of the bargain: flags that merely look like link flags must
+# still key. -shared implies PIC on some targets and -pthread defines
+# _REENTRANT, so neither is safe to drop however inert it looks here.
+reset_cache
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -c l.c -o "$WORK/p1.o" ) 2>/dev/null
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -pthread -c l.c -o "$WORK/p2.o" ) 2>/dev/null
+check "-pthread is still a separate entry" "$(misses)" "2"
+( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
+    "$VCACHE" gcc -O2 -static -c l.c -o "$WORK/p3.o" ) 2>/dev/null
+check "-static is still a separate entry" "$(misses)" "3"
 
 # --------------------------------------------------------------------------
 section "16. clang"
@@ -1161,6 +1225,86 @@ if command -v clang >/dev/null 2>&1; then
   check "clang -MJ is not cached" "$(uncacheable)" "1"
   check "and the fragment is produced" \
     "$([[ -f "$WORK/frag.json" ]] && echo yes)" "yes"
+
+  # -Werror must not disable caching. vcache adds -fno-working-directory to the
+  # preprocessing run for gcc's benefit; clang has no use for it and says so,
+  # which under -Werror is an error, and every compile would quietly fall back
+  # to running the compiler.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -Werror -O1 -c -I include src/lib.cc -o "$WORK/we1.o" ) 2>/dev/null
+  check "clang -Werror still preprocesses" "$(stat_of 'preprocess failed')" "0"
+  check "and is cached" "$(misses)" "1"
+  ( cd "$WORK/clang-b" && VCACHE_ROOTS="$WORK/clang-b=proj" \
+      "$VCACHE" clang -Werror -O1 -c -I include src/lib.cc -o "$WORK/we2.o" ) 2>/dev/null
+  check "clang -Werror hits across checkouts" "$(hits)" "1"
+
+  # A file named by a flag whose contents pick what code comes out. The
+  # preprocessed text cannot stand in for it: clang reads the list in the middle
+  # end, so both compiles below preprocess to exactly the same bytes.
+  reset_cache
+  # A memory access is what asan instruments, so this source is what makes the
+  # two ignore lists produce visibly different objects.
+  printf 'int probe(int *p){ p[0] = p[1] + 1; return p[0]; }\n' \
+    > "$WORK/clang-a/src/ign.c"
+  printf 'fun:*\n' > "$WORK/clang-a/ign.txt"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -fsanitize=address -fsanitize-ignorelist=ign.txt \
+      -c src/ign.c -o "$WORK/ig1.o" ) 2>/dev/null
+  check "an -fsanitize-ignorelist compile is cacheable" "$(uncacheable)" "0"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -fsanitize=address -fsanitize-ignorelist=ign.txt \
+      -c src/ign.c -o "$WORK/ig2.o" ) 2>/dev/null
+  check "an unchanged ignore list hits" "$(hits)" "1"
+
+  printf 'fun:nothing_at_all\n' > "$WORK/clang-a/ign.txt"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -fsanitize=address -fsanitize-ignorelist=ign.txt \
+      -c src/ign.c -o "$WORK/ig3.o" ) 2>/dev/null
+  check "editing the ignore list is a separate entry" "$(hits)" "1"
+  if cmp -s "$WORK/ig1.o" "$WORK/ig3.o"; then
+    bad "an edited ignore list served the old object"
+  else
+    ok "an edited ignore list produced a different object"
+  fi
+
+  # clang is not silent about linker flags under -c: it names the offending flag
+  # in an "unused" warning, which vcache stores and replays. Sharing an entry
+  # between -lm and -lz would report a flag the caller never passed, so unlike
+  # gcc these have to stay in the key.
+  reset_cache
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lm -c src/warn.c -o "$WORK/ln1.o" ) 2>/dev/null
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lz -c src/warn.c -o "$WORK/ln2.o" ) 2>/dev/null
+  check "clang keys linker flags" "$(misses)" "2"
+  ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+      "$VCACHE" clang -O1 -lm -c src/warn.c -o "$WORK/ln3.o" ) 2>"$WORK/ln3.err"
+  check "and the repeat hits" "$(hits)" "1"
+  if grep -q -- '-lm' "$WORK/ln3.err" && ! grep -q -- '-lz' "$WORK/ln3.err"; then
+    ok "the replayed warning names the flag that was passed"
+  else
+    bad "the replayed warning names the flag that was passed"
+  fi
+
+  # Modules are declined rather than keyed: a .pcm names the modules it imports
+  # in turn, so hashing the one file on the command line would not cover the
+  # transitive set, and `import` is not expanded by the preprocessor the way
+  # `#include` is.
+  reset_cache
+  printf 'export module M;\nexport constexpr int val() { return 111; }\n' \
+    > "$WORK/clang-a/m.cppm"
+  printf 'import M;\nint caller() { return val(); }\n' > "$WORK/clang-a/use.cc"
+  if ( cd "$WORK/clang-a" && clang++ -std=c++20 --precompile m.cppm -o M.pcm ) 2>/dev/null; then
+    ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
+        "$VCACHE" clang++ -std=c++20 -O2 -fmodule-file=M=M.pcm -c use.cc \
+        -o "$WORK/mod.o" ) 2>/dev/null
+    check "-fmodule-file is not cached" "$(uncacheable)" "1"
+    check "and the object is still produced" \
+      "$([[ -s "$WORK/mod.o" ]] && echo yes)" "yes"
+  else
+    printf '  \033[33mSKIP\033[0m clang++ cannot precompile a C++20 module\n'
+  fi
 else
   printf '  \033[33mSKIP\033[0m clang not installed\n'
 fi

@@ -18,6 +18,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vcache::args {
@@ -83,6 +84,23 @@ struct CompilerArgs {
   // knowledge of roots.
   std::vector<std::string> key_args;
 
+  // Flags the driver forwards to the linker and nowhere else. Under -c they
+  // change no output at all, so core/compile.cc leaves them out of the key and
+  // two compiles differing only in -L or -Wl,-rpath share an entry -- which
+  // matters most for the S3 layer, where those paths are machine-specific and
+  // RootMap does not reach them. clang is not so quiet: it names the flag in an
+  // "unused" warning that vcache stores and replays, so there they stay in the
+  // key. Present in base_args either way; the real compile must see exactly
+  // what the caller passed, warnings included.
+  std::vector<std::string> link_args;
+
+  // Files named by a flag whose *contents* select what code comes out, but
+  // which the preprocessor never reads: sanitizer ignore lists, sample
+  // profiles, plugins. The flag text alone is not enough -- editing one of
+  // these in place must change the key -- and the preprocessed output says
+  // nothing about them, so core/compile.cc hashes each file into the key.
+  std::vector<std::string> key_files;
+
   // The command line with the source, -o, dependency flags and incoming prefix
   // maps removed; vcache rebuilds the real invocation from this.
   std::vector<std::string> base_args;
@@ -105,6 +123,14 @@ CompilerArgs Parse(const std::vector<std::string>& argv);
 
 // Expands @file response-file arguments recursively. Returns false if a file
 // could not be read or nesting got implausibly deep.
+// True for a flag the driver hands to the linker and never to the compiler
+// proper. Exposed because the dependency-scan key filters the raw command line
+// rather than a parsed CompilerArgs.
+bool IsLinkOnlyFlag(std::string_view arg);
+
+// Which of those take their value as the following argument.
+bool LinkOnlyFlagTakesValue(std::string_view arg);
+
 bool ExpandResponseFiles(const std::vector<std::string>& in,
                          std::vector<std::string>* out);
 

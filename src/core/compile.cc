@@ -45,15 +45,28 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
 }
 
+// Which driver this is. The version banner settles it whenever there is one;
+// the compiler-check modes that skip the probe fall back to the name, which is
+// what a cross-compiler prefix or a versioned suffix leaves intact.
+bool LooksLikeClang(const std::string& banner, const std::string& path) {
+  if (!banner.empty()) return banner.find("clang version") != std::string::npos;
+  return util::BaseName(path).find("clang") != std::string::npos;
+}
+
 // Assembles the preprocessing command: the original flags, plus the root
 // prefix maps, minus anything that would write files.
 //
-// -fno-working-directory is essential here. gcc emits a `# 1 "<cwd>//"`
+// -fno-working-directory is essential under gcc. It emits a `# 1 "<cwd>//"`
 // linemarker whenever debug info is enabled, and -ffile-prefix-map does *not*
 // rewrite it, so without this flag the preprocessed text differs between build
 // directories and every cross-directory lookup misses.
+//
+// clang emits no such linemarker and rejects the flag as unused -- fatally so
+// under -Werror, which would turn every clang compile into a failed preprocess
+// and silently disable the cache. So it goes only to the driver that needs it.
 std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed,
-                                                const RootMap& roots) {
+                                                const RootMap& roots,
+                                                const CompilerId& compiler_id) {
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
   // base_args deliberately excludes dependency flags: gcc rejects -MP or -MF
@@ -63,7 +76,7 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
   for (const std::string& arg : roots.PrefixMapArgs(PrefixMapStyle::kC)) {
     cmd.push_back(arg);
   }
-  cmd.push_back("-fno-working-directory");
+  if (!compiler_id.is_clang) cmd.push_back("-fno-working-directory");
   cmd.push_back("-E");
   cmd.push_back(parsed.source);
   return cmd;
@@ -201,6 +214,32 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     hasher.UpdateDelimited(roots.Canonicalize(arg));
   }
 
+  // Linker-only flags change nothing about the object under -c, and gcc ignores
+  // them in silence, so they stay out of the key: a -L or -Wl,-rpath carrying a
+  // machine-specific path no longer forks the entry across machines. clang
+  // instead names the flag in an "unused" warning, which vcache stores and
+  // replays on a hit, so there the key has to keep them or the replayed text
+  // would report a flag the caller never passed.
+  if (compiler_id.is_clang) {
+    for (const std::string& arg : parsed.link_args) {
+      hasher.UpdateDelimited(roots.Canonicalize(arg));
+    }
+  }
+
+  // Files the compiler reads after preprocessing -- sanitizer ignore lists,
+  // sample profiles, plugins. Their contents never reach the preprocessed text,
+  // so they are hashed here. Hashing to a digest first keeps the framing fixed
+  // width, so two adjacent files cannot run together. One that cannot be read
+  // means no key at all: running the compiler beats guessing at its input.
+  for (const std::string& path : parsed.key_files) {
+    auto digest = hash::HashFile(path);
+    if (!digest) {
+      VCACHE_LOG("cannot hash keyed input file " + path);
+      return "";
+    }
+    hasher.UpdateDelimited(*digest);
+  }
+
   for (const std::string& name : config.extra_env_vars) {
     const char* value = std::getenv(name.c_str());
     hasher.UpdateDelimited(name);
@@ -272,6 +311,9 @@ CompilerId ResolveCompilerId(const std::string& compiler,
   } info;
   if (auto size = util::FileSize(real)) info.size = *size;
 
+  // Set on every path below, including the ones that never read a banner.
+  id.is_clang = LooksLikeClang("", real);
+
   if (check_mode == "mtime") {
     hash::Hasher hasher;
     hasher.UpdateDelimited(real);
@@ -302,6 +344,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
   const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
 
   if (auto cached = util::ReadFile(memo_path)) {
+    id.is_clang = LooksLikeClang(*cached, real);
     id.fingerprint = hash::HashString(*cached);
     id.description = util::Split(*cached, '\n', /*skip_empty=*/true).empty()
                          ? real
@@ -327,6 +370,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
   }
 
   util::WriteFileAtomic(memo_path, banner);
+  id.is_clang = LooksLikeClang(banner, real);
   id.fingerprint = hash::HashString(banner);
   const auto lines = util::Split(banner, '\n', /*skip_empty=*/true);
   id.description = lines.empty() ? real : lines.back();
@@ -362,7 +406,8 @@ struct DepManifestEntry {
 // flags naming where the answer goes, since the answer's content does not
 // depend on them.
 std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
-                                        const RootMap& roots) {
+                                        const RootMap& roots,
+                                        bool keep_link_args) {
   std::vector<std::string> out;
   for (size_t i = 1; i < parsed.argv.size(); ++i) {
     const std::string& arg = parsed.argv[i];
@@ -371,6 +416,13 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
       continue;
     }
     if (util::StartsWith(arg, "-MF") && arg.size() > 3) continue;
+    // A dependency list is no more sensitive to linker flags than an object is;
+    // the driver split is the same one ComputeKey makes, and for the same
+    // reason -- this path stores clang's diagnostics too.
+    if (!keep_link_args && args::IsLinkOnlyFlag(arg)) {
+      if (args::LinkOnlyFlagTakesValue(arg) && i + 1 < parsed.argv.size()) ++i;
+      continue;
+    }
     if (arg == parsed.source) {
       // The path is irrelevant once canonicalised; the content is hashed below.
       out.push_back("--vcache-source");
@@ -497,7 +549,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   hasher.UpdateDelimited(native_target);
   hasher.UpdateDelimited(roots.Fingerprint());
   hasher.UpdateDelimited(*source_digest);
-  for (const std::string& arg : DepScanKeyArgs(parsed, roots)) {
+  for (const std::string& arg : DepScanKeyArgs(parsed, roots, compiler_id.is_clang)) {
     hasher.UpdateDelimited(arg);
   }
   for (const std::string& name : config.extra_env_vars) {
@@ -802,7 +854,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // ---- preprocess ---------------------------------------------------------
 
   const std::string preprocessed = *temp_dir + "/pp.i";
-  const std::vector<std::string> pp_cmd = BuildPreprocessCommand(parsed, roots);
+  const std::vector<std::string> pp_cmd =
+      BuildPreprocessCommand(parsed, roots, compiler_id);
   VCACHE_LOG("preprocess: " + util::Join(pp_cmd, " "));
 
   util::ProcResult pp = util::Run(

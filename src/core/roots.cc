@@ -305,13 +305,8 @@ bool StartsPathToken(const std::string& text, size_t hit) {
 // every machine that later hits it (see compile.cc / rust_compile.cc, which
 // write CanonicalizeText()'s result into the cached blob).
 //
-// Note this only guards the right edge of a match. The left edge is
-// unguarded: a root can still match in the middle of an unrelated path (e.g.
-// "/opt/home/u/proj/x.c" rewrites the "/home/u/proj" suffix even though it is
-// not a root of that path). Left-boundary matches are textually
-// indistinguishable from a legitimate root reference preceded by another path
-// segment or a compiler flag (e.g. "-I/home/u/proj/include"), so fixing that
-// is a separate, harder change and is not attempted here.
+// Note this only guards the right edge of a match; StartsPathToken() above
+// guards the left. Both have to accept before ReplaceAll() rewrites a hit.
 bool IsPathTokenBoundary(const std::string& text, size_t after) {
   if (after >= text.size()) return true;
   const unsigned char next = static_cast<unsigned char>(text[after]);
@@ -326,11 +321,12 @@ bool IsPathTokenBoundary(const std::string& text, size_t after) {
 }
 
 // Like a plain find-and-replace, but a match is only accepted at a path
-// component boundary; see IsPathTokenBoundary() for the exact rule. If a root
-// path still appears verbatim in the output afterward, that is a local
-// absolute path about to be persisted into a shared cache entry, so it is
-// logged (when VCACHE_LOG is enabled) rather than silently dropped -- this is
-// diagnostic only and never changes the returned text or fails the build.
+// component boundary on both sides; see StartsPathToken() and
+// IsPathTokenBoundary() for the exact rules. If a root path still appears
+// verbatim in the output afterward, that is a local absolute path about to be
+// persisted into a shared cache entry, so it is logged (when VCACHE_LOG is
+// enabled) rather than silently dropped -- this is diagnostic only and never
+// changes the returned text or fails the build.
 std::string ReplaceAll(std::string text, const std::string& from,
                        const std::string& to) {
   if (from.empty()) return text;

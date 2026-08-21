@@ -202,6 +202,12 @@ void TestRootMap() {
   CheckEq(roots.CanonicalizeText("error in /home/u/proj\xC3\xA9/a.cc"),
           "error in /home/u/proj\xC3\xA9/a.cc",
           "CanonicalizeText does not match a non-ASCII sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj%2/a.cc"),
+          "error in /home/u/proj%2/a.cc",
+          "CanonicalizeText does not match a '%'-separated sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj=x/a.cc"),
+          "error in /home/u/proj=x/a.cc",
+          "CanonicalizeText does not match an '='-separated sibling");
 
   // The under-rewrite direction: a bare root followed by punctuation must
   // still be rewritten, not left in the output verbatim, since the result is
@@ -220,6 +226,15 @@ void TestRootMap() {
   CheckEq(roots.CanonicalizeText("(see /home/u/proj)"),
           "(see /vcache/proj)",
           "CanonicalizeText rewrites the bare root before ')'");
+  CheckEq(roots.CanonicalizeText("the file /home/u/proj is stale"),
+          "the file /vcache/proj is stale",
+          "CanonicalizeText rewrites the bare root before a space");
+  CheckEq(roots.CanonicalizeText("cannot open '/home/u/proj'"),
+          "cannot open '/vcache/proj'",
+          "CanonicalizeText rewrites the bare root before a quote");
+  CheckEq(roots.CanonicalizeText("see [/home/u/proj]"),
+          "see [/vcache/proj]",
+          "CanonicalizeText rewrites the bare root before ']'");
   // But "proj.old" is a sibling, not the root followed by punctuation --
   // the '.' here continues the name because it is not followed by
   // whitespace or end of text.

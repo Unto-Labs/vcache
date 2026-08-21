@@ -172,6 +172,77 @@ void TestRootMap() {
   CheckEq(roots.LocalizeText("error in /vcache/proj/src/a.cc:12"),
           "error in /home/u/proj/src/a.cc:12", "LocalizeText");
 
+  // Text rewriting must respect the same component boundaries as
+  // Canonicalize(): a sibling directory whose name merely extends the root's
+  // must not be rewritten, even embedded in free-form diagnostic text.
+  CheckEq(roots.CanonicalizeText("error in /home/u/projX/src/a.cc:12"),
+          "error in /home/u/projX/src/a.cc:12",
+          "CanonicalizeText respects path component boundaries");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj-old/a.cc"),
+          "error in /home/u/proj-old/a.cc",
+          "CanonicalizeText does not match a hyphenated sibling");
+  CheckEq(roots.LocalizeText("error in /vcache/projX/src/a.cc:12"),
+          "error in /vcache/projX/src/a.cc:12",
+          "LocalizeText respects path component boundaries");
+  // The root itself, with no trailing separator, must still be rewritten.
+  CheckEq(roots.CanonicalizeText("cd /home/u/proj; build"),
+          "cd /vcache/proj; build",
+          "CanonicalizeText still rewrites the bare root");
+
+  // Siblings using a non-alphanumeric separator, or a non-ASCII name, must
+  // not be rewritten either -- these bytes are legal in a filename, so an
+  // allowlist of five character classes is not enough (the point that
+  // exposed the original denylist-based fix as incomplete).
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj~old/a.cc"),
+          "error in /home/u/proj~old/a.cc",
+          "CanonicalizeText does not match a tilde-separated sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj@2/a.cc"),
+          "error in /home/u/proj@2/a.cc",
+          "CanonicalizeText does not match an '@'-separated sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj\xC3\xA9/a.cc"),
+          "error in /home/u/proj\xC3\xA9/a.cc",
+          "CanonicalizeText does not match a non-ASCII sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj%2/a.cc"),
+          "error in /home/u/proj%2/a.cc",
+          "CanonicalizeText does not match a '%'-separated sibling");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj=x/a.cc"),
+          "error in /home/u/proj=x/a.cc",
+          "CanonicalizeText does not match an '='-separated sibling");
+
+  // The under-rewrite direction: a bare root followed by punctuation must
+  // still be rewritten, not left in the output verbatim, since the result is
+  // written into diagnostics persisted into the shared cache. Getting this
+  // wrong leaks a developer's local absolute path to every machine that
+  // later hits the entry.
+  CheckEq(roots.CanonicalizeText("warning generated in /home/u/proj."),
+          "warning generated in /vcache/proj.",
+          "CanonicalizeText rewrites the bare root before a sentence-final '.'");
+  CheckEq(roots.CanonicalizeText("path is /home/u/proj:"),
+          "path is /vcache/proj:",
+          "CanonicalizeText rewrites the bare root before ':'");
+  CheckEq(roots.CanonicalizeText("In file included from /home/u/proj, line 3"),
+          "In file included from /vcache/proj, line 3",
+          "CanonicalizeText rewrites the bare root before ','");
+  CheckEq(roots.CanonicalizeText("(see /home/u/proj)"),
+          "(see /vcache/proj)",
+          "CanonicalizeText rewrites the bare root before ')'");
+  CheckEq(roots.CanonicalizeText("the file /home/u/proj is stale"),
+          "the file /vcache/proj is stale",
+          "CanonicalizeText rewrites the bare root before a space");
+  CheckEq(roots.CanonicalizeText("cannot open '/home/u/proj'"),
+          "cannot open '/vcache/proj'",
+          "CanonicalizeText rewrites the bare root before a quote");
+  CheckEq(roots.CanonicalizeText("see [/home/u/proj]"),
+          "see [/vcache/proj]",
+          "CanonicalizeText rewrites the bare root before ']'");
+  // But "proj.old" is a sibling, not the root followed by punctuation --
+  // the '.' here continues the name because it is not followed by
+  // whitespace or end of text.
+  CheckEq(roots.CanonicalizeText("backup at /home/u/proj.old/a.cc"),
+          "backup at /home/u/proj.old/a.cc",
+          "CanonicalizeText treats '.' as part of the name, not a terminator, "
+          "when it is not sentence-final");
+
   // Policy parsing. The default is error, so a typo must not silently fall
   // back to a permissive setting.
   core::IncomingMapPolicy policy = core::IncomingMapPolicy::kKeep;

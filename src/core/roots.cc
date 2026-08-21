@@ -3,6 +3,7 @@
 #include "core/roots.h"
 
 #include <algorithm>
+#include <cctype>
 #include <set>
 
 #include "util/fs.h"
@@ -197,12 +198,82 @@ std::string RootMap::Canonicalize(std::string_view path) const {
 
 namespace {
 
+// True if `c` ends a path token in compiler diagnostic text, e.g. the ':' in
+// "proj/a.cc:12" or the ')' in "(proj/a.cc)". POSIX allows almost any byte in
+// a filename, so instead of enumerating characters that continue a name (an
+// unbounded set that previously missed '~', '@', space, and all of UTF-8),
+// this enumerates the small, known set of characters that terminate a path
+// token in the text gcc/clang/rustc actually emit. Anything not in this set,
+// including every byte above 0x7f, is treated as continuing the name, so a
+// root followed by one of those is a different directory and must not be
+// rewritten.
+bool EndsPathToken(unsigned char c) {
+  switch (c) {
+    case ':': case ',': case ';':
+    case '\'': case '"':
+    case ')': case ']': case '}': case '>':
+    case ' ': case '\t': case '\n': case '\r':
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Like a plain find-and-replace, but a match is only accepted at a path
+// component boundary. Diagnostics and other free-form text can otherwise
+// contain a root's path as a strict prefix of an unrelated sibling (e.g. root
+// "/home/u/proj" inside "/home/u/projX/a.cc" or "/home/u/proj-old/a.cc"),
+// which must not be rewritten.
+//
+// A match is accepted when the next character is '/', the text ends, or
+// EndsPathToken() says the next character cannot start the same path
+// component. '.' gets special treatment: it is a legal filename character
+// (so "proj.old" must not be split), but it is also how a sentence describing
+// the bare root ends ("... in /home/u/proj."). It is therefore only treated
+// as a terminator when whitespace or the end of the text follows it;
+// otherwise it is treated as continuing the name.
+//
+// This deliberately errs toward over-rewriting a pathological sibling name
+// (e.g. a directory literally called "proj:" or "proj (old)") rather than
+// under-rewriting the root itself: the former is a broken jump-to-file link,
+// while the latter would leave a developer's local absolute path in
+// diagnostic text that is persisted into the shared cache and replayed onto
+// every machine that later hits it (see compile.cc / rust_compile.cc, which
+// write CanonicalizeText()'s result into the cached blob).
+//
+// Note this only guards the right edge of a match. The left edge is
+// unguarded: a root can still match in the middle of an unrelated path (e.g.
+// "/opt/home/u/proj/x.c" rewrites the "/home/u/proj" suffix even though it is
+// not a root of that path). Left-boundary matches are textually
+// indistinguishable from a legitimate root reference preceded by another path
+// segment or a compiler flag (e.g. "-I/home/u/proj/include"), so fixing that
+// is a separate, harder change and is not attempted here.
+bool IsPathTokenBoundary(const std::string& text, size_t after) {
+  if (after >= text.size()) return true;
+  const unsigned char next = static_cast<unsigned char>(text[after]);
+  if (next == '/') return true;
+  if (next != '.') return EndsPathToken(next);
+  // '.' terminates only when it is not itself continuing a name, i.e. when
+  // nothing follows it or what follows is whitespace.
+  if (after + 1 >= text.size()) return true;
+  const unsigned char after_dot = static_cast<unsigned char>(text[after + 1]);
+  return after_dot == ' ' || after_dot == '\t' || after_dot == '\n' ||
+         after_dot == '\r';
+}
+
+// Like a plain find-and-replace, but a match is only accepted at a path
+// component boundary; see IsPathTokenBoundary() for the exact rule. If a root
+// path still appears verbatim in the output afterward, that is a local
+// absolute path about to be persisted into a shared cache entry, so it is
+// logged (when VCACHE_LOG is enabled) rather than silently dropped -- this is
+// diagnostic only and never changes the returned text or fails the build.
 std::string ReplaceAll(std::string text, const std::string& from,
                        const std::string& to) {
   if (from.empty()) return text;
   std::string out;
   out.reserve(text.size());
   size_t pos = 0;
+  bool any_unrewritten = false;
   while (true) {
     size_t hit = text.find(from, pos);
     if (hit == std::string::npos) {
@@ -210,8 +281,15 @@ std::string ReplaceAll(std::string text, const std::string& from,
       break;
     }
     out.append(text, pos, hit - pos);
-    out.append(to);
-    pos = hit + from.size();
+    const size_t after = hit + from.size();
+    const bool boundary_ok = IsPathTokenBoundary(text, after);
+    if (!boundary_ok) any_unrewritten = true;
+    out.append(boundary_ok ? to : from);
+    pos = after;
+  }
+  if (any_unrewritten) {
+    VCACHE_LOG("root path left unrewritten in text (component boundary "
+                "declined match): " + from);
   }
   return out;
 }

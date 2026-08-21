@@ -75,19 +75,25 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
     return false;
   }
 
-  // Only this shard can have grown.  Use its even share as a cheap signal that
-  // the global cache might need enforcement, then make the eviction decision
-  // from the actual global size.
+  // Only this shard can have grown.  Its even share is the cheap trigger; the
+  // decision is global and is made inside TrimGlobal, from one walk.
   const uint64_t shard_budget = std::max<uint64_t>(max_size_ / kShardCount, 1);
   uint64_t shard_size = 0;
   for (const auto& entry : util::ListFilesRecursive(shard)) shard_size += entry.size;
-  if (shard_size > shard_budget && TotalSize() > max_size_) {
-    TrimGlobal(static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
+  if (shard_size > shard_budget) {
+    TrimGlobal(max_size_, static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
   }
   return true;
 }
 
-void DiskStorage::TrimGlobal(uint64_t target_bytes) {
+// The walk is what costs -- ListFilesRecursive() stats every entry -- so the
+// over-budget test and the eviction share one.  Asking TotalSize() first and
+// then walking again to evict doubles the price of a store, and does so
+// precisely in the case that motivated this change: a cache whose shards are
+// skewed past their even share but whose global total is still comfortably
+// under the limit, where the answer is "no eviction" and the second walk never
+// happens at all.
+void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
   std::vector<util::FileEntry> entries;
   uint64_t total = 0;
   for (int i = 0; i < kShardCount; ++i) {
@@ -101,7 +107,7 @@ void DiskStorage::TrimGlobal(uint64_t target_bytes) {
                    std::make_move_iterator(shard_entries.begin()),
                    std::make_move_iterator(shard_entries.end()));
   }
-  if (total <= target_bytes) return;
+  if (total <= high_water) return;
 
   // Oldest first.
   std::sort(entries.begin(), entries.end(),
@@ -115,7 +121,18 @@ void DiskStorage::TrimGlobal(uint64_t target_bytes) {
     if (util::RemoveFile(entry.path)) {
       total -= entry.size;
       ++removed;
+      continue;
     }
+    // A parallel build runs many vcache processes against one cache, so an
+    // entry can be evicted by another of them between this walk and this
+    // unlink.  Those bytes have left the cache, so they have to be counted as
+    // freed.  Counting only our own successes makes each concurrent trimmer
+    // evict a full budget's worth *itself*, walking further down a list whose
+    // head is already gone and taking live entries with it -- so N trimmers
+    // hollow the cache to roughly N times the intended depth.  A removal that
+    // failed for any other reason (a permission problem, a directory in the
+    // way) really has left the bytes in place, and must not be counted.
+    if (errno == ENOENT) total -= entry.size;
   }
   if (removed > 0) {
     VCACHE_LOG("disk: globally evicted " + std::to_string(removed) +
@@ -125,7 +142,10 @@ void DiskStorage::TrimGlobal(uint64_t target_bytes) {
 
 void DiskStorage::Trim() {
   if (read_only_) return;
-  TrimGlobal(static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
+  // An explicit trim has no hysteresis to preserve: evict whenever the cache
+  // is above the target rather than waiting for it to cross max_size_.
+  const auto target = static_cast<uint64_t>(max_size_ * kTrimTargetFraction);
+  TrimGlobal(target, target);
 }
 
 bool DiskStorage::Clear() {

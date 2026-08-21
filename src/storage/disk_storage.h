@@ -39,9 +39,10 @@ class DiskStorage : public Storage {
   std::string PathForKey(const std::string& key) const;
   std::string ShardDir(const std::string& key) const;
 
-  // Evicts globally least-recently-used entries until the cache is back under
-  // `target_bytes`.
-  void TrimGlobal(uint64_t target_bytes);
+  // If the cache holds more than `high_water` bytes, evicts globally
+  // least-recently-used entries until it is back under `target_bytes`.  One
+  // walk answers both, since walking is the expensive part.
+  void TrimGlobal(uint64_t high_water, uint64_t target_bytes);
 
   std::string dir_;
   uint64_t max_size_;

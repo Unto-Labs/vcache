@@ -1400,6 +1400,55 @@ void TestDiskStorageEviction() {
           "Trim drops the oldest entries first");
   }
 
+  // ---- a removal that genuinely failed is not counted as freed ----------
+  // The trimmer subtracts an entry's size whenever the entry is gone, which
+  // includes a concurrent vcache having unlinked it first (ENOENT). That rule
+  // must not extend to a removal that actually failed: those bytes are still
+  // in the cache, and crediting them lets the trimmer stop early believing it
+  // freed space it never freed.
+  //
+  // The sizes make the two rules disagree. The four oldest entries sit in an
+  // unwritable shard and cannot be unlinked; crediting them alone reaches the
+  // target exactly, so a trimmer that counts failures stops right there and
+  // frees nothing at all. A correct one keeps going into the writable shard.
+  //
+  // An unwritable directory is the deterministic way to get a failing
+  // unlink(2). Root ignores directory permissions, so skip there rather than
+  // assert something untrue.
+  if (::geteuid() != 0) {
+    TempCacheDir tmp;
+    const uint64_t max_size = 5120;  // target = 0.8 * 5120 = 4096
+
+    const std::string locked = tmp.path() + "/aa";
+    util::MakeDirs(locked);
+    for (int i = 0; i < 4; ++i) {
+      const std::string f = locked + "/stuck" + std::to_string(i);
+      util::WriteFileAtomic(f, std::string(1024, 's'));
+      Age(f, 100 - i);  // oldest, so the trimmer reaches these first
+    }
+
+    const std::string open_shard = tmp.path() + "/bb";
+    util::MakeDirs(open_shard);
+    for (int i = 0; i < 4; ++i) {
+      const std::string f = open_shard + "/free" + std::to_string(i);
+      util::WriteFileAtomic(f, std::string(1024, 'f'));
+      Age(f, 10 - i);  // newer, so they are only reached if the stuck four
+                       // are correctly not credited
+    }
+
+    ::chmod(locked.c_str(), 0555);
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    disk.Trim();
+    ::chmod(locked.c_str(), 0755);
+
+    Check(CountFiles(locked) == 4, "entries that cannot be unlinked stay put");
+    Check(CountFiles(open_shard) == 0,
+          "and the trimmer keeps evicting past them rather than crediting "
+          "bytes it never freed");
+    Check(disk.TotalSize() == 4 * 1024,
+          "so the cache really is trimmed to what could be removed");
+  }
+
   // ---- a read-only layer never mutates the cache ------------------------
   {
     TempCacheDir tmp;

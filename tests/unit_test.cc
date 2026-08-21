@@ -172,6 +172,23 @@ void TestRootMap() {
   CheckEq(roots.LocalizeText("error in /vcache/proj/src/a.cc:12"),
           "error in /home/u/proj/src/a.cc:12", "LocalizeText");
 
+  // Text rewriting must respect the same component boundaries as
+  // Canonicalize(): a sibling directory whose name merely extends the root's
+  // must not be rewritten, even embedded in free-form diagnostic text.
+  CheckEq(roots.CanonicalizeText("error in /home/u/projX/src/a.cc:12"),
+          "error in /home/u/projX/src/a.cc:12",
+          "CanonicalizeText respects path component boundaries");
+  CheckEq(roots.CanonicalizeText("error in /home/u/proj-old/a.cc"),
+          "error in /home/u/proj-old/a.cc",
+          "CanonicalizeText does not match a hyphenated sibling");
+  CheckEq(roots.LocalizeText("error in /vcache/projX/src/a.cc:12"),
+          "error in /vcache/projX/src/a.cc:12",
+          "LocalizeText respects path component boundaries");
+  // The root itself, with no trailing separator, must still be rewritten.
+  CheckEq(roots.CanonicalizeText("cd /home/u/proj; build"),
+          "cd /vcache/proj; build",
+          "CanonicalizeText still rewrites the bare root");
+
   // Policy parsing. The default is error, so a typo must not silently fall
   // back to a permissive setting.
   core::IncomingMapPolicy policy = core::IncomingMapPolicy::kKeep;

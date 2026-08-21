@@ -197,6 +197,23 @@ std::string RootMap::Canonicalize(std::string_view path) const {
 
 namespace {
 
+// True if `c` could continue the same path component a match ended in, e.g.
+// the 'X' in "/home/u/projX". Used to keep text-mode replacement from
+// treating "/home/u/proj" as a match inside "/home/u/projX/a.cc", the same
+// class of bug Canonicalize()/IsUnder() already guard against for structured
+// paths.
+bool ContinuesPathComponent(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+         c == '-' || c == '.' || c == '+';
+}
+
+// Like a plain find-and-replace, but a match is only accepted at a path
+// component boundary: nothing immediately follows it, or the next character
+// is not one that could continue the same file or directory name. Diagnostics
+// and other free-form text can otherwise contain a root's path as a strict
+// prefix of an unrelated sibling (e.g. root "/home/u/proj" inside
+// "/home/u/projX/a.cc" or "/home/u/proj-old/a.cc"), which must not be
+// rewritten.
 std::string ReplaceAll(std::string text, const std::string& from,
                        const std::string& to) {
   if (from.empty()) return text;
@@ -210,8 +227,11 @@ std::string ReplaceAll(std::string text, const std::string& from,
       break;
     }
     out.append(text, pos, hit - pos);
-    out.append(to);
-    pos = hit + from.size();
+    const size_t after = hit + from.size();
+    const bool boundary_ok =
+        after >= text.size() || !ContinuesPathComponent(text[after]);
+    out.append(boundary_ok ? to : from);
+    pos = after;
   }
   return out;
 }

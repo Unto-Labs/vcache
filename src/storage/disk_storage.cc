@@ -75,12 +75,34 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
     return false;
   }
 
-  // Only this shard can have grown.  Its even share is the cheap trigger; the
-  // decision is global and is made inside TrimGlobal, from one walk.
+  // Only this shard can have grown, and walking it is cheap.  What it has to
+  // decide is when to pay for the global walk, which is not cheap: measured on
+  // a 30k-entry cache with a warm dentry cache, one shard costs ~0.3ms and the
+  // whole cache ~95ms.
+  //
+  // "Is this shard over its even share?" is the wrong question, because it is
+  // a state and not an event.  A shard holding a few large objects is over its
+  // share permanently, so every store into it would pay the global walk -- and
+  // vcache is a fresh process per compile, so there is no in-process guard that
+  // could ever fire.  That is the shape this change is meant to serve, so it is
+  // exactly the shape that must not be quadratic.
+  //
+  // Trigger on the crossing instead: pay for the global walk only when this
+  // store moves the shard across a multiple of its share.  A shard that is
+  // already fat stays quiet until it has grown by another whole share, which
+  // bounds the walks to one per `shard_budget` bytes written into a shard
+  // rather than one per store.  It degrades sanely too: a workload that
+  // somehow concentrated in a single shard keeps crossing multiples and so
+  // keeps being checked, instead of falling silent after the first crossing.
   const uint64_t shard_budget = std::max<uint64_t>(max_size_ / kShardCount, 1);
   uint64_t shard_size = 0;
   for (const auto& entry : util::ListFilesRecursive(shard)) shard_size += entry.size;
-  if (shard_size > shard_budget) {
+  // Rewriting an existing key makes this an underestimate and so can trigger a
+  // walk that was not due.  That costs time and never correctness, and a
+  // rewrite means the same key hashed to the same content, which is rare.
+  const uint64_t before =
+      shard_size >= value.size() ? shard_size - value.size() : 0;
+  if (shard_size / shard_budget != before / shard_budget) {
     TrimGlobal(max_size_, static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
   }
   return true;

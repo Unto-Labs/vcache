@@ -29,6 +29,7 @@
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "storage/chain.h"
+#include "storage/disk_storage.h"
 #include "storage/s3_storage.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -1202,6 +1203,269 @@ void TestS3ResponseParsing() {
         "rejects a body that is not a listing");
 }
 
+
+// --------------------------------------------------------------------------
+// Disk cache eviction.
+//
+// The disk layer shards on the first byte of the key, and eviction used to be
+// per-shard: each of the 256 shards was trimmed against max_size/256. Entries
+// are not uniformly sized, so a handful of large objects landing in one shard
+// blew through that 1/256th share and evicted the shard's hot entries while
+// the rest of the cache sat nearly empty -- 1.52 GiB held in a 4 GiB cache,
+// and identical builds plateauing at 84-86% hits.
+//
+// There is no clock to inject: the layer uses each file's mtime as its LRU
+// timestamp, deliberately, because relatime makes atime unreliable. So the
+// mtime *is* the clock, and Age() below stamps it directly. Without that,
+// entries written inside the same second sort arbitrarily and any ordering
+// assertion is a coin flip that passes on a fast machine.
+// --------------------------------------------------------------------------
+
+// A cache directory that cleans itself up, so a failing case cannot leak state
+// into the next one.
+class TempCacheDir {
+ public:
+  TempCacheDir() {
+    char tmpl[] = "/tmp/vcache-disk-test-XXXXXX";
+    const char* made = ::mkdtemp(tmpl);
+    path_ = made ? made : "";
+  }
+  ~TempCacheDir() {
+    if (!path_.empty()) util::RemoveRecursive(path_);
+  }
+  TempCacheDir(const TempCacheDir&) = delete;
+  TempCacheDir& operator=(const TempCacheDir&) = delete;
+
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+// Backdates an entry's mtime, which is what the trimmer sorts on. Larger
+// `seconds` means older, so Age(k, 100) is evicted before Age(k, 1).
+void Age(const std::string& file, int64_t seconds) {
+  struct stat st {};
+  if (::stat(file.c_str(), &st) != 0) return;
+  struct timespec times[2];
+  times[0].tv_sec = st.st_atim.tv_sec - seconds;
+  times[0].tv_nsec = 0;
+  times[1].tv_sec = st.st_mtim.tv_sec - seconds;
+  times[1].tv_nsec = 0;
+  ::utimensat(0, file.c_str(), times, 0);
+}
+
+// Keys are hex digests in production and the shard is just the first two
+// characters, so a test can place an entry in a chosen shard by construction.
+std::string KeyIn(const std::string& shard, const std::string& suffix) {
+  return shard + suffix;
+}
+
+std::string EntryPath(const std::string& dir, const std::string& key) {
+  return dir + "/" + key.substr(0, 2) + "/" + key.substr(2);
+}
+
+size_t CountFiles(const std::string& dir) {
+  return util::ListFilesRecursive(dir).size();
+}
+
+void TestDiskStorageEviction() {
+  Section("disk storage: global eviction");
+
+  // ---- layout and round trip -------------------------------------------
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 1 << 20, /*read_only=*/false);
+    Check(disk.Put("abcdef", "payload"), "Put accepts a normal key");
+    std::string got;
+    Check(disk.Get("abcdef", &got) && got == "payload", "Get returns what Put stored");
+    Check(util::ReadFile(tmp.path() + "/ab/cdef").has_value(),
+          "the entry lands in the shard named by the first two key characters");
+    Check(!disk.Put("ab", "x"), "a key too short to shard is refused");
+    Check(!disk.Get("ab", &got), "a key too short to shard never hits");
+  }
+
+  // ---- the regression --------------------------------------------------
+  // Four 4 KiB entries in one shard is 16 KiB, far past this cache's 1 KiB
+  // per-shard share, while the whole cache holds well under its 256 KiB
+  // budget. Nothing should be evicted. Under the old per-shard rule this is
+  // exactly the case that threw away hot entries.
+  {
+    TempCacheDir tmp;
+    const uint64_t max_size = 256 * 1024;  // shard share = 1 KiB
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    const std::string payload(4096, 'x');
+    for (int i = 0; i < 4; ++i) {
+      disk.Put(KeyIn("aa", "skew" + std::to_string(i)), payload);
+    }
+    Check(CountFiles(tmp.path()) == 4,
+          "a shard far over its 1/256th share is left alone below the global budget");
+    Check(disk.TotalSize() == 4 * 4096, "TotalSize sums every shard");
+  }
+
+  // ---- eviction happens once the global budget is exceeded --------------
+  {
+    TempCacheDir tmp;
+    const uint64_t max_size = 8192;
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    const std::string payload(1024, 'y');
+    for (int i = 0; i < 12; ++i) {
+      const std::string key = KeyIn("aa", "e" + std::to_string(i));
+      disk.Put(key, payload);
+      Age(EntryPath(tmp.path(), key), 100 - i);  // e0 oldest, e11 newest
+    }
+    Check(disk.TotalSize() <= max_size,
+          "the cache is brought back under its configured size");
+    Check(disk.TotalSize() > 0, "eviction stops at the target rather than emptying the cache");
+    std::string got;
+    Check(disk.Get(KeyIn("aa", "e11"), &got), "the newest entry survives");
+    Check(!disk.Get(KeyIn("aa", "e0"), &got), "the oldest entry is the one evicted");
+  }
+
+  // ---- eviction is global, not shard-local ------------------------------
+  // An old entry in a quiet shard must be reclaimed to make room for pressure
+  // in a busy one. The sizes here are chosen so the two rules disagree: the
+  // stale entry sits *below* its own shard's 1/256th share, so per-shard
+  // trimming would never touch it no matter how full the cache got, while the
+  // cache as a whole is over budget and global eviction takes it first. A
+  // smaller cache would not discriminate -- every entry would exceed its
+  // shard's share and the old rule would evict the stale one for its own
+  // local reasons, passing the test for the wrong reason.
+  {
+    TempCacheDir tmp;
+    const uint64_t max_size = 1 << 20;  // shard share = 4 KiB
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+
+    const std::string stale = KeyIn("bb", "ancient");
+    disk.Put(stale, std::string(1024, 'z'));  // 1 KiB, under its 4 KiB share
+    Age(EntryPath(tmp.path(), stale), 10000);
+
+    const std::string chunk(16 * 1024, 'z');
+    for (int i = 0; i < 64; ++i) {  // 1 MiB into one shard
+      const std::string key = KeyIn("aa", "hot" + std::to_string(i));
+      disk.Put(key, chunk);
+      Age(EntryPath(tmp.path(), key), 10);
+    }
+
+    std::string got;
+    Check(!disk.Get(stale, &got),
+          "an old entry below its own shard's share is still evicted for global pressure");
+    Check(disk.Get(KeyIn("aa", "hot63"), &got),
+          "the newer entries that caused the pressure are kept");
+  }
+
+  // ---- a hit refreshes the LRU timestamp --------------------------------
+  {
+    TempCacheDir tmp;
+    const uint64_t max_size = 8192;
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    const std::string payload(1024, 'w');
+
+    const std::string touched = KeyIn("cc", "touched");
+    disk.Put(touched, payload);
+    Age(EntryPath(tmp.path(), touched), 10000);
+
+    std::string got;
+    Check(disk.Get(touched, &got), "the entry is present before the read");
+    // The read above rewrote its mtime, so it is now the newest thing here.
+
+    for (int i = 0; i < 10; ++i) {
+      const std::string key = KeyIn("dd", "fill" + std::to_string(i));
+      disk.Put(key, payload);
+      Age(EntryPath(tmp.path(), key), 500);
+    }
+    Check(disk.Get(touched, &got),
+          "a read protects an otherwise stale entry from the next eviction");
+  }
+
+  // ---- explicit Trim ----------------------------------------------------
+  {
+    TempCacheDir tmp;
+    const uint64_t max_size = 4096;
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    // Write past the budget without going through Put's own trigger, so this
+    // case exercises Trim() on its own.
+    util::MakeDirs(tmp.path() + "/ee");
+    for (int i = 0; i < 8; ++i) {
+      util::WriteFileAtomic(tmp.path() + "/ee/manual" + std::to_string(i),
+                            std::string(1024, 'q'));
+      Age(tmp.path() + "/ee/manual" + std::to_string(i), 100 - i);
+    }
+    Check(disk.TotalSize() == 8 * 1024, "the cache starts over its budget");
+    disk.Trim();
+    Check(disk.TotalSize() <= max_size, "Trim enforces the global budget");
+    Check(util::ReadFile(tmp.path() + "/ee/manual7").has_value(),
+          "Trim keeps the newest entries");
+    Check(!util::ReadFile(tmp.path() + "/ee/manual0").has_value(),
+          "Trim drops the oldest entries first");
+  }
+
+  // ---- a removal that genuinely failed is not counted as freed ----------
+  // The trimmer subtracts an entry's size whenever the entry is gone, which
+  // includes a concurrent vcache having unlinked it first (ENOENT). That rule
+  // must not extend to a removal that actually failed: those bytes are still
+  // in the cache, and crediting them lets the trimmer stop early believing it
+  // freed space it never freed.
+  //
+  // The sizes make the two rules disagree. The four oldest entries sit in an
+  // unwritable shard and cannot be unlinked; crediting them alone reaches the
+  // target exactly, so a trimmer that counts failures stops right there and
+  // frees nothing at all. A correct one keeps going into the writable shard.
+  //
+  // An unwritable directory is the deterministic way to get a failing
+  // unlink(2). Root ignores directory permissions, so skip there rather than
+  // assert something untrue.
+  if (::geteuid() != 0) {
+    TempCacheDir tmp;
+    const uint64_t max_size = 5120;  // target = 0.8 * 5120 = 4096
+
+    const std::string locked = tmp.path() + "/aa";
+    util::MakeDirs(locked);
+    for (int i = 0; i < 4; ++i) {
+      const std::string f = locked + "/stuck" + std::to_string(i);
+      util::WriteFileAtomic(f, std::string(1024, 's'));
+      Age(f, 100 - i);  // oldest, so the trimmer reaches these first
+    }
+
+    const std::string open_shard = tmp.path() + "/bb";
+    util::MakeDirs(open_shard);
+    for (int i = 0; i < 4; ++i) {
+      const std::string f = open_shard + "/free" + std::to_string(i);
+      util::WriteFileAtomic(f, std::string(1024, 'f'));
+      Age(f, 10 - i);  // newer, so they are only reached if the stuck four
+                       // are correctly not credited
+    }
+
+    ::chmod(locked.c_str(), 0555);
+    storage::DiskStorage disk(tmp.path(), max_size, /*read_only=*/false);
+    disk.Trim();
+    ::chmod(locked.c_str(), 0755);
+
+    Check(CountFiles(locked) == 4, "entries that cannot be unlinked stay put");
+    Check(CountFiles(open_shard) == 0,
+          "and the trimmer keeps evicting past them rather than crediting "
+          "bytes it never freed");
+    Check(disk.TotalSize() == 4 * 1024,
+          "so the cache really is trimmed to what could be removed");
+  }
+
+  // ---- a read-only layer never mutates the cache ------------------------
+  {
+    TempCacheDir tmp;
+    util::MakeDirs(tmp.path() + "/ff");
+    for (int i = 0; i < 8; ++i) {
+      util::WriteFileAtomic(tmp.path() + "/ff/ro" + std::to_string(i),
+                            std::string(1024, 'r'));
+    }
+    storage::DiskStorage disk(tmp.path(), 1024, /*read_only=*/true);
+    Check(!disk.writable(), "a read-only layer reports itself unwritable");
+    Check(!disk.Put("aabbcc", "nope"), "a read-only layer refuses to store");
+    disk.Trim();
+    Check(CountFiles(tmp.path()) == 8,
+          "a read-only layer evicts nothing even when far over budget");
+  }
+}
+
 }  // namespace
 
 // A replayed artifact has to be as readable as a compiled one. mkstemp creates
@@ -1320,6 +1584,13 @@ int main() {
   TestS3ResponseParsing();
   TestWrittenFileMode();
   TestWriteErrnoIsPreserved();
+  // Must run after TestWrittenFileMode. util::DefaultFileMode() caches the
+  // umask in a function-local static on first use, so that test forks before
+  // this process has written anything, to get a child that initialises its own
+  // copy under umask(077). Anything calling WriteFileAtomic earlier -- as the
+  // disk cache does on every Put -- primes the cache in the parent, the child
+  // inherits it, and the strict-umask assertion fails.
+  TestDiskStorageEviction();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

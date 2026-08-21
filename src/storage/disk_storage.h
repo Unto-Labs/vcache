@@ -3,10 +3,16 @@
 // Local filesystem cache.
 //
 // Entries live at <dir>/<xx>/<rest-of-key>, sharded on the first byte of the
-// key into 256 directories.  A shard crossing its even share of the global
-// budget triggers a global size check.  Eviction itself is global so a few
-// large objects that happen to hash into one shard cannot displace hot entries
-// while most of the configured cache is still empty.
+// key into 256 directories.
+//
+// Eviction is global: a few large objects that happen to hash into one shard
+// must not displace that shard's hot entries while most of the configured
+// cache still sits empty.  Deciding globally means walking the whole tree,
+// which is far too expensive to do on every store, so a store pays for it only
+// when it moves its own shard across a multiple of the shard's even share of
+// the budget -- cheap to detect from the one shard already being walked, and
+// an event rather than a state, so a permanently oversized shard does not
+// re-trigger it on every store.  See Put() for the measurements behind that.
 #pragma once
 
 #include <cstdint>

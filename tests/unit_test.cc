@@ -243,6 +243,55 @@ void TestRootMap() {
           "CanonicalizeText treats '.' as part of the name, not a terminator, "
           "when it is not sentence-final");
 
+
+  // The left edge of a match. find() has no notion of where a path begins, so
+  // a root also matched in the middle of an unrelated absolute path:
+  // "/opt/home/u/proj/x.c" became "/opt/vcache/proj/x.c". These pin the
+  // rejection.
+  CheckEq(roots.CanonicalizeText("/opt/home/u/proj/x.c"),
+          "/opt/home/u/proj/x.c",
+          "CanonicalizeText ignores a root matched inside a longer path");
+  CheckEq(roots.CanonicalizeText("in /mnt/backup/home/u/proj/a.cc:3"),
+          "in /mnt/backup/home/u/proj/a.cc:3",
+          "CanonicalizeText ignores a mid-path match after whitespace");
+  CheckEq(roots.LocalizeText("/opt/vcache/proj/x.c"), "/opt/vcache/proj/x.c",
+          "LocalizeText ignores a canonical root matched inside a longer path");
+
+  // The other direction matters more: rejecting the left edge must not start
+  // declining legitimate references, because an unrewritten root is a local
+  // absolute path persisted into the shared cache. A match preceded by a run
+  // holding no '/' -- a compiler flag -- still begins a path.
+  CheckEq(roots.CanonicalizeText("-I/home/u/proj/include"),
+          "-I/vcache/proj/include",
+          "CanonicalizeText still rewrites a root after -I");
+  CheckEq(roots.CanonicalizeText("--sysroot=/home/u/proj"),
+          "--sysroot=/vcache/proj",
+          "CanonicalizeText still rewrites a root after a flag's '='");
+  CheckEq(roots.CanonicalizeText("cannot open '/home/u/proj/a.h'"),
+          "cannot open '/vcache/proj/a.h'",
+          "CanonicalizeText still rewrites a quoted root");
+  CheckEq(roots.CanonicalizeText("see [/home/u/proj]"),
+          "see [/vcache/proj]",
+          "CanonicalizeText still rewrites a bracketed root");
+  CheckEq(roots.CanonicalizeText("/home/u/proj/a.cc:1: note"),
+          "/vcache/proj/a.cc:1: note",
+          "CanonicalizeText still rewrites a root at the start of the text");
+
+  // The same walk makes the rule correct rather than merely convenient: with
+  // root "/proj", the path "/home/u/proj/a.cc" is not under that root, and
+  // Canonicalize() has always said so. Text mode now agrees.
+  {
+    core::RootMap short_root = MakeRoots({"/proj=proj"});
+    CheckEq(short_root.Canonicalize("/home/u/proj/a.cc"), "/home/u/proj/a.cc",
+            "Canonicalize: /home/u/proj is not under root /proj");
+    CheckEq(short_root.CanonicalizeText("error in /home/u/proj/a.cc"),
+            "error in /home/u/proj/a.cc",
+            "CanonicalizeText agrees: /home/u/proj is not under root /proj");
+    CheckEq(short_root.CanonicalizeText("error in /proj/a.cc"),
+            "error in /vcache/proj/a.cc",
+            "CanonicalizeText still rewrites a genuine match on root /proj");
+  }
+
   // Policy parsing. The default is error, so a typo must not silently fall
   // back to a permissive setting.
   core::IncomingMapPolicy policy = core::IncomingMapPolicy::kKeep;

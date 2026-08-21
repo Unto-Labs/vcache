@@ -219,6 +219,70 @@ bool EndsPathToken(unsigned char c) {
   }
 }
 
+// True if `c` can immediately precede a path token: the separators a path is
+// quoted, bracketed, flagged or delimited with. Used walking backwards from a
+// match, so it is the mirror of EndsPathToken() plus the opening halves.
+bool PrecedesPathToken(unsigned char c) {
+  switch (c) {
+    case '(': case '[': case '{': case '<': case '=':
+      return true;
+    default:
+      return EndsPathToken(c);
+  }
+}
+
+// True if a match beginning at `hit` starts a path token, rather than sitting
+// inside a longer one.
+//
+// IsPathTokenBoundary() guards the right edge; this guards the left. Without
+// it a root still matches in the middle of an unrelated absolute path, because
+// find() has no notion of where a path begins:
+//
+//   root "/home/u/proj"  in  "/opt/home/u/proj/x.c"  ->  "/opt/vcache/proj/x.c"
+//
+// The awkward part is that a mid-path match and a legitimate one are
+// textually identical at the match itself -- both are an ordinary character
+// followed by the root:
+//
+//   "/opt/home/u/proj/x.c"      the match is inside another path   reject
+//   "-I/home/u/proj/include"    the match follows a compiler flag  accept
+//
+// What separates them is what lies further back. Walk left to the nearest
+// token separator: if a '/' turns up first, the match is part of some longer
+// path and must not be rewritten; if a separator or the start of the text
+// turns up first, whatever sits between is a flag like "-I" or "--sysroot=",
+// and the match does begin a path.
+//
+// This also makes the rule right rather than merely convenient: with root
+// "/proj", the text "/home/u/proj/a.cc" is not under that root at all, and the
+// same walk rejects it for the same reason.
+//
+// The walk stops at the first '/' or separator, so in real diagnostic text it
+// covers a single path component or flag rather than scanning the whole line.
+//
+// Like the right edge, this is a rule about text and not a proof, and it is
+// wrong in both directions for inputs that do not occur in compiler output:
+//
+//   /home/u/a=b/home/u/proj/x.c   a directory named with a separator ends the
+//                                 walk early, so a mid-path match is accepted
+//                                 and rewritten
+//   file:///home/u/proj/a.cc      the walk meets the scheme's '/' first, so a
+//   //home/u/proj/a.cc            legitimate match is declined and the local
+//                                 path stays in the text
+//
+// The second pair is the direction that leaks, so it is the one to weigh: an
+// unrewritten root is a local absolute path persisted into a shared cache
+// entry. Neither shape appears in gcc, clang or rustc diagnostics, which is
+// what makes the trade acceptable rather than merely convenient.
+bool StartsPathToken(const std::string& text, size_t hit) {
+  for (size_t i = hit; i > 0; --i) {
+    const unsigned char c = static_cast<unsigned char>(text[i - 1]);
+    if (c == '/') return false;
+    if (PrecedesPathToken(c)) return true;
+  }
+  return true;  // the match begins the text
+}
+
 // Like a plain find-and-replace, but a match is only accepted at a path
 // component boundary. Diagnostics and other free-form text can otherwise
 // contain a root's path as a strict prefix of an unrelated sibling (e.g. root
@@ -241,13 +305,8 @@ bool EndsPathToken(unsigned char c) {
 // every machine that later hits it (see compile.cc / rust_compile.cc, which
 // write CanonicalizeText()'s result into the cached blob).
 //
-// Note this only guards the right edge of a match. The left edge is
-// unguarded: a root can still match in the middle of an unrelated path (e.g.
-// "/opt/home/u/proj/x.c" rewrites the "/home/u/proj" suffix even though it is
-// not a root of that path). Left-boundary matches are textually
-// indistinguishable from a legitimate root reference preceded by another path
-// segment or a compiler flag (e.g. "-I/home/u/proj/include"), so fixing that
-// is a separate, harder change and is not attempted here.
+// Note this only guards the right edge of a match; StartsPathToken() above
+// guards the left. Both have to accept before ReplaceAll() rewrites a hit.
 bool IsPathTokenBoundary(const std::string& text, size_t after) {
   if (after >= text.size()) return true;
   const unsigned char next = static_cast<unsigned char>(text[after]);
@@ -262,11 +321,12 @@ bool IsPathTokenBoundary(const std::string& text, size_t after) {
 }
 
 // Like a plain find-and-replace, but a match is only accepted at a path
-// component boundary; see IsPathTokenBoundary() for the exact rule. If a root
-// path still appears verbatim in the output afterward, that is a local
-// absolute path about to be persisted into a shared cache entry, so it is
-// logged (when VCACHE_LOG is enabled) rather than silently dropped -- this is
-// diagnostic only and never changes the returned text or fails the build.
+// component boundary on both sides; see StartsPathToken() and
+// IsPathTokenBoundary() for the exact rules. If a root path still appears
+// verbatim in the output afterward, that is a local absolute path about to be
+// persisted into a shared cache entry, so it is logged (when VCACHE_LOG is
+// enabled) rather than silently dropped -- this is diagnostic only and never
+// changes the returned text or fails the build.
 std::string ReplaceAll(std::string text, const std::string& from,
                        const std::string& to) {
   if (from.empty()) return text;
@@ -282,7 +342,8 @@ std::string ReplaceAll(std::string text, const std::string& from,
     }
     out.append(text, pos, hit - pos);
     const size_t after = hit + from.size();
-    const bool boundary_ok = IsPathTokenBoundary(text, after);
+    const bool boundary_ok =
+        StartsPathToken(text, hit) && IsPathTokenBoundary(text, after);
     if (!boundary_ok) any_unrewritten = true;
     out.append(boundary_ok ? to : from);
     pos = after;

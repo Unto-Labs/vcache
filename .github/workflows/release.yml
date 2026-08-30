@@ -1,0 +1,91 @@
+# Builds release binaries and attaches them to a GitHub Release.
+#
+# Every artifact is produced by building AND running the full test suite on the
+# platform it targets. A platform whose tests do not pass produces no asset
+# rather than an untested one, and does not block the platforms that passed.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach assets to (e.g. v1.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest runner we support so the glibc baseline stays
+          # low: a binary built on 24.04 requires glibc 2.38 and will not start
+          # on Ubuntu 22.04, Debian 12 or RHEL 9.
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+          - name: linux-aarch64
+            runner: ubuntu-22.04-arm
+          - name: macos-arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install a C++20 toolchain
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-12
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+          echo "CC=gcc-12" >> "$GITHUB_ENV"
+
+      - name: Fetch third-party sources
+        run: ./third-party/fetch.sh
+
+      - name: Build
+        run: make -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Test
+        run: make test
+
+      - name: Report what the binary needs
+        run: |
+          ./bin/vcache --version
+          if command -v ldd >/dev/null; then
+            ldd ./bin/vcache || true
+            echo "glibc symbols required:"
+            objdump -T ./bin/vcache | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1
+          else
+            otool -L ./bin/vcache || true
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          dir="vcache-${tag}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp bin/vcache LICENSE NOTICE README.md "$dir/"
+          tar czf "${dir}.tar.gz" "$dir"
+          shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          echo "archive=${dir}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 ||
+            gh release create "$tag" --title "vcache ${tag#v}" --notes "Release binaries are built and tested on each target platform."
+          gh release upload "$tag" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.archive }}.sha256" --clobber

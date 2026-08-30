@@ -1407,6 +1407,13 @@ check "and it did not report a hit" "$(hits)" "0"
 # --------------------------------------------------------------------------
 section "link caching"
 
+# Linux only. The tracer that discovers a link's input set needs LD_PRELOAD
+# interposition, /proc/self/exe, /proc/self/fd and dl_iterate_phdr; vcache
+# declines link caching elsewhere, so there is nothing here to assert.
+if [[ "$(uname -s)" != Linux ]]; then
+  printf '  \033[33mSKIP\033[0m link caching is Linux-only\n'
+else
+
 # A link has no preprocessed text to key on, so its input set is discovered by
 # tracing. These cases are mostly about the discovered set being right in both
 # directions: everything that matters is in it, and nothing that does not.
@@ -1679,6 +1686,7 @@ reset_cache
 check "link caching is off by default" "$(disk_entries)" "0"
 
 unset VCACHE_LINK_CACHE
+fi
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

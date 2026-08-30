@@ -198,7 +198,14 @@ concluding the cache is merely cold.
 
 ## Caching the link step
 
-Off by default. `VCACHE_LINK_CACHE=1` turns it on.
+Off by default, and **Linux only**. `VCACHE_LINK_CACHE=1` turns it on.
+
+Discovering a link's real input set depends on `LD_PRELOAD` interposition,
+`/proc/self/exe`, `/proc/self/fd` and `dl_iterate_phdr`. macOS blocks
+`DYLD_INSERT_LIBRARIES` for system binaries and has no `/proc`, so there is no
+trace, no absent set, and no way to show a hit is sound. Elsewhere vcache leaves
+links to the compile path, which declines them exactly as it did before link
+caching existed; setting `VCACHE_LINK_CACHE` there changes nothing.
 
 A link is a pure function of its inputs -- two LTO links of identical inputs
 produce a byte-identical binary -- so caching one is sound in principle. What

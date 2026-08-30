@@ -91,6 +91,7 @@ CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
 # Defined before the flags section because CFLAGS is expanded immediately.
 
 BLAKE3_ARCH := $(shell uname -m)
+HOST_OS     := $(shell uname -s)
 ifeq ($(BLAKE3_ARCH),x86_64)
   BLAKE3_S    := $(BLAKE3_DIR)/blake3_sse2_x86-64_unix.S \
                  $(BLAKE3_DIR)/blake3_sse41_x86-64_unix.S \
@@ -222,8 +223,17 @@ MAIN_SRC := $(SRC)/main.cc
 # The link tracer is LD_PRELOADed into the linker's whole process tree, so it
 # is a standalone shared object rather than part of the binary. It links
 # against libdl only; anything more would be visible to every traced process.
+#
+# Linux only: it reads /proc/self/exe and /proc/self/fd and walks the loaded
+# objects with dl_iterate_phdr, none of which exist on macOS. Building it
+# elsewhere would fail on <link.h> before reaching anything interesting, so it
+# is simply not part of the build there, and link caching declines at runtime.
 TRACER_SRC := $(SRC)/trace/fstrace.c
+ifeq ($(HOST_OS),Linux)
 TRACER_SO  := $(BINDIR)/vcache-fstrace.so
+else
+TRACER_SO  :=
+endif
 
 # BLAKE3 portable C. The architecture-specific kernels are selected above.
 BLAKE3_C  := $(BLAKE3_DIR)/blake3.c $(BLAKE3_DIR)/blake3_dispatch.c \
@@ -246,9 +256,11 @@ DEPS     := $(ALL_OBJS:.o=.d)
 
 all: $(BINDIR)/vcache $(TRACER_SO)
 
+ifeq ($(HOST_OS),Linux)
 $(TRACER_SO): $(TRACER_SRC)
 	@mkdir -p $(BINDIR)
 	$(CC) -std=c11 -O2 -fPIC -shared -Wall -Wextra -o $@ $< -ldl
+endif
 
 deps:
 	@$(TP)/fetch.sh

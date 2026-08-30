@@ -23,6 +23,8 @@
 #include "util/subprocess.h"
 
 namespace vcache::core {
+
+#ifdef __linux__
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
@@ -513,5 +515,28 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
              ? kCacheMediaFailureExit
              : 0;
 }
+
+#else  // !__linux__
+
+// Linux only. Discovering a link's real input set depends on LD_PRELOAD
+// interposition, /proc/self/exe, /proc/self/fd and dl_iterate_phdr. macOS
+// blocks DYLD_INSERT_LIBRARIES for system binaries and has no /proc, so there
+// is no trace, no absent set, and therefore no way to show a hit is sound --
+// this is a missing mechanism, not a few calls to port.
+//
+// Reporting `handled = false` leaves the invocation to the compile path, which
+// declines it exactly as it did before link caching existed, so behaviour on
+// other platforms is identical to 1.0.x rather than merely similar.
+int RunLink(const std::vector<std::string>& argv, const Config& config,
+            const RootMap& roots, storage::CacheChain* cache, bool* handled) {
+  (void)argv;
+  (void)config;
+  (void)roots;
+  (void)cache;
+  *handled = false;
+  return 0;
+}
+
+#endif  // __linux__
 
 }  // namespace vcache::core

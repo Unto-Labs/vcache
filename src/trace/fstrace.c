@@ -31,6 +31,7 @@
 #include <link.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -164,15 +165,38 @@ static void emit_at_result(int dirfd, const char *path, int failed,
     next_##sym;                                       \
   })
 
+/* Our own load address, so we can leave ourselves out of the input set.
+   Compared by base rather than by name: dladdr and dl_iterate_phdr can spell
+   the same object differently, and a name comparison would quietly stop
+   matching. */
+static ElfW(Addr) self_base(void) {
+  static ElfW(Addr) base;
+  static int resolved;
+  if (!resolved) {
+    resolved = 1;
+    Dl_info info;
+    if (dladdr((void *)(uintptr_t)&self_base, &info) != 0) {
+      base = (ElfW(Addr))(uintptr_t)info.dli_fbase;
+    }
+  }
+  return base;
+}
+
 static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
   (void)size;
   (void)data;
-  if (info->dlpi_name != NULL && info->dlpi_name[0] == '/') {
-    /* Dependencies are loaded before interposition is active. Include every
-       already-loaded DSO so a system or toolchain library update invalidates
-       the manifest instead of silently reusing an old link. */
-    emit('R', info->dlpi_name);
-  }
+  if (info->dlpi_name == NULL || info->dlpi_name[0] != '/') return 0;
+
+  /* The tracer observes the link; it does not take part in it. Recording
+     ourselves would make every rebuild of vcache invalidate every link entry,
+     for a file that cannot affect the output. */
+  if (info->dlpi_addr == self_base()) return 0;
+
+  /* Dependencies are loaded before interposition is active. Include every
+     other already-loaded DSO: for the common linkers the implementation is a
+     shared library -- ld.bfd's logic lives in libbfd, lld's in libLLVM -- and
+     libz/libzstd emit output bytes directly for compressed debug sections. */
+  emit('R', info->dlpi_name);
   return 0;
 }
 

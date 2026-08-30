@@ -1653,6 +1653,25 @@ STUBEOF
   fi
 fi
 
+# The tracer observes a link; it is not part of it. Recording itself would make
+# every rebuild of vcache invalidate every link entry, for a file that cannot
+# affect the output -- and it would bite hardest while developing vcache, which
+# is exactly when the cache is wanted.
+tracer_so="$(dirname "$VCACHE")/vcache-fstrace.so"
+if [[ -f "$tracer_so" ]]; then
+  rm -f "$WORK/self-trace.log"
+  ( cd "$WORK/link-one" && VCACHE_TRACE_LOG="$WORK/self-trace.log" \
+      LD_PRELOAD="$tracer_so" gcc helper.o main.o -o app-self ) 2>/dev/null
+  check "the tracer does not record itself as an input" \
+    "$(grep -c 'vcache-fstrace' "$WORK/self-trace.log" || true)" "0"
+  # ...but it must still record the libraries that are part of the linker: for
+  # ld.bfd the implementation lives in libbfd, and libz/libzstd emit output
+  # bytes for compressed debug sections.
+  check "and it still records the other loaded libraries" \
+    "$(awk -F'\t' '$1=="R"{print $2}' "$WORK/self-trace.log" |
+       grep -cE '\.so($|\.)' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+fi
+
 # Link caching is off unless asked for.
 reset_cache
 ( cd "$WORK/link-one" && env -u VCACHE_LINK_CACHE "$VCACHE" \

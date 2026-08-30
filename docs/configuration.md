@@ -249,6 +249,34 @@ and result metadata, but link-output sidecars are deliberately local in this
 version; remote-only link caching is therefore declined. `VCACHE_READONLY=1`
 serves existing local link hits but writes neither metadata nor sidecars.
 
+### Why the linker's shared libraries are inputs
+
+A link entry records every shared library loaded by the toolchain processes, not
+just the executables. That looks over-cautious until you check what the linkers
+actually load:
+
+```
+ld.bfd  ->  libbfd-2.42-system.so, libctf, libsframe, libz, libzstd, libc
+lld     ->  libLLVM.so.22.1, libstdc++, libz, libzstd, libc
+```
+
+For the two most common linkers **the implementation is a shared library**.
+`/usr/bin/ld.bfd` is a thin driver; object parsing, relocation and layout live
+in `libbfd`. `lld` is thinner still -- the whole of LLD is inside `libLLVM.so`.
+Hash only the executable and a binutils or LLVM update changes the linker
+completely while the file you hashed is byte-identical.
+
+`libz` and `libzstd` are more direct again: `--compress-debug-sections=zstd`
+runs debug sections through libzstd, so its version decides output bytes.
+
+The cost is real -- a libc or zlib update invalidates every link entry -- and
+there is no clean rule that keeps libbfd and libLLVM while dropping libc, since
+"system library" and "part of the linker" are the same set here.
+
+The tracer itself is deliberately excluded. It observes the link and cannot
+affect the output, so recording it would make every rebuild of vcache invalidate
+every link entry.
+
 ### Using it from CMake
 
 Three things to know, because getting any of them wrong makes the feature look

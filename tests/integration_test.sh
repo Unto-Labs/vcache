@@ -1520,6 +1520,66 @@ check "a link with a map file hits" "$(hits)" "1"
 check "and the map file is replayed, not silently skipped" \
   "$([[ -s "$WORK/link-one/link.map" ]] && echo yes)" "yes"
 
+# The two guards that decide whether an entry is sound enough to store are
+# worth breaking on purpose. A guard that has never been seen to fire is
+# indistinguishable from one that cannot.
+#
+# Both are driven by a stub tracer, so what is under test is vcache's reaction
+# to a degraded trace rather than the real tracer's behaviour.
+if cc_stub=$(command -v gcc || command -v cc) && [[ -n "$cc_stub" ]]; then
+  cat > "$WORK/stub-tracer.c" <<'STUBEOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+__attribute__((constructor)) static void stub(void) {
+  const char *log = getenv("VCACHE_TRACE_LOG");
+  const char *mode = getenv("STUB_MODE");
+  if (log == NULL || mode == NULL) return;
+  if (strcmp(mode, "incomplete") == 0) {
+    /* Write a trace that is otherwise complete and usable -- including a
+       process record, so the empty-tools guard is not what rejects it -- and
+       then raise the marker. The marker must be the only reason this is not
+       stored, or the test proves nothing. */
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+      (void)!write(fd, "P\t/bin/sh\nR\t/etc/hostname\n", 27);
+      close(fd);
+    }
+    char marker[4096];
+    snprintf(marker, sizeof marker, "%s.incomplete", log);
+    int mfd = open(marker, O_WRONLY | O_CREAT, 0600);
+    if (mfd >= 0) close(mfd);
+    return;
+  }
+  if (strcmp(mode, "noprocs") == 0) {
+    /* Reads, but never announces a process: the input set may be partial. */
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, "R\t/etc/hostname\n", 16); close(fd); }
+  }
+}
+STUBEOF
+  if "$cc_stub" -fPIC -shared -o "$WORK/stub-tracer.so" "$WORK/stub-tracer.c" 2>/dev/null; then
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=incomplete VCACHE_TRACER="$WORK/stub-tracer.so" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-inc ) 2>/dev/null
+    check "an incomplete trace is not stored" "$(disk_entries)" "0"
+    check "and it is counted uncacheable, not silently dropped" "$(uncacheable)" "1"
+    check "and the binary is still produced" \
+      "$([[ -x "$WORK/link-one/app-inc" ]] && echo yes)" "yes"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-np ) 2>/dev/null
+    check "a trace naming no processes is not stored" "$(disk_entries)" "0"
+    check "and that is counted uncacheable too" "$(uncacheable)" "1"
+  else
+    printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
+  fi
+fi
+
 # Link caching is off unless asked for.
 reset_cache
 ( cd "$WORK/link-one" && env -u VCACHE_LINK_CACHE "$VCACHE" \

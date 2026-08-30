@@ -29,17 +29,29 @@ deliberately not done.
 
 ## Checklist
 
-- [ ] 1. Link command-line parsing (`src/args/link_args.{h,cc}`)
-- [ ] 2. LD_PRELOAD tracer (`src/trace/fstrace.c`), built by the Makefile
-- [ ] 3. Trace parsing and classification (`src/core/link_trace.{h,cc}`)
-- [ ] 4. Manifest: serialise/validate (`src/core/link_manifest.{h,cc}`)
-- [ ] 5. Key computation and the run path (`src/core/link.{h,cc}`)
-- [ ] 6. Dispatch from `main.cc`; stats counters
-- [ ] 7. Unit tests
-- [ ] 8. Integration tests, including a real cross-directory link
-- [ ] 9. Security audit
-- [ ] 10. Docs
+- [x] 1. Link command-line parsing (`src/args/link_args.{h,cc}`)
+- [x] 2. LD_PRELOAD tracer (`src/trace/fstrace.c`), built by the Makefile
+- [x] 3. Trace parsing and classification (`src/core/link_trace.{h,cc}`)
+- [x] 4. Manifest: serialise/validate -- folded into `core/link.cc` rather than
+      its own file; it is 60 lines and only one caller will ever have it
+- [x] 5. Key computation and the run path (`src/core/link.{h,cc}`)
+- [x] 6. Dispatch from `main.cc`; reuses the existing counters
+- [x] 7. Unit tests (parse + trace classification)
+- [x] 8. Integration tests, including a real cross-directory link
+- [x] 9. Security audit -- two issues found and fixed
+- [x] 10. Docs
 - [ ] 11. PR + critical loop
+
+## Result
+
+The link that motivated this, `g++ -flto=auto` over 25 objects:
+
+```
+cold (miss)   2.43 s
+warm (hit)    0.06 s      byte-identical output
+```
+
+Suites: unit 343, integration 202, 0 failed.
 
 ## Reuse rather than reinvent
 

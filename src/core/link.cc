@@ -174,9 +174,18 @@ bool MaterializeOutputs(const storage::Blob& blob,
     }
     if (!util::WriteFileAtomic(f.name, f.contents)) return false;
     if (f.executable) {
+      // Add execute where the umask would have allowed it, not everywhere.
+      // WriteFileAtomic has already applied 0666 & ~umask, so under a strict
+      // umask the file is 0600; adding all three execute bits unconditionally
+      // would publish 0711 and let other users run a binary they cannot read.
       struct stat st;
       if (::stat(f.name.c_str(), &st) == 0) {
-        ::chmod(f.name.c_str(), st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH);
+        const mode_t allowed = util::DefaultFileMode();
+        mode_t add = 0;
+        if (allowed & S_IRUSR) add |= S_IXUSR;
+        if (allowed & S_IRGRP) add |= S_IXGRP;
+        if (allowed & S_IROTH) add |= S_IXOTH;
+        ::chmod(f.name.c_str(), st.st_mode | add);
       }
     }
   }
@@ -281,6 +290,18 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   if (result.exit_code != 0) {
     RecordCounter(cache_dir, Counter::kCompileFailed);
     return result.exit_code < 0 ? 127 : result.exit_code;
+  }
+
+  // The tracer creates this when it could not record something: a write that
+  // failed, or a record too long to fit in one atomic write. Either way the
+  // input set is missing an entry, and an entry with a missing input is one
+  // that can hit when it should not. Storing it would be worse than not
+  // caching this link at all.
+  struct stat incomplete_st;
+  if (::stat((trace_log + ".incomplete").c_str(), &incomplete_st) == 0) {
+    VCACHE_LOG("link: the trace is incomplete; not storing");
+    RecordCounter(cache_dir, Counter::kUncacheable);
+    return 0;
   }
 
   LinkTrace trace;

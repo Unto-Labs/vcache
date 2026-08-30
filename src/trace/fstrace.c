@@ -38,6 +38,12 @@
 
 static int log_fd = -1;
 
+/* Records must fit in one write. A path is bounded by PATH_MAX, but the tracer
+   also sees strings that merely occupy a path argument, so the bound is
+   enforced rather than assumed. Staying at or below PIPE_BUF keeps an O_APPEND
+   write from being torn when the whole process tree is writing at once. */
+#define VCACHE_RECORD_MAX 4096
+
 static void ensure_log(void) {
   if (log_fd != -1) return;
   const char *p = getenv("VCACHE_TRACE_LOG");
@@ -49,19 +55,56 @@ static void ensure_log(void) {
 
 /* One write per record. O_APPEND makes concurrent writes from the process tree
    atomic up to PIPE_BUF, which every path we emit is comfortably below. */
+/* A lost record is not a lost log line: it is an input missing from the set
+   that decides whether a later hit is sound. So any failure to record is made
+   loud by creating "<log>.incomplete", which the caller checks before storing
+   an entry. Losing the marker too is survivable -- a tracer that cannot write
+   at all produces no process records either, which the caller already
+   refuses. */
+static void mark_incomplete(void) {
+  const char *p = getenv("VCACHE_TRACE_LOG");
+  if (p == NULL || *p == '\0') return;
+  char path[VCACHE_RECORD_MAX];
+  size_t n = 0;
+  for (const char *q = p; *q != '\0' && n < sizeof path - 12; ++q) path[n++] = *q;
+  const char suffix[] = ".incomplete";
+  for (size_t i = 0; i < sizeof suffix - 1; ++i) path[n++] = suffix[i];
+  path[n] = '\0';
+  int fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+                        O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+  if (fd >= 0) syscall(SYS_close, fd);
+}
+
 static void emit(char kind, const char *path) {
   if (path == NULL || *path == '\0') return;
   ensure_log();
   if (log_fd < 0) return;
-  char buf[4352];
+
+  char buf[VCACHE_RECORD_MAX];
   size_t n = 0;
   buf[n++] = kind;
   buf[n++] = '\t';
-  for (const char *q = path; *q != '\0' && n < sizeof buf - 2; ++q) {
+  const char *q = path;
+  for (; *q != '\0' && n < sizeof buf - 1; ++q) {
     buf[n++] = (*q == '\n' || *q == '\t') ? ' ' : *q;
   }
+  if (*q != '\0') {
+    /* Truncating would record a path that is not the one that was touched,
+       and validating it later would check the wrong file. Drop the record and
+       say so instead. */
+    mark_incomplete();
+    return;
+  }
   buf[n++] = '\n';
-  (void)!syscall(SYS_write, log_fd, buf, n);
+
+  size_t written = 0;
+  while (written < n) {
+    long r = syscall(SYS_write, log_fd, buf + written, n - written);
+    if (r > 0) { written += (size_t)r; continue; }
+    if (r < 0 && errno == EINTR) continue;
+    mark_incomplete();
+    return;
+  }
 }
 
 /* Only ENOENT counts as a negative input. A permission error is a different

@@ -5,6 +5,8 @@
 // cache-side error instead of failing the user's build.
 #pragma once
 
+#include <sys/types.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -17,6 +19,11 @@ bool IsDirectory(const std::string& path);
 
 // Creates `path` and all missing parents. Returns true if it exists afterwards.
 bool MakeDirs(const std::string& path);
+
+// 0666 masked by the process umask, cached on first use. Exposed so callers
+// that add permission bits to a file can stay inside what the umask allows
+// rather than publishing more than the user asked for.
+mode_t DefaultFileMode();
 
 std::optional<std::string> ReadFile(const std::string& path);
 

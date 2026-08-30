@@ -27,6 +27,8 @@ namespace {
 // only reads by setting, so the value is restored immediately. vcache is
 // single-threaded and spawns the compiler well after this runs, so the brief
 // window cannot leak a zero umask into a child.
+}  // namespace
+
 mode_t DefaultFileMode() {
   static const mode_t kMode = [] {
     const mode_t previous = ::umask(0);
@@ -35,6 +37,8 @@ mode_t DefaultFileMode() {
   }();
   return kMode;
 }
+
+namespace {
 
 // std::filesystem throws on many operations; every call here goes through a
 // noexcept wrapper so a surprising errno never aborts the user's build.

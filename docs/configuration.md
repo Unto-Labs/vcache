@@ -240,6 +240,45 @@ that the input set is complete, vcache declines.
 outputs and replayed, so a hit does not hand back the binary while the companion
 file silently fails to appear.
 
+### Using it from CMake
+
+Three things to know, because getting any of them wrong makes the feature look
+like it does nothing rather than fail.
+
+**`CMAKE_<LANG>_COMPILER_LAUNCHER` does not apply to link rules.** It wraps
+compiles only. Links need `CMAKE_<LANG>_LINKER_LAUNCHER`:
+
+```
+-DCMAKE_C_COMPILER_LAUNCHER=vcache  -DCMAKE_C_LINKER_LAUNCHER=vcache
+-DCMAKE_CXX_COMPILER_LAUNCHER=vcache -DCMAKE_CXX_LINKER_LAUNCHER=vcache
+```
+
+Without the second pair the generated rule calls the driver directly. A full
+LLVM build configured that way cached 7,877 compiles and zero links, with no
+error anywhere to say so. Check the generated rule rather than assuming:
+
+```console
+$ grep -m1 -A1 '^rule CXX_EXECUTABLE_LINKER' CMakeFiles/rules.ninja
+```
+
+**Sub-builds need it passed again.** Each entry in `LLVM_ENABLE_RUNTIMES`, and
+compiler-rt's builtins, is a separate CMake project that does not inherit
+either launcher; they take `RUNTIMES_CMAKE_ARGS` and `BUILTINS_CMAKE_ARGS`.
+Projects with nested CMake builds generally have some equivalent.
+
+**CMake has no launcher for assembly.** `CMAKE_<LANG>_COMPILER_LAUNCHER`
+supports C, CXX, Fortran, ISPC, OBJC, OBJCXX, CUDA and HIP -- not `ASM`. So
+`.S` sources compile outside the cache, and with `-g` they record the absolute
+source path in `.debug_line`, which makes the object differ per checkout. That
+is invisible until it propagates: in LLVM, four BLAKE3 `.S` objects made
+`libLLVMSupport.a` differ between two checkouts, and every link that pulls in
+that archive then missed.
+
+Nothing vcache can fix from its side. `-Wa,--debug-prefix-map` does not remap
+it either; building the assembly without debug info does, and the objects then
+match byte for byte. Worth knowing before concluding that link caching does not
+work on a project.
+
 ### Debugging a link miss
 
 `VCACHE_LOG` names the input that changed or the path that stopped being

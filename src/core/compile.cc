@@ -319,6 +319,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
     int64_t mtime = 0;
   } info;
   if (auto size = util::FileSize(real)) info.size = *size;
+  if (auto mtime = util::FileMtime(real)) info.mtime = *mtime;
 
   // Set on every path below, including the ones that never read a banner.
   id.is_clang = LooksLikeClang("", real);
@@ -327,6 +328,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
     hash::Hasher hasher;
     hasher.UpdateDelimited(roots.Canonicalize(real));
     hasher.UpdateU64(info.size);
+    hasher.UpdateU64(static_cast<uint64_t>(info.mtime));
     id.fingerprint = hasher.Hex();
     id.description = real + " (mtime check)";
     return id;
@@ -346,10 +348,18 @@ CompilerId ResolveCompilerId(const std::string& compiler,
   //
   // Spawning a process per compilation would be wasteful, so the answer is
   // memoised in the cache directory keyed by the binary's identity.
+  // The memo key must change whenever the binary does, or a compiler rebuilt in
+  // place is answered from the previous one's banner. Size alone does not catch
+  // that: relinking a compiler after a source change routinely lands on the
+  // same byte count, and the stale banner then decides the cache key for every
+  // compilation the new binary performs. mtime is safe to use here even though
+  // it is not machine-independent, because the memo is a purely local record of
+  // a local probe -- what travels between machines is the banner it holds.
   hash::Hasher memo_key;
-  memo_key.UpdateDelimited("compiler-version-memo-v1");
+  memo_key.UpdateDelimited("compiler-version-memo-v2");
   memo_key.UpdateDelimited(real);
   memo_key.UpdateU64(info.size);
+  memo_key.UpdateU64(static_cast<uint64_t>(info.mtime));
   const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
 
   if (auto cached = util::ReadFile(memo_path)) {

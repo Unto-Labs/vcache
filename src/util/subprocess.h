@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vcache::util {
@@ -22,6 +23,11 @@ struct ProcOptions {
   // When set, the child's stdout is redirected into this file instead of being
   // captured in memory. Used for large preprocessor output.
   std::string stdout_file;
+
+  // Variables to set in the child only. The link tracer needs LD_PRELOAD and
+  // its log path to reach the linker's whole process tree without vcache's own
+  // environment being modified, which would leak into anything else it runs.
+  std::vector<std::pair<std::string, std::string>> env;
 };
 
 // Runs argv[0] with `argv`. Returns exit_code == -1 if the process could not be

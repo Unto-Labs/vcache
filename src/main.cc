@@ -17,6 +17,7 @@
 #include "args/compiler_args.h"
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/link.h"
 #include "core/config.h"
 #include "core/roots.h"
 #include "core/stats.h"
@@ -362,6 +363,17 @@ int main(int argc, char** argv) {
 
   if (vcache::args::LooksLikeRustc(command[0])) {
     return vcache::rust::RunRustCompile(command, config, roots, chain.get());
+  }
+
+  // A link is tried first, and reports whether it recognised the command line.
+  // The two parsers agree on the phase flags -- -c, -E, -S, -M -- so a compile
+  // is never mistaken for a link, but the link parser is the one that can say
+  // "this is not a link" cheaply.
+  if (config.link_cache) {
+    bool handled = false;
+    const int rc =
+        vcache::core::RunLink(command, config, roots, chain.get(), &handled);
+    if (handled) return rc;
   }
   return vcache::core::RunCompile(command, config, roots, chain.get());
 }

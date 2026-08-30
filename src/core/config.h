@@ -116,6 +116,12 @@ struct Config {
   bool read_only = false;  // look up but never store
   bool recache = false;    // ignore hits, recompile and overwrite
 
+  // Link caching. Off by default while it earns trust: it is a much younger
+  // path than the compile one, its input set is discovered rather than derived
+  // from preprocessed text, and a wrong answer there is a mislinked binary
+  // rather than a slow build.
+  bool link_cache = false;
+
   // Fail the invocation when a cache layer is broken, as opposed to cold.
   // Off by default: a cache that cannot be reached should slow a build down,
   // never break one. On, it turns a silent degradation into a hard error,

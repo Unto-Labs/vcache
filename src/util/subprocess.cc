@@ -87,6 +87,13 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
     c_argv.reserve(argv.size() + 1);
     for (const std::string& a : argv) c_argv.push_back(const_cast<char*>(a.c_str()));
     c_argv.push_back(nullptr);
+    // setenv is not on the async-signal-safe list, but vcache is
+    // single-threaded, so the child's heap cannot be observed mid-mutation by
+    // another thread. The alternative, building an envp by hand, would have to
+    // allocate here anyway.
+    for (const auto& [name, value] : opts.env) {
+      ::setenv(name.c_str(), value.c_str(), 1);
+    }
     ::execvp(c_argv[0], c_argv.data());
     ::_exit(127);
   }

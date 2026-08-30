@@ -251,6 +251,7 @@ void ApplyEnvironment(Config* config) {
       EnvBool("VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE",
               config->error_on_cache_media_failure);
   config->recache = EnvBool("VCACHE_RECACHE", config->recache);
+  config->link_cache = EnvBool("VCACHE_LINK_CACHE", config->link_cache);
 
   if (auto v = Env("VCACHE_INCOMING_PREFIX_MAPS")) {
     if (!ParseIncomingMapPolicy(*v, &config->incoming_map_policy)) {

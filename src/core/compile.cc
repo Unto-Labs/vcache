@@ -30,6 +30,8 @@ constexpr std::string_view kCacheKeyVersion = "vcache-key-v2";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
 // everything vcache cannot or should not cache.
+}  // namespace
+
 int RunPassthrough(const std::vector<std::string>& argv) {
   VCACHE_LOG("passthrough: " + util::Join(argv, " "));
   util::ProcResult result = util::Run(argv);
@@ -44,6 +46,8 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   const char* v = std::getenv(name);
   return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
 }
+
+namespace {
 
 // Which driver this is. The version banner settles it whenever there is one;
 // the compiler-check modes that skip the probe fall back to the name, which is

@@ -59,6 +59,15 @@ constexpr int kCacheMediaFailureExit = 90;
 // the caller can fail the invocation when configured to.
 //
 // Note that this is about the *media*, not the entry: a miss reports nothing.
+// Runs the command unchanged and returns its exit code. Every path that
+// declines to cache goes through here, so that "vcache could not help" and
+// "the build failed" stay distinguishable: 127 means vcache could not even
+// start the tool.
+int RunPassthrough(const std::vector<std::string>& argv);
+
+// Environment lookup treating an empty value as unset.
+std::string EnvOr(const char* name, const std::string& fallback);
+
 bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
                             const std::string& cache_dir);
 

@@ -110,6 +110,8 @@ timeout        = 30                # seconds
 | — | `AWS_SESSION_TOKEN` | — | — |
 | — | `VCACHE_CONFIG` | — | see search order |
 | — | `VCACHE_DISABLE` | — | `false` |
+| — | `VCACHE_LINK_CACHE` | — | `false` |
+| — | `VCACHE_TRACER` | — | next to the binary |
 | — | `VCACHE_RECACHE` | — | `false` |
 | — | `VCACHE_COMPILER_CHECK` | — | `version` |
 | — | `VCACHE_LOG` | — | off |
@@ -193,6 +195,138 @@ particular bucket rather than something a shell alias can set on the way past.
 With it set, a wrong-credentials bucket looks like a cache that never hits
 rather than an error — check `--show-config` and the bucket policy before
 concluding the cache is merely cold.
+
+## Caching the link step
+
+Off by default, and **Linux only**. `VCACHE_LINK_CACHE=1` turns it on.
+
+Discovering a link's real input set depends on `LD_PRELOAD` interposition,
+`/proc/self/exe`, `/proc/self/fd` and `dl_iterate_phdr`. macOS blocks
+`DYLD_INSERT_LIBRARIES` for system binaries and has no `/proc`, so there is no
+trace, no absent set, and no way to show a hit is sound. Elsewhere vcache leaves
+links to the compile path, which declines them exactly as it did before link
+caching existed; setting `VCACHE_LINK_CACHE` there changes nothing.
+
+A link is a pure function of its inputs -- two LTO links of identical inputs
+produce a byte-identical binary -- so caching one is sound in principle. What
+makes it harder than caching a compile is that there is no `-E` equivalent: the
+input set is *discovered*, not declared. ccache and sccache decline to cache
+links for exactly this reason.
+
+vcache discovers the set by watching the link. `vcache-fstrace.so` is
+`LD_PRELOAD`ed into the linker's whole process tree and records what was read,
+what was probed and found absent, and which executables ran. A hit then requires
+both halves:
+
+- every recorded input still hashes the same, **and**
+- every recorded absent path is still absent.
+
+The second is not a nicety. `-lfoo` resolves to `/usr/lib/libfoo.so` only
+because `/opt/lib/libfoo.so` was missing; an entry recording only what it read
+would hit after someone installs the latter and hand back a binary linked
+against the wrong library. Re-checking costs 0.45 ms against a 2.3 s link, so
+there is no reason to be clever about it.
+
+### What is not cached
+
+Declined, each because caching it would give a wrong or incomplete answer:
+
+| Case | Why |
+| --- | --- |
+| `--build-id=uuid` | the output is not a function of the inputs |
+| compiling and linking in one command | the compile half is already cached |
+| output to `/dev/null` or a stream | nothing to store |
+| no `-o` | the implied `a.out` is not worth an entry |
+| the tracer is missing or was not loaded | no absent set, so a hit cannot be shown to be sound |
+| the disk cache is disabled | large outputs are local content-addressed sidecars; the remote tier does not carry them |
+| an inherited `LD_PRELOAD` is active | a preloaded library can change the link before the tracer can observe it |
+
+The last one matters most. A statically linked linker, or a loader that ignores
+`LD_PRELOAD`, produces no process records; rather than cache on the assumption
+that the input set is complete, vcache declines.
+
+`-Map`, the `-Wl,-Map=...` and `-Wl,-Map,...` forms, `-Xlinker -Map`, and the
+corresponding `--dependency-file` forms are captured as additional outputs and
+replayed, so a hit does not hand back the binary while the companion file
+silently fails to appear.
+
+Link outputs live content-addressed in the local disk cache and are verified
+against their recorded digest before every hit. S3 may carry the small manifest
+and result metadata, but link-output sidecars are deliberately local in this
+version; remote-only link caching is therefore declined. `VCACHE_READONLY=1`
+serves existing local link hits but writes neither metadata nor sidecars.
+
+### Why the linker's shared libraries are inputs
+
+A link entry records every shared library loaded by the toolchain processes, not
+just the executables. That looks over-cautious until you check what the linkers
+actually load:
+
+```
+ld.bfd  ->  libbfd-2.42-system.so, libctf, libsframe, libz, libzstd, libc
+lld     ->  libLLVM.so.22.1, libstdc++, libz, libzstd, libc
+```
+
+For the two most common linkers **the implementation is a shared library**.
+`/usr/bin/ld.bfd` is a thin driver; object parsing, relocation and layout live
+in `libbfd`. `lld` is thinner still -- the whole of LLD is inside `libLLVM.so`.
+Hash only the executable and a binutils or LLVM update changes the linker
+completely while the file you hashed is byte-identical.
+
+`libz` and `libzstd` are more direct again: `--compress-debug-sections=zstd`
+runs debug sections through libzstd, so its version decides output bytes.
+
+The cost is real -- a libc or zlib update invalidates every link entry -- and
+there is no clean rule that keeps libbfd and libLLVM while dropping libc, since
+"system library" and "part of the linker" are the same set here.
+
+The tracer itself is deliberately excluded. It observes the link and cannot
+affect the output, so recording it would make every rebuild of vcache invalidate
+every link entry.
+
+### Using it from CMake
+
+Three things to know, because getting any of them wrong makes the feature look
+like it does nothing rather than fail.
+
+**`CMAKE_<LANG>_COMPILER_LAUNCHER` does not apply to link rules.** It wraps
+compiles only. Links need `CMAKE_<LANG>_LINKER_LAUNCHER`:
+
+```
+-DCMAKE_C_COMPILER_LAUNCHER=vcache  -DCMAKE_C_LINKER_LAUNCHER=vcache
+-DCMAKE_CXX_COMPILER_LAUNCHER=vcache -DCMAKE_CXX_LINKER_LAUNCHER=vcache
+```
+
+Without the second pair the generated rule calls the driver directly. A full
+LLVM build configured that way cached 7,877 compiles and zero links, with no
+error anywhere to say so. Check the generated rule rather than assuming:
+
+```console
+$ grep -m1 -A1 '^rule CXX_EXECUTABLE_LINKER' CMakeFiles/rules.ninja
+```
+
+**Sub-builds need it passed again.** Each entry in `LLVM_ENABLE_RUNTIMES`, and
+compiler-rt's builtins, is a separate CMake project that does not inherit
+either launcher; they take `RUNTIMES_CMAKE_ARGS` and `BUILTINS_CMAKE_ARGS`.
+Projects with nested CMake builds generally have some equivalent.
+
+**CMake has no launcher for assembly.** `CMAKE_<LANG>_COMPILER_LAUNCHER`
+supports C, CXX, Fortran, ISPC, OBJC, OBJCXX, CUDA and HIP -- not `ASM`. So
+`.S` sources compile outside the cache, and with `-g` they record the absolute
+source path in `.debug_line`, which makes the object differ per checkout. That
+is invisible until it propagates: in LLVM, four BLAKE3 `.S` objects made
+`libLLVMSupport.a` differ between two checkouts, and every link that pulls in
+that archive then missed.
+
+Nothing vcache can fix from its side. `-Wa,--debug-prefix-map` does not remap
+it either; building the assembly without debug info does, and the objects then
+match byte for byte. Worth knowing before concluding that link caching does not
+work on a project.
+
+### Debugging a link miss
+
+`VCACHE_LOG` names the input that changed or the path that stopped being
+absent, which is usually the whole answer.
 
 ## Flags that write a second output file
 

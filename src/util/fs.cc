@@ -3,6 +3,9 @@
 #include "util/fs.h"
 
 #include <fcntl.h>
+#include <vector>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -27,6 +30,8 @@ namespace {
 // only reads by setting, so the value is restored immediately. vcache is
 // single-threaded and spawns the compiler well after this runs, so the brief
 // window cannot leak a zero umask into a child.
+}  // namespace
+
 mode_t DefaultFileMode() {
   static const mode_t kMode = [] {
     const mode_t previous = ::umask(0);
@@ -35,6 +40,8 @@ mode_t DefaultFileMode() {
   }();
   return kMode;
 }
+
+namespace {
 
 // std::filesystem throws on many operations; every call here goes through a
 // noexcept wrapper so a surprising errno never aborts the user's build.
@@ -153,6 +160,72 @@ bool LinkOrCopy(const std::string& from, const std::string& to) {
   auto data = ReadFile(from);
   if (!data) return false;
   return WriteFileAtomic(to, *data);
+}
+
+bool CloneFile(const std::string& from, const std::string& to) {
+  const int src = ::open(from.c_str(), O_RDONLY | O_CLOEXEC);
+  if (src < 0) return false;
+
+  struct stat st;
+  if (::fstat(src, &st) != 0) { ::close(src); return false; }
+
+  const std::string tmp = to + ".tmp." + std::to_string(::getpid());
+  const int dst =
+      ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (dst < 0) { ::close(src); return false; }
+
+  bool ok = false;
+#ifdef FICLONE
+  // Whole-file reflink. Instant and space-free where the filesystem supports
+  // it, and the result is an independent inode.
+  ok = ::ioctl(dst, FICLONE, src) == 0;
+#endif
+  if (!ok) {
+    // Kernel-side copy: no user-space buffer, and the filesystem may still
+    // share extents underneath.
+    off_t remaining = st.st_size;
+    ok = true;
+    while (remaining > 0) {
+      const ssize_t n = ::copy_file_range(src, nullptr, dst, nullptr,
+                                          static_cast<size_t>(remaining), 0);
+      if (n > 0) { remaining -= n; continue; }
+      if (n < 0 && errno == EINTR) continue;
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    // Last resort: stream through a fixed buffer rather than reading the whole
+    // file into memory, which for a multi-gigabyte link output would cost more
+    // than the link being cached.
+    if (::lseek(src, 0, SEEK_SET) != (off_t)-1 &&
+        ::lseek(dst, 0, SEEK_SET) != (off_t)-1 &&
+        ::ftruncate(dst, 0) == 0) {
+      std::vector<char> buf(1 << 20);
+      ok = true;
+      for (;;) {
+        const ssize_t r = ::read(src, buf.data(), buf.size());
+        if (r == 0) break;
+        if (r < 0) { if (errno == EINTR) continue; ok = false; break; }
+        ssize_t written = 0;
+        while (written < r) {
+          const ssize_t w = ::write(dst, buf.data() + written, r - written);
+          if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+          written += w;
+        }
+        if (!ok) break;
+      }
+    }
+  }
+
+  if (ok) ok = ::fchmod(dst, DefaultFileMode()) == 0;
+  if (::close(dst) != 0) ok = false;
+  ::close(src);
+  if (!ok || ::rename(tmp.c_str(), to.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 std::optional<uint64_t> FileSize(const std::string& path) {

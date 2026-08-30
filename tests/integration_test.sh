@@ -1405,5 +1405,289 @@ check "a same-size rebuilt compiler is not served from the old memo" \
 check "and it did not report a hit" "$(hits)" "0"
 
 # --------------------------------------------------------------------------
+section "link caching"
+
+# Linux only. The tracer that discovers a link's input set needs LD_PRELOAD
+# interposition, /proc/self/exe, /proc/self/fd and dl_iterate_phdr; vcache
+# declines link caching elsewhere, so there is nothing here to assert.
+if [[ "$(uname -s)" != Linux ]]; then
+  printf '  \033[33mSKIP\033[0m link caching is Linux-only\n'
+else
+
+# A link has no preprocessed text to key on, so its input set is discovered by
+# tracing. These cases are mostly about the discovered set being right in both
+# directions: everything that matters is in it, and nothing that does not.
+
+export VCACHE_LINK_CACHE=1
+
+# The tracer is part of the correctness boundary, so exercise it directly:
+# instrumentation must not change the errno seen by the tool, and a relative
+# openat path must be resolved against its directory fd rather than the cwd.
+mkdir -p "$WORK/tracer-openat/dir"
+printf 'input\n' > "$WORK/tracer-openat/dir/value"
+cat > "$WORK/tracer-openat/check.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+  int missing = open("definitely-missing", O_RDONLY);
+  if (missing >= 0 || errno != ENOENT) return 1;
+  int dir = open("dir", O_RDONLY | O_DIRECTORY);
+  if (dir < 0) return 2;
+  int input = openat(dir, "value", O_RDONLY);
+  if (input < 0) return 3;
+  close(input);
+  close(dir);
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-openat/check.c" -o "$WORK/tracer-openat/check"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+tracer_rc=$?
+check "the tracer preserves a failed call's errno" "$tracer_rc" "0"
+check "openat records the directory-fd-resolved input" \
+  "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
+      "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
+
+make_link_project() {  # $1 = root, $2 = value returned by helper()
+  mkdir -p "$1"
+  cat > "$1/helper.c" <<EOF
+int helper(void) { return $2; }
+EOF
+  cat > "$1/main.c" <<'EOF'
+#include <stdio.h>
+int helper(void);
+int main(void) { printf("%d\n", helper()); return 0; }
+EOF
+  ( cd "$1" && gcc -c helper.c -o helper.o && gcc -c main.c -o main.o )
+}
+
+reset_cache
+make_link_project "$WORK/link-one" 7
+make_link_project "$WORK/a-considerably-longer-link-two" 7
+for d in "$WORK/link-one" "$WORK/a-considerably-longer-link-two"; do
+  ( cd "$d" && "$VCACHE" --vcache-root="$PWD=proj" \
+      gcc -g -O2 helper.o main.o -o app ) 2>/dev/null
+done
+check "a link hits across checkouts" "$(hits)" "1"
+check "and the binaries are byte-identical" \
+  "$(cmp -s "$WORK/link-one/app" "$WORK/a-considerably-longer-link-two/app" \
+     && echo same)" "same"
+check "and the replayed binary runs" \
+  "$("$WORK/a-considerably-longer-link-two/app")" "7"
+check "and it is executable" \
+  "$([[ -x "$WORK/a-considerably-longer-link-two/app" ]] && echo yes)" "yes"
+
+# The property a positive-only cache cannot have. -lval resolves in late/ only
+# because early/ does not contain it; installing a different library there must
+# not be served the old entry.
+reset_cache
+mkdir -p "$WORK/ldsearch/early" "$WORK/ldsearch/late" "$WORK/ldsearch/proj"
+( cd "$WORK/ldsearch/proj"
+  cat > m.c <<'EOF'
+#include <stdio.h>
+int value(void);
+int main(void) { printf("%d\n", value()); return 0; }
+EOF
+  printf 'int value(void){ return 111; }\n' > late.c
+  printf 'int value(void){ return 999; }\n' > early.c
+  gcc -c m.c -o m.o && gcc -c late.c -o late.o && gcc -c early.c -o early.o
+  ar rcs "$WORK/ldsearch/late/libval.a" late.o
+  ar rcs "$WORK/ldsearch/early-libval.a" early.o ) 2>/dev/null
+
+link_val() {
+  ( cd "$WORK/ldsearch/proj" && rm -f app && "$VCACHE" --vcache-root="$PWD=proj" \
+      gcc m.o -L"$WORK/ldsearch/early" -L"$WORK/ldsearch/late" -lval -o app \
+      && ./app ) 2>/dev/null
+}
+check "the first link resolves in the later -L directory" "$(link_val)" "111"
+check "an unchanged repeat hits" "$(link_val >/dev/null; hits)" "1"
+cp "$WORK/ldsearch/early-libval.a" "$WORK/ldsearch/early/libval.a"
+check "a library appearing in an earlier -L directory is not served the old entry" \
+  "$(link_val)" "999"
+check "and that was a miss, not a hit" "$(misses)" "2"
+
+# A changed input must not be served either, which the pre-key handles because
+# the objects are named on the command line.
+reset_cache
+make_link_project "$WORK/link-changed" 1
+( cd "$WORK/link-changed" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app ) 2>/dev/null
+make_link_project "$WORK/link-changed" 2
+( cd "$WORK/link-changed" && rm -f app && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app && ./app ) > "$WORK/changed.out" 2>/dev/null
+check "a changed object is not served the old binary" \
+  "$(cat "$WORK/changed.out")" "2"
+
+# Flags whose output is not a function of the inputs, and shapes that belong to
+# the compile path, must be declined rather than cached.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,--build-id=uuid -o app-uuid ) 2>/dev/null
+check "--build-id=uuid is not cached" "$(uncacheable)" "1"
+check "and the binary is still produced" \
+  "$([[ -x "$WORK/link-one/app-uuid" ]] && echo yes)" "yes"
+
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.c main.c -o app-src ) 2>/dev/null
+check "compiling and linking in one step is not cached as a link" \
+  "$(uncacheable)" "1"
+check "and that binary is produced too" \
+  "$([[ -x "$WORK/link-one/app-src" ]] && echo yes)" "yes"
+
+# Without the tracer there is no absent set, so a hit cannot be shown to be
+# sound. That must decline, not cache on trust.
+reset_cache
+( cd "$WORK/link-one" && VCACHE_TRACER=/nonexistent/tracer.so \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-notrace ) 2>/dev/null
+check "a missing tracer makes the link uncacheable" "$(uncacheable)" "1"
+check "and the link still happens" \
+  "$([[ -x "$WORK/link-one/app-notrace" ]] && echo yes)" "yes"
+
+# A flag that makes the link write a second file: replaying the binary without
+# it would look successful and leave the map file missing.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map=link.map -o app-map ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-map link.map && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map=link.map -o app-map ) 2>/dev/null
+check "a link with a map file hits" "$(hits)" "1"
+check "and the map file is replayed, not silently skipped" \
+  "$([[ -s "$WORK/link-one/link.map" ]] && echo yes)" "yes"
+
+# The comma and -Xlinker spellings are equally real driver interfaces. Missing
+# either output would let a hit return success while leaving a stale map behind.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map,comma.map -o app-comma ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-comma comma.map && \
+    "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map,comma.map -o app-comma ) 2>/dev/null
+check "the comma-form map link hits" "$(hits)" "1"
+check "and its map file is replayed" \
+  "$([[ -s "$WORK/link-one/comma.map" ]] && echo yes)" "yes"
+
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Xlinker -Map -Xlinker xlinker.map -o app-xlinker ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-xlinker xlinker.map && \
+    "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Xlinker -Map -Xlinker xlinker.map -o app-xlinker ) 2>/dev/null
+check "the -Xlinker map link hits" "$(hits)" "1"
+check "and its map file is replayed" \
+  "$([[ -s "$WORK/link-one/xlinker.map" ]] && echo yes)" "yes"
+
+# Out-of-band outputs still carry their digest in the checked blob. Corrupting
+# the sidecar must be a miss, never a successful hit returning corrupt bytes.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-verified ) 2>/dev/null
+sidecar=$(find "$VCACHE_DIR" -type f -name '*.linkout' -print -quit)
+printf 'corrupt\n' > "$sidecar"
+( cd "$WORK/link-one" && rm -f app-verified && \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-verified ) 2>/dev/null
+check "a corrupt link sidecar is not served as a hit" "$(hits)" "0"
+check "and the real linker repairs it on a miss" \
+  "$("$WORK/link-one/app-verified")" "7"
+
+# Read-only applies to the sidecars written outside Storage::Put too.
+reset_cache
+( cd "$WORK/link-one" && VCACHE_READONLY=1 \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-readonly ) 2>/dev/null
+check "read-only link caching writes no sidecar" \
+  "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l)" "0"
+
+# The two guards that decide whether an entry is sound enough to store are
+# worth breaking on purpose. A guard that has never been seen to fire is
+# indistinguishable from one that cannot.
+#
+# Both are driven by a stub tracer, so what is under test is vcache's reaction
+# to a degraded trace rather than the real tracer's behaviour.
+if cc_stub=$(command -v gcc || command -v cc) && [[ -n "$cc_stub" ]]; then
+  cat > "$WORK/stub-tracer.c" <<'STUBEOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+__attribute__((constructor)) static void stub(void) {
+  const char *log = getenv("VCACHE_TRACE_LOG");
+  const char *mode = getenv("STUB_MODE");
+  if (log == NULL || mode == NULL) return;
+  if (strcmp(mode, "incomplete") == 0) {
+    /* Write a trace that is otherwise complete and usable -- including a
+       process record, so the empty-tools guard is not what rejects it -- and
+       then raise the marker. The marker must be the only reason this is not
+       stored, or the test proves nothing. */
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+      (void)!write(fd, "P\t/bin/sh\nR\t/etc/hostname\n", 27);
+      close(fd);
+    }
+    char marker[4096];
+    snprintf(marker, sizeof marker, "%s.incomplete", log);
+    int mfd = open(marker, O_WRONLY | O_CREAT, 0600);
+    if (mfd >= 0) close(mfd);
+    return;
+  }
+  if (strcmp(mode, "noprocs") == 0) {
+    /* Reads, but never announces a process: the input set may be partial. */
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, "R\t/etc/hostname\n", 16); close(fd); }
+  }
+}
+STUBEOF
+  if "$cc_stub" -fPIC -shared -o "$WORK/stub-tracer.so" "$WORK/stub-tracer.c" 2>/dev/null; then
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=incomplete VCACHE_TRACER="$WORK/stub-tracer.so" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-inc ) 2>/dev/null
+    check "an incomplete trace is not stored" "$(disk_entries)" "0"
+    check "and it is counted uncacheable, not silently dropped" "$(uncacheable)" "1"
+    check "and the binary is still produced" \
+      "$([[ -x "$WORK/link-one/app-inc" ]] && echo yes)" "yes"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-np ) 2>/dev/null
+    check "a trace naming no processes is not stored" "$(disk_entries)" "0"
+    check "and that is counted uncacheable too" "$(uncacheable)" "1"
+  else
+    printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
+  fi
+fi
+
+# The tracer observes a link; it is not part of it. Recording itself would make
+# every rebuild of vcache invalidate every link entry, for a file that cannot
+# affect the output -- and it would bite hardest while developing vcache, which
+# is exactly when the cache is wanted.
+tracer_so="$(dirname "$VCACHE")/vcache-fstrace.so"
+if [[ -f "$tracer_so" ]]; then
+  rm -f "$WORK/self-trace.log"
+  ( cd "$WORK/link-one" && VCACHE_TRACE_LOG="$WORK/self-trace.log" \
+      LD_PRELOAD="$tracer_so" gcc helper.o main.o -o app-self ) 2>/dev/null
+  check "the tracer does not record itself as an input" \
+    "$(grep -c 'vcache-fstrace' "$WORK/self-trace.log" || true)" "0"
+  # ...but it must still record the libraries that are part of the linker: for
+  # ld.bfd the implementation lives in libbfd, and libz/libzstd emit output
+  # bytes for compressed debug sections.
+  check "and it still records the other loaded libraries" \
+    "$(awk -F'\t' '$1=="R"{print $2}' "$WORK/self-trace.log" |
+       grep -cE '\.so($|\.)' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+fi
+
+# Link caching is off unless asked for.
+reset_cache
+( cd "$WORK/link-one" && env -u VCACHE_LINK_CACHE "$VCACHE" \
+    --vcache-root="$PWD=proj" gcc helper.o main.o -o app-off ) 2>/dev/null
+check "link caching is off by default" "$(disk_entries)" "0"
+
+unset VCACHE_LINK_CACHE
+fi
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

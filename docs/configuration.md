@@ -635,7 +635,7 @@ How the toolchain is identified:
 | --- | --- |
 | `version` *(default)* | Hash of `<compiler> -v` output — version, target triple, configure flags. Machine-independent, so entries are shareable through S3. Memoised in the cache directory, so the extra process runs once per toolchain, not once per compilation. |
 | `content` | Hash the compiler driver binary. Differs between machines even for identical toolchains. |
-| `mtime` | Path and size only. Fastest, least safe. |
+| `mtime` | Path, size and mtime only -- no probe, no banner. Fastest, least safe. |
 
 `version` is the default precisely because a shared remote cache is a first-class
 use case and mtimes never agree across machines.

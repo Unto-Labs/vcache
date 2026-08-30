@@ -1323,5 +1323,87 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "a compiler that lives inside the mapped tree"
+# A project that builds part of itself with a compiler it just built -- LLVM
+# compiling its own runtime libraries with the clang from this build -- puts the
+# driver inside the source root. clang then reports that location in `-v`
+# output ("InstalledDir:", and the repository it was configured from), which is
+# what VCACHE_COMPILER_CHECK=version hashes. Hashing it verbatim gives two
+# checkouts of one revision different compiler identities, so nothing shares.
+reset_cache
+for d in "$WORK/cc-one" "$WORK/a-considerably-longer-cc-two"; do
+  make_project "$d"
+  mkdir -p "$d/bin"
+  cat > "$d/bin/mycc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  echo "mycc version 1.0 (git://example/repo.git abcdef)" >&2
+  echo "Target: x86_64-pc-linux-gnu" >&2
+  echo "InstalledDir: $d/bin" >&2
+  exit 0
+fi
+exec g++ "\$@"
+EOF
+  chmod +x "$d/bin/mycc"
+done
+( cd "$WORK/cc-one" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+( cd "$WORK/a-considerably-longer-cc-two" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "an in-tree compiler hits across checkouts" "$(hits)" "1"
+check "and only one entry was stored" "$(disk_entries)" "1"
+check "and the objects are byte-identical" \
+  "$(cmp -s "$WORK/cc-one/lib.o" "$WORK/a-considerably-longer-cc-two/lib.o" \
+     && echo same)" "same"
+
+# The mapping must not paper over a genuinely different compiler: only the part
+# of the banner that names a mapped path is normalised away.
+reset_cache
+sed -i 's/mycc version 1.0/mycc version 2.0/' "$WORK/a-considerably-longer-cc-two/bin/mycc"
+( cd "$WORK/cc-one" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+( cd "$WORK/a-considerably-longer-cc-two" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "a different compiler version still misses" "$(misses)" "2"
+
+# --------------------------------------------------------------------------
+section "a compiler rebuilt in place is not answered from the old banner"
+# `<compiler> -v` is memoised, because spawning it per compilation would be
+# wasteful. If that memo is keyed only by the driver's path and size, a compiler
+# rebuilt in place keeps the previous banner -- and relinking after a source
+# change lands on the same byte count often enough that this is not a corner
+# case. The result is a false HIT: objects from the old compiler served to the
+# new one. Rebuilding must invalidate the memo.
+reset_cache
+mkdir -p "$WORK/rebuilt-cc"
+make_project "$WORK/rebuilt-cc"
+write_stub_cc() {  # $1 = version string, same length every time
+  cat > "$WORK/rebuilt-cc/mycc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  echo "mycc version $1 (git://example/repo.git abcdef)" >&2
+  echo "Target: x86_64-pc-linux-gnu" >&2
+  exit 0
+fi
+exec g++ "\$@"
+EOF
+  chmod +x "$WORK/rebuilt-cc/mycc"
+}
+write_stub_cc "1.0"
+size_before=$(stat -c %s "$WORK/rebuilt-cc/mycc")
+( cd "$WORK/rebuilt-cc" && "$VCACHE" --vcache-root="$PWD=proj" \
+    ./mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "the first compile with the stub misses" "$(misses)" "1"
+
+write_stub_cc "2.0"
+check "the rebuilt stub is the same size" \
+  "$(stat -c %s "$WORK/rebuilt-cc/mycc")" "$size_before"
+( cd "$WORK/rebuilt-cc" && "$VCACHE" --vcache-root="$PWD=proj" \
+    ./mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "a same-size rebuilt compiler is not served from the old memo" \
+  "$(misses)" "2"
+check "and it did not report a hit" "$(hits)" "0"
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

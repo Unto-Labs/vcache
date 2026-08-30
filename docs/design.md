@@ -59,10 +59,12 @@ Deliberately excluded, and why each matters:
 
 - `version` (default) — hash of `<compiler> -v` output. Machine-independent, so
   entries are shareable through S3. The result is memoised in the cache
-  directory keyed by the binary's path and size, so the extra process runs once
-  per toolchain rather than once per compilation.
+  directory keyed by the binary's path, size and mtime, so the extra process
+  runs once per toolchain version rather than once per compilation. Paths under
+  a configured root are canonicalised out of the banner before it is hashed.
 - `content` — hash the driver binary. Machine-specific in practice.
-- `mtime` — path and size only. Fastest, least safe across machines.
+- `mtime` — canonicalised path, size and mtime only. Fastest, least safe across
+  machines.
 
 `version` is the default specifically because a shared remote cache is a first-
 class use case, and mtime differs across machines for identical toolchains.

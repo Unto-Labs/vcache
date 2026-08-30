@@ -161,6 +161,13 @@ std::optional<uint64_t> FileSize(const std::string& path) {
   return static_cast<uint64_t>(st.st_size);
 }
 
+std::optional<int64_t> FileMtime(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+  return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 +
+         static_cast<int64_t>(st.st_mtim.tv_nsec);
+}
+
 std::optional<std::string> RealPath(const std::string& path) {
   char buf[PATH_MAX];
   if (::realpath(path.c_str(), buf) == nullptr) return std::nullopt;

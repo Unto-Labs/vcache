@@ -30,6 +30,11 @@ bool LinkOrCopy(const std::string& from, const std::string& to);
 
 std::optional<uint64_t> FileSize(const std::string& path);
 
+// Modification time in nanoseconds since the epoch, or nullopt if the file
+// does not exist. Used to tell a rebuilt file from the one that was there
+// before when its size happens to be unchanged.
+std::optional<int64_t> FileMtime(const std::string& path);
+
 // Returns the absolute, symlink-resolved path, or nullopt if it does not exist.
 std::optional<std::string> RealPath(const std::string& path);
 

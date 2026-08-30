@@ -204,6 +204,14 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   hasher.UpdateDelimited(compiler_id.fingerprint);
   hasher.UpdateDelimited(native_target);
 
+  // The two key inputs that are neither the source nor the flags, logged
+  // because a miss caused by either is otherwise invisible: the command line
+  // and the source can be identical in two checkouts while one of these
+  // quietly differs.
+  VCACHE_LOG("key input compiler=" + compiler_id.fingerprint + " (" +
+             compiler_id.description + ") roots=" + roots.Fingerprint() +
+             " native=" + native_target);
+
   // Root mapping participates in the key: the same source canonicalised under
   // a different mapping produces a different object.
   hasher.UpdateDelimited(roots.Fingerprint());

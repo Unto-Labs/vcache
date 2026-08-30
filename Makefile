@@ -217,6 +217,12 @@ VCACHE_SRCS := \
 
 MAIN_SRC := $(SRC)/main.cc
 
+# The link tracer is LD_PRELOADed into the linker's whole process tree, so it
+# is a standalone shared object rather than part of the binary. It links
+# against libdl only; anything more would be visible to every traced process.
+TRACER_SRC := $(SRC)/trace/fstrace.c
+TRACER_SO  := $(BINDIR)/vcache-fstrace.so
+
 # BLAKE3 portable C. The architecture-specific kernels are selected above.
 BLAKE3_C  := $(BLAKE3_DIR)/blake3.c $(BLAKE3_DIR)/blake3_dispatch.c \
              $(BLAKE3_DIR)/blake3_portable.c
@@ -236,7 +242,11 @@ DEPS     := $(ALL_OBJS:.o=.d)
 
 .PHONY: all deps test clean distclean boost-subset
 
-all: $(BINDIR)/vcache
+all: $(BINDIR)/vcache $(TRACER_SO)
+
+$(TRACER_SO): $(TRACER_SRC)
+	@mkdir -p $(BINDIR)
+	$(CC) -std=c11 -O2 -fPIC -shared -Wall -Wextra -o $@ $< -ldl
 
 deps:
 	@$(TP)/fetch.sh

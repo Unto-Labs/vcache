@@ -110,6 +110,8 @@ timeout        = 30                # seconds
 | — | `AWS_SESSION_TOKEN` | — | — |
 | — | `VCACHE_CONFIG` | — | see search order |
 | — | `VCACHE_DISABLE` | — | `false` |
+| — | `VCACHE_LINK_CACHE` | — | `false` |
+| — | `VCACHE_TRACER` | — | next to the binary |
 | — | `VCACHE_RECACHE` | — | `false` |
 | — | `VCACHE_COMPILER_CHECK` | — | `version` |
 | — | `VCACHE_LOG` | — | off |
@@ -193,6 +195,55 @@ particular bucket rather than something a shell alias can set on the way past.
 With it set, a wrong-credentials bucket looks like a cache that never hits
 rather than an error — check `--show-config` and the bucket policy before
 concluding the cache is merely cold.
+
+## Caching the link step
+
+Off by default. `VCACHE_LINK_CACHE=1` turns it on.
+
+A link is a pure function of its inputs -- two LTO links of identical inputs
+produce a byte-identical binary -- so caching one is sound in principle. What
+makes it harder than caching a compile is that there is no `-E` equivalent: the
+input set is *discovered*, not declared. ccache and sccache decline to cache
+links for exactly this reason.
+
+vcache discovers the set by watching the link. `vcache-fstrace.so` is
+`LD_PRELOAD`ed into the linker's whole process tree and records what was read,
+what was probed and found absent, and which executables ran. A hit then requires
+both halves:
+
+- every recorded input still hashes the same, **and**
+- every recorded absent path is still absent.
+
+The second is not a nicety. `-lfoo` resolves to `/usr/lib/libfoo.so` only
+because `/opt/lib/libfoo.so` was missing; an entry recording only what it read
+would hit after someone installs the latter and hand back a binary linked
+against the wrong library. Re-checking costs 0.45 ms against a 2.3 s link, so
+there is no reason to be clever about it.
+
+### What is not cached
+
+Declined, each because caching it would give a wrong or incomplete answer:
+
+| Case | Why |
+| --- | --- |
+| `--build-id=uuid` | the output is not a function of the inputs |
+| compiling and linking in one command | the compile half is already cached |
+| output to `/dev/null` or a stream | nothing to store |
+| no `-o` | the implied `a.out` is not worth an entry |
+| the tracer is missing or was not loaded | no absent set, so a hit cannot be shown to be sound |
+
+The last one matters most. A statically linked linker, or a loader that ignores
+`LD_PRELOAD`, produces no process records; rather than cache on the assumption
+that the input set is complete, vcache declines.
+
+`-Map`, `-Wl,-Map=` and `-Wl,--dependency-file=` are captured as additional
+outputs and replayed, so a hit does not hand back the binary while the companion
+file silently fails to appear.
+
+### Debugging a link miss
+
+`VCACHE_LOG` names the input that changed or the path that stopped being
+absent, which is usually the whole answer.
 
 ## Flags that write a second output file
 

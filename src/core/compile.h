@@ -30,9 +30,19 @@ struct CompilerId {
 //              the right default once a shared S3 layer is in play.
 //   content -- hash the driver binary itself.
 //   mtime   -- hash path, size and mtime. Fastest, but machine-specific.
+//
+// `roots` is applied to whatever the mode hashes, because a compiler can live
+// *inside* a mapped root -- a build that compiles its runtime libraries with
+// the compiler it just built is the normal case, not an exotic one. Both the
+// path (`mtime`) and the `-v` banner (`version`, which reports clang's
+// `InstalledDir:` and the source repository it was configured from) then carry
+// the checkout's location, and hashing that verbatim gives two checkouts of one
+// revision different compiler identities and so a cold cache. Canonicalising
+// first is the same rule vcache already applies to source paths.
 CompilerId ResolveCompilerId(const std::string& compiler,
                              const std::string& check_mode,
-                             const std::string& cache_dir);
+                             const std::string& cache_dir,
+                             const RootMap& roots);
 
 // Builds the root mapping for this invocation from configuration, adding the
 // current directory when it would otherwise be left unmapped.

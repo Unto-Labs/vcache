@@ -308,7 +308,8 @@ bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
 
 CompilerId ResolveCompilerId(const std::string& compiler,
                              const std::string& check_mode,
-                             const std::string& cache_dir) {
+                             const std::string& cache_dir,
+                             const RootMap& roots) {
   CompilerId id;
   const std::string real =
       util::RealPath(compiler).value_or(compiler);
@@ -324,7 +325,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   if (check_mode == "mtime") {
     hash::Hasher hasher;
-    hasher.UpdateDelimited(real);
+    hasher.UpdateDelimited(roots.Canonicalize(real));
     hasher.UpdateU64(info.size);
     id.fingerprint = hasher.Hex();
     id.description = real + " (mtime check)";
@@ -353,7 +354,10 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   if (auto cached = util::ReadFile(memo_path)) {
     id.is_clang = LooksLikeClang(*cached, real);
-    id.fingerprint = hash::HashString(*cached);
+    // The memo is keyed by the local path, so it holds the banner as printed.
+    // Canonicalise on use rather than on store, so the same memo stays correct
+    // if the root mapping changes.
+    id.fingerprint = hash::HashString(roots.CanonicalizeText(*cached));
     id.description = util::Split(*cached, '\n', /*skip_empty=*/true).empty()
                          ? real
                          : util::Split(*cached, '\n', true).back();
@@ -379,7 +383,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   util::WriteFileAtomic(memo_path, banner);
   id.is_clang = LooksLikeClang(banner, real);
-  id.fingerprint = hash::HashString(banner);
+  id.fingerprint = hash::HashString(roots.CanonicalizeText(banner));
   const auto lines = util::Split(banner, '\n', /*skip_empty=*/true);
   id.description = lines.empty() ? real : lines.back();
   return id;
@@ -527,7 +531,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   const std::string check_mode = EnvOr("VCACHE_COMPILER_CHECK", "version");
   const CompilerId compiler_id =
-      ResolveCompilerId(parsed.compiler, check_mode, cache_dir);
+      ResolveCompilerId(parsed.compiler, check_mode, cache_dir, roots);
 
   std::string native_target;
   if (!parsed.native_flags.empty()) {
@@ -826,7 +830,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   const std::string check_mode = EnvOr("VCACHE_COMPILER_CHECK", "version");
   const CompilerId compiler_id =
-      ResolveCompilerId(parsed.compiler, check_mode, cache_dir);
+      ResolveCompilerId(parsed.compiler, check_mode, cache_dir, roots);
 
   // -march=native and friends: resolve them to a concrete target fingerprint,
   // or decline to cache if the caller asked for that or the probe failed.

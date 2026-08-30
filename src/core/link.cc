@@ -157,6 +157,18 @@ std::string TracerPath() {
 }
 
 // Every output the link is expected to write.
+// Where a link output is kept, content-addressed by its digest.
+//
+// Deliberately inside the disk cache's own shard layout: Trim, Clear and
+// TotalSize all walk those shards, so these files are evicted, cleared and
+// counted like any other entry without a second accounting path. The coupling
+// to that layout is the price; the alternative is a parallel store that the
+// budget does not know about.
+std::string LinkOutputPath(const std::string& cache_dir,
+                           const std::string& digest) {
+  return cache_dir + "/" + digest.substr(0, 2) + "/" + digest + ".linkout";
+}
+
 std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
   std::vector<std::string> out{parsed.output};
   out.insert(out.end(), parsed.extra_outputs.begin(), parsed.extra_outputs.end());
@@ -164,7 +176,8 @@ std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
 }
 
 bool MaterializeOutputs(const storage::Blob& blob,
-                        const std::vector<std::string>& outputs) {
+                        const std::vector<std::string>& outputs,
+                        const std::string& cache_dir) {
   for (const storage::BlobFile& f : blob.files) {
     const auto it = std::find(outputs.begin(), outputs.end(), f.name);
     if (it == outputs.end()) {
@@ -172,7 +185,16 @@ bool MaterializeOutputs(const storage::Blob& blob,
                  f.name);
       return false;
     }
-    if (!util::WriteFileAtomic(f.name, f.contents)) return false;
+    // `contents` carries the digest, not the bytes. Link outputs are far too
+    // large to move through a blob: a 2.2 GB shared library took 37 s to replay
+    // that way against 51 s to link outright, and peaked at more memory than
+    // the linker used. Cloning the stored file is a reflink where the
+    // filesystem allows one.
+    const std::string stored = LinkOutputPath(cache_dir, f.contents);
+    if (!util::CloneFile(stored, f.name)) {
+      VCACHE_LOG("link hit: stored output is gone or unreadable: " + stored);
+      return false;
+    }
     if (f.executable) {
       // Add execute where the umask would have allowed it, not everywhere.
       // WriteFileAtomic has already applied 0666 & ~umask, so under a strict
@@ -250,7 +272,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("link: manifest entry matched but its result is gone");
         continue;
       }
-      if (!MaterializeOutputs(blob, outputs)) break;
+      if (!MaterializeOutputs(blob, outputs, cache_dir)) break;
       if (!blob.stderr_text.empty()) {
         ::fputs(roots.LocalizeText(blob.stderr_text).c_str(), stderr);
       }
@@ -328,7 +350,23 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     result_hasher.UpdateDelimited(roots.Canonicalize(tool));
     result_hasher.UpdateDelimited(*digest);
   }
+  // Files named on the command line are already hashed into the pre-key, so a
+  // pre-key match has proved they are unchanged. Recording them again would
+  // make every hit hash them a second time, which on a large link is not a
+  // rounding error: libLLVM.so takes 288 inputs totalling 13 GB, and hashing
+  // that set twice was half the cost of the hit.
+  std::vector<std::string> named;
+  named.reserve(parsed.inputs.size());
+  for (const std::string& in : parsed.inputs) {
+    auto real = util::RealPath(in);
+    named.push_back(roots.Canonicalize(real ? *real : in));
+  }
+  std::sort(named.begin(), named.end());
+
   for (const std::string& in : trace.inputs) {
+    if (std::binary_search(named.begin(), named.end(), roots.Canonicalize(in))) {
+      continue;
+    }
     auto digest = hash::HashFile(in);
     // A file that is gone by now was an intermediate the toolchain created and
     // removed -- collect2's constructor table, the LTO resolution file. It
@@ -350,15 +388,24 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   storage::Blob out_blob;
   out_blob.stderr_text = roots.CanonicalizeText(result.stderr_data);
   for (const std::string& path : outputs) {
-    auto contents = util::ReadFile(path);
-    if (!contents) {
+    auto digest = hash::HashFile(path);
+    if (!digest) {
       VCACHE_LOG("link: expected output was not produced: " + path);
+      return 0;
+    }
+    const std::string stored = LinkOutputPath(cache_dir, *digest);
+    if (!util::MakeDirs(util::DirName(stored))) return 0;
+    // Content-addressed, so an output identical to one already stored costs
+    // nothing to store again -- and the clone is a reflink where possible, so
+    // it costs nothing in space either.
+    if (!util::CloneFile(path, stored)) {
+      VCACHE_LOG("link: could not stage output into the cache: " + path);
       return 0;
     }
     struct stat st;
     const bool executable =
         ::stat(path.c_str(), &st) == 0 && (st.st_mode & S_IXUSR) != 0;
-    out_blob.files.push_back({path, std::move(*contents), executable});
+    out_blob.files.push_back({path, *digest, executable});
   }
 
   if (cache != nullptr) {

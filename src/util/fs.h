@@ -35,6 +35,19 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents);
 // example across filesystems). Used to materialise cached objects cheaply.
 bool LinkOrCopy(const std::string& from, const std::string& to);
 
+// Copies `from` to `to` without pulling the file through user space, and
+// without sharing an inode with the source.
+//
+// Tries a reflink first, which is near-instant on a filesystem that supports
+// copy-on-write, then an in-kernel copy, then a bounded streaming loop. A
+// hardlink is deliberately not attempted: the destination is a build artifact a
+// linker may later truncate in place, and sharing an inode would corrupt the
+// cached copy along with it.
+//
+// The write goes to a temporary beside `to` and is renamed into place, so a
+// reader never observes a half-written file.
+bool CloneFile(const std::string& from, const std::string& to);
+
 std::optional<uint64_t> FileSize(const std::string& path);
 
 // Modification time in nanoseconds since the epoch, or nullopt if the file

@@ -50,6 +50,12 @@ is a hit at all when a ccache hit would not have been.
 
 ## Quick start
 
+Prerequisites: a C++20 compiler, `make`, `curl`, and **libcurl development
+headers** — `libcurl4-openssl-dev` on Debian/Ubuntu, `libcurl-devel` on Fedora
+and RHEL, already present in the macOS SDK. vcache loads libcurl at runtime with
+`dlopen`, so the shared library is only needed if you use the S3 layer, but
+`curl/curl.h` is required to build either way.
+
 ```console
 $ ./third-party/fetch.sh     # builds tcmalloc (one time)
 $ make -j

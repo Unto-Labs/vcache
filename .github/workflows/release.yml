@@ -68,6 +68,18 @@ jobs:
             otool -L ./bin/vcache || true
           fi
 
+      - name: Check the tracer ships with the binary
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          test -f bin/vcache-fstrace.so
+          # A release binary that cannot find its tracer declines link caching
+          # instead of failing, so only an explicit check catches this.
+          out=$(VCACHE_LOG=/dev/stdout VCACHE_LINK_CACHE=1 VCACHE_DIR="$PWD/.trcheck" \
+                ./bin/vcache true 2>&1 || true)
+          case "$out" in
+            *"tracer not found"*) echo "tracer not discoverable beside the binary"; exit 1 ;;
+          esac
+
       - name: Package
         id: package
         run: |
@@ -75,6 +87,14 @@ jobs:
           dir="vcache-${tag}-${{ matrix.name }}"
           mkdir "$dir"
           cp bin/vcache LICENSE NOTICE README.md "$dir/"
+          # The link tracer is a separate shared object that vcache looks for
+          # beside its own binary. Shipping the binary alone makes link caching
+          # decline with "tracer not found" -- quietly, since declining is how
+          # it is supposed to react to a missing tracer. Linux only; it is not
+          # built elsewhere.
+          if [ -f bin/vcache-fstrace.so ]; then
+            cp bin/vcache-fstrace.so "$dir/"
+          fi
           tar czf "${dir}.tar.gz" "$dir"
           shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
           echo "archive=${dir}.tar.gz" >> "$GITHUB_OUTPUT"

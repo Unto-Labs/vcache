@@ -207,6 +207,7 @@ VCACHE_SRCS := \
   $(SRC)/core/stats.cc \
   $(SRC)/core/compile.cc \
   $(SRC)/args/compiler_args.cc \
+  $(SRC)/args/link_args.cc \
   $(SRC)/args/rustc_args.cc \
   $(SRC)/rust/rust_compile.cc \
   $(SRC)/storage/disk_storage.cc \

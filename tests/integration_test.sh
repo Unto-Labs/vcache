@@ -1405,5 +1405,129 @@ check "a same-size rebuilt compiler is not served from the old memo" \
 check "and it did not report a hit" "$(hits)" "0"
 
 # --------------------------------------------------------------------------
+section "link caching"
+
+# A link has no preprocessed text to key on, so its input set is discovered by
+# tracing. These cases are mostly about the discovered set being right in both
+# directions: everything that matters is in it, and nothing that does not.
+
+export VCACHE_LINK_CACHE=1
+
+make_link_project() {  # $1 = root, $2 = value returned by helper()
+  mkdir -p "$1"
+  cat > "$1/helper.c" <<EOF
+int helper(void) { return $2; }
+EOF
+  cat > "$1/main.c" <<'EOF'
+#include <stdio.h>
+int helper(void);
+int main(void) { printf("%d\n", helper()); return 0; }
+EOF
+  ( cd "$1" && gcc -c helper.c -o helper.o && gcc -c main.c -o main.o )
+}
+
+reset_cache
+make_link_project "$WORK/link-one" 7
+make_link_project "$WORK/a-considerably-longer-link-two" 7
+for d in "$WORK/link-one" "$WORK/a-considerably-longer-link-two"; do
+  ( cd "$d" && "$VCACHE" --vcache-root="$PWD=proj" \
+      gcc -g -O2 helper.o main.o -o app ) 2>/dev/null
+done
+check "a link hits across checkouts" "$(hits)" "1"
+check "and the binaries are byte-identical" \
+  "$(cmp -s "$WORK/link-one/app" "$WORK/a-considerably-longer-link-two/app" \
+     && echo same)" "same"
+check "and the replayed binary runs" \
+  "$("$WORK/a-considerably-longer-link-two/app")" "7"
+check "and it is executable" \
+  "$([[ -x "$WORK/a-considerably-longer-link-two/app" ]] && echo yes)" "yes"
+
+# The property a positive-only cache cannot have. -lval resolves in late/ only
+# because early/ does not contain it; installing a different library there must
+# not be served the old entry.
+reset_cache
+mkdir -p "$WORK/ldsearch/early" "$WORK/ldsearch/late" "$WORK/ldsearch/proj"
+( cd "$WORK/ldsearch/proj"
+  cat > m.c <<'EOF'
+#include <stdio.h>
+int value(void);
+int main(void) { printf("%d\n", value()); return 0; }
+EOF
+  printf 'int value(void){ return 111; }\n' > late.c
+  printf 'int value(void){ return 999; }\n' > early.c
+  gcc -c m.c -o m.o && gcc -c late.c -o late.o && gcc -c early.c -o early.o
+  ar rcs "$WORK/ldsearch/late/libval.a" late.o
+  ar rcs "$WORK/ldsearch/early-libval.a" early.o ) 2>/dev/null
+
+link_val() {
+  ( cd "$WORK/ldsearch/proj" && rm -f app && "$VCACHE" --vcache-root="$PWD=proj" \
+      gcc m.o -L"$WORK/ldsearch/early" -L"$WORK/ldsearch/late" -lval -o app \
+      && ./app ) 2>/dev/null
+}
+check "the first link resolves in the later -L directory" "$(link_val)" "111"
+check "an unchanged repeat hits" "$(link_val >/dev/null; hits)" "1"
+cp "$WORK/ldsearch/early-libval.a" "$WORK/ldsearch/early/libval.a"
+check "a library appearing in an earlier -L directory is not served the old entry" \
+  "$(link_val)" "999"
+check "and that was a miss, not a hit" "$(misses)" "2"
+
+# A changed input must not be served either, which the pre-key handles because
+# the objects are named on the command line.
+reset_cache
+make_link_project "$WORK/link-changed" 1
+( cd "$WORK/link-changed" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app ) 2>/dev/null
+make_link_project "$WORK/link-changed" 2
+( cd "$WORK/link-changed" && rm -f app && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app && ./app ) > "$WORK/changed.out" 2>/dev/null
+check "a changed object is not served the old binary" \
+  "$(cat "$WORK/changed.out")" "2"
+
+# Flags whose output is not a function of the inputs, and shapes that belong to
+# the compile path, must be declined rather than cached.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,--build-id=uuid -o app-uuid ) 2>/dev/null
+check "--build-id=uuid is not cached" "$(uncacheable)" "1"
+check "and the binary is still produced" \
+  "$([[ -x "$WORK/link-one/app-uuid" ]] && echo yes)" "yes"
+
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.c main.c -o app-src ) 2>/dev/null
+check "compiling and linking in one step is not cached as a link" \
+  "$(uncacheable)" "1"
+check "and that binary is produced too" \
+  "$([[ -x "$WORK/link-one/app-src" ]] && echo yes)" "yes"
+
+# Without the tracer there is no absent set, so a hit cannot be shown to be
+# sound. That must decline, not cache on trust.
+reset_cache
+( cd "$WORK/link-one" && VCACHE_TRACER=/nonexistent/tracer.so \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-notrace ) 2>/dev/null
+check "a missing tracer makes the link uncacheable" "$(uncacheable)" "1"
+check "and the link still happens" \
+  "$([[ -x "$WORK/link-one/app-notrace" ]] && echo yes)" "yes"
+
+# A flag that makes the link write a second file: replaying the binary without
+# it would look successful and leave the map file missing.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map=link.map -o app-map ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-map link.map && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map=link.map -o app-map ) 2>/dev/null
+check "a link with a map file hits" "$(hits)" "1"
+check "and the map file is replayed, not silently skipped" \
+  "$([[ -s "$WORK/link-one/link.map" ]] && echo yes)" "yes"
+
+# Link caching is off unless asked for.
+reset_cache
+( cd "$WORK/link-one" && env -u VCACHE_LINK_CACHE "$VCACHE" \
+    --vcache-root="$PWD=proj" gcc helper.o main.o -o app-off ) 2>/dev/null
+check "link caching is off by default" "$(disk_entries)" "0"
+
+unset VCACHE_LINK_CACHE
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

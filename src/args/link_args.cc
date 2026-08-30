@@ -59,6 +59,7 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
 
   bool saw_input = false;
   bool saw_source = false;
+  std::string pending_uncacheable;
 
   for (size_t i = 1; i < r.argv.size(); ++i) {
     const std::string& a = r.argv[i];
@@ -102,9 +103,14 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     }
 
     // Deliberately not cached: the output is not a function of the inputs.
+    // Recorded rather than returned immediately, because the invocation is
+    // still a link and the caller has to know that: returning here with
+    // is_link false would send it down the compile path instead.
     if (a == "-Wl,--build-id=uuid" || a == "--build-id=uuid") {
-      r.uncacheable = "--build-id=uuid produces a different binary every run";
-      return r;
+      pending_uncacheable =
+          "--build-id=uuid produces a different binary every run";
+      r.key_args.push_back(a);
+      continue;
     }
 
     // Scripts and lists are inputs whose contents matter.
@@ -145,6 +151,10 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
   if (!saw_input && r.inputs.empty()) return r;  // not a link we recognise
   r.is_link = true;
 
+  if (!pending_uncacheable.empty()) {
+    r.uncacheable = pending_uncacheable;
+    return r;
+  }
   if (saw_source) {
     r.uncacheable = "compiles and links in one step";
     return r;

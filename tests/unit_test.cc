@@ -21,6 +21,8 @@
 #include <vector>
 
 #include "args/compiler_args.h"
+#include "core/link_trace.h"
+#include "args/link_args.h"
 #include "args/rustc_args.h"
 #include "core/config.h"
 #include "core/depfile.h"
@@ -82,6 +84,124 @@ core::RootMap MakeRoots(const std::vector<std::string>& specs) {
 }
 
 // ---------------------------------------------------------------------------
+
+void TestLinkArgs() {
+  Section("args::ParseLink");
+
+  auto plain = args::ParseLink({"gcc", "a.o", "b.o", "-o", "app"});
+  Check(plain.is_link && plain.uncacheable.empty(), "a plain link is cacheable");
+  CheckEq(plain.output, "app", "output is found");
+  Check(plain.inputs.size() == 2, "both objects are inputs");
+
+  // Phase flags belong to the compile path; the link parser must not claim them.
+  Check(!args::ParseLink({"gcc", "-c", "a.c", "-o", "a.o"}).is_link,
+        "-c is not a link");
+  Check(!args::ParseLink({"gcc", "-E", "a.c"}).is_link, "-E is not a link");
+  Check(!args::ParseLink({"gcc", "-S", "a.c"}).is_link, "-S is not a link");
+  Check(!args::ParseLink({"gcc", "-M", "a.c"}).is_link, "-M is not a link");
+
+  // Declines, each for a reason that would otherwise be a wrong answer.
+  auto uuid = args::ParseLink(
+      {"gcc", "a.o", "-Wl,--build-id=uuid", "-o", "app"});
+  Check(uuid.is_link && !uuid.uncacheable.empty(),
+        "--build-id=uuid is declined");
+  auto mixed = args::ParseLink({"gcc", "a.o", "b.c", "-o", "app"});
+  Check(mixed.is_link && !mixed.uncacheable.empty(),
+        "compile-and-link is declined");
+  auto devnull = args::ParseLink({"gcc", "a.o", "-o", "/dev/null"});
+  Check(devnull.is_link && !devnull.uncacheable.empty(),
+        "output to /dev/null is declined");
+  auto noout = args::ParseLink({"gcc", "a.o"});
+  Check(noout.is_link && !noout.uncacheable.empty(), "no -o is declined");
+
+  // Second outputs have to be captured, or a hit returns the binary and
+  // silently leaves the companion file missing.
+  auto mapped = args::ParseLink(
+      {"gcc", "a.o", "-Wl,-Map=out.map", "-o", "app"});
+  Check(mapped.extra_outputs.size() == 1 && mapped.extra_outputs[0] == "out.map",
+        "-Wl,-Map= is recorded as an extra output");
+  auto depf = args::ParseLink(
+      {"gcc", "a.o", "-Wl,--dependency-file=d.d", "-o", "app"});
+  Check(depf.extra_outputs.size() == 1, "--dependency-file is an extra output");
+
+  // Scripts are inputs whose contents matter.
+  auto scripted = args::ParseLink(
+      {"gcc", "a.o", "-T", "link.ld", "-o", "app"});
+  Check(std::find(scripted.inputs.begin(), scripted.inputs.end(), "link.ld") !=
+            scripted.inputs.end(),
+        "a linker script is an input");
+
+  // Shared libraries in all their spellings.
+  Check(args::LooksLikeLinkInput("libfoo.so"), ".so is a link input");
+  Check(args::LooksLikeLinkInput("libfoo.so.1"), ".so.1 is a link input");
+  Check(args::LooksLikeLinkInput("libfoo.so.1.2.3"), ".so.1.2.3 is a link input");
+  Check(args::LooksLikeLinkInput("foo.a"), ".a is a link input");
+  Check(!args::LooksLikeLinkInput("foo.c"), ".c is not a link input");
+  Check(!args::LooksLikeLinkInput("libfoo.solid"), ".solid is not a shared lib");
+
+  // -o attached to the flag.
+  CheckEq(args::ParseLink({"gcc", "a.o", "-oapp"}).output, "app",
+          "-oapp attached form");
+}
+
+void TestLinkTraceClassification() {
+  Section("core::link_trace");
+
+  // Process and kernel state is never an input.
+  Check(core::IsIgnoredPath("/proc/self/maps"), "/proc is ignored");
+  Check(core::IsIgnoredPath("/sys/devices/x"), "/sys is ignored");
+  Check(core::IsIgnoredPath("/dev/null"), "/dev is ignored");
+  Check(core::IsIgnoredPath("/usr/lib/locale/C.utf8/LC_CTYPE"),
+        "locale data is ignored");
+  Check(core::IsIgnoredPath("/usr/lib/x86_64-linux-gnu/gconv/gconv-modules"),
+        "gconv data is ignored");
+  Check(core::IsIgnoredPath("/usr/lib/."), "a directory self-reference is ignored");
+  Check(core::IsIgnoredPath("relative/path"), "a relative path is ignored");
+
+  // Temporary directories are deliberately NOT ignored by prefix: TMPDIR is
+  // frequently not /tmp, and a build running inside /tmp would otherwise have
+  // its objects dropped from the input set.
+  Check(!core::IsIgnoredPath("/tmp/build/foo.o"),
+        "/tmp is not excluded by prefix");
+  Check(!core::IsIgnoredPath("/usr/lib/x86_64-linux-gnu/libc.so.6"),
+        "a real library is kept");
+  Check(!core::IsIgnoredPath("/home/u/proj/a.o"), "a real object is kept");
+
+  // A trace log becomes two sets, with the output excluded from both.
+  const std::string dir = "/tmp/vcache-tracetest";
+  util::RemoveRecursive(dir);
+  Check(util::MakeDirs(dir), "trace test dir");
+  const std::string log = dir + "/trace";
+  util::WriteFileAtomic(log,
+                        "P\t/usr/bin/ld\n"
+                        "R\t/home/u/proj/a.o\n"
+                        "M\t/opt/lib/libfoo.so\n"
+                        "R\t/home/u/proj/app\n"       // the output
+                        "R\t/proc/self/exe\n"          // ignored
+                        "M\t/home/u/proj/app\n"        // the output again
+                        "garbage line\n");
+  core::LinkTrace trace;
+  Check(core::ParseTraceLog(log, {"/home/u/proj/app"}, "/home/u/proj", &trace),
+        "a trace log parses");
+  Check(trace.tools.size() == 1 && trace.tools[0] == "/usr/bin/ld",
+        "the toolchain is captured");
+  Check(trace.inputs.size() == 1 && trace.inputs[0] == "/home/u/proj/a.o",
+        "the output is not an input to itself");
+  Check(trace.absent.size() == 1 && trace.absent[0] == "/opt/lib/libfoo.so",
+        "the absent set survives, without the output");
+
+  // A path both probed-absent and later read is an input, not an absence;
+  // keeping it in both sets would make the entry permanently unhittable.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nM\t/a/b.so\nR\t/a/b.so\n");
+  core::LinkTrace second;
+  Check(core::ParseTraceLog(log, {}, "/", &second), "second trace parses");
+  Check(second.absent.empty(), "a path later found is not left in the absent set");
+  Check(second.inputs.size() == 1, "and is recorded as an input");
+
+  Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
+        "a missing trace log is reported");
+  util::RemoveRecursive(dir);
+}
 
 void TestStringUtils() {
   Section("util::str");
@@ -1577,6 +1697,7 @@ int main() {
   TestCacheChain();
   TestHasher();
   TestSha256();
+  TestLinkArgs();
   TestCompilerArgs();
   TestClangArgs();
   TestRustcArgs();
@@ -1591,6 +1712,9 @@ int main() {
   // disk cache does on every Put -- primes the cache in the parent, the child
   // inherits it, and the strict-umask assertion fails.
   TestDiskStorageEviction();
+  // Also after TestWrittenFileMode, and for the same reason: it writes
+  // files, which primes util::DefaultFileMode()'s cached umask.
+  TestLinkTraceClassification();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

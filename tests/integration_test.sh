@@ -1323,5 +1323,49 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "a compiler that lives inside the mapped tree"
+# A project that builds part of itself with a compiler it just built -- LLVM
+# compiling its own runtime libraries with the clang from this build -- puts the
+# driver inside the source root. clang then reports that location in `-v`
+# output ("InstalledDir:", and the repository it was configured from), which is
+# what VCACHE_COMPILER_CHECK=version hashes. Hashing it verbatim gives two
+# checkouts of one revision different compiler identities, so nothing shares.
+reset_cache
+for d in "$WORK/cc-one" "$WORK/a-considerably-longer-cc-two"; do
+  make_project "$d"
+  mkdir -p "$d/bin"
+  cat > "$d/bin/mycc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  echo "mycc version 1.0 (git://example/repo.git abcdef)" >&2
+  echo "Target: x86_64-pc-linux-gnu" >&2
+  echo "InstalledDir: $d/bin" >&2
+  exit 0
+fi
+exec g++ "\$@"
+EOF
+  chmod +x "$d/bin/mycc"
+done
+( cd "$WORK/cc-one" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+( cd "$WORK/a-considerably-longer-cc-two" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "an in-tree compiler hits across checkouts" "$(hits)" "1"
+check "and only one entry was stored" "$(disk_entries)" "1"
+check "and the objects are byte-identical" \
+  "$(cmp -s "$WORK/cc-one/lib.o" "$WORK/a-considerably-longer-cc-two/lib.o" \
+     && echo same)" "same"
+
+# The mapping must not paper over a genuinely different compiler: only the part
+# of the banner that names a mapped path is normalised away.
+reset_cache
+sed -i 's/mycc version 1.0/mycc version 2.0/' "$WORK/a-considerably-longer-cc-two/bin/mycc"
+( cd "$WORK/cc-one" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+( cd "$WORK/a-considerably-longer-cc-two" && \
+  "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
+check "a different compiler version still misses" "$(misses)" "2"
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

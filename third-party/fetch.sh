@@ -29,7 +29,15 @@ log() { printf '>> %s\n' "$*"; }
 verify() {
   local file="$1" expected="$2"
   local actual
-  actual="$(sha256sum "$file" | cut -d' ' -f1)"
+  # sha256sum is coreutils; macOS ships shasum instead.
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+  else
+    echo "need sha256sum or shasum to verify downloads" >&2
+    return 1
+  fi
   if [[ "$actual" != "$expected" ]]; then
     echo "checksum mismatch for $file" >&2
     echo "  expected $expected" >&2

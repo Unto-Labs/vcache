@@ -40,11 +40,11 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Install a C++20 toolchain
+      - name: Install a C++20 toolchain and libcurl headers
         if: startsWith(matrix.runner, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-12
+          sudo apt-get install -y g++-12 libcurl4-openssl-dev
           echo "CXX=g++-12" >> "$GITHUB_ENV"
           echo "CC=gcc-12" >> "$GITHUB_ENV"
 

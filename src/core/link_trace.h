@@ -30,9 +30,9 @@ struct LinkTrace {
 // excluded from every set, since an output is not an input to itself.
 // `cwd` resolves relative paths as the tracer recorded them.
 //
-// Returns false only on a log that cannot be read at all. A malformed line is
-// skipped: a partially readable trace still yields a usable input set, and the
-// caller decides whether to trust it.
+// Returns false when the log cannot be read or any record is malformed. A
+// partially readable trace is not a usable input set: the missing record may be
+// the only evidence that a later hit should be invalidated.
 bool ParseTraceLog(const std::string& log_path,
                    const std::vector<std::string>& outputs,
                    const std::string& cwd, LinkTrace* out);

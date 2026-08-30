@@ -1,7 +1,7 @@
 # Link caching in vcache — implementation plan
 
-Branch `vlad/link-cache`. Design rationale and measurements:
-`~/agent-backup/vcache-link-caching-20260830/DESIGN.md`.
+Branch `vlad/link-cache`. This file records the design rationale and
+measurements that accompanied the implementation.
 
 ## Why this is tractable
 
@@ -38,7 +38,8 @@ deliberately not done.
 - [x] 6. Dispatch from `main.cc`; reuses the existing counters
 - [x] 7. Unit tests (parse + trace classification)
 - [x] 8. Integration tests, including a real cross-directory link
-- [x] 9. Security audit -- two issues found and fixed
+- [x] 9. Security audit -- tracer completeness, error transparency, output
+      integrity and read-only behavior reviewed and hardened
 - [x] 10. Docs
 - [ ] 11. PR + critical loop
 
@@ -51,15 +52,15 @@ cold (miss)   2.43 s
 warm (hit)    0.06 s      byte-identical output
 ```
 
-Suites: unit 343, integration 202, 0 failed.
+Suites after the critical-loop hardening: unit 350, integration 216, 0 failed.
 
 ## Reuse rather than reinvent
 
 - `RootMap` for canonicalising every path that enters a key.
 - The dep-scan manifest pattern: several remembered states per key, validated by
   re-hashing, nothing trusted on mtime.
-- `storage::CacheChain` and `Blob` for storage; `LinkOrCopy` for materialising
-  outputs (reflink-cheap on this host's ZFS).
+- `storage::CacheChain` and `Blob` for metadata; content-addressed local output
+  sidecars materialised by `CloneFile` and verified by digest on every hit.
 - `CompilerId` for toolchain identity, already canonicalised through roots.
 
 ## Deliberately out of scope for this branch

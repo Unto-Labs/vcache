@@ -123,6 +123,21 @@ void TestLinkArgs() {
   auto depf = args::ParseLink(
       {"gcc", "a.o", "-Wl,--dependency-file=d.d", "-o", "app"});
   Check(depf.extra_outputs.size() == 1, "--dependency-file is an extra output");
+  auto comma_map = args::ParseLink(
+      {"gcc", "a.o", "-Wl,-Map,out.map", "-o", "app"});
+  Check(comma_map.extra_outputs.size() == 1 &&
+            comma_map.extra_outputs[0] == "out.map",
+        "-Wl,-Map, is recorded as an extra output");
+  auto xlinker_map = args::ParseLink(
+      {"gcc", "a.o", "-Xlinker", "-Map", "-Xlinker", "out.map",
+       "-o", "app"});
+  Check(xlinker_map.extra_outputs.size() == 1 &&
+            xlinker_map.extra_outputs[0] == "out.map",
+        "-Xlinker -Map captures its forwarded output");
+  auto xlinker_uuid = args::ParseLink(
+      {"gcc", "a.o", "-Xlinker", "--build-id=uuid", "-o", "app"});
+  Check(xlinker_uuid.is_link && !xlinker_uuid.uncacheable.empty(),
+        "-Xlinker --build-id=uuid is declined");
 
   // Scripts are inputs whose contents matter.
   auto scripted = args::ParseLink(
@@ -163,11 +178,7 @@ void TestLinkTraceClassification() {
   // Process and kernel state is never an input.
   Check(core::IsIgnoredPath("/proc/self/maps"), "/proc is ignored");
   Check(core::IsIgnoredPath("/sys/devices/x"), "/sys is ignored");
-  Check(core::IsIgnoredPath("/dev/null"), "/dev is ignored");
-  Check(core::IsIgnoredPath("/usr/lib/locale/C.utf8/LC_CTYPE"),
-        "locale data is ignored");
-  Check(core::IsIgnoredPath("/usr/lib/x86_64-linux-gnu/gconv/gconv-modules"),
-        "gconv data is ignored");
+  Check(core::IsIgnoredPath("/dev/null"), "/dev/null is ignored");
   Check(core::IsIgnoredPath("/usr/lib/."), "a directory self-reference is ignored");
   Check(core::IsIgnoredPath("relative/path"), "a relative path is ignored");
 
@@ -176,6 +187,12 @@ void TestLinkTraceClassification() {
   // its objects dropped from the input set.
   Check(!core::IsIgnoredPath("/tmp/build/foo.o"),
         "/tmp is not excluded by prefix");
+  Check(!core::IsIgnoredPath("/dev/shm/build/foo.o"),
+        "/dev/shm is not excluded with device nodes");
+  Check(!core::IsIgnoredPath("/run/user/1000/build/foo.o"),
+        "/run is not excluded by prefix");
+  Check(!core::IsIgnoredPath("/home/u/proj/locale/messages.o"),
+        "a project locale directory is not excluded by name");
   Check(!core::IsIgnoredPath("/usr/lib/x86_64-linux-gnu/libc.so.6"),
         "a real library is kept");
   Check(!core::IsIgnoredPath("/home/u/proj/a.o"), "a real object is kept");
@@ -191,8 +208,7 @@ void TestLinkTraceClassification() {
                         "M\t/opt/lib/libfoo.so\n"
                         "R\t/home/u/proj/app\n"       // the output
                         "R\t/proc/self/exe\n"          // ignored
-                        "M\t/home/u/proj/app\n"        // the output again
-                        "garbage line\n");
+                        "M\t/home/u/proj/app\n");       // the output again
   core::LinkTrace trace;
   Check(core::ParseTraceLog(log, {"/home/u/proj/app"}, "/home/u/proj", &trace),
         "a trace log parses");
@@ -213,6 +229,10 @@ void TestLinkTraceClassification() {
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\ngarbage line\n");
+  core::LinkTrace malformed;
+  Check(!core::ParseTraceLog(log, {}, "/", &malformed),
+        "a malformed trace is rejected rather than partially trusted");
   util::RemoveRecursive(dir);
 }
 

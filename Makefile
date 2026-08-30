@@ -266,7 +266,7 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 	@mkdir -p $(BINDIR)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test: $(BINDIR)/vcache_test $(BINDIR)/vcache
+test: $(BINDIR)/vcache_test $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test
 	@$(TOP)/tests/integration_test.sh
 

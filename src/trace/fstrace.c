@@ -28,6 +28,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,7 +87,13 @@ static void emit(char kind, const char *path) {
   buf[n++] = '\t';
   const char *q = path;
   for (; *q != '\0' && n < sizeof buf - 1; ++q) {
-    buf[n++] = (*q == '\n' || *q == '\t') ? ' ' : *q;
+    if (*q == '\n' || *q == '\t') {
+      /* The line protocol cannot represent these bytes. Substitution would
+         name a different file and make later validation unsound. */
+      mark_incomplete();
+      return;
+    }
+    buf[n++] = *q;
   }
   if (*q != '\0') {
     /* Truncating would record a path that is not the one that was touched,
@@ -110,9 +117,43 @@ static void emit(char kind, const char *path) {
 /* Only ENOENT counts as a negative input. A permission error is a different
    question, and treating it as "absent" would invalidate entries for reasons
    that have nothing to do with the link. */
-static void emit_result(const char *path, int failed) {
+static void emit_result(const char *path, int failed, int saved_errno) {
   if (!failed) { emit('R', path); return; }
-  if (errno == ENOENT) emit('M', path);
+  if (saved_errno == ENOENT) emit('M', path);
+}
+
+/* Resolve a relative openat path against its directory descriptor. Treating it
+   as cwd-relative records a different file and can omit the real input. */
+static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) {
+  if (path == NULL || *path == '\0') return 0;
+  if (*path == '/' || dirfd == AT_FDCWD) {
+    size_t n = strlen(path);
+    if (n >= size) return 0;
+    memcpy(out, path, n + 1);
+    return 1;
+  }
+  char proc_path[64];
+  int pn = snprintf(proc_path, sizeof proc_path, "/proc/self/fd/%d", dirfd);
+  if (pn <= 0 || (size_t)pn >= sizeof proc_path) return 0;
+  long n = syscall(SYS_readlinkat, AT_FDCWD, proc_path, out, size - 1);
+  if (n <= 0 || (size_t)n >= size - 1) return 0;
+  size_t used = (size_t)n;
+  if (out[used - 1] != '/') out[used++] = '/';
+  size_t rest = strlen(path);
+  if (used + rest >= size) return 0;
+  memcpy(out + used, path, rest + 1);
+  return 1;
+}
+
+static void emit_at_result(int dirfd, const char *path, int failed,
+                           int saved_errno) {
+  if (failed && saved_errno != ENOENT) return;
+  char resolved[VCACHE_RECORD_MAX];
+  if (resolve_at_path(dirfd, path, resolved, sizeof resolved)) {
+    emit_result(resolved, failed, saved_errno);
+  } else {
+    mark_incomplete();
+  }
 }
 
 #define NEXT(sym)                                     \
@@ -123,17 +164,32 @@ static void emit_result(const char *path, int failed) {
     next_##sym;                                       \
   })
 
+static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  (void)data;
+  if (info->dlpi_name != NULL && info->dlpi_name[0] == '/') {
+    /* Dependencies are loaded before interposition is active. Include every
+       already-loaded DSO so a system or toolchain library update invalidates
+       the manifest instead of silently reusing an old link. */
+    emit('R', info->dlpi_name);
+  }
+  return 0;
+}
+
 __attribute__((constructor)) static void announce_self(void) {
   char exe[4096];
   long n = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe, sizeof exe - 1);
   if (n > 0) { exe[n] = '\0'; emit('P', exe); }
+  dl_iterate_phdr(announce_object, NULL);
 }
 
 int open(const char *path, int flags, ...) {
   mode_t m = 0;
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open)(path, flags, m);
-  emit_result(path, r < 0);
+  int saved = errno;
+  emit_result(path, r < 0, saved);
+  errno = saved;
   return r;
 }
 
@@ -141,7 +197,9 @@ int open64(const char *path, int flags, ...) {
   mode_t m = 0;
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open64)(path, flags, m);
-  emit_result(path, r < 0);
+  int saved = errno;
+  emit_result(path, r < 0, saved);
+  errno = saved;
   return r;
 }
 
@@ -149,42 +207,90 @@ int openat(int dirfd, const char *path, int flags, ...) {
   mode_t m = 0;
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(openat)(dirfd, path, flags, m);
-  emit_result(path, r < 0);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved);
+  errno = saved;
+  return r;
+}
+
+int openat64(int dirfd, const char *path, int flags, ...) {
+  mode_t m = 0;
+  if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
+  int r = NEXT(openat64)(dirfd, path, flags, m);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved);
+  errno = saved;
   return r;
 }
 
 FILE *fopen(const char *path, const char *mode) {
   FILE *r = NEXT(fopen)(path, mode);
-  emit_result(path, r == NULL);
+  int saved = errno;
+  emit_result(path, r == NULL, saved);
+  errno = saved;
+  return r;
+}
+
+FILE *fopen64(const char *path, const char *mode) {
+  FILE *r = NEXT(fopen64)(path, mode);
+  int saved = errno;
+  emit_result(path, r == NULL, saved);
+  errno = saved;
   return r;
 }
 
 int stat(const char *path, struct stat *st) {
   int r = NEXT(stat)(path, st);
-  emit_result(path, r != 0);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
   return r;
 }
 
 int lstat(const char *path, struct stat *st) {
   int r = NEXT(lstat)(path, st);
-  emit_result(path, r != 0);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
   return r;
 }
 
 int access(const char *path, int mode) {
   int r = NEXT(access)(path, mode);
-  emit_result(path, r != 0);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+  int r = NEXT(faccessat)(dirfd, path, mode, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+  int r = NEXT(fstatat)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved);
+  errno = saved;
   return r;
 }
 
 DIR *opendir(const char *path) {
   DIR *r = NEXT(opendir)(path);
-  if (r != NULL) emit('D', path); else emit_result(path, 1);
+  int saved = errno;
+  if (r != NULL) emit('D', path); else emit_result(path, 1, saved);
+  errno = saved;
   return r;
 }
 
 ssize_t readlink(const char *path, char *buf, size_t n) {
   ssize_t r = NEXT(readlink)(path, buf, n);
-  emit_result(path, r < 0);
+  int saved = errno;
+  emit_result(path, r < 0, saved);
+  errno = saved;
   return r;
 }

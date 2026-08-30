@@ -87,12 +87,16 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     // Flags that make the link write a second file. Replaying an entry without
     // reproducing these would return a correct binary while the companion
     // silently never appeared -- the same trap the compile path guards against.
-    if (a == "-Map" && i + 1 < r.argv.size()) {
+    if ((a == "-Map" || a == "--Map" || a == "--dependency-file") &&
+        i + 1 < r.argv.size()) {
       r.extra_outputs.push_back(r.argv[++i]);
       r.key_args.push_back(a);
       continue;
     }
-    if (util::StartsWith(a, "-Wl,-Map=") || util::StartsWith(a, "-Wl,--Map=")) {
+    if (util::StartsWith(a, "-Map=") || util::StartsWith(a, "--Map=") ||
+        util::StartsWith(a, "--dependency-file=") ||
+        util::StartsWith(a, "-Wl,-Map=") ||
+        util::StartsWith(a, "-Wl,--Map=")) {
       r.extra_outputs.push_back(a.substr(a.find('=') + 1));
       r.key_args.push_back(a);
       continue;
@@ -100,6 +104,50 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     if (util::StartsWith(a, "-Wl,--dependency-file=")) {
       r.extra_outputs.push_back(a.substr(a.find('=') + 1));
       r.key_args.push_back(a);
+      continue;
+    }
+    if (util::StartsWith(a, "-Wl,-Map,") ||
+        util::StartsWith(a, "-Wl,--Map,") ||
+        util::StartsWith(a, "-Wl,--dependency-file,")) {
+      r.extra_outputs.push_back(a.substr(a.find(',', 4) + 1));
+      r.key_args.push_back(a);
+      continue;
+    }
+
+    // `-Xlinker` forwards exactly one following argument. Output-producing
+    // linker options commonly use `-Xlinker -Map -Xlinker out.map`; treating
+    // the second `-Xlinker` as the map filename loses the real side output and
+    // can turn a cache hit into a successful command with a stale map file.
+    if (a == "-Xlinker") {
+      if (i + 1 >= r.argv.size()) {
+        pending_uncacheable = "-Xlinker with no argument";
+        continue;
+      }
+      const std::string forwarded = r.argv[++i];
+      r.key_args.push_back(a);
+      r.key_args.push_back(forwarded);
+      if (forwarded == "--build-id=uuid") {
+        pending_uncacheable =
+            "--build-id=uuid produces a different binary every run";
+        continue;
+      }
+      if (forwarded == "-Map" || forwarded == "--Map" ||
+          forwarded == "--dependency-file") {
+        if (i + 2 >= r.argv.size() || r.argv[i + 1] != "-Xlinker") {
+          pending_uncacheable =
+              "an output-producing -Xlinker option has no forwarded value";
+          continue;
+        }
+        r.key_args.push_back(r.argv[++i]);
+        r.extra_outputs.push_back(r.argv[++i]);
+        r.key_args.push_back(r.extra_outputs.back());
+        continue;
+      }
+      if (util::StartsWith(forwarded, "-Map=") ||
+          util::StartsWith(forwarded, "--Map=") ||
+          util::StartsWith(forwarded, "--dependency-file=")) {
+        r.extra_outputs.push_back(forwarded.substr(forwarded.find('=') + 1));
+      }
       continue;
     }
 

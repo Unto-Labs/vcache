@@ -1413,6 +1413,37 @@ section "link caching"
 
 export VCACHE_LINK_CACHE=1
 
+# The tracer is part of the correctness boundary, so exercise it directly:
+# instrumentation must not change the errno seen by the tool, and a relative
+# openat path must be resolved against its directory fd rather than the cwd.
+mkdir -p "$WORK/tracer-openat/dir"
+printf 'input\n' > "$WORK/tracer-openat/dir/value"
+cat > "$WORK/tracer-openat/check.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+  int missing = open("definitely-missing", O_RDONLY);
+  if (missing >= 0 || errno != ENOENT) return 1;
+  int dir = open("dir", O_RDONLY | O_DIRECTORY);
+  if (dir < 0) return 2;
+  int input = openat(dir, "value", O_RDONLY);
+  if (input < 0) return 3;
+  close(input);
+  close(dir);
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-openat/check.c" -o "$WORK/tracer-openat/check"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+tracer_rc=$?
+check "the tracer preserves a failed call's errno" "$tracer_rc" "0"
+check "openat records the directory-fd-resolved input" \
+  "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
+      "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF
@@ -1519,6 +1550,48 @@ reset_cache
 check "a link with a map file hits" "$(hits)" "1"
 check "and the map file is replayed, not silently skipped" \
   "$([[ -s "$WORK/link-one/link.map" ]] && echo yes)" "yes"
+
+# The comma and -Xlinker spellings are equally real driver interfaces. Missing
+# either output would let a hit return success while leaving a stale map behind.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map,comma.map -o app-comma ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-comma comma.map && \
+    "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Wl,-Map,comma.map -o app-comma ) 2>/dev/null
+check "the comma-form map link hits" "$(hits)" "1"
+check "and its map file is replayed" \
+  "$([[ -s "$WORK/link-one/comma.map" ]] && echo yes)" "yes"
+
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Xlinker -Map -Xlinker xlinker.map -o app-xlinker ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-xlinker xlinker.map && \
+    "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -Xlinker -Map -Xlinker xlinker.map -o app-xlinker ) 2>/dev/null
+check "the -Xlinker map link hits" "$(hits)" "1"
+check "and its map file is replayed" \
+  "$([[ -s "$WORK/link-one/xlinker.map" ]] && echo yes)" "yes"
+
+# Out-of-band outputs still carry their digest in the checked blob. Corrupting
+# the sidecar must be a miss, never a successful hit returning corrupt bytes.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-verified ) 2>/dev/null
+sidecar=$(find "$VCACHE_DIR" -type f -name '*.linkout' -print -quit)
+printf 'corrupt\n' > "$sidecar"
+( cd "$WORK/link-one" && rm -f app-verified && \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-verified ) 2>/dev/null
+check "a corrupt link sidecar is not served as a hit" "$(hits)" "0"
+check "and the real linker repairs it on a miss" \
+  "$("$WORK/link-one/app-verified")" "7"
+
+# Read-only applies to the sidecars written outside Storage::Put too.
+reset_cache
+( cd "$WORK/link-one" && VCACHE_READONLY=1 \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-readonly ) 2>/dev/null
+check "read-only link caching writes no sidecar" \
+  "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l)" "0"
 
 # The two guards that decide whether an entry is sound enough to store are
 # worth breaking on purpose. A guard that has never been seen to fire is

@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 
@@ -120,6 +122,12 @@ bool LinkManifestStillHolds(const LinkManifestEntry& e, const RootMap& roots) {
       VCACHE_LOG("link manifest: a path that was absent now exists: " + local);
       return false;
     }
+    if (errno != ENOENT) {
+      // EACCES, EIO and friends do not prove absence. The original trace only
+      // records ENOENT, so require that same answer when validating a hit.
+      VCACHE_LOG("link manifest: cannot prove path is still absent: " + local);
+      return false;
+    }
   }
   return true;
 }
@@ -203,6 +211,17 @@ std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
 bool MaterializeOutputs(const storage::Blob& blob,
                         const std::vector<std::string>& outputs,
                         const std::string& cache_dir) {
+  std::vector<std::string> expected = outputs;
+  std::vector<std::string> stored_names;
+  stored_names.reserve(blob.files.size());
+  for (const storage::BlobFile& f : blob.files) stored_names.push_back(f.name);
+  std::sort(expected.begin(), expected.end());
+  std::sort(stored_names.begin(), stored_names.end());
+  if (expected != stored_names) {
+    VCACHE_LOG("link hit: cached output set does not match this invocation");
+    return false;
+  }
+
   for (const storage::BlobFile& f : blob.files) {
     const auto it = std::find(outputs.begin(), outputs.end(), f.name);
     if (it == outputs.end()) {
@@ -215,7 +234,21 @@ bool MaterializeOutputs(const storage::Blob& blob,
     // that way against 51 s to link outright, and peaked at more memory than
     // the linker used. Cloning the stored file is a reflink where the
     // filesystem allows one.
+    const bool valid_digest =
+        f.contents.size() == hash::kDigestHexLen &&
+        std::all_of(f.contents.begin(), f.contents.end(), [](unsigned char c) {
+          return std::isxdigit(c) != 0;
+        });
+    if (!valid_digest) {
+      VCACHE_LOG("link hit: cached output has an invalid content digest");
+      return false;
+    }
     const std::string stored = LinkOutputPath(cache_dir, f.contents);
+    const auto actual_digest = hash::HashFile(stored);
+    if (!actual_digest || *actual_digest != f.contents) {
+      VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
+      return false;
+    }
     if (!util::CloneFile(stored, f.name)) {
       VCACHE_LOG("link hit: stored output is gone or unreadable: " + stored);
       return false;
@@ -226,14 +259,13 @@ bool MaterializeOutputs(const storage::Blob& blob,
       // umask the file is 0600; adding all three execute bits unconditionally
       // would publish 0711 and let other users run a binary they cannot read.
       struct stat st;
-      if (::stat(f.name.c_str(), &st) == 0) {
-        const mode_t allowed = util::DefaultFileMode();
-        mode_t add = 0;
-        if (allowed & S_IRUSR) add |= S_IXUSR;
-        if (allowed & S_IRGRP) add |= S_IXGRP;
-        if (allowed & S_IROTH) add |= S_IXOTH;
-        ::chmod(f.name.c_str(), st.st_mode | add);
-      }
+      if (::stat(f.name.c_str(), &st) != 0) return false;
+      const mode_t allowed = util::DefaultFileMode();
+      mode_t add = 0;
+      if (allowed & S_IRUSR) add |= S_IXUSR;
+      if (allowed & S_IRGRP) add |= S_IXGRP;
+      if (allowed & S_IROTH) add |= S_IXOTH;
+      if (::chmod(f.name.c_str(), st.st_mode | add) != 0) return false;
     }
   }
   return true;
@@ -261,6 +293,22 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     // Without the tracer there is no absent set, and without an absent set a
     // hit cannot be shown to be sound. Decline rather than cache on a guess.
     VCACHE_LOG("uncacheable link: tracer not found at " + tracer);
+    RecordCounter(cache_dir, Counter::kUncacheable);
+    return RunPassthrough(argv);
+  }
+  if (!config.disk.enabled) {
+    // Link outputs are content-addressed sidecars in the disk cache. A remote
+    // blob alone only contains their digests and cannot materialise a hit.
+    VCACHE_LOG("uncacheable link: link caching requires the disk cache");
+    RecordCounter(cache_dir, Counter::kUncacheable);
+    return RunPassthrough(argv);
+  }
+  const char* inherited_preload = std::getenv("LD_PRELOAD");
+  if (inherited_preload != nullptr && *inherited_preload != '\0') {
+    // A preloaded library can change linker behaviour, and it is loaded before
+    // this tracer can observe it. Decline rather than key only its pathname and
+    // miss an in-place content change.
+    VCACHE_LOG("uncacheable link: an existing LD_PRELOAD is active");
     RecordCounter(cache_dir, Counter::kUncacheable);
     return RunPassthrough(argv);
   }
@@ -324,11 +372,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   util::ProcOptions opts;
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
-  const char* existing = std::getenv("LD_PRELOAD");
-  opts.env.emplace_back("LD_PRELOAD",
-                        (existing != nullptr && *existing != '\0')
-                            ? tracer + " " + existing
-                            : tracer);
+  opts.env.emplace_back("LD_PRELOAD", tracer);
   util::ProcResult result = util::Run(argv, opts);
 
   if (!result.stderr_data.empty()) {
@@ -365,9 +409,16 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     return 0;
   }
 
+  if (config.read_only) {
+    // The link has already run, but read-only means no sidecars or entries may
+    // be written. Staging a .linkout directly would bypass Storage::writable().
+    return 0;
+  }
+
   LinkManifestEntry fresh;
   hash::Hasher result_hasher;
   result_hasher.UpdateDelimited(pre_key);
+  result_hasher.UpdateDelimited("tools");
   for (const std::string& tool : trace.tools) {
     auto digest = hash::HashFile(tool);
     if (!digest) continue;
@@ -388,6 +439,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   }
   std::sort(named.begin(), named.end());
 
+  result_hasher.UpdateDelimited("inputs");
   for (const std::string& in : trace.inputs) {
     if (std::binary_search(named.begin(), named.end(), roots.Canonicalize(in))) {
       continue;
@@ -404,6 +456,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     result_hasher.UpdateDelimited(roots.Canonicalize(in));
     result_hasher.UpdateDelimited(*digest);
   }
+  result_hasher.UpdateDelimited("absent");
   for (const std::string& a : trace.absent) {
     fresh.absent.push_back(roots.Canonicalize(a));
     result_hasher.UpdateDelimited(roots.Canonicalize(a));

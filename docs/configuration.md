@@ -231,14 +231,23 @@ Declined, each because caching it would give a wrong or incomplete answer:
 | output to `/dev/null` or a stream | nothing to store |
 | no `-o` | the implied `a.out` is not worth an entry |
 | the tracer is missing or was not loaded | no absent set, so a hit cannot be shown to be sound |
+| the disk cache is disabled | large outputs are local content-addressed sidecars; the remote tier does not carry them |
+| an inherited `LD_PRELOAD` is active | a preloaded library can change the link before the tracer can observe it |
 
 The last one matters most. A statically linked linker, or a loader that ignores
 `LD_PRELOAD`, produces no process records; rather than cache on the assumption
 that the input set is complete, vcache declines.
 
-`-Map`, `-Wl,-Map=` and `-Wl,--dependency-file=` are captured as additional
-outputs and replayed, so a hit does not hand back the binary while the companion
-file silently fails to appear.
+`-Map`, the `-Wl,-Map=...` and `-Wl,-Map,...` forms, `-Xlinker -Map`, and the
+corresponding `--dependency-file` forms are captured as additional outputs and
+replayed, so a hit does not hand back the binary while the companion file
+silently fails to appear.
+
+Link outputs live content-addressed in the local disk cache and are verified
+against their recorded digest before every hit. S3 may carry the small manifest
+and result metadata, but link-output sidecars are deliberately local in this
+version; remote-only link caching is therefore declined. `VCACHE_READONLY=1`
+serves existing local link hits but writes neither metadata nor sidecars.
 
 ### Using it from CMake
 

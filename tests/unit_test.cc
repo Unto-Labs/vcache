@@ -139,6 +139,19 @@ void TestLinkArgs() {
   Check(!args::LooksLikeLinkInput("foo.c"), ".c is not a link input");
   Check(!args::LooksLikeLinkInput("libfoo.solid"), ".solid is not a shared lib");
 
+  // A value taken by the flag's length, not by searching for a separator:
+  // a path containing '=' or ',' splits in the wrong place otherwise, and the
+  // pre-key then hashes a path that does not exist.
+  auto odd = args::ParseLink(
+      {"gcc", "a.o", "-Wl,--version-script=/a=b/c,d/ver.map", "-o", "app"});
+  Check(std::find(odd.inputs.begin(), odd.inputs.end(),
+                  "/a=b/c,d/ver.map") != odd.inputs.end(),
+        "a script path containing = and , survives intact");
+  auto dashT = args::ParseLink({"gcc", "a.o", "-Wl,-T,/x,y/link.ld", "-o", "app"});
+  Check(std::find(dashT.inputs.begin(), dashT.inputs.end(), "/x,y/link.ld") !=
+            dashT.inputs.end(),
+        "-Wl,-T, takes its value by flag length");
+
   // -o attached to the flag.
   CheckEq(args::ParseLink({"gcc", "a.o", "-oapp"}).output, "app",
           "-oapp attached form");

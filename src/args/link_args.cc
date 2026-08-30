@@ -3,6 +3,7 @@
 #include "args/link_args.h"
 
 #include <algorithm>
+#include <string_view>
 
 #include "args/compiler_args.h"
 #include "util/fs.h"
@@ -119,11 +120,16 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
       r.key_args.push_back(a);
       continue;
     }
-    for (const char* p : {"-Wl,--version-script=", "-Wl,--dynamic-list=",
-                          "-Wl,-T,", "-Wl,--retain-symbols-file="}) {
-      if (util::StartsWith(a, p)) {
-        const size_t eq = a.find_last_of("=,");
-        if (eq != std::string::npos) r.inputs.push_back(a.substr(eq + 1));
+    // The value starts immediately after the flag, so take it by the flag's
+    // own length. Searching for the last '=' or ',' instead splits a path that
+    // contains either character in the wrong place, and hands the pre-key a
+    // path that does not exist.
+    for (std::string_view flag : {std::string_view("-Wl,--version-script="),
+                                  std::string_view("-Wl,--dynamic-list="),
+                                  std::string_view("-Wl,-T,"),
+                                  std::string_view("-Wl,--retain-symbols-file=")}) {
+      if (util::StartsWith(a, flag) && a.size() > flag.size()) {
+        r.inputs.push_back(a.substr(flag.size()));
         break;
       }
     }

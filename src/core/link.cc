@@ -132,18 +132,43 @@ std::string ComputePreKey(const args::LinkArgs& parsed, const RootMap& roots,
   h.UpdateDelimited(driver_id.fingerprint);
   h.UpdateDelimited(roots.Fingerprint());
   for (const std::string& a : parsed.key_args) {
-    h.UpdateDelimited(roots.Canonicalize(a));
+    // CanonicalizeText, not Canonicalize: the latter rewrites a path only when
+    // the whole string is one, so "-L/checkout/lib" and "-Wl,-rpath,/checkout"
+    // pass through untouched and make the key differ per checkout. A link
+    // command line is mostly paths embedded in flags, so prefix matching leaves
+    // almost all of them local -- which is why two checkouts of one revision
+    // derived different keys and shared nothing.
+    h.UpdateDelimited(roots.CanonicalizeText(a));
   }
   // Inputs named on the command line are hashed by content here, so a changed
   // object does not even reach the manifest lookup.
   for (const std::string& in : parsed.inputs) {
     auto digest = hash::HashFile(in);
-    h.UpdateDelimited(roots.Canonicalize(in));
+    h.UpdateDelimited(roots.CanonicalizeText(in));
     h.UpdateDelimited(digest ? *digest : std::string("<missing>"));
   }
   for (const char* name : kLinkEnvVars) {
     h.UpdateDelimited(name);
     h.UpdateDelimited(EnvOrEmpty(name));
+  }
+
+  // Per-group digests, so a key that differs between two checkouts can be
+  // narrowed to the group responsible by diffing two logs, rather than by
+  // bisecting the whole command line.
+  if (util::LoggingEnabled()) {
+    hash::Hasher ha, hi;
+    for (const std::string& a : parsed.key_args) {
+      ha.UpdateDelimited(roots.CanonicalizeText(a));
+    }
+    for (const std::string& in : parsed.inputs) {
+      auto d = hash::HashFile(in);
+      hi.UpdateDelimited(roots.CanonicalizeText(in));
+      hi.UpdateDelimited(d ? *d : std::string("<missing>"));
+    }
+    VCACHE_LOG("link key groups: driver=" + driver_id.fingerprint.substr(0, 16) +
+               " roots=" + roots.Fingerprint() +
+               " args=" + ha.Hex().substr(0, 16) +
+               " inputs=" + hi.Hex().substr(0, 16));
   }
   return h.Hex();
 }

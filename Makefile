@@ -170,6 +170,11 @@ else
   DEBUG_FMT_LD :=
 endif
 
+# The probe file has served its purpose. Without this every make invocation --
+# including `make -n` and `make clean` -- leaves one behind in $TMPDIR forever;
+# 223 of them had accumulated here across two months of development.
+PROBE_CLEANUP := $(shell rm -f $(PROBE_SRC))
+
 CXXFLAGS := -std=c++20 $(OPT) $(LTO) $(SECTIONS) $(DEBUG_FMT) $(WARN) $(INCLUDES) \
             -pthread -DTOML_EXCEPTIONS=0 -fno-strict-aliasing
 # Only third-party C (BLAKE3) is compiled with these.

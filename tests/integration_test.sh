@@ -29,6 +29,20 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 skipped() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+
+# BSD sed -i wants a backup suffix and GNU sed -i must not have one separated
+# from it, so no single spelling works on both -- and getting it wrong makes sed
+# read the *filename* as its script. Edit through a temporary instead, writing
+# back with cat so the file keeps its mode; one of these files is an executable.
+sed_inplace() {
+  local script=$1 file=$2
+  sed "$script" "$file" > "$file.sed.tmp" && cat "$file.sed.tmp" > "$file"
+  rm -f "$file.sed.tmp"
+}
+
+# True when the C compiler called `gcc` is really clang, as it is on macOS.
+# Some expectations differ between the two and are not about vcache being wrong.
+cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 export VCACHE_DIR="$WORK/cache"
@@ -755,7 +769,8 @@ except Exception: sys.exit(1)
 
   # A cap just under the total forces at least one eviction; the 80% target
   # means it keeps going past the cap itself.
-  total_bytes=$(find "$S3DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s}')
+    # find -printf is GNU's; concatenating and counting bytes is exact everywhere.
+  total_bytes=$(find "$S3DIR" -type f -exec cat {} + | wc -c | tr -d ' ')
   VCACHE_S3_TTL_DAYS=0 VCACHE_S3_CACHE_SIZE="$((total_bytes - 1))" \
     "$VCACHE" --trim > "$WORK/trim2.out" 2>&1
   after=$(find "$S3DIR" -type f | wc -l | tr -d " ")
@@ -1083,7 +1098,7 @@ scan_a
 check "editing an indirect header invalidates the entry" "$(misses)" "2"
 
 # Restoring it exactly must hit again -- the manifest compares content, not mtime.
-sed -i '$ d' "$WORK/dep-a/inc/base.h"
+sed_inplace '$ d' "$WORK/dep-a/inc/base.h"
 touch "$WORK/dep-a/inc/base.h"
 scan_a
 check "restoring the header hits again despite a new mtime" "$(hits)" "2"
@@ -1244,7 +1259,15 @@ check "a compile with linker flags is a miss" "$(misses)" "1"
 ( cd "$WORK/link" && VCACHE_ROOTS="$WORK/link=proj" \
     "$VCACHE" gcc -O2 -L/somewhere/else -Wl,-rpath,/opt -rdynamic -s \
     -c l.c -o "$WORK/l2.o" ) 2>/dev/null
-check "different linker flags hit the same entry" "$(hits)" "1"
+if cc_is_clang; then
+  # Deliberate, and the opposite answer for a good reason: clang names an unused
+  # linker flag in a warning, vcache stores that warning and replays it on a
+  # hit, so the flags have to be in the key or the replayed text would report a
+  # flag the caller never passed. gcc ignores them in silence, so they do not.
+  check "different linker flags are a separate entry under clang" "$(misses)" "2"
+else
+  check "different linker flags hit the same entry" "$(hits)" "1"
+fi
 
 # The served object has to be what the compiler would have produced, not merely
 # something: a key that drops too much is a wrong answer, not a slow one.
@@ -1296,7 +1319,12 @@ if command -v clang >/dev/null 2>&1; then
       "$VCACHE" clang -O2 -c -I include src/lib.cc -o "$WORK/cc1.o" ) 2>/dev/null
   ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
       "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/gg1.o" ) 2>/dev/null
-  check "clang and gcc do not share an entry" "$(misses)" "2"
+  if [[ "$(clang --version 2>/dev/null | head -1)" == "$(gcc --version 2>/dev/null | head -1)" ]]; then
+    # macOS ships one compiler under both names, so sharing the entry is right.
+    skipped "clang and gcc are the same compiler here"
+  else
+    check "clang and gcc do not share an entry" "$(misses)" "2"
+  fi
 
   # The Firedancer sequence sccache could not cache. It must cache here, and
   # still hit from a different directory.
@@ -1513,7 +1541,7 @@ check "and the objects are byte-identical" \
 # The mapping must not paper over a genuinely different compiler: only the part
 # of the banner that names a mapped path is normalised away.
 reset_cache
-sed -i 's/mycc version 1.0/mycc version 2.0/' "$WORK/a-considerably-longer-cc-two/bin/mycc"
+sed_inplace 's/mycc version 1.0/mycc version 2.0/' "$WORK/a-considerably-longer-cc-two/bin/mycc"
 ( cd "$WORK/cc-one" && \
   "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 ( cd "$WORK/a-considerably-longer-cc-two" && \

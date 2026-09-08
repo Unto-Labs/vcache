@@ -49,6 +49,32 @@ linked_libraries() {
   fi
 }
 
+# When two checkouts fail to share an entry, the useful question is what their
+# preprocessed text disagrees about -- that text is the cache key. Answer it
+# here rather than leave someone to reconstruct the compile by hand from a bare
+# "expected 1, got 0".
+explain_cross_checkout_miss() {
+  local dir_a=$1 spec_a=$2 dir_b=$3 spec_b=$4; shift 4
+  local la="$WORK/miss-a.log" lb="$WORK/miss-b.log"
+  rm -f "$la" "$lb"
+  ( cd "$dir_a" && VCACHE_ROOTS="$spec_a" VCACHE_LOG="$la" "$VCACHE" "$@" ) >/dev/null 2>&1
+  ( cd "$dir_b" && VCACHE_ROOTS="$spec_b" VCACHE_LOG="$lb" "$VCACHE" "$@" ) >/dev/null 2>&1
+  printf '       A %s\n' "$(grep -o 'key input.*' "$la" 2>/dev/null | head -1)"
+  printf '       B %s\n' "$(grep -o 'key input.*' "$lb" 2>/dev/null | head -1)"
+  local ca cb
+  ca=$(sed -n 's/.*\] preprocess: //p' "$la" 2>/dev/null | head -1)
+  cb=$(sed -n 's/.*\] preprocess: //p' "$lb" 2>/dev/null | head -1)
+  printf '       A prefix maps: %s\n' "$(printf '%s' "$ca" | tr ' ' '\n' | grep -c 'prefix-map')"
+  ( cd "$dir_a" && eval "$ca" ) > "$WORK/pp-a.i" 2>/dev/null
+  ( cd "$dir_b" && eval "$cb" ) > "$WORK/pp-b.i" 2>/dev/null
+  if cmp -s "$WORK/pp-a.i" "$WORK/pp-b.i"; then
+    printf '       preprocessed text is identical; the key differs elsewhere\n'
+  else
+    printf '       preprocessed text differs:\n'
+    diff "$WORK/pp-a.i" "$WORK/pp-b.i" 2>/dev/null | head -8 | sed 's/^/         /'
+  fi
+}
+
 # Counter helpers read straight from --show-stats.
 stat_of() { "$VCACHE" --show-stats | grep -F "$1" | awk '{print $NF}'; }
 hits()   { stat_of "cache hit (disk)"; }
@@ -95,7 +121,15 @@ check "first compile is a miss" "$(misses)" "1"
 
 ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
     "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/b.o" ) 2>/dev/null
-check "second checkout hits the cache" "$(hits)" "1"
+if [[ "$(hits)" == "1" ]]; then
+  ok "second checkout hits the cache"
+else
+  bad "second checkout hits the cache (got $(hits))"
+  explain_cross_checkout_miss \
+    "$WORK/checkout-a" "$WORK/checkout-a=proj" \
+    "$WORK/checkout-b" "$WORK/checkout-b=proj" \
+    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/diag.o"
+fi
 
 if cmp -s "$WORK/a.o" "$WORK/b.o"; then
   ok "objects from both checkouts are byte-identical"
@@ -535,7 +569,7 @@ for n in 1 2 3; do
 done
 VCACHE_CACHE_SIZE=10K "$VCACHE" --trim >/dev/null
 check "global trim preserves a skewed shard below the total budget" \
-  "$(find "$VCACHE_DIR/aa" -type f | wc -l)" "3"
+  "$(find "$VCACHE_DIR/aa" -type f | wc -l | tr -d " ")" "3"
 
 # --------------------------------------------------------------------------
 section "11. S3 layer (against a mock object store)"
@@ -567,7 +601,7 @@ except Exception: sys.exit(1)
   ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s1.o" ) 2>/dev/null
   check "compile with s3 enabled is a miss" "$(misses)" "1"
-  objects_written=$(find "$S3DIR" -type f 2>/dev/null | wc -l)
+  objects_written=$(find "$S3DIR" -type f 2>/dev/null | wc -l | tr -d " ")
   check "entry was uploaded to s3" "$objects_written" "1"
   # One store, both layers. Asserted before the local layer is wiped below,
   # since that would otherwise destroy the only evidence -- and the disk hit
@@ -621,17 +655,17 @@ except Exception: sys.exit(1)
 
   # --- trim -----------------------------------------------------------------
 
-  before=$(find "$S3DIR" -type f | wc -l)
+  before=$(find "$S3DIR" -type f | wc -l | tr -d " ")
   check "one object present before trimming" "$before" "1"
 
   # Nothing to enforce: no ttl and no cap must leave the bucket alone.
   VCACHE_S3_TTL_DAYS=0 "$VCACHE" --trim >/dev/null 2>&1
-  check "trim with nothing configured deletes nothing" "$(find "$S3DIR" -type f | wc -l)" "1"
+  check "trim with nothing configured deletes nothing" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "1"
 
   # Expired by age.
   backdate "40 days ago"
   "$VCACHE" --trim > "$WORK/trim.out" 2>&1
-  check "trim deletes an expired object" "$(find "$S3DIR" -type f | wc -l)" "0"
+  check "trim deletes an expired object" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "0"
   if grep -q 'deleted 1 expired' "$WORK/trim.out"; then
     ok "trim reports what it deleted"
   else
@@ -647,7 +681,7 @@ except Exception: sys.exit(1)
     # Distinct ages so eviction order is well defined.
     find "$S3DIR" -type f -newermt "-1 minute" -exec touch -d "$((4 - n)) days ago" {} +
   done
-  check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l)" "3"
+  check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "3"
 
   kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
   MOCK_S3_PAGE_SIZE=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
@@ -667,7 +701,7 @@ except Exception: sys.exit(1)
   total_bytes=$(find "$S3DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s}')
   VCACHE_S3_TTL_DAYS=0 VCACHE_S3_CACHE_SIZE="$((total_bytes - 1))" \
     "$VCACHE" --trim > "$WORK/trim2.out" 2>&1
-  after=$(find "$S3DIR" -type f | wc -l)
+  after=$(find "$S3DIR" -type f | wc -l | tr -d " ")
   if [[ "$after" -lt 3 && "$after" -ge 1 ]]; then
     ok "trim evicts down to the byte budget across a paged listing"
   else
@@ -1646,7 +1680,7 @@ reset_cache
 ( cd "$WORK/link-one" && VCACHE_READONLY=1 \
     "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-readonly ) 2>/dev/null
 check "read-only link caching writes no sidecar" \
-  "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l)" "0"
+  "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l | tr -d " ")" "0"
 
 # The two guards that decide whether an entry is sound enough to store are
 # worth breaking on purpose. A guard that has never been seen to fire is

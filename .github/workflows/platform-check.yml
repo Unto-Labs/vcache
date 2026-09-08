@@ -21,6 +21,9 @@ jobs:
   check:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    # The suite takes well under a minute everywhere it passes. A run that
+    # reaches this has hung, and on macOS that costs ten times the minutes.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

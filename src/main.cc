@@ -218,8 +218,17 @@ int main(int argc, char** argv) {
   if (masquerading) {
     // Resolve the real compiler on $PATH, skipping this binary so the symlink
     // cannot invoke itself.
-    const std::string self_real =
-        vcache::util::RealPath("/proc/self/exe").value_or("");
+    const std::string self_real = vcache::util::SelfPath().value_or("");
+    if (self_real.empty()) {
+      // Without knowing our own path the skip below does nothing, the symlink
+      // finds itself first, and vcache executes itself until the machine gives
+      // up. Refusing is the only safe answer.
+      ::fprintf(stderr,
+                "vcache: cannot determine its own path; refusing to masquerade "
+                "as %s\n",
+                self_base.c_str());
+      return 127;
+    }
     auto real = vcache::util::FindInPath(self_base, self_real);
     if (!real) {
       ::fprintf(stderr, "vcache: cannot find a real %s on PATH\n", self_base.c_str());

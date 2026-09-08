@@ -13,6 +13,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include <cerrno>
 #include <cstdio>
@@ -328,6 +331,23 @@ std::vector<FileEntry> ListFilesRecursive(const std::string& root) {
                             static_cast<int64_t>(st.st_mtime)});
   }
   return out;
+}
+
+std::optional<std::string> SelfPath() {
+#if defined(__APPLE__)
+  // Darwin has no procfs. _NSGetExecutablePath reports the buffer it needs
+  // through the same out-parameter, and the path it gives back may be relative
+  // or contain symlinks, so it still goes through realpath.
+  uint32_t size = 0;
+  ::_NSGetExecutablePath(nullptr, &size);
+  if (size == 0) return std::nullopt;
+  std::string buf(size, '\0');
+  if (::_NSGetExecutablePath(buf.data(), &size) != 0) return std::nullopt;
+  buf.resize(std::strlen(buf.c_str()));
+  return RealPath(buf);
+#else
+  return RealPath("/proc/self/exe");
+#endif
 }
 
 std::optional<std::string> FindInPath(const std::string& name,

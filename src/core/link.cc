@@ -186,7 +186,7 @@ std::string ComputePreKey(const args::LinkArgs& parsed, const RootMap& roots,
 std::string TracerPath() {
   const char* override_path = std::getenv("VCACHE_TRACER");
   if (override_path != nullptr && *override_path != '\0') return override_path;
-  auto self = util::RealPath("/proc/self/exe");
+  auto self = util::SelfPath();
   if (!self) return "";
   return util::DirName(*self) + "/vcache-fstrace.so";
 }

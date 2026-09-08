@@ -25,6 +25,30 @@ section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 export VCACHE_DIR="$WORK/cache"
 
+# Dumps the paths an object records in its debug info. readelf is GNU's; macOS
+# has dwarfdump. Both are asked for the compilation-unit info; `strings` is the
+# last resort and is enough for "does this path appear at all", which is all
+# these checks ask. Without this the greps below found nothing on macOS, which
+# failed one check and silently *passed* its negated twin.
+debug_info() {
+  if command -v readelf >/dev/null 2>&1; then
+    readelf --debug-dump=info "$1" 2>/dev/null
+  elif command -v dwarfdump >/dev/null 2>&1; then
+    dwarfdump --debug-info "$1" 2>/dev/null
+  else
+    strings "$1" 2>/dev/null
+  fi
+}
+
+# The shared libraries a binary needs at load time, one per line.
+linked_libraries() {
+  if command -v readelf >/dev/null 2>&1; then
+    readelf -d "$1" 2>/dev/null | grep NEEDED
+  elif command -v otool >/dev/null 2>&1; then
+    otool -L "$1" 2>/dev/null | tail -n +2
+  fi
+}
+
 # Counter helpers read straight from --show-stats.
 stat_of() { "$VCACHE" --show-stats | grep -F "$1" | awk '{print $NF}'; }
 hits()   { stat_of "cache hit (disk)"; }
@@ -80,12 +104,12 @@ else
 fi
 
 # The canonical prefix must be what actually landed in the debug info.
-if readelf --debug-dump=info "$WORK/a.o" 2>/dev/null | grep -q "/vcache/proj"; then
+if debug_info "$WORK/a.o" | grep -q "/vcache/proj"; then
   ok "debug info records the canonical path"
 else
   bad "debug info records the canonical path"
 fi
-if readelf --debug-dump=info "$WORK/a.o" 2>/dev/null | grep -q "checkout-a"; then
+if debug_info "$WORK/a.o" | grep -q "checkout-a"; then
   bad "debug info leaks the local path"
 else
   ok "debug info does not leak the local path"
@@ -110,6 +134,28 @@ if cmp -s "$WORK/build-a/out.o" "$WORK/build-b/out.o"; then
 else
   bad "out-of-tree objects are byte-identical"
 fi
+
+# A root reached through a symlink must map the same as one reached directly.
+# vcache resolves the root it is given, but the compiler is handed whatever the
+# build system wrote -- and on macOS $TMPDIR lives under /var, a symlink to
+# /private/var, so this is the ordinary case there rather than a corner.
+reset_cache
+mkdir -p "$WORK/symlinked"
+ln -sfn "$WORK/checkout-a" "$WORK/symlinked/via-link"
+
+( cd "$WORK/build-a" && VCACHE_ROOTS="$WORK/symlinked/via-link=proj" \
+    "$VCACHE" g++ -g -c -I "$WORK/symlinked/via-link/include" \
+    "$WORK/symlinked/via-link/src/lib.cc" -o sym.o ) 2>/dev/null
+check "a root given through a symlink compiles" "$?" "0"
+check "and records the canonical path, not the link" \
+  "$(debug_info "$WORK/build-a/sym.o" | grep -c 'symlinked/via-link')" "0"
+
+( cd "$WORK/build-b" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+    "$VCACHE" g++ -g -c -I "$WORK/checkout-a/include" \
+    "$WORK/checkout-a/src/lib.cc" -o sym.o ) 2>/dev/null
+check "the same tree by its real path hits that entry" "$(hits)" "1"
+check "and the objects are byte-identical" \
+  "$(cmp -s "$WORK/build-a/sym.o" "$WORK/build-b/sym.o" && echo same)" "same"
 
 # --------------------------------------------------------------------------
 section "3. dependency files are replayed with local paths"
@@ -299,12 +345,12 @@ rm -f "$WORK/p2.o"
     -ffile-prefix-map="$WORK/checkout-a"=/somewhere \
     -c -I include src/lib.cc -o "$WORK/p2.o" ) 2>/dev/null
 check "--vcache-allow-prefix-maps compiles" "$?" "0"
-if readelf --debug-dump=info "$WORK/p2.o" 2>/dev/null | grep -q "/somewhere"; then
+if debug_info "$WORK/p2.o" | grep -q "/somewhere"; then
   bad "override drops the caller's mapping"
 else
   ok "override drops the caller's mapping"
 fi
-if readelf --debug-dump=info "$WORK/p2.o" 2>/dev/null | grep -q "/vcache/proj"; then
+if debug_info "$WORK/p2.o" | grep -q "/vcache/proj"; then
   ok "override applies vcache's mapping instead"
 else
   bad "override applies vcache's mapping instead"
@@ -348,7 +394,7 @@ rm -f "$WORK/p6.o"
     -c -I include src/lib.cc -o "$WORK/p6.o" ) 2>/dev/null
 check "policy=keep compiles" "$?" "0"
 check "policy=keep does not cache" "$(uncacheable)" "1"
-if readelf --debug-dump=info "$WORK/p6.o" 2>/dev/null | grep -q "/somewhere"; then
+if debug_info "$WORK/p6.o" | grep -q "/somewhere"; then
   ok "policy=keep preserves the caller's mapping"
 else
   bad "policy=keep preserves the caller's mapping"
@@ -810,7 +856,7 @@ section "12. runtime dependencies stay minimal"
 
 # vcache runs once per compilation, so every DT_NEEDED entry is mapped and
 # relocated on every invocation. libcurl alone drags in ~30 shared objects.
-needed="$(readelf -d "$VCACHE" 2>/dev/null | grep NEEDED)"
+needed="$(linked_libraries "$VCACHE")"
 if grep -q "libcurl" <<<"$needed"; then
   bad "libcurl is not a link-time dependency"
 else
@@ -821,11 +867,13 @@ if grep -qE "libcrypto|libssl" <<<"$needed"; then
 else
   ok "OpenSSL is not a link-time dependency"
 fi
-ldd_count="$(ldd "$VCACHE" 2>/dev/null | wc -l)"
-if [[ "$ldd_count" -le 6 ]]; then
-  ok "ldd closure is small ($ldd_count entries)"
+# Counted through the same helper so the number means something on macOS too,
+# where there is no ldd and this silently reported an empty closure.
+lib_count="$(linked_libraries "$VCACHE" | wc -l | tr -d ' ')"
+if [[ "$lib_count" -ge 1 && "$lib_count" -le 6 ]]; then
+  ok "link-time closure is small ($lib_count entries)"
 else
-  bad "ldd closure is small (got $ldd_count entries)"
+  bad "link-time closure is small (got $lib_count entries)"
 fi
 
 # The dlopen must actually be conditional, not merely deferred to startup.

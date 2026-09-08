@@ -58,6 +58,14 @@ std::optional<int64_t> FileMtime(const std::string& path);
 // Returns the absolute, symlink-resolved path, or nullopt if it does not exist.
 std::optional<std::string> RealPath(const std::string& path);
 
+// The absolute, symlink-resolved path of the running executable.
+//
+// Masquerade mode depends on this: invoked through a symlink named `g++`,
+// vcache walks $PATH for the real one and must skip itself. Without an answer
+// here that skip does nothing, the first candidate found is the symlink again,
+// and vcache executes itself forever.
+std::optional<std::string> SelfPath();
+
 // Lexical absolute path: prepends the cwd if needed and removes `.`/`..`
 // components without touching the filesystem. Unlike RealPath this works for
 // paths that do not exist yet.

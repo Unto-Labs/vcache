@@ -131,6 +131,25 @@ RootMap RootMap::FromSpecs(const std::vector<std::string>& specs,
     }
     used_canonicals.insert(unique);
     map.roots_.push_back(Root{abs, unique});
+
+    // The spelling the caller used, when a symlink makes it differ from the
+    // resolved one, mapped to the *same* canonical prefix.
+    //
+    // Resolving is what lets two spellings of one tree agree, but resolving
+    // alone only teaches vcache the resolved spelling -- and the compiler is
+    // handed whatever the build system wrote. On macOS that is the common case
+    // rather than a corner: $TMPDIR lives under /var, which is a symlink to
+    // /private/var, so a root given as /var/... never matches a source given as
+    // /var/..., and nothing is remapped at all. Both spellings are the same
+    // tree, so both earn the same prefix.
+    const std::string lexical = StripTrailingSlashes(util::AbsoluteLexical(path_part));
+    if (lexical != abs && !lexical.empty() && lexical != "/") {
+      bool taken = false;
+      for (const Root& r : map.roots_) {
+        if (r.path == lexical) taken = true;
+      }
+      if (!taken) map.roots_.push_back(Root{lexical, unique});
+    }
   }
 
   map.SortRoots();
@@ -371,9 +390,18 @@ std::string RootMap::LocalizeText(const std::string& text) const {
   std::vector<const Root*> by_canonical;
   by_canonical.reserve(roots_.size());
   for (const Root& r : roots_) by_canonical.push_back(&r);
+  // Longest canonical first so a nested root is not shadowed by its parent, and
+  // a total order beyond that: two roots can share a canonical prefix, and
+  // which local spelling the text gets back must not depend on sort stability.
+  // The shorter path wins, which is the spelling the caller wrote when the
+  // other is a resolved symlink.
   std::sort(by_canonical.begin(), by_canonical.end(),
             [](const Root* a, const Root* b) {
-              return a->canonical.size() > b->canonical.size();
+              if (a->canonical.size() != b->canonical.size()) {
+                return a->canonical.size() > b->canonical.size();
+              }
+              if (a->path.size() != b->path.size()) return a->path.size() < b->path.size();
+              return a->path < b->path;
             });
   for (const Root* r : by_canonical) {
     out = ReplaceAll(std::move(out), r->canonical, r->path);
@@ -396,11 +424,14 @@ std::string RootMap::Localize(std::string_view path) const {
 
 std::string RootMap::Fingerprint() const {
   // Canonical targets only, sorted so the key does not depend on the order the
-  // roots happened to be configured in.
+  // roots happened to be configured in, and deduplicated so that an alias --
+  // two spellings of one tree sharing a prefix -- does not change the key. A
+  // tree reached through a symlink must key the same as one reached directly.
   std::vector<std::string> canonicals;
   canonicals.reserve(roots_.size());
   for (const Root& r : roots_) canonicals.push_back(r.canonical);
   std::sort(canonicals.begin(), canonicals.end());
+  canonicals.erase(std::unique(canonicals.begin(), canonicals.end()), canonicals.end());
 
   std::string out;
   for (const std::string& c : canonicals) {

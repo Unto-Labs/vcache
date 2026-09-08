@@ -252,7 +252,7 @@ DEPS     := $(ALL_OBJS:.o=.d)
 
 # ---- targets ----------------------------------------------------------------
 
-.PHONY: all deps test clean distclean boost-subset
+.PHONY: all deps test kernel-test clean distclean boost-subset
 
 all: $(BINDIR)/vcache $(TRACER_SO)
 
@@ -281,6 +281,12 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 test: $(BINDIR)/vcache_test $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test
 	@$(TOP)/tests/integration_test.sh
+
+# Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and
+# takes minutes. Pass options through with KERNEL_TEST_ARGS, e.g.
+#   make kernel-test KERNEL_TEST_ARGS="--versions 6.19.13,6.19.14 --keep"
+kernel-test: $(BINDIR)/vcache
+	@$(TOP)/tests/linux_kernel_test.sh --vcache $(BINDIR)/vcache $(KERNEL_TEST_ARGS)
 
 $(OBJDIR)/%.o: $(TOP)/%.cc
 	@mkdir -p $(dir $@)

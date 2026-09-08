@@ -1689,5 +1689,48 @@ unset VCACHE_LINK_CACHE
 fi
 
 # --------------------------------------------------------------------------
+section "17. kbuild-shaped command lines"
+
+# The Linux kernel never spells the dependency flags the way the driver does.
+# Every compile it runs carries -Wp,-MMD,<file>, and the host tools it builds
+# under tools/ add -Wp,-MT,<target> with both paths absolute. Treating -Wp, as
+# one opaque flag put those paths in the cache key, which is enough on its own
+# to stop two checkouts of the same tree ever sharing an entry.
+
+reset_cache
+for dir in "$WORK/kb-one" "$WORK/kb-two"; do
+  mkdir -p "$dir/sub"
+  printf '#include <h.h>\nint f(void){return X;}\n' > "$dir/sub/a.c"
+  printf '#define X 1\n' > "$dir/sub/h.h"
+done
+
+( cd "$WORK/kb-one" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc \
+    "-Wp,-MMD,$PWD/sub/.a.o.d" "-Wp,-MT,$PWD/sub/a.o" -I "$PWD/sub" \
+    -c sub/a.c -o "$PWD/sub/a.o" )
+check "a kbuild-shaped compile is cached" "$(misses)" "1"
+check "and the dependency file is written" \
+  "$([[ -s "$WORK/kb-one/sub/.a.o.d" ]] && echo yes)" "yes"
+
+( cd "$WORK/kb-two" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc \
+    "-Wp,-MMD,$PWD/sub/.a.o.d" "-Wp,-MT,$PWD/sub/a.o" -I "$PWD/sub" \
+    -c sub/a.c -o "$PWD/sub/a.o" )
+check "and the same compile in another directory hits" "$(hits)" "1"
+check "with a byte-identical object" \
+  "$(cmp -s "$WORK/kb-one/sub/a.o" "$WORK/kb-two/sub/a.o" && echo same)" "same"
+
+# The depfile has to come back on the hit as well -- kbuild feeds it straight
+# to fixdep, which fails outright if it is missing -- and it has to name paths
+# in *this* tree, not the one the entry was stored from.
+check "the dependency file is replayed on the hit" \
+  "$([[ -s "$WORK/kb-two/sub/.a.o.d" ]] && echo yes)" "yes"
+check "naming this tree's target" \
+  "$(grep -cF "$WORK/kb-two/sub/a.o" "$WORK/kb-two/sub/.a.o.d")" "1"
+check "and this tree's prerequisites" \
+  "$(grep -cF "$WORK/kb-two/sub/h.h" "$WORK/kb-two/sub/.a.o.d")" "1"
+check "with nothing left pointing at the other tree" \
+  "$(grep -cF "$WORK/kb-one" "$WORK/kb-two/sub/.a.o.d")" "0"
+
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -157,6 +157,69 @@ bool IsDepFlag(std::string_view arg) {
   return StartsWith(arg, "-MF") || StartsWith(arg, "-MT") || StartsWith(arg, "-MQ");
 }
 
+// -Wp, hands its comma-separated payload straight to the preprocessor,
+// bypassing the driver's own option table. kbuild generates every dependency
+// file that way -- `-Wp,-MMD,<file>` for the kernel proper, and
+// `-Wp,-MD,<file> -Wp,-MT,<target>` for the host tools under tools/ -- so a
+// parser that treats `-Wp,...` as one opaque flag both misses the dependency
+// file entirely and puts its path in the cache key. The host-tool paths are
+// absolute, which is enough on its own to stop two checkouts ever agreeing.
+//
+// Rewriting them into the driver spellings hands them to the dependency
+// handling further down, which already keeps the path out of the key and
+// canonicalises the file itself. Anything else inside a -Wp, is left exactly
+// as it was.
+//
+// Under -Wp, the options that take a value take it as the *next* comma field,
+// which is why this cannot be a simple textual substitution.
+void RewritePreprocessorDepOptions(std::vector<std::string>* argv) {
+  std::vector<std::string> out;
+  out.reserve(argv->size());
+
+  for (const std::string& arg : *argv) {
+    if (!StartsWith(arg, "-Wp,")) {
+      out.push_back(arg);
+      continue;
+    }
+    const std::vector<std::string> fields = util::Split(arg.substr(4), ',');
+    std::vector<std::string> residual;
+    bool rewrote = false;
+
+    for (size_t i = 0; i < fields.size(); ++i) {
+      const std::string& field = fields[i];
+      // Value-taking forms. -MD/-MMD name the file directly here, where the
+      // driver would derive it from the output stem, so they become the driver
+      // spelling plus an explicit -MF.
+      if ((field == "-MD" || field == "-MMD" || field == "-MF" ||
+           field == "-MT" || field == "-MQ") &&
+          i + 1 < fields.size()) {
+        out.push_back(field);
+        if (field == "-MD" || field == "-MMD") out.push_back("-MF");
+        out.push_back(fields[++i]);
+        rewrote = true;
+        continue;
+      }
+      // Bare flags that mean the same thing at both levels. -M and -MM are
+      // deliberately absent: to the driver they also imply -E, which is a
+      // different invocation from the one the caller asked for.
+      if (field == "-MP" || field == "-MG") {
+        out.push_back(field);
+        rewrote = true;
+        continue;
+      }
+      residual.push_back(field);
+    }
+
+    if (!rewrote) {
+      out.push_back(arg);  // unchanged, byte for byte
+    } else if (!residual.empty()) {
+      out.push_back("-Wp," + util::Join(residual, ","));
+    }
+  }
+
+  argv->swap(out);
+}
+
 std::string Extension(const std::string& path) {
   const std::string base = util::BaseName(path);
   size_t dot = base.find_last_of('.');
@@ -348,6 +411,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     result.argv = raw_argv;
     return result;
   }
+  RewritePreprocessorDepOptions(&result.argv);
   result.compiler = result.argv[0];
 
   std::vector<std::string> sources;

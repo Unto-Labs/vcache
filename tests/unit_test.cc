@@ -1008,6 +1008,55 @@ void TestCompilerArgs() {
     }
   }
   Check(!dep_flag_in_base, "dependency flags are kept out of base_args");
+
+  // kbuild never spells the dependency flags the way the driver does: it hands
+  // them to the preprocessor with -Wp,. Left opaque, the depfile path -- which
+  // is absolute for everything the kernel builds under tools/ -- lands in the
+  // cache key, and no two checkouts ever agree on it.
+  {
+    auto wp = args::Parse({"gcc", "-Wp,-MMD,dir/.f.o.d", "-c", "f.c", "-o",
+                           "dir/f.o"});
+    Check(wp.generates_deps, "-Wp,-MMD names a dependency file");
+    CheckEq(wp.depfile, "dir/.f.o.d", "and vcache knows where it goes");
+    for (const std::string& arg : wp.base_args) {
+      Check(arg.find("-Wp,") == std::string::npos,
+            "the -Wp, form is not passed through to the preprocessor");
+    }
+    for (const std::string& arg : wp.key_args) {
+      Check(arg.find("dir/.f.o.d") == std::string::npos,
+            "and the depfile path stays out of the key");
+    }
+
+    // The host tools under tools/ use the two-flag form with absolute paths.
+    auto wp_mt = args::Parse({"gcc", "-Wp,-MD,/abs/b/.f.o.d", "-Wp,-MT,/abs/b/f.o",
+                              "-c", "f.c", "-o", "/abs/b/f.o"});
+    CheckEq(wp_mt.depfile, "/abs/b/.f.o.d", "-Wp,-MD names the file");
+    Check(wp_mt.dep_target_explicit, "-Wp,-MT is an explicit target");
+    bool keyed_target = false;
+    for (const std::string& arg : wp_mt.key_args) {
+      if (arg == "/abs/b/f.o") keyed_target = true;
+    }
+    Check(keyed_target,
+          "the -Wp, target is keyed, since it is written into the depfile");
+
+    // Anything inside a -Wp, that is not a dependency option is left exactly
+    // as it was, because it may well affect the generated code.
+    auto wp_other = args::Parse({"gcc", "-Wp,-D,FOO", "-c", "f.c", "-o", "f.o"});
+    bool kept = false;
+    for (const std::string& arg : wp_other.base_args) {
+      if (arg == "-Wp,-D,FOO") kept = true;
+    }
+    Check(kept, "a non-dependency -Wp, is passed through untouched");
+
+    auto wp_mixed =
+        args::Parse({"gcc", "-Wp,-MMD,f.d,-D,FOO", "-c", "f.c", "-o", "f.o"});
+    CheckEq(wp_mixed.depfile, "f.d", "a mixed -Wp, still yields the depfile");
+    bool residual = false;
+    for (const std::string& arg : wp_mixed.base_args) {
+      if (arg == "-Wp,-D,FOO") residual = true;
+    }
+    Check(residual, "and the rest of it survives as its own -Wp,");
+  }
   bool has_mp = false, has_mmd = false;
   for (const std::string& arg : full_deps.dep_args) {
     if (arg == "-MP") has_mp = true;

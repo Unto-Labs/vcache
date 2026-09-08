@@ -160,7 +160,11 @@ ifeq ($(HAVE_GZ_ZSTD),1)
   # zstd compresses DWARF far better than zlib at similar cost, and -ggdb3
   # produces a lot of DWARF.
   DEBUG_FMT    := -gz=zstd
-  DEBUG_FMT_LD := -Wl,--compress-debug-sections=zstd
+  # The probe above only compiles. --compress-debug-sections is GNU ld's, so ask
+  # separately whether the linker takes it rather than infer it from the
+  # compiler: on macOS the compile succeeds and the link would not.
+  DEBUG_FMT_LD := $(shell $(CXX) -Wl,--compress-debug-sections=zstd $(PROBE_SRC) \
+                    -o /dev/null >/dev/null 2>&1 && echo -Wl,--compress-debug-sections=zstd)
 else
   DEBUG_FMT    :=
   DEBUG_FMT_LD :=
@@ -181,15 +185,25 @@ ASFLAGS  := -g $(DEBUG_FMT)
 #
 # LTO flags must be repeated at link time, and the optimisation level with them,
 # since that is when code generation actually happens.
+# No -lcurl and no -lcrypto on either platform: libcurl is dlopen'd on demand,
+# and SHA-256/HMAC are vendored in src/hash/sha256.cc. Between them that removes
+# about thirty shared objects from the load set of every compilation.
+ifeq ($(HOST_OS),Darwin)
+# Apple's linker is not GNU ld and takes none of the flags below: --gc-sections
+# is spelled -dead_strip, --as-needed has no equivalent and nothing to do (ld64
+# does not record unused dylibs), and -Wl,-O1 is not an option it knows.
+# -static-libgcc is rejected outright by clang here, and -static-libstdc++ has
+# nothing to do when the C++ runtime is libc++ from libSystem. dlopen is in
+# libSystem too, so there is no -ldl to link.
+LDFLAGS  := -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) -Wl,-dead_strip
+LDLIBS   := $(TCMALLOC_A)
+else
 LDFLAGS  := -static-libstdc++ -static-libgcc -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) \
             -Wl,--gc-sections -Wl,--as-needed -Wl,-O1
-# No -lcurl and no -lcrypto: libcurl is dlopen'd on demand, and SHA-256/HMAC are
-# vendored in src/hash/sha256.cc. Between them that removes about thirty shared
-# objects from the load set of every compilation.
-#
 # -ldl is a no-op on glibc 2.34+, where dlopen moved into libc; --as-needed drops
 # it from DT_NEEDED. Kept for older glibc, which needs it for dlopen.
 LDLIBS   := $(TCMALLOC_A) -ldl
+endif
 
 # ---- sources ----------------------------------------------------------------
 

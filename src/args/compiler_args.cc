@@ -138,6 +138,13 @@ std::optional<std::string> KeyedFileFlagValue(std::string_view arg) {
       "-fxray-always-instrument=",
       "-fxray-never-instrument=",
       "-fplugin=",
+      // gcc reads the layout seed out of this file during struct layout, which
+      // happens after preprocessing. The Linux kernel generates the seed
+      // per-tree under CONFIG_RANDSTRUCT, so two checkouts hold different
+      // seeds behind an identical command line; serving one's objects to the
+      // other would give a kernel whose structs disagree about their own
+      // layout, with nothing on the command line to show it.
+      "-frandomize-layout-seed-file=",
   };
   for (std::string_view p : kPrefixes) {
     if (StartsWith(arg, p)) return std::string(arg.substr(p.size()));

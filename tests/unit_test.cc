@@ -1069,6 +1069,18 @@ void TestCompilerArgs() {
     }
     Check(residual, "and the rest of it survives as its own -Wp,");
   }
+
+  // A file gcc reads after preprocessing has to be hashed, or its contents are
+  // invisible to the key. The kernel generates its randstruct seed per tree.
+  {
+    auto seeded = args::Parse({"gcc", "-frandomize-layout-seed-file=scripts/seed",
+                               "-c", "f.c", "-o", "f.o"});
+    bool keyed = false;
+    for (const std::string& path : seeded.key_files) {
+      if (path == "scripts/seed") keyed = true;
+    }
+    Check(keyed, "the randstruct seed file is hashed into the key");
+  }
   bool has_mp = false, has_mmd = false;
   for (const std::string& arg : full_deps.dep_args) {
     if (arg == "-MP") has_mp = true;

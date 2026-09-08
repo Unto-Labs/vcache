@@ -1730,6 +1730,21 @@ check "and this tree's prerequisites" \
 check "with nothing left pointing at the other tree" \
   "$(grep -cF "$WORK/kb-one" "$WORK/kb-two/sub/.a.o.d")" "0"
 
+# A compile that fails still owes a dependency file: gcc writes it during
+# preprocessing, before the error, and kbuild feeds it to fixdep either way.
+# The kernel's lib/test_fortify targets compile code that is meant not to
+# build, so a missing .d there stops the build outright.
+reset_cache
+mkdir -p "$WORK/kb-fail"
+printf '#include <stdlib.h>\nthis is not c;\n' > "$WORK/kb-fail/bad.c"
+( cd "$WORK/kb-fail" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc \
+    "-Wp,-MMD,$PWD/.bad.o.d" -c bad.c -o bad.o ) 2>/dev/null
+check "a failed compile still reports the compiler's status" "$?" "1"
+check "and still writes its dependency file" \
+  "$([[ -s "$WORK/kb-fail/.bad.o.d" ]] && echo yes)" "yes"
+check "but leaves no object behind" \
+  "$([[ -e "$WORK/kb-fail/bad.o" ]] && echo yes || echo no)" "no"
+
 # --------------------------------------------------------------------------
 section "18. .incbin is not cached"
 

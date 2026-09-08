@@ -959,6 +959,17 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);
   }
   if (compiled.exit_code != 0) {
+    // gcc emits the dependency file during preprocessing, so a compilation
+    // that fails afterwards still leaves one behind, and builds rely on that.
+    // The kernel's lib/test_fortify targets compile code that is *meant* not
+    // to build, and kbuild still hands the .d to fixdep when it does not:
+    // without this the build stops with "fixdep: error opening file".
+    // No object is placed, exactly as the compiler leaves none.
+    if (!tmp_depfile.empty()) {
+      if (auto text = util::ReadFile(tmp_depfile)) {
+        util::WriteFileAtomic(parsed.depfile, *text);
+      }
+    }
     VCACHE_LOG("compile failed with exit code " + std::to_string(compiled.exit_code));
     RecordCounter(cache_dir, Counter::kCompileFailed);
     return compiled.exit_code;

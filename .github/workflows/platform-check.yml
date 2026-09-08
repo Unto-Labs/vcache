@@ -1,0 +1,61 @@
+# Builds and tests on every platform the release targets, without publishing
+# anything.
+#
+# The release workflow is the only thing that has ever built vcache on macOS,
+# and it only runs on a tag -- so a platform breaking was discovered by cutting
+# a release and watching it fail, twice. This runs the same build and the same
+# suite on demand, against whatever ref you point it at, and produces no
+# artifacts and no release.
+#
+#   gh workflow run platform-check.yml
+#   gh workflow run platform-check.yml --ref some-branch
+#
+# It is deliberately not on `push`: the repository has no CI budget set aside
+# for that, and the value here is being able to check before tagging.
+name: platform-check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+          - name: linux-aarch64
+            runner: ubuntu-22.04-arm
+          - name: macos-arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a C++20 toolchain and libcurl headers
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-12 libcurl4-openssl-dev
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+          echo "CC=gcc-12" >> "$GITHUB_ENV"
+
+      - name: Fetch third-party sources
+        run: ./third-party/fetch.sh
+
+      - name: Build
+        run: make -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Test
+        run: make test
+
+      - name: Report what the binary needs
+        run: |
+          ./bin/vcache --version
+          if command -v ldd >/dev/null; then
+            ldd ./bin/vcache || true
+          else
+            otool -L ./bin/vcache || true
+          fi

@@ -41,6 +41,7 @@ jobs:
         run: ./third-party/regen-boost-subset.sh clang++
 
       - name: Report what this platform selects
+        if: always()
         run: |
           echo "config headers this trace selected:"
           find third-party/boost/boost/config/compiler \
@@ -49,7 +50,12 @@ jobs:
           echo
           echo "total headers: $(find third-party/boost/boost -type f | wc -l)"
 
+      # The subset is written before the script verifies it, and the verify step
+      # fails on anything in vcache's own sources that does not compile here --
+      # which is worth seeing separately from whether the trace worked. Upload
+      # either way.
       - name: Upload the traced subset
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: boost-subset-macos

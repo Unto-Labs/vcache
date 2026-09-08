@@ -1473,10 +1473,17 @@ class TempCacheDir {
 void Age(const std::string& file, int64_t seconds) {
   struct stat st {};
   if (::stat(file.c_str(), &st) != 0) return;
+  // POSIX spells these st_atim/st_mtim; Apple spells them st_atimespec and
+  // st_mtimespec, predating the standardised names.
+#if defined(__APPLE__)
+  const struct timespec atime = st.st_atimespec, mtime = st.st_mtimespec;
+#else
+  const struct timespec atime = st.st_atim, mtime = st.st_mtim;
+#endif
   struct timespec times[2];
-  times[0].tv_sec = st.st_atim.tv_sec - seconds;
+  times[0].tv_sec = atime.tv_sec - seconds;
   times[0].tv_nsec = 0;
-  times[1].tv_sec = st.st_mtim.tv_sec - seconds;
+  times[1].tv_sec = mtime.tv_sec - seconds;
   times[1].tv_nsec = 0;
   ::utimensat(0, file.c_str(), times, 0);
 }

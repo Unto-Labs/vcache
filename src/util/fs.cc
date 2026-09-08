@@ -4,7 +4,9 @@
 
 #include <fcntl.h>
 #include <vector>
-#include <linux/fs.h>
+#if defined(__linux__)
+#include <linux/fs.h>   // FICLONE, used under #ifdef below
+#endif
 #include <sys/ioctl.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -24,6 +26,17 @@ namespace fs = std::filesystem;
 
 namespace vcache::util {
 namespace {
+
+// POSIX spells the nanosecond timestamps st_mtim; Apple spells them
+// st_mtimespec and predates the standardised name. One accessor rather than an
+// #ifdef at each use.
+inline struct timespec StatMtime(const struct stat& st) {
+#if defined(__APPLE__)
+  return st.st_mtimespec;
+#else
+  return st.st_mtim;
+#endif
+}
 
 // The mode a normally-created file gets: 0666 masked by the process umask,
 // which is what fopen, gcc and rustc all end up with. Read once -- umask(2)
@@ -177,12 +190,16 @@ bool CloneFile(const std::string& from, const std::string& to) {
   bool ok = false;
 #ifdef FICLONE
   // Whole-file reflink. Instant and space-free where the filesystem supports
-  // it, and the result is an independent inode.
+  // it, and the result is an independent inode. APFS has the same trick behind
+  // clonefile(2); wiring that up is worth doing once there is a Mac to test it
+  // on. Until then macOS falls through to the byte copy below, which is correct
+  // and merely slower.
   ok = ::ioctl(dst, FICLONE, src) == 0;
 #endif
+#if defined(__linux__)
   if (!ok) {
     // Kernel-side copy: no user-space buffer, and the filesystem may still
-    // share extents underneath.
+    // share extents underneath. Linux-only.
     off_t remaining = st.st_size;
     ok = true;
     while (remaining > 0) {
@@ -194,6 +211,7 @@ bool CloneFile(const std::string& from, const std::string& to) {
       break;
     }
   }
+#endif
   if (!ok) {
     // Last resort: stream through a fixed buffer rather than reading the whole
     // file into memory, which for a multi-gigabyte link output would cost more
@@ -237,8 +255,9 @@ std::optional<uint64_t> FileSize(const std::string& path) {
 std::optional<int64_t> FileMtime(const std::string& path) {
   struct stat st;
   if (::stat(path.c_str(), &st) != 0) return std::nullopt;
-  return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 +
-         static_cast<int64_t>(st.st_mtim.tv_nsec);
+  const struct timespec mtime = StatMtime(st);
+  return static_cast<int64_t>(mtime.tv_sec) * 1000000000 +
+         static_cast<int64_t>(mtime.tv_nsec);
 }
 
 std::optional<std::string> RealPath(const std::string& path) {

@@ -1754,6 +1754,15 @@ section "18. .incbin is not cached"
 # relies on this -- kernel/kheaders.c embeds a tar of the tree's headers -- and
 # caching it serves an object holding some other build's payload.
 
+# The directive itself is portable; `.pushsection .rodata, "a"` is not -- that
+# spelling is ELF's, and a Mach-O assembler rejects it. The decline is decided
+# from the preprocessed text and has nothing platform-specific in it, and
+# ContainsIncbin is covered by the unit tests everywhere, so skipping the
+# end-to-end case off ELF loses nothing that is not checked elsewhere.
+if [[ "$(uname -s)" != Linux ]]; then
+  printf '  \033[33mSKIP\033[0m .incbin end-to-end needs ELF section syntax\n'
+else
+
 reset_cache
 mkdir -p "$WORK/incbin"
 printf 'payload-one' > "$WORK/incbin/payload.bin"
@@ -1787,6 +1796,8 @@ printf 'int g(void){return 2;}\n' > "$WORK/incbin/p.c"
 ( cd "$WORK/incbin" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc -c p.c -o p.o )
 check "a file without .incbin is still cached" "$(misses)" "1"
 check "and is not counted uncacheable" "$(uncacheable)" "0"
+
+fi
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

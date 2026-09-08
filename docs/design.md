@@ -52,6 +52,18 @@ Deliberately excluded, and why each matters:
 - **Local root paths.** `RootMap::Fingerprint()` emits only canonical targets.
   This was an actual bug during development: including local paths made every
   cross-directory lookup miss even though everything else was correct.
+- **The dependency file's path**, however it is spelled. `-MF`, `-MT`, and the
+  `-Wp,-MMD,<file>` form kbuild uses all name a side output rather than change
+  the object, so the path stays out of the key and the file is stored beside the
+  object with its own paths canonicalised.
+
+Where the preprocessed text stops standing in for the compilation, vcache
+declines rather than guesses. `.incbin` is the case that matters in practice: it
+makes the *assembler* open a file, so neither its name nor its contents are in
+the text, and two compilations can hash identically while owing different
+objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
+profiles, plugins, the randstruct layout seed — are hashed by content instead,
+since there the flag at least names the file.
 
 ## Compiler identity
 

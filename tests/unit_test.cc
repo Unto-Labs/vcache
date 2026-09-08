@@ -558,6 +558,18 @@ void TestPreprocessedNormalization() {
   // Malformed input must not corrupt the stream.
   CheckEq(core::NormalizeLinemarker("# 5 \"unterminated", roots),
           "# 5 \"unterminated", "leaves an unterminated path alone");
+
+  // .incbin makes the assembler read a file the preprocessed text never
+  // mentions, so it has to be recognised wherever it is spelled.
+  Check(core::ContainsIncbin("\t.incbin \"kernel/kheaders_data.tar.xz\"\n"),
+        "finds a bare .incbin in preprocessed assembler");
+  Check(core::ContainsIncbin(
+            "\"\\t.incbin \\\"kernel/config_data.gz\\\"\\t\\n\""),
+        "finds .incbin inside an asm() string literal");
+  Check(!core::ContainsIncbin("int incbin = 1;"),
+        "does not fire without the leading dot");
+  Check(!core::ContainsIncbin("static void inc(void);"),
+        "does not fire on ordinary code");
 }
 
 void TestBlob() {

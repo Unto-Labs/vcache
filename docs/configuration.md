@@ -827,10 +827,18 @@ A build always makes progress.
 **C/C++:** linking (no `-c`); `-E` only; `-MG`; more than one input file;
 input from stdin; no recognised source language; plain `.s` assembly (`.S` is
 cacheable, since it is preprocessed); output to `/dev/null` or `-`;
+an `.incbin` directive anywhere in the preprocessed text (see below);
 `-save-temps`, `-fsyntax-only`,
 `-specs=`, `-frepo`, `-fmodules`, PGO flags (`-fprofile-generate`,
 `-fprofile-use`, `-fprofile-instr-use`, `-fauto-profile`),
 `-fsanitize-blacklist=`; malformed or deeply nested `@response-files`.
+
+`.incbin` is the one on that list that is not a flag. It tells the *assembler*
+to splice a file in verbatim, so neither the file's name nor its contents reach
+the preprocessed text that vcache hashes: two compilations can preprocess
+identically and still owe different objects. The Linux kernel embeds its
+compressed image, its real-mode trampoline and its own `.config` this way — see
+[linux-kernel.md](linux-kernel.md).
 
 **Rust:** no `--out-dir`; no `--emit`; `--emit` with an explicit output path;
 an explicit `-o`; more than one input file; input from stdin.

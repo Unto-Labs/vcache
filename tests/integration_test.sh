@@ -1730,6 +1730,48 @@ check "and this tree's prerequisites" \
 check "with nothing left pointing at the other tree" \
   "$(grep -cF "$WORK/kb-one" "$WORK/kb-two/sub/.a.o.d")" "0"
 
+# --------------------------------------------------------------------------
+section "18. .incbin is not cached"
+
+# .incbin tells the *assembler* to splice a file in verbatim. Neither its name
+# nor its contents reach the preprocessed text, so two compilations that
+# preprocess identically can legitimately owe different objects. The kernel
+# relies on this -- kernel/kheaders.c embeds a tar of the tree's headers -- and
+# caching it serves an object holding some other build's payload.
+
+reset_cache
+mkdir -p "$WORK/incbin"
+printf 'payload-one' > "$WORK/incbin/payload.bin"
+cat > "$WORK/incbin/e.c" <<'INCBIN_EOF'
+asm("  .pushsection .rodata, \"a\"\n"
+    "  .globl blob\n"
+    "blob:\n"
+    "  .incbin \"payload.bin\"\n"
+    "  .popsection\n");
+extern char blob[];
+char* get(void) { return blob; }
+INCBIN_EOF
+
+( cd "$WORK/incbin" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc -c e.c -o e.o )
+check ".incbin is declined" "$(uncacheable)" "1"
+check "and nothing is stored for it" "$(disk_entries)" "0"
+
+# The point of declining it: change only the payload, which the preprocessed
+# text cannot see, and the object must still follow.
+printf 'payload-two' > "$WORK/incbin/payload.bin"
+( cd "$WORK/incbin" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc -c e.c -o e.o )
+check "a changed payload is picked up" \
+  "$(strings "$WORK/incbin/e.o" | grep -c 'payload-two')" "1"
+check "and the stale one is gone" \
+  "$(strings "$WORK/incbin/e.o" | grep -c 'payload-one')" "0"
+
+# The same source without the directive caches normally, so the check above is
+# about .incbin and not about this file being unusual.
+reset_cache
+printf 'int g(void){return 2;}\n' > "$WORK/incbin/p.c"
+( cd "$WORK/incbin" && VCACHE_ROOTS="$PWD=proj" "$VCACHE" gcc -c p.c -o p.o )
+check "a file without .incbin is still cached" "$(misses)" "1"
+check "and is not counted uncacheable" "$(uncacheable)" "0"
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

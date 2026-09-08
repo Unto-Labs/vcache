@@ -37,6 +37,17 @@ std::string Escape(const std::string& s) {
 
 }  // namespace
 
+bool ContainsIncbin(std::string_view line) {
+  // A plain substring search. The directive may be spelled ".incbin" inside a
+  // string literal in an asm() statement, or bare in preprocessed assembler,
+  // and may be preceded by a tab, a quote or an escape -- so anchoring on
+  // anything more than the directive itself only adds ways to miss it. Erring
+  // towards "found" costs a cache entry; erring the other way costs a wrong
+  // object, which is not a trade worth making.
+  static constexpr std::string_view kDirective = ".incbin";
+  return line.find(kDirective) != std::string_view::npos;
+}
+
 std::string NormalizeLinemarker(const std::string& line, const RootMap& roots) {
   // Shape: `# <number> "<path>"[ flags...]`. Anything else passes through.
   if (line.empty() || line[0] != '#') return line;
@@ -75,7 +86,9 @@ std::string NormalizeLinemarker(const std::string& line, const RootMap& roots) {
 
 bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       const RootMap& roots,
-                                      hash::Hasher* hasher) {
+                                      hash::Hasher* hasher,
+                                      bool* saw_incbin) {
+  if (saw_incbin != nullptr) *saw_incbin = false;
   FILE* f = ::fopen(path.c_str(), "rb");
   if (f == nullptr) return false;
 
@@ -91,6 +104,11 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
       hasher->Update(normalized);
     } else {
       hasher->Update(line);
+      // Only non-linemarker lines can carry it, and once one has, there is
+      // nothing left to learn, so the search stops for the rest of the file.
+      if (saw_incbin != nullptr && !*saw_incbin && ContainsIncbin(line)) {
+        *saw_incbin = true;
+      }
     }
     if (with_newline) hasher->Update("\n");
   };

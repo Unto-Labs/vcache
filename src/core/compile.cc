@@ -202,7 +202,7 @@ std::string ResolveNativeTarget(const args::CompilerArgs& parsed,
 std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
                        const CompilerId& compiler_id, const Config& config,
                        const std::string& native_target,
-                       const std::string& preprocessed_path) {
+                       const std::string& preprocessed_path, bool* saw_incbin) {
   hash::Hasher hasher;
   hasher.UpdateDelimited(kCacheKeyVersion);
   hasher.UpdateDelimited(compiler_id.fingerprint);
@@ -262,7 +262,8 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // and of the source itself. Its linemarkers still hold raw absolute paths --
   // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
   // on the way into the hash.
-  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher)) {
+  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher,
+                                        saw_incbin)) {
     return "";
   }
   return hasher.Hex();
@@ -895,10 +896,21 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     return RunPassthrough(argv);
   }
 
-  const std::string key =
-      ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed);
+  bool saw_incbin = false;
+  const std::string key = ComputeKey(parsed, roots, compiler_id, config,
+                                     native_target, preprocessed, &saw_incbin);
   if (key.empty()) {
     VCACHE_LOG("could not compute cache key; falling back");
+    return RunPassthrough(argv);
+  }
+  // The preprocessed text is the whole of what vcache knows about this
+  // compilation, and .incbin means the assembler will read a file that text
+  // never mentions. Two builds can preprocess identically and still owe
+  // different objects, so there is no key that would be honest here.
+  if (saw_incbin) {
+    VCACHE_LOG("uncacheable: .incbin names a file the assembler reads, whose "
+               "contents the preprocessed text does not carry");
+    RecordCounter(cache_dir, Counter::kUncacheable);
     return RunPassthrough(argv);
   }
   VCACHE_LOG("key " + key + " for " + parsed.source + " -> " + parsed.output);

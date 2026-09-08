@@ -20,6 +20,13 @@
 #     (`./regen-boost-subset.sh g++ clang++`) and the union is written out, since
 #     Boost selects different config headers per compiler.
 #
+# One thing a single run cannot do is cover another *platform*. Boost picks its
+# platform and standard-library config headers from predefined macros, so a run
+# on Linux never opens boost/config/platform/macos.hpp or config/stdlib/libcpp.hpp
+# however many compilers it is given. Covering macOS means running this on macOS
+# and merging the result -- .github/workflows/boost-subset.yml does exactly that,
+# since the project has no Mac to hand.
+#
 # Usage:  ./regen-boost-subset.sh [CXX...]        (default: g++)
 
 set -euo pipefail
@@ -50,7 +57,17 @@ if [[ ! -d "$FULL/boost" ]]; then
     log "downloading Boost ${BOOST_VERSION} (149 MB, one time)"
     curl -sSL --fail -o "$DL/boost.tar.gz" "$BOOST_URL"
   fi
-  actual="$(sha256sum "$DL/boost.tar.gz" | cut -d' ' -f1)"
+  # sha256sum is coreutils; macOS ships shasum instead. This script has to run
+  # on macOS, because that is the only place clang selects the Apple and libc++
+  # config headers the subset needs -- see the note on compiler coverage below.
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$DL/boost.tar.gz" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$DL/boost.tar.gz" | cut -d' ' -f1)"
+  else
+    echo "need sha256sum or shasum to verify the download" >&2
+    exit 1
+  fi
   if [[ "$actual" != "$BOOST_SHA256" ]]; then
     echo "checksum mismatch for boost.tar.gz" >&2
     echo "  expected $BOOST_SHA256" >&2
@@ -136,7 +153,8 @@ else
   tar xzOf "$DL/boost.tar.gz" "${BOOST_UNDERSCORE}/LICENSE_1_0.txt" > "$OUT/LICENSE" 2>/dev/null || true
 fi
 
-log "subset is $(du -sh --apparent-size "$OUT" | cut -f1) across $(find "$OUT/boost" -type f | wc -l) headers"
+# --apparent-size is GNU-only; plain -h is close enough and works everywhere.
+log "subset is $(du -sh "$OUT" | cut -f1) across $(find "$OUT/boost" -type f | wc -l) headers"
 
 # Prove the result actually builds before leaving it in place: a silently
 # incomplete subset is the failure mode worth guarding against.

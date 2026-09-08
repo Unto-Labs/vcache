@@ -204,6 +204,18 @@ std::vector<std::string> RootMap::PrefixMapArgs(PrefixMapStyle style) const {
 }
 
 std::string RootMap::Canonicalize(std::string_view path) const {
+  // Matched on the spelling as given, deliberately. A path carrying redundant
+  // separators -- "$TMPDIR/proj" where $TMPDIR ends in a slash gives
+  // ".../T//proj" -- names the same file but is not the same string, and the
+  // roots are stored normalised, so it will not match.
+  //
+  // Recognising it here alone would be worse than not recognising it: gcc
+  // matches -ffile-prefix-map by literal prefix too, so the compiler would
+  // leave the path in the object's debug info while vcache canonicalised it in
+  // the text it hashes. Two trees would then agree on a key while their objects
+  // genuinely differed, which is the one failure mode this whole design exists
+  // to prevent. The honest answer for such a path is no mapping and no sharing.
+  //
   // Iterate in reverse so the most specific (longest) root is tried first,
   // matching gcc's effective behaviour for the flags we emit.
   for (auto it = roots_.rbegin(); it != roots_.rend(); ++it) {

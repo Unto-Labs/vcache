@@ -379,9 +379,18 @@ A root spec takes three forms:
 | `/home/you/proj=/usr/src/myapp` | `/usr/src/myapp` | you want to choose the path that lands in debug info |
 
 Relative paths are resolved against the current directory. Symlinks are
-resolved, so two spellings of the same tree map identically. A root that does
-not exist yet is accepted (useful for generated-source directories) and handled
-lexically.
+resolved, and the spelling you wrote is kept as an alias for the same prefix, so
+a tree reached either way maps identically. A root that does not exist yet is
+accepted (useful for generated-source directories) and handled lexically.
+
+One spelling is *not* matched: a path carrying redundant separators or `.`
+components, such as `/build//proj/src/a.cc`. It names the same file, but gcc
+compares `-ffile-prefix-map` by literal prefix too, so recognising it on
+vcache's side alone would canonicalise the text vcache hashes while leaving the
+real path in the object — two trees agreeing on a key while their objects
+differ. Such a path gets no mapping and no sharing instead, which costs hits and
+never correctness. It arises in practice when a build directory is built from a
+variable that already ends in a slash: `$TMPDIR` on macOS does.
 
 The middle form is the one to reach for in practice: if one machine has
 `/home/alice/checkout` and another has `/build/ci-123`, the basename default

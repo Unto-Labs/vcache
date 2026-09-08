@@ -12,7 +12,14 @@ set -uo pipefail
 TOP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VCACHE="$TOP/bin/vcache"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/vcache-it-XXXXXX")"
+# $TMPDIR ends in a slash on macOS, which would make every path here carry a
+# doubled separator -- ".../T//vcache-it-XXXX/..." -- and vcache deliberately
+# does not match such a spelling against a root (see RootMap::Canonicalize).
+# The suite would then be testing that case everywhere rather than the one it
+# means to. Strip it so the paths are ordinary.
+TMPBASE="${TMPDIR:-/tmp}"
+while [[ "$TMPBASE" == */ && "$TMPBASE" != "/" ]]; do TMPBASE="${TMPBASE%/}"; done
+WORK="$(mktemp -d "$TMPBASE/vcache-it-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 PASS=0

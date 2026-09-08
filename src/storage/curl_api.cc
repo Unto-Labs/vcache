@@ -14,11 +14,23 @@ namespace {
 // Tried in order. Debian and Ubuntu ship a GnuTLS-linked build under a
 // different soname, and some distributions only install the unversioned symlink
 // with the -dev package.
+//
+// Mach-O names its libraries differently, so a list of ELF sonames finds
+// nothing on macOS and the S3 layer is unusable there -- silently, because a
+// layer that cannot load is reported as a cache miss rather than an error.
+// The system libcurl lives in the dyld shared cache rather than on disk, so it
+// is opened by name and not by path.
 constexpr const char* kCandidates[] = {
+#if defined(__APPLE__)
+    "libcurl.4.dylib",
+    "libcurl.dylib",
+    "/usr/lib/libcurl.4.dylib",
+#else
     "libcurl.so.4",
     "libcurl-gnutls.so.4",
     "libcurl-nss.so.4",
     "libcurl.so",
+#endif
 };
 
 std::once_flag g_once;

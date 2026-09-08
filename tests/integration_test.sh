@@ -21,6 +21,7 @@ FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
+skipped() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 export VCACHE_DIR="$WORK/cache"
@@ -87,7 +88,16 @@ reset_cache() { rm -rf "$VCACHE_DIR"; }
 # contents: stats, compilers/ and native/.
 disk_entries() {
   find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
-    2>/dev/null | wc -l
+    2>/dev/null | wc -l | tr -d ' '
+}
+
+# True if the compiler accepts every flag given. gcc has options clang does not
+# -- -fopt-info and -aux-info among them -- and the tests that assert the file
+# such a flag writes cannot mean anything on a compiler that never took it.
+compiler_supports() {
+  local probe="$WORK/.probe.c"
+  printf 'int main(void){return 0;}\n' > "$probe"
+  ( cd "$WORK" && gcc "$@" -c "$probe" -o "$WORK/.probe.o" ) >/dev/null 2>&1
 }
 
 # Builds a small project tree at $1 whose contents are identical everywhere.
@@ -162,7 +172,15 @@ mkdir -p "$WORK/build-a" "$WORK/build-b"
     "$VCACHE" g++ -g -c -I "$WORK/checkout-b/include" \
     "$WORK/checkout-b/src/lib.cc" -o out.o ) 2>/dev/null
 
-check "out-of-tree build hits across checkouts" "$(hits)" "1"
+if [[ "$(hits)" == "1" ]]; then
+  ok "out-of-tree build hits across checkouts"
+else
+  bad "out-of-tree build hits across checkouts (got $(hits))"
+  explain_cross_checkout_miss \
+    "$WORK/build-a" "$WORK/checkout-a=proj" \
+    "$WORK/build-b" "$WORK/checkout-b=proj" \
+    g++ -g -c -I "$WORK/checkout-a/include" "$WORK/checkout-a/src/lib.cc" -o diag.o
+fi
 if cmp -s "$WORK/build-a/out.o" "$WORK/build-b/out.o"; then
   ok "out-of-tree objects are byte-identical"
 else
@@ -1139,7 +1157,11 @@ reset_cache
 ( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
     "$VCACHE" gcc -O2 -fopt-info-optimized=oi.txt -c s.c -o oi.o ) 2>/dev/null
 check "-fopt-info-optimized=FILE is not cached" "$(uncacheable)" "1"
-check "and the report is produced" "$([[ -f "$WORK/side/oi.txt" ]] && echo yes)" "yes"
+if compiler_supports -O2 -fopt-info-optimized=/dev/null; then
+  check "and the report is produced" "$([[ -f "$WORK/side/oi.txt" ]] && echo yes)" "yes"
+else
+  skipped "-fopt-info is a gcc option; this compiler has none"
+fi
 
 reset_cache
 ( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
@@ -1150,7 +1172,11 @@ reset_cache
 ( cd "$WORK/side" && VCACHE_ROOTS="$WORK/side=proj" \
     "$VCACHE" gcc -aux-info aux.txt -c s.c -o ai.o ) 2>/dev/null
 check "-aux-info is not cached" "$(uncacheable)" "1"
-check "and the listing is produced" "$([[ -f "$WORK/side/aux.txt" ]] && echo yes)" "yes"
+if compiler_supports -aux-info /dev/null; then
+  check "and the listing is produced" "$([[ -f "$WORK/side/aux.txt" ]] && echo yes)" "yes"
+else
+  skipped "-aux-info is a gcc option; this compiler has none"
+fi
 
 # Without such a flag the same source caches normally, so the check above is
 # about the flag and not about this file being unusual.
@@ -1303,8 +1329,15 @@ if command -v clang >/dev/null 2>&1; then
   rm -f "$WORK/sd1.dwo" "$WORK/clang-a/warn.dwo"
   ( cd "$WORK/clang-a" && VCACHE_ROOTS="$WORK/clang-a=proj" \
       "$VCACHE" clang -g -gsplit-dwarf -c src/warn.c -o "$WORK/sd1.o" ) 2>/dev/null
-  check "and a second compile still writes the .dwo" \
-    "$([[ -f "$WORK/sd1.dwo" || -f "$WORK/clang-a/warn.dwo" ]] && echo yes)" "yes"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    # Mach-O has no .dwo: clang accepts -gsplit-dwarf and emits nothing beside
+    # the object, so there is no companion file to assert. Declining to cache
+    # it is still the right answer and is checked above.
+    skipped "split DWARF writes no companion file on Mach-O"
+  else
+    check "and a second compile still writes the .dwo" \
+      "$([[ -f "$WORK/sd1.dwo" || -f "$WORK/clang-a/warn.dwo" ]] && echo yes)" "yes"
+  fi
 
   # The embedding variant has no companion file, so it must stay cacheable.
   reset_cache

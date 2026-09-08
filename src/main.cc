@@ -84,7 +84,11 @@ void PrintUsage() {
       "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n"
       "\n"
       "Config file: $VCACHE_CONFIG, ~/.config/vcache/config.toml, or\n"
-      "             /etc/vcache/config.toml\n",
+      "             /etc/vcache/config.toml\n"
+      "\n"
+      "Recipes:     building the Linux kernel        docs/linux-kernel.md\n"
+      "Docs:        quickstart, configuration, design, preprocessor-problem\n"
+      "             <https://github.com/Unto-Labs/vcache/tree/main/docs>\n",
       kVersion);
 }
 

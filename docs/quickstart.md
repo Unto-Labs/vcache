@@ -125,6 +125,8 @@ debugger at the real sources:
 
 ## Next steps
 
+- [linux-kernel.md](linux-kernel.md) — a copy-paste recipe for building the Linux
+  kernel, and what it measures
 - [configuration.md](configuration.md) — every option, precedence, worked examples,
   and how to set up a shared S3 cache
 - [preprocessor-problem.md](preprocessor-problem.md) — why this is needed, with

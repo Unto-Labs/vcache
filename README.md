@@ -47,6 +47,7 @@ is a hit at all when a ccache hit would not have been.
 | [docs/configuration.md](docs/configuration.md) | Every option, precedence, worked examples |
 | [docs/preprocessor-problem.md](docs/preprocessor-problem.md) | Why this is needed, with measurements |
 | [docs/design.md](docs/design.md) | How it is put together |
+| [docs/linux-kernel.md](docs/linux-kernel.md) | Recipe: caching Linux kernel builds |
 
 ## Quick start
 
@@ -322,12 +323,22 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
 $ make test
 ```
 
-169 unit tests and 95 integration tests, covering cross-directory hits,
-out-of-tree builds, dependency-file replay, diagnostics replay, uncacheable
-fallback, masquerade mode, Rust, cache management, `-march=native` resolution,
-dependency-scan manifests, and the S3 layer against a mock object store. SigV4
-is checked against AWS's documented signing-key vector and an independent
-reference implementation.
+364 unit assertions and 235 integration assertions, covering cross-directory
+hits, out-of-tree builds, dependency-file replay, diagnostics replay,
+uncacheable fallback, masquerade mode, Rust, cache management, `-march=native`
+resolution, dependency-scan manifests, kbuild-shaped `-Wp,` command lines,
+`.incbin`, and the S3 layer against a mock object store. SigV4 is checked
+against AWS's documented signing-key vector and an independent reference
+implementation.
+
+```console
+$ make kernel-test
+```
+
+A real Linux kernel build, kept out of `make test` because it downloads two
+kernel tarballs, wants ~10 GB of disk and takes a few minutes. It is the only
+test that exercises kbuild end to end — see
+[docs/linux-kernel.md](docs/linux-kernel.md).
 
 ## Licence
 

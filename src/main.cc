@@ -32,7 +32,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "vcache 1.1.0";
+constexpr const char* kVersion = "vcache 1.2.0";
 
 void PrintUsage() {
   std::printf(

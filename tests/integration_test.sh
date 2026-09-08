@@ -50,29 +50,40 @@ linked_libraries() {
   fi
 }
 
-# When two checkouts fail to share an entry, the useful question is what their
-# preprocessed text disagrees about -- that text is the cache key. Answer it
-# here rather than leave someone to reconstruct the compile by hand from a bare
-# "expected 1, got 0".
+# When two checkouts fail to share an entry, the useful questions are what
+# vcache resolved the roots to and what the two preprocessed texts -- which are
+# the cache key -- disagree about. Answer both here rather than leave someone to
+# reconstruct the compile by hand from a bare "expected 1, got 0".
+#
+#   explain_cross_checkout_miss DIR_A SPEC_A DIR_B SPEC_B  A args... -- B args...
 explain_cross_checkout_miss() {
   local dir_a=$1 spec_a=$2 dir_b=$3 spec_b=$4; shift 4
+  local -a args_a=() args_b=(); local side=a
+  local x
+  for x in "$@"; do
+    if [[ "$x" == "--" ]]; then side=b; continue; fi
+    if [[ "$side" == a ]]; then args_a+=("$x"); else args_b+=("$x"); fi
+  done
+
+  printf '       roots in A:\n'
+  ( cd "$dir_a" && VCACHE_ROOTS="$spec_a" "$VCACHE" --show-roots ) 2>&1 | sed 's/^/         /'
+  printf '       roots in B:\n'
+  ( cd "$dir_b" && VCACHE_ROOTS="$spec_b" "$VCACHE" --show-roots ) 2>&1 | sed 's/^/         /'
+
   local la="$WORK/miss-a.log" lb="$WORK/miss-b.log"
   rm -f "$la" "$lb"
-  ( cd "$dir_a" && VCACHE_ROOTS="$spec_a" VCACHE_LOG="$la" "$VCACHE" "$@" ) >/dev/null 2>&1
-  ( cd "$dir_b" && VCACHE_ROOTS="$spec_b" VCACHE_LOG="$lb" "$VCACHE" "$@" ) >/dev/null 2>&1
-  printf '       A %s\n' "$(grep -o 'key input.*' "$la" 2>/dev/null | head -1)"
-  printf '       B %s\n' "$(grep -o 'key input.*' "$lb" 2>/dev/null | head -1)"
+  ( cd "$dir_a" && VCACHE_ROOTS="$spec_a" VCACHE_LOG="$la" "$VCACHE" "${args_a[@]}" ) >/dev/null 2>&1
+  ( cd "$dir_b" && VCACHE_ROOTS="$spec_b" VCACHE_LOG="$lb" "$VCACHE" "${args_b[@]}" ) >/dev/null 2>&1
   local ca cb
   ca=$(sed -n 's/.*\] preprocess: //p' "$la" 2>/dev/null | head -1)
   cb=$(sed -n 's/.*\] preprocess: //p' "$lb" 2>/dev/null | head -1)
-  printf '       A prefix maps: %s\n' "$(printf '%s' "$ca" | tr ' ' '\n' | grep -c 'prefix-map')"
   ( cd "$dir_a" && eval "$ca" ) > "$WORK/pp-a.i" 2>/dev/null
   ( cd "$dir_b" && eval "$cb" ) > "$WORK/pp-b.i" 2>/dev/null
   if cmp -s "$WORK/pp-a.i" "$WORK/pp-b.i"; then
     printf '       preprocessed text is identical; the key differs elsewhere\n'
   else
     printf '       preprocessed text differs:\n'
-    diff "$WORK/pp-a.i" "$WORK/pp-b.i" 2>/dev/null | head -8 | sed 's/^/         /'
+    diff "$WORK/pp-a.i" "$WORK/pp-b.i" 2>/dev/null | head -6 | sed 's/^/         /'
   fi
 }
 
@@ -138,7 +149,8 @@ else
   explain_cross_checkout_miss \
     "$WORK/checkout-a" "$WORK/checkout-a=proj" \
     "$WORK/checkout-b" "$WORK/checkout-b=proj" \
-    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/diag.o"
+    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/diag-a.o" -- \
+    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/diag-b.o"
 fi
 
 if cmp -s "$WORK/a.o" "$WORK/b.o"; then
@@ -179,7 +191,8 @@ else
   explain_cross_checkout_miss \
     "$WORK/build-a" "$WORK/checkout-a=proj" \
     "$WORK/build-b" "$WORK/checkout-b=proj" \
-    g++ -g -c -I "$WORK/checkout-a/include" "$WORK/checkout-a/src/lib.cc" -o diag.o
+    g++ -g -c -I "$WORK/checkout-a/include" "$WORK/checkout-a/src/lib.cc" -o diag.o -- \
+    g++ -g -c -I "$WORK/checkout-b/include" "$WORK/checkout-b/src/lib.cc" -o diag.o
 fi
 if cmp -s "$WORK/build-a/out.o" "$WORK/build-b/out.o"; then
   ok "out-of-tree objects are byte-identical"
@@ -646,10 +659,29 @@ except Exception: sys.exit(1)
   #
   # Age is taken from the object's Last-Modified, so backdating the stored file
   # is what an expired entry looks like from vcache's side.
-  backdate() { find "$S3DIR" -type f -exec touch -d "$1" {} +; }
+  # GNU touch accepts -d with a relative date; BSD's does not, and neither
+  # spelling of `find -newermt` is portable either. python3 is already a
+  # prerequisite for this whole section, and setting an mtime through it is
+  # exact and the same everywhere. Takes an age in seconds; `only_recent`
+  # restricts it to objects written in the last minute, which is how the
+  # eviction test gives its three entries distinct ages.
+  backdate() {
+    python3 - "$S3DIR" "$1" "${2:-all}" <<'BACKDATE'
+import os, sys, time
+root, ago, scope = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+now = time.time()
+for dirpath, _, names in os.walk(root):
+    for n in names:
+        p = os.path.join(dirpath, n)
+        if scope == "only_recent" and now - os.stat(p).st_mtime > 60:
+            continue
+        os.utime(p, (now - ago, now - ago))
+BACKDATE
+  }
+  day=86400
 
   reset_cache
-  backdate "40 days ago"
+  backdate "$((40 * day))"
   ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s5.o" ) 2>/dev/null
   check "an entry past its ttl is not served" "$(stat_of 'cache hit (s3)')" "0"
@@ -658,14 +690,14 @@ except Exception: sys.exit(1)
   # The same object inside the window still serves, so the previous check is
   # about age and not about the object having become unreadable.
   reset_cache
-  backdate "2 days ago"
+  backdate "$((2 * day))"
   ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s6.o" ) 2>/dev/null
   check "an entry inside the ttl still serves" "$(stat_of 'cache hit (s3)')" "1"
 
   # A ttl of zero disables the check rather than expiring everything.
   reset_cache
-  backdate "400 days ago"
+  backdate "$((400 * day))"
   ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
       VCACHE_S3_TTL_DAYS=0 \
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s7.o" ) 2>/dev/null
@@ -681,7 +713,7 @@ except Exception: sys.exit(1)
   check "trim with nothing configured deletes nothing" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "1"
 
   # Expired by age.
-  backdate "40 days ago"
+  backdate "$((40 * day))"
   "$VCACHE" --trim > "$WORK/trim.out" 2>&1
   check "trim deletes an expired object" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "0"
   if grep -q 'deleted 1 expired' "$WORK/trim.out"; then
@@ -697,7 +729,7 @@ except Exception: sys.exit(1)
     ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
         "$VCACHE" g++ -g -O$n -c -I include src/lib.cc -o "$WORK/t$n.o" ) 2>/dev/null
     # Distinct ages so eviction order is well defined.
-    find "$S3DIR" -type f -newermt "-1 minute" -exec touch -d "$((4 - n)) days ago" {} +
+    backdate "$(( (4 - n) * day ))" only_recent
   done
   check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "3"
 
@@ -1505,14 +1537,14 @@ EOF
   chmod +x "$WORK/rebuilt-cc/mycc"
 }
 write_stub_cc "1.0"
-size_before=$(stat -c %s "$WORK/rebuilt-cc/mycc")
+size_before=$(wc -c < "$WORK/rebuilt-cc/mycc" | tr -d " ")
 ( cd "$WORK/rebuilt-cc" && "$VCACHE" --vcache-root="$PWD=proj" \
     ./mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 check "the first compile with the stub misses" "$(misses)" "1"
 
 write_stub_cc "2.0"
 check "the rebuilt stub is the same size" \
-  "$(stat -c %s "$WORK/rebuilt-cc/mycc")" "$size_before"
+  "$(wc -c < "$WORK/rebuilt-cc/mycc" | tr -d " ")" "$size_before"
 ( cd "$WORK/rebuilt-cc" && "$VCACHE" --vcache-root="$PWD=proj" \
     ./mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 check "a same-size rebuilt compiler is not served from the old memo" \

@@ -137,6 +137,32 @@ discarding only the bytes: 1.28 G instructions becomes 1.17 G. The formatting
 was never the expense. Deciding *what* to format is, and a key has to encode the
 same decisions the text does, so it cannot skip them.
 
+**A faster allocator does not help either, and a linear one is worse.** This was
+the third hypothesis and the most tempting: a preprocessor is short-lived, so
+give it an arena on huge pages and make `free` a no-op. Measured, preloaded over
+glibc on `http.c`:
+
+| | instructions | faults | peak RSS |
+| --- | --- | --- | --- |
+| glibc | 1.28 G | 5463 | 23 MB |
+| arena, no-op `free` | 1.88 G | 1397 | 573 MB |
+
+Slower, and the RSS says why: libcpp's peak live set is 23 MB but it allocates
+573 MB over the run. It churns — macro expansion buffers come and go constantly
+— so glibc spends its time recycling 23 MB while the arena spends its time
+zeroing 573 MB of fresh pages. Kernel time went from about 4% to 18.7%. Huge
+pages cut the fault count fourfold and did not save it, because the cost is
+zeroing, not faulting.
+
+The experiment is kept in `test/bump-alloc.c`, along with the two traps that
+have to be avoided before it is even that close — a bump allocator that always
+copies on `realloc` makes libcpp's buffer growth O(n²) and is *4×* slower, and
+a `calloc` that memsets arena memory re-zeroes pages the kernel already zeroed.
+
+Underneath all of it: allocation is only about 6% of the profile to begin with,
+because libcpp already pools through its own `_cpp_buff` instead of calling
+malloc per token. There was never 4× hiding there.
+
 What remains is genuine work that byte-identity requires. `in_system_header_at`
 alone is 22.5% of the run, measured by stubbing it out, and it resists memoising:
 the obvious cache on the unwound spelling location hits 8.3% of the time,

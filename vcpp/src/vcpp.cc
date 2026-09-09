@@ -203,8 +203,14 @@ static inline int in_system_header_at (location_t loc)
     {
       location_t spelt
         = linemap_macro_map_loc_unwind_toward_spelling (line_table, mm, loc);
+      // libcpp 16 turned the accessor into a member function.
+#if VCPP_LIBCPP_MAJOR >= 16
+      q = (spelt < RESERVED_LOCATION_COUNT)
+            ? mm->get_expansion_point_location () : spelt;
+#else
       q = (spelt < RESERVED_LOCATION_COUNT)
             ? MACRO_MAP_EXPANSION_POINT_LOCATION (mm) : spelt;
+#endif
     }
 
   // Memoising this on the unwound location looks obvious and does not work:
@@ -687,8 +693,14 @@ static enum c_lang lang_from_std (const std::string &s)
   if (s == "gnu11" || s == "gnu1x")     return CLK_GNUC11;
   if (s == "c17" || s == "c18")         return CLK_STDC17;
   if (s == "gnu17" || s == "gnu18")     return CLK_GNUC17;
+  // Spelled CLK_*2X through libcpp 15, CLK_*23 from 16.
+#if VCPP_LIBCPP_MAJOR >= 16
+  if (s == "c2x" || s == "c23")         return CLK_STDC23;
+  if (s == "gnu2x" || s == "gnu23")     return CLK_GNUC23;
+#else
   if (s == "c2x" || s == "c23")         return CLK_STDC2X;
   if (s == "gnu2x" || s == "gnu23")     return CLK_GNUC2X;
+#endif
   fprintf (stderr, "vcpp: declining: unrecognised -std=%s\n", s.c_str ());
   _exit (3);
 }
@@ -861,6 +873,16 @@ static int cb_has_attribute (cpp_reader *pf, bool std_syntax)
 static int cb_has_builtin (cpp_reader *pf)
 { return answer_has ("builtin", parse_has_operand (pf)); }
 
+// libcpp 13 has no has_feature callback at all -- __has_feature arrived later.
+// libcpp 16 registers the builtin without gating it on the callback being
+// present, so leaving this null is not "the operator is undefined", it is a
+// null call through pfile->cb.has_feature the first time a header asks.
+#if VCPP_LIBCPP_MAJOR >= 16
+static int cb_has_feature (cpp_reader *pf, bool is_feature)
+{ return answer_has (is_feature ? "feature" : "extension",
+                     parse_has_operand (pf)); }
+#endif
+
 int main (int argc, char **argv)
 {
   std::vector<std::string> brack_dirs, defines, undefs;
@@ -958,6 +980,9 @@ int main (int argc, char **argv)
   // undefined, and #ifdef __has_attribute then takes the wrong branch.
   cb->has_attribute = cb_has_attribute;
   cb->has_builtin   = cb_has_builtin;
+#if VCPP_LIBCPP_MAJOR >= 16
+  cb->has_feature   = cb_has_feature;
+#endif
 
   // vcpp is standing in for a specific compiler, so it has to search that
   // compiler's system directories, not its own guesses. vcache will pass them;

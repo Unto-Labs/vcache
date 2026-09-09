@@ -298,11 +298,27 @@ still has the `sysp == 2` branch that would print it. Confirmed here by
 instrumenting vcpp: the `cpp_dir` carries `sysp=2` and the resulting line map
 reports 1.
 
+A patch for this is written and verified — `patch -p1`, a one-word type fix plus
+a `gcc.dg/cpp` testcase that passes on gcc 13 and on a patched libcpp 16 and
+fails on an unpatched one. It has not been sent; GCC takes no pull requests, so
+it needs a Bugzilla report and a mail to gcc-patches@ from a person who can sign
+it off. See `~/agent-backup/gcc-sysp-patch-20260909/`.
+
 So `fetch-libcpp.sh` picks the release matching the local `gcc` by default, and
 `VCPP_GCC_VERSION` overrides it. `Makefile` reads the version the script
 actually built and compiles against that API — libcpp's C++ API is not stable
-either (`reallocator` became `m_reallocator`, `cpp_set_include_chains` grew a
-chain for `#embed`, `line_maps` gained `cmdline_location`).
+either: `reallocator` became `m_reallocator`, `cpp_set_include_chains` grew a
+chain for `#embed`, `line_maps` gained `cmdline_location`,
+`MACRO_MAP_EXPANSION_POINT_LOCATION` became a member function, and `CLK_STDC2X`
+became `CLK_STDC23`.
+
+The client contract moved too, and one of those changes crashes rather than
+failing to compile. libcpp 13 has no `has_feature` callback at all; libcpp 16
+registers `__has_feature` and `__has_extension` as builtin macros **without**
+gating them on the callback being present, the way it does gate
+`__has_attribute` and `__has_builtin`. Leaving `cb->has_feature` null there is
+not "the operator is undefined" — it is a null call the first time a header asks,
+which glibc's headers do.
 
 ### What vcpp has to learn from the target compiler
 

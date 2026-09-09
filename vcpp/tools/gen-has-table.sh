@@ -105,14 +105,14 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # Harvest "__has_KIND (name)" occurrences. Only literal spellings are found;
 # a name reached through macro expansion will show up later as a decline,
 # which is the safe direction to be wrong in.
-for kind in attribute builtin; do
+for kind in attribute builtin feature extension; do
   grep -rhoE "__has_${kind}[[:space:]]*\([[:space:]]*[A-Za-z_][A-Za-z0-9_:]*" "${srcs[@]}" 2>/dev/null \
     | sed -E "s/.*\([[:space:]]*//" \
     | sort -u > "$tmp/$kind.names" || true
 done
 
 : > "$tmp/table"
-for kind in attribute builtin; do
+for kind in attribute builtin feature extension; do
   answer_names "$kind" "$tmp/$kind.names" "$tmp/w" >> "$tmp/table" || exit 1
 done
 

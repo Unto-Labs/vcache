@@ -94,7 +94,7 @@ static const char *special_fname_builtin () { return "<built-in>"; }
 
 // gcc/input.cc:expand_location_1, for the caret aspect at the expansion point,
 // which is all the output driver asks for.
-static expanded_location expand_loc (location_t loc)
+static expanded_location expand_loc_1 (location_t loc)
 {
   expanded_location xloc;
   memset (&xloc, 0, sizeof xloc);
@@ -110,12 +110,104 @@ static expanded_location expand_loc (location_t loc)
   return xloc;
 }
 
+// Resolving a location is the single most expensive thing this program does:
+// linemap_lookup_macro_index alone was 19.6% of the run before this cache.
+// Two things make it cacheable.
+//
+// The driver asks about the same location several times in a row -- the
+// streamer wants its line, maybe_print_line wants its line and its file, and
+// do_line_change wants its column -- so an exact-match memo collapses those to
+// one resolution.
+//
+// Better, every token produced by one macro expansion resolves to the *same*
+// expansion point. linemap_macro_map_loc_to_exp_point takes a location but
+// marks it ATTRIBUTE_UNUSED and returns the map's expansion point, so the
+// answer depends on the map alone. Caching the map's whole location range
+// turns one resolution per expanded token into one per expansion, which is
+// where the bulk of the macro-index lookups were going.
+//
+// Safe because a location's resolution never changes: line maps are
+// append-only, and the map a location belongs to is fixed when the location is
+// handed out. Ad-hoc locations live above LINE_MAP_MAX_LOCATION and so can
+// never fall inside a cached range.
+// One-entry memo of "which macro map does this location belong to". Finding
+// that map is a binary search (linemap_lookup_macro_index), and libcpp has no
+// cache for it the way it does for ordinary maps -- but one macro expansion
+// hands out a contiguous run of locations, so one search serves the whole run.
+static location_t mm_lo = 1, mm_hi = 0;              // empty: lo > hi
+static const line_map_macro *mm_map = nullptr;
+
+// The macro map containing LOC, or null if LOC is not from a macro expansion.
+static inline const line_map_macro *macro_map_for (location_t loc)
+{
+  if (loc >= mm_lo && loc < mm_hi)
+    return mm_map;
+  if (loc < RESERVED_LOCATION_COUNT)
+    return nullptr;
+  const line_map *map = linemap_lookup (line_table, loc);
+  if (!map || !linemap_macro_expansion_map_p (map))
+    return nullptr;
+  mm_map = linemap_check_macro (map);
+  mm_lo = MAP_START_LOCATION (mm_map);
+  mm_hi = mm_lo + MACRO_MAP_NUM_MACRO_TOKENS (mm_map);
+  return mm_map;
+}
+
+static location_t xloc_lo = 1, xloc_hi = 0;   // empty: lo > hi
+static expanded_location xloc_cached;
+
+static inline expanded_location expand_loc (location_t loc)
+{
+  if (loc >= xloc_lo && loc < xloc_hi)
+    return xloc_cached;
+
+  xloc_cached = expand_loc_1 (loc);
+
+  // Widen the cache to the whole macro map when this location came from one.
+  const line_map_macro *mm = macro_map_for (loc);
+  if (mm)
+    { xloc_lo = mm_lo; xloc_hi = mm_hi; }
+  else
+    { xloc_lo = loc; xloc_hi = loc + 1; }
+  return xloc_cached;
+}
+
 static const char *LOCATION_FILE (location_t l) { return expand_loc (l).file; }
 static int LOCATION_LINE   (location_t l) { return expand_loc (l).line; }
 static int LOCATION_COLUMN (location_t l) { return expand_loc (l).column; }
 
-static int in_system_header_at (location_t loc)
-{ return linemap_location_in_system_header_p (line_table, loc); }
+// Asked once per token, and again by print_line_1 for the location it just
+// expanded. Same reasoning as the cache above.
+static location_t sysp_cached_at = UNKNOWN_LOCATION;
+static int sysp_cached = 0;
+static bool sysp_cache_valid = false;
+
+static inline int in_system_header_at (location_t loc)
+{
+  if (sysp_cache_valid && loc == sysp_cached_at)
+    return sysp_cached;
+
+  // System-ness is *not* a property of the macro map -- libcpp unwinds toward
+  // the spelling location, so a token from the macro body answers for the file
+  // the macro was defined in while a token from an argument answers for where
+  // the argument was written. But that unwind is an array index once the map is
+  // known, and the map is what the memo above supplies, so this does libcpp's
+  // first iteration without its binary search and hands the rest back.
+  location_t q = loc;
+  const line_map_macro *mm = macro_map_for (loc);
+  if (mm)
+    {
+      location_t spelt
+        = linemap_macro_map_loc_unwind_toward_spelling (line_table, mm, loc);
+      q = (spelt < RESERVED_LOCATION_COUNT)
+            ? MACRO_MAP_EXPANSION_POINT_LOCATION (mm) : spelt;
+    }
+
+  sysp_cached = linemap_location_in_system_header_p (line_table, q);
+  sysp_cached_at = loc;
+  sysp_cache_valid = true;
+  return sysp_cached;
+}
 
 static bool is_location_from_builtin_token (location_t loc)
 {
@@ -705,6 +797,12 @@ int main (int argc, char **argv)
   line_table->reallocator = [] (void *p, size_t n) { return xrealloc (p, n); };
   line_table->round_alloc_size = [] (size_t n) { return n; };
 #endif
+  // gcc/toplev.cc sets this immediately after linemap_init, and leaving it at
+  // zero is expensive as well as unfaithful: the lexer gives every token a
+  // range, and with no range bits reserved in the location itself every one of
+  // them has to be recorded as an ad-hoc location in a side hash table.
+  // (gcc drops it back to 0 only for -flarge-source-files.)
+  line_table->default_range_bits = 5;
 
   // The reader's language decides both how tokens are lexed and which
   // __STDC_* macros libcpp predefines, so it has to match what the target

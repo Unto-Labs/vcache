@@ -47,6 +47,10 @@ HAS_TABLE="$tmp/has.tbl"
 compare_one() {
   local src="$1"; shift
   "$CC" "$@" -E "$src" -o "$tmp/gcc.i" 2>/dev/null || return 0   # gcc itself failed; not our business
+  # Learn any __has_* name the harvest missed before judging the output; a
+  # decline that a table entry would have answered is not a real decline.
+  "$HERE/../tools/gen-has-table.sh" --cc "$CC" -o "$HAS_TABLE" --learn -- \
+    "$VCPP" --has-table="$HAS_TABLE" "$@" "$src" -o /dev/null >/dev/null 2>&1
   "$VCPP" --has-table="$HAS_TABLE" "$@" "$src" -o "$tmp/vcpp.i" 2>"$tmp/err"
   local rc=$?
   # 3 is vcpp declining: it met something it cannot answer and said so rather

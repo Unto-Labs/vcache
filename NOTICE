@@ -4,6 +4,12 @@ Copyright 2026 Unto Labs
 This product includes software developed at Unto Labs, licensed under the
 Apache License, Version 2.0 (see LICENSE).
 
+vcpp/ is NOT covered by that licence. It is a separate GPL-3.0-or-later
+program, built on GCC's libcpp, which is GPLv3 and carries no runtime-library
+exception. vcache executes vcpp the way it executes gcc, so nothing under vcpp/
+is linked into the vcache binary and vcache's own licence is unaffected. See
+vcpp/LICENSE and vcpp/README.md.
+
 Vendored third-party components under third-party/ are not covered by that
 licence and retain their own terms:
 

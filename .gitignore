@@ -12,3 +12,10 @@
 *.o
 *.d
 *.a
+
+# vcpp builds against GCC's libcpp, which is fetched by vcpp/fetch-libcpp.sh
+# rather than vendored -- keeping 58k lines of GPLv3 out of an Apache-2.0 tree.
+/vcpp/.dl/
+/vcpp/gcc-*/
+/vcpp/build/
+/vcpp/bin/

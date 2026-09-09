@@ -298,11 +298,11 @@ still has the `sysp == 2` branch that would print it. Confirmed here by
 instrumenting vcpp: the `cpp_dir` carries `sysp=2` and the resulting line map
 reports 1.
 
-A patch for this is written and verified — `patch -p1`, a one-word type fix plus
-a `gcc.dg/cpp` testcase that passes on gcc 13 and on a patched libcpp 16 and
-fails on an unpatched one. It has not been sent; GCC takes no pull requests, so
-it needs a Bugzilla report and a mail to gcc-patches@ from a person who can sign
-it off. See `~/agent-backup/gcc-sysp-patch-20260909/`.
+A patch for this is written and verified — a one-word type fix plus a
+`gcc.dg/cpp` testcase that passes on gcc 13 and on a patched libcpp 16 and fails
+on an unpatched one. It has not been submitted upstream; GCC takes no pull
+requests, so it needs a Bugzilla report and a mail to gcc-patches@ carrying a
+`Signed-off-by` from whoever sends it.
 
 So `fetch-libcpp.sh` picks the release matching the local `gcc` by default, and
 `VCPP_GCC_VERSION` overrides it. `Makefile` reads the version the script

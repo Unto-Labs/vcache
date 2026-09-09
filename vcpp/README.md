@@ -187,10 +187,42 @@ splicing. That needs a writable private mapping with a guaranteed writable tail
 page, and would fault on a file whose size is an exact multiple of the page size.
 gcc removed mmap from libcpp years ago and there is no trace of it left.
 
-The failed opens are the larger of the two and still only 1.4%, and removing them
-means indexing the include directories instead of probing them — trading a
-snapshot for a syscall, which is a semantic change for about a percent.
-`test/io-cost.c` has the measurement.
+The failed opens were the larger of the two, and those *were* worth fixing —
+just not by indexing directories. See below. `test/io-cost.c` has the
+measurement.
+
+### Not searching directories that cannot contain the header
+
+Searching N include directories for `bits/types.h` costs one `open()` per
+directory, and most of them fail. On `http.c`: 988 distinct failed opens, of
+which **779 — 79% — are for a path whose parent directory does not exist at
+all**, across only 43 such directories. `bits` is looked for under three
+prefixes that have no `bits` in them, 95 times each; `openssl` likewise, 68
+times each.
+
+libcpp already caches nonexistent *files* for the life of the reader, so it
+never repeats a failed lookup. It has no equivalent for nonexistent
+*directories*, which is where the repetition actually is. `cpp_dir::construct`
+is the hook: libcpp calls it to build the path to try and treats a null return
+exactly as `ENOENT`, without issuing the open.
+
+| | before | after |
+| --- | --- | --- |
+| `openat` calls | 1417 | 641 |
+| of which failed | 988 | 212 |
+| `stat` calls | 0 | 52 |
+| wall (`perf stat -r 20`) | 112.37 ms | **109.49 ms** |
+
+2.6% for 776 fewer syscalls, and 242/242 still byte-identical.
+
+This assumes a directory that does not exist now will not exist later in the
+run — the same assumption libcpp already makes about files, one level coarser.
+It is deliberately *not* a directory listing: a directory that exists is still
+probed for the file itself, so a header appearing mid-run is still found. A
+listing would also answer the remaining 212 failures, which are files genuinely
+absent from directories that do exist, but it assumes non-existence for files
+nothing ever probed — strictly stronger than what libcpp assumes — and it is
+worth about 0.3%. Not taken.
 
 What remains is genuine work that byte-identity requires. `in_system_header_at`
 alone is 22.5% of the run, measured by stubbing it out, and it resists memoising:

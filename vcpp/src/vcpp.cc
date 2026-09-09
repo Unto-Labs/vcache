@@ -48,6 +48,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <sys/stat.h>
 
 class line_maps *line_table;
 
@@ -514,6 +515,74 @@ static void stream_token (cpp_reader *pf, const cpp_token *token, location_t loc
 }
 
 // ---------------------------------------------------------------------------
+// Include search: skipping directories that cannot contain the header.
+//
+// Searching N include directories for "bits/types.h" costs one open() per
+// directory, and on a real translation unit most of them fail. Measured on
+// git's http.c: 988 distinct failed opens, of which 779 -- 79% -- are for a
+// path whose *parent directory* does not exist at all. There are only 43 such
+// directories. "bits" is looked for under three prefixes that have no "bits"
+// in them, 95 times each; "openssl" likewise, 68 times each.
+//
+// libcpp already caches nonexistent files for the life of the reader
+// (nonexistent_file_hash), so it will not repeat a failed lookup. It has no
+// equivalent for nonexistent *directories*, which is where the repetition
+// actually is.
+//
+// cpp_dir::construct is the hook for this: libcpp calls it to build the path
+// to try, and treats a null return exactly as ENOENT -- without issuing the
+// open. So this answers "could this directory possibly hold that header?" and
+// returns null when the answer is no.
+//
+// Soundness: this assumes a directory that does not exist now will not exist
+// later in the run. That is the same assumption libcpp already makes about
+// files, one level coarser, and it holds for the length of one preprocessing
+// run. It is not a directory *listing* -- an existing directory is always
+// probed for the file itself, so a header appearing mid-run is still found.
+static std::map<std::string, bool> dir_exists_cache;
+
+static bool dir_exists (const std::string &path)
+{
+  auto it = dir_exists_cache.find (path);
+  if (it != dir_exists_cache.end ())
+    return it->second;
+  struct stat st;
+  bool ok = stat (path.c_str (), &st) == 0 && S_ISDIR (st.st_mode);
+  dir_exists_cache[path] = ok;
+  return ok;
+}
+
+// libcpp frees what this returns, so the path must come from malloc.
+// Mirrors append_file_to_dir for the case where the search does go ahead.
+static char *vcpp_construct (const char *fname, cpp_dir *dir)
+{
+  const char *slash = strrchr (fname, '/');
+  if (slash)
+    {
+      // Every parent component, not just the last: "a/b/c.h" is unreachable if
+      // either "<dir>/a" or "<dir>/a/b" is missing, and checking the outermost
+      // first means one stat usually settles it.
+      std::string prefix (dir->name, dir->len);
+      if (!prefix.empty () && prefix[prefix.size () - 1] != '/')
+        prefix += '/';
+      for (const char *p = fname; p <= slash; p++)
+        if (*p == '/')
+          {
+            if (!dir_exists (prefix + std::string (fname, p - fname)))
+              return nullptr;
+          }
+    }
+
+  size_t dlen = dir->len, flen = strlen (fname);
+  char *path = (char *) xmalloc (dlen + 1 + flen + 1);
+  memcpy (path, dir->name, dlen);
+  if (dlen && path[dlen - 1] != '/')
+    path[dlen++] = '/';
+  memcpy (&path[dlen], fname, flen + 1);
+  return path;
+}
+
+// ---------------------------------------------------------------------------
 // File and directive callbacks.
 
 static void push_command_line_include ();
@@ -903,6 +972,7 @@ int main (int argc, char **argv)
       memset (n, 0, sizeof *n);
       n->name = xstrdup (d.c_str ());
       n->len = d.size ();
+      n->construct = vcpp_construct;
       if (tail) tail->next = n; else head = n;
       tail = n;
     }
@@ -919,6 +989,7 @@ int main (int argc, char **argv)
       // makes gcc's linemarkers say " 3 4" rather than " 3". The C++ header
       // directories are the exception, and vcpp does not do C++ yet.
       n->sysp = 2;
+      n->construct = vcpp_construct;
       if (tail) tail->next = n; else head = n;
       tail = n;
     }

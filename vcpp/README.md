@@ -3,12 +3,14 @@
 A preprocessor for compilation caching. **Licensed GPL-3.0-or-later — not
 Apache-2.0 like the rest of this repository.** See [Licence](#licence).
 
-Status: **byte-identical to `gcc -E`** on every file tried so far — all 242 C
-files of git 2.55.0 and the bundled corpus, with no declines and no errors. It
-is not yet *faster* than `gcc -E`, because none of the reductions that motivate
-it are implemented: what exists today is a faithful port of gcc's `-E` driver
-onto stock libcpp, which is the correctness baseline the optimisation work
-starts from.
+Status: **byte-identical to `gcc -E`** on every file tried — all 242 C files of
+git 2.55.0 and the bundled corpus, with no declines and no errors — and
+**1.11× faster** overall, 1.18× on the largest translation units.
+
+That is far short of the 4–6× this file used to project, and the shortfall is
+not a matter of unfinished work. Both reductions the project was betting on have
+now been measured and neither is available while the output has to match gcc
+byte for byte. See [What the speedup ceiling actually is](#what-the-speedup-ceiling-actually-is).
 
 ## Why it exists
 
@@ -69,41 +71,87 @@ plus an arena allocator, hashing tokens instead of formatting 4.8 MB of text,
 and indexing the include path once rather than issuing 1,454 failing `openat`
 calls, is what vcpp is.
 
-Floor, from the profile: lexing, expansion and interning together are about 12%
-of the current cost, so **4–6×** is the target. A hit would go from 189 ms to
-60–80 ms.
+Whether any of that is reachable is answered above, and the answer is mostly no:
+the provenance a cache "never asks for" turns out to be what gcc's own
+linemarkers are built on.
 
 ## Where it stands
 
-Measured on git 2.55.0's `http.c` (5.9 MB of preprocessed output), best of ten:
+`test/bench.sh --tree` on git 2.55.0's six largest translation units, best of
+fifteen. It refuses to report a time for any file whose output does not match,
+because a speedup that changes the text is not a speedup:
 
 | | wall | instructions |
 | --- | --- | --- |
-| `gcc -E` | 0.13 s | 1.46 G |
-| vcpp | 0.17 s | 1.87 G |
-| vcpp, libcpp built with `-flto` | 0.16 s | 1.77 G |
+| `gcc -E` | 0.42 s | 4.44 G |
+| vcpp, first working version | 0.61 s | 5.78 G |
+| vcpp now | **0.38 s** | 4.46 G |
 
-vcpp is currently *slower*. Part of that is the comparison: Ubuntu builds `cc1`
-with LTO and PGO, and rebuilding libcpp with plain LTO closes about a fifth of
-the gap on its own. The rest has not been chased down, because it is not what
-the project is about — the reductions below are worth far more than the
-remainder.
+Three changes got it there, and the largest was not a clever one. Caching
+location resolution — one memo covering a whole macro map, since every token an
+expansion produces resolves to the same expansion point — was worth about 12%.
+Bulk-writing identifiers and turning off stdio locking, a few percent more. But
+the big one was that `line_table->default_range_bits` was left at zero where
+gcc sets it to 5, so every single token was allocating an ad-hoc location in a
+side hash table. That one line was worth more than everything else combined.
 
-A profile of vcpp on the same file says the thesis survived contact:
+## What the speedup ceiling actually is
 
-| | share |
-| --- | --- |
-| `linemap_lookup_macro_index` | 19.6% |
-| other source-location machinery | 18.1% |
-| `cpp_get_token_1` | 4.5% |
-| `_cpp_lex_direct` | 3.9% |
-| `enter_macro_context` | 2.9% |
+This file used to argue for 4–6×, on the grounds that source-location tracking
+was 37.7% of the run and a cache never needs to ask which macro expansion a
+token came from. The first half was right. The second half was wrong, and it is
+worth being precise about why, because it is the project's go/no-go question.
 
-**Source-location tracking is 37.7% of the run**, and the single hottest
-function is the one that answers "which macro expansion did this token come
-from" — a question a cache never asks. That is the work vcpp exists to delete,
-and it is still all there, because deleting it is the next phase and not this
-one.
+**Turning off macro-expansion tracking does not merely perturb `__LINE__`.**
+`-ftrack-macro-expansion=0` is fast — 0.88 G instructions against 1.28 G on
+`http.c`, which would be 1.86× against gcc — and it produces the wrong text on
+**every one of git's 242 files**, by 1060 lines on one 28k-line file alone. The
+reason is not `__LINE__`. It is that gcc emits a linemarker whenever a token's
+system-header-ness changes, and that includes crossing into and out of a macro
+argument:
+
+```c
+ gettimeofday(&tv,
+# 204 "compat/posix.h" 3 4
+                  ((void *)0)
+# 204 "compat/posix.h"
+                      );
+```
+
+`NULL` comes from a system header, the call around it does not, and recording
+that needs a per-token spelling location — exactly the expansion history that
+`=0` throws away. `=1` keeps enough for `__LINE__` (it gets the multi-line
+macro-argument case right) but still loses the per-token definition location,
+and so still gets 171 of 242 files wrong.
+
+`__LINE__` alone would have been survivable, and it is a real difference —
+`ID(
+ __LINE__)` gives 3 under gcc and 2 under `=0`. The linemarkers are not
+survivable, and there is no cheap guard for them, because they are pervasive
+rather than rare.
+
+**Hashing instead of formatting is worth 8.6%, not a multiple.** vcache needs a
+key, not the text, so the obvious move is to skip writing 5.9 MB. Measured by
+keeping every decision — spacing, linemarkers, every location query — and
+discarding only the bytes: 1.28 G instructions becomes 1.17 G. The formatting
+was never the expense. Deciding *what* to format is, and a key has to encode the
+same decisions the text does, so it cannot skip them.
+
+What remains is genuine work that byte-identity requires. `in_system_header_at`
+alone is 22.5% of the run, measured by stubbing it out, and it resists memoising:
+the obvious cache on the unwound spelling location hits 8.3% of the time,
+because most macro tokens turn out to be argument tokens whose spelling location
+is unique to that use rather than body tokens sharing a definition site.
+
+So the honest number is 1.1–1.2×, not 4–6×. Preprocessing is 87.6% of a cache
+hit, so that is roughly an 8% faster hit. **Whether that justifies maintaining a
+GPLv3 fork of libcpp is a judgement call, and it should be made on this number
+rather than on the projection this file used to carry.**
+
+The larger win, if one exists, is not inside vcpp: it is for vcache to stop
+needing byte-identical text at all — to key on something coarser that is still
+sound. That is a change to vcache's soundness argument, not to its preprocessor,
+and it is not one to make casually.
 
 ## Approach
 

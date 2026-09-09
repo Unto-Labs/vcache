@@ -41,6 +41,9 @@
 #include "line-map.h"
 #include "cpplib.h"
 #include <cstdio>
+#ifdef __GLIBC__
+# include <stdio_ext.h>   // __fsetlocking
+#endif
 #include <cstring>
 #include <vector>
 #include <string>
@@ -203,6 +206,10 @@ static inline int in_system_header_at (location_t loc)
             ? MACRO_MAP_EXPANSION_POINT_LOCATION (mm) : spelt;
     }
 
+  // Memoising this on the unwound location looks obvious and does not work:
+  // measured, it hits 8.3% of the time, because most macro tokens turn out to
+  // be argument tokens whose spelling location is genuinely unique to that use
+  // rather than body tokens sharing a definition site. Left as a plain call.
   sysp_cached = linemap_location_in_system_header_p (line_table, q);
   sysp_cached_at = loc;
   sysp_cache_valid = true;
@@ -244,9 +251,15 @@ static bool print_line_1 (location_t src_loc, const char *special_flags,
     {
       const char *file_path = LOCATION_FILE (src_loc);
       size_t to_file_len = strlen (file_path);
-      // cpp_quote_string does not NUL-terminate; we do it ourselves.
-      std::vector<unsigned char> quoted (to_file_len * 4 + 1);
-      unsigned char *p = cpp_quote_string (quoted.data (),
+      // cpp_quote_string does not NUL-terminate; we do it ourselves. Paths are
+      // short, so keep the common case off the heap -- this runs once per
+      // linemarker and used to be a malloc/free pair each time.
+      unsigned char stackbuf[512];
+      std::vector<unsigned char> heapbuf;
+      unsigned char *quoted = stackbuf;
+      if (to_file_len * 4 + 1 > sizeof stackbuf)
+        { heapbuf.resize (to_file_len * 4 + 1); quoted = heapbuf.data (); }
+      unsigned char *p = cpp_quote_string (quoted,
                                            (const unsigned char *) file_path,
                                            to_file_len);
       *p = '\0';
@@ -254,7 +267,7 @@ static bool print_line_1 (location_t src_loc, const char *special_flags,
       print.src_line = LOCATION_LINE (src_loc);
       print.src_file = file_path;
 
-      fprintf (stream, "# %u \"%s\"%s", print.src_line, quoted.data (),
+      fprintf (stream, "# %u \"%s\"%s", print.src_line, quoted,
                special_flags);
 
       int sysp = in_system_header_at (src_loc);
@@ -337,6 +350,32 @@ static bool do_line_change (cpp_reader *pf, const cpp_token *token,
 static void cb_line_change (cpp_reader *pf, const cpp_token *token,
                             int parsing_args)
 { do_line_change (pf, token, token->src_loc, parsing_args); }
+
+// libcpp writes identifiers one fputc per character, because any byte may need
+// turning into a \uXXXX escape, and identifiers are the commonest token there
+// is. They are also almost always pure ASCII, so check that once and write the
+// whole thing in one go; anything else goes back to libcpp unchanged.
+static inline void output_token (const cpp_token *token, FILE *fp)
+{
+  if (token->type == CPP_NAME && !(token->flags & NAMED_OP))
+    {
+      const unsigned char *name = NODE_NAME (token->val.node.node);
+      size_t len = NODE_LEN (token->val.node.node), i = 0;
+      while (i < len && !(name[i] & ~0x7F))
+        i++;
+      if (i == len)
+        {
+          fwrite (name, 1, len, fp);
+          return;
+        }
+    }
+  else if (token->type == CPP_NUMBER)
+    {
+      fwrite (token->val.str.text, 1, token->val.str.len, fp);
+      return;
+    }
+  cpp_output_token (token, fp);
+}
 
 static void account_for_newlines (const unsigned char *str, size_t len)
 {
@@ -465,7 +504,7 @@ static void stream_token (cpp_reader *pf, const cpp_token *token, location_t loc
         // before emitting the token.
         line_marker_emitted = do_line_change (pf, token, loc, false);
 
-      cpp_output_token (token, print.outf);
+      output_token (token, print.outf);
       print.printed = true;
     }
 
@@ -760,6 +799,7 @@ int main (int argc, char **argv)
   // Held by value: argv-derived std::strings in the parse loop below do not
   // outlive an iteration.
   std::string predef_file, std_opt;
+  int track_macro = 2;   // libcpp's default, and gcc's
   const char *input = nullptr, *output = nullptr;
 
   for (int i = 1; i < argc; i++)
@@ -778,6 +818,8 @@ int main (int argc, char **argv)
       else if (a == "-o" && i + 1 < argc)       output = argv[++i];
       else if (a == "-P")                       flag_no_line_commands = true;
       else if (a.rfind ("-std=", 0) == 0)       std_opt = a.substr (5);
+      else if (a.rfind ("-ftrack-macro-expansion=", 0) == 0)
+        track_macro = atoi (a.c_str () + 24);
       else if (a == "-E")                       ;
       else if (a[0] != '-')                     input = argv[i];
     }
@@ -810,10 +852,21 @@ int main (int argc, char **argv)
   pfile = cpp_create_reader (lang_from_std (std_opt), nullptr, line_table);
   cpp_options *opts = cpp_get_options (pfile);
   opts->traditional = 0;
+  opts->track_macro_expansion = track_macro;
 
 
   out = output ? fopen (output, "w") : stdout;
   if (!out) { perror ("vcpp"); return 1; }
+  // Preprocessed output runs to megabytes and stdio's default buffer is 4 KB,
+  // which turns a 5.9 MB translation unit into some 1500 write syscalls.
+  static char outbuf[1 << 20];
+  setvbuf (out, outbuf, _IOFBF, sizeof outbuf);
+#ifdef __GLIBC__
+  // Single-threaded, and libcpp emits identifiers a character at a time, so
+  // the per-call stdio lock is pure overhead -- including inside libcpp, which
+  // this reaches without patching it.
+  __fsetlocking (out, FSETLOCKING_BYCALLER);
+#endif
 
   print.outf = out;
   print.src_line = 1;

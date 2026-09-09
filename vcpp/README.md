@@ -163,6 +163,35 @@ Underneath all of it: allocation is only about 6% of the profile to begin with,
 because libcpp already pools through its own `_cpp_buff` instead of calling
 malloc per token. There was never 4× hiding there.
 
+**Mapping the input files instead of reading them would be slower too.** A run
+on `http.c` does 430 `read()`s totalling 3.77 MB and 1417 `openat()`s, 988 of
+which fail as the include search tries each directory in turn. Measured
+directly, against a ~100 ms run, with warm caches — which is what a repeat build
+sees:
+
+| | | |
+| --- | --- | --- |
+| 988 failed `open()` | 1.45 ms | 1.4% |
+| 3.77 MB via `read()` | 0.55 ms | 0.5% |
+| 3.77 MB via `mmap()` | 0.85 ms | 0.8% |
+
+Faulting in 920 pages costs more than one memcpy out of a warm page cache, so
+the map loses by about 0.3 ms. Same direction as the allocator: page faults beat
+copying only when the copy is large and cold.
+
+libcpp could not take a mapping as it stands, either. `read_file_guts` allocates
+`st_size + 16` because the SSE4 lexer reads aligned 16-byte chunks past the end
+of the content and stops on a `'\n'` sentinel libcpp writes into the buffer, and
+`_cpp_clean_line` then rewrites the buffer in place for backslash-newline
+splicing. That needs a writable private mapping with a guaranteed writable tail
+page, and would fault on a file whose size is an exact multiple of the page size.
+gcc removed mmap from libcpp years ago and there is no trace of it left.
+
+The failed opens are the larger of the two and still only 1.4%, and removing them
+means indexing the include directories instead of probing them — trading a
+snapshot for a syscall, which is a semantic change for about a percent.
+`test/io-cost.c` has the measurement.
+
 What remains is genuine work that byte-identity requires. `in_system_header_at`
 alone is 22.5% of the run, measured by stubbing it out, and it resists memoising:
 the obvious cache on the unwound spelling location hits 8.3% of the time,

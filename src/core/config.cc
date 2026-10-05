@@ -180,6 +180,12 @@ void ApplyTomlFile(const std::string& path, Config* config) {
                                    "' (expected manifest or uncacheable)");
       }
     }
+    if (auto v = TomlString(*vc, "rust_dep_info")) {
+      if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
+        config->warnings.push_back("vcache.rust_dep_info: unknown policy '" + *v +
+                                   "' (expected manifest or always)");
+      }
+    }
   }
 }
 
@@ -274,6 +280,13 @@ void ApplyEnvironment(Config* config) {
                                  "' (expected manifest or uncacheable)");
     }
   }
+
+  if (auto v = Env("VCACHE_RUST_DEP_INFO")) {
+    if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
+      config->warnings.push_back("VCACHE_RUST_DEP_INFO: unknown policy '" + *v +
+                                 "' (expected manifest or always)");
+    }
+  }
 }
 
 }  // namespace
@@ -314,6 +327,26 @@ const char* DepScanPolicyName(DepScanPolicy policy) {
   switch (policy) {
     case DepScanPolicy::kManifest: return "manifest";
     case DepScanPolicy::kUncacheable: return "uncacheable";
+  }
+  return "manifest";
+}
+
+bool ParseRustDepInfoPolicy(std::string_view name, RustDepInfoPolicy* out) {
+  if (name == "manifest") {
+    *out = RustDepInfoPolicy::kManifest;
+    return true;
+  }
+  if (name == "always") {
+    *out = RustDepInfoPolicy::kAlways;
+    return true;
+  }
+  return false;
+}
+
+const char* RustDepInfoPolicyName(RustDepInfoPolicy policy) {
+  switch (policy) {
+    case RustDepInfoPolicy::kManifest: return "manifest";
+    case RustDepInfoPolicy::kAlways: return "always";
   }
   return "manifest";
 }
@@ -376,6 +409,8 @@ std::string DescribeConfig(const Config& config) {
   out << "native target:    " << NativeTargetPolicyName(config.native_target_policy)
       << "\n";
   out << "dependency scans: " << DepScanPolicyName(config.dep_scan_policy) << "\n";
+  out << "rust dep-info:    " << RustDepInfoPolicyName(config.rust_dep_info_policy)
+      << "\n";
   out << "read only:        " << (config.read_only ? "yes" : "no") << "\n";
   out << "error on media failure: "
       << (config.error_on_cache_media_failure ? "yes" : "no") << "\n";

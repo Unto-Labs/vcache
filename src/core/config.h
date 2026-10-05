@@ -89,6 +89,18 @@ enum class DepScanPolicy {
 bool ParseDepScanPolicy(std::string_view name, DepScanPolicy* out);
 const char* DepScanPolicyName(DepScanPolicy policy);
 
+// When a Rust lookup runs rustc --emit=dep-info to learn the crate's sources.
+enum class RustDepInfoPolicy {
+  // Only when no remembered state from an earlier run still matches. A hit
+  // costs one hash per source file instead of a macro-expanding rustc run.
+  kManifest,
+  // On every lookup, which is exact but costs the expansion even on a hit.
+  kAlways,
+};
+
+bool ParseRustDepInfoPolicy(std::string_view name, RustDepInfoPolicy* out);
+const char* RustDepInfoPolicyName(RustDepInfoPolicy policy);
+
 struct Config {
   DiskCacheConfig disk;
   S3CacheConfig s3;
@@ -111,6 +123,8 @@ struct Config {
   NativeTargetPolicy native_target_policy = NativeTargetPolicy::kResolve;
 
   DepScanPolicy dep_scan_policy = DepScanPolicy::kManifest;
+
+  RustDepInfoPolicy rust_dep_info_policy = RustDepInfoPolicy::kManifest;
 
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store

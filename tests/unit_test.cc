@@ -16,6 +16,7 @@
 #include <map>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,7 @@
 #include "core/stats.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
+#include "rust/rust_manifest.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
 #include "storage/s3_storage.h"
@@ -1415,6 +1417,150 @@ void TestRustcArgs() {
   Check(!args::LooksLikeRustc("/usr/bin/g++"), "does not mistake g++ for rustc");
 }
 
+// A 64-character key whose last digit is `i`, for ordering assertions.
+std::string StateKey(int i) {
+  return std::string(hash::kDigestHexLen - 1, '0') + "0123456789abcdef"[i];
+}
+
+void TestRustManifest() {
+  Section("rust::manifest");
+
+  auto scratch = util::MakeTempDir("vcache-rust-manifest-");
+  Check(scratch.has_value(), "scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string root = *scratch + "/a";
+  const std::string other_root = *scratch + "/b";
+  for (const std::string& tree : {root, other_root}) {
+    util::MakeDirs(tree + "/src");
+    util::WriteFileAtomic(tree + "/src/lib.rs", "mod helper;\n");
+    util::WriteFileAtomic(tree + "/src/helper.rs", "pub fn v() -> u32 { 1 }\n");
+  }
+  const core::RootMap roots = MakeRoots({root + "=crate"});
+
+  rust::RustManifestState state;
+  state.key = StateKey(1);
+  for (const char* rel : {"/src/lib.rs", "/src/helper.rs"}) {
+    state.files.emplace_back(roots.Canonicalize(root + rel),
+                             hash::HashFile(root + rel).value_or(""));
+  }
+  state.env_deps = {{"VCACHE_UT_SET", "a\\\\b"},
+                    {"VCACHE_UT_UNSET", std::nullopt},
+                    {"VCACHE_UT_EMPTY", ""}};
+  state.externs = {{"proc_macro", ""}, {"syn", hash::HashString("libsyn")}};
+  CheckEq(state.files[0].first, "/vcache/crate/src/lib.rs", "files are recorded canonically");
+
+  rust::RustManifestState spaced;
+  spaced.key = StateKey(2);
+  spaced.files.emplace_back("/vcache/crate/src/a b.rs", hash::HashString("x"));
+
+  // ---- serialise / parse ----
+  const std::string text = rust::RenderRustManifest({state, spaced});
+  std::vector<rust::RustManifestState> parsed;
+  Check(rust::ParseRustManifest(text, &parsed), "manifest parses back");
+  CheckEq(rust::RenderRustManifest(parsed), text, "manifest round-trips exactly");
+  Check(parsed.size() == 2 && parsed[0].key == state.key &&
+            parsed[0].files == state.files && parsed[0].externs.size() == 2 &&
+            parsed[0].externs[0].digest.empty() &&
+            parsed[0].externs[1].digest == state.externs[1].digest,
+        "files and extern digests survive the round trip");
+  Check(parsed.size() == 2 && parsed[0].env_deps.size() == 3 &&
+            parsed[0].env_deps[0].value == std::optional<std::string>("a\\\\b") &&
+            !parsed[0].env_deps[1].value.has_value() &&
+            parsed[0].env_deps[2].value == std::optional<std::string>(""),
+        "set, unset and empty env values stay distinct");
+  Check(parsed.size() == 2 && parsed[1].files.size() == 1 &&
+            parsed[1].files[0].first == "/vcache/crate/src/a b.rs",
+        "a path containing a space survives");
+
+  const std::string header = "vcache-rustmanifest-1\n";
+  const std::vector<std::pair<std::string, std::string>> malformed = {
+      {"vcache-rustmanifest-0\n", "a different header"},
+      {header + "F " + hash::HashString("x") + " /a.rs\n", "a file before any state"},
+      {header + "state abc\n", "a short key"},
+      {header + "state " + StateKey(1) + "\nF abc /a.rs\n", "a short file digest"},
+      {header + "state " + StateKey(1) + "\nE =x\n", "an env line without a name"},
+      {header + "state " + StateKey(1) + "\nQ x\n", "an unknown record"},
+  };
+  for (const auto& [bad_text, what] : malformed) {
+    std::vector<rust::RustManifestState> ignored;
+    Check(!rust::ParseRustManifest(bad_text, &ignored), "rejects " + what);
+  }
+
+  CheckEq(rust::EscapeEnvDepValue("a\\b\nc\rd=e"), "a\\\\b\\nc\\rd=e",
+          "env values are escaped the way rustc writes them");
+
+  // ---- matching ----
+  ::setenv("VCACHE_UT_SET", "a\\b", 1);
+  ::unsetenv("VCACHE_UT_UNSET");
+  ::setenv("VCACHE_UT_EMPTY", "", 1);
+  auto mismatch = [&](const std::vector<rust::RustExtern>& externs,
+                      const core::RootMap& with_roots) {
+    return rust::FindRustStateMismatch(state, externs, with_roots).value_or("");
+  };
+  CheckEq(mismatch(state.externs, roots), "", "an unchanged state matches");
+  CheckEq(mismatch(state.externs, MakeRoots({other_root + "=crate"})), "",
+          "the same state matches from another checkout");
+
+  util::WriteFileAtomic(root + "/src/helper.rs", "pub fn v() -> u32 { 2 }\n");
+  CheckEq(mismatch(state.externs, roots), root + "/src/helper.rs changed",
+          "a changed source rejects the state");
+  util::WriteFileAtomic(root + "/src/helper.rs", "pub fn v() -> u32 { 1 }\n");
+  CheckEq(mismatch(state.externs, roots), "", "reverting the source matches again");
+  std::error_code ec;
+  fs::rename(root + "/src/helper.rs", root + "/helper.rs.away", ec);
+  CheckEq(mismatch(state.externs, roots), root + "/src/helper.rs is gone",
+          "a deleted source rejects the state");
+  fs::rename(root + "/helper.rs.away", root + "/src/helper.rs", ec);
+
+  ::setenv("VCACHE_UT_SET", "a\\c", 1);
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_SET is 'a\\\\c', was 'a\\\\b'",
+          "a changed env value rejects the state");
+  ::setenv("VCACHE_UT_SET", "a\\b", 1);
+  ::setenv("VCACHE_UT_UNSET", "x", 1);
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_UNSET is 'x', was unset",
+          "setting an unset variable rejects the state");
+  ::unsetenv("VCACHE_UT_UNSET");
+  ::unsetenv("VCACHE_UT_EMPTY");
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_EMPTY is unset, was ''",
+          "unsetting an empty variable rejects the state");
+  ::setenv("VCACHE_UT_EMPTY", "", 1);
+
+  std::vector<rust::RustExtern> rebuilt = state.externs;
+  rebuilt[1].digest = hash::HashString("libsyn rebuilt");
+  CheckEq(mismatch(rebuilt, roots), "extern syn changed",
+          "a changed extern digest rejects the state");
+  std::vector<rust::RustExtern> extra = state.externs;
+  extra.push_back({"quote", hash::HashString("libquote")});
+  CheckEq(mismatch(extra, roots), "the --extern set differs",
+          "a different extern set rejects the state");
+  CheckEq(mismatch(state.externs, roots), "", "the restored inputs match again");
+
+  // ---- the cap ----
+  std::vector<rust::RustManifestState> states;
+  for (int i = 0; i < 10; ++i) {
+    rust::RustManifestState fresh;
+    fresh.key = StateKey(i);
+    states = rust::RecordRustState(std::move(fresh), std::move(states));
+  }
+  auto order = [&]() {
+    std::string out;
+    for (const rust::RustManifestState& s : states) out += s.key.back();
+    return out;
+  };
+  CheckEq(order(), "98765432", "eight states, newest first, oldest dropped");
+  states = rust::RecordRustState(states[4], states);
+  CheckEq(order(), "59876432", "re-recording a state moves it to the front once");
+  rust::RustManifestState newest;
+  newest.key = StateKey(10);
+  states = rust::RecordRustState(std::move(newest), std::move(states));
+  CheckEq(order(), "a5987643", "the least recently used state is the one evicted");
+}
+
 void TestSigV4() {
   Section("storage::sigv4");
 
@@ -2060,6 +2206,8 @@ int main() {
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
   TestStats();
+  // Writes files too.
+  TestRustManifest();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

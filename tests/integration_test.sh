@@ -2212,5 +2212,55 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "--show-stats breaks decisions down by reason"
+
+# The positional counters say how many invocations were declined; the reason
+# rows say which rule declined them, under the same names the log uses.
+reason_row() { printf '  %-20s%s' "$1" "$2"; }
+uncacheable_block() {
+  "$VCACHE" --show-stats | awk '/^uncacheable /{ shown = 1; print; next }
+                                shown && /^  /{ print; next }
+                                { shown = 0 }'
+}
+
+reset_cache
+mkdir -p "$WORK/reasons"
+printf 'int r(void){return 3;}\nint main(void){return r() - 3;}\n' > "$WORK/reasons/r.c"
+"$VCACHE" --zero-stats >/dev/null
+( cd "$WORK/reasons" && VCACHE_ROOTS="$WORK/reasons=proj" "$VCACHE" gcc -c r.c -o r.o ) 2>/dev/null
+( cd "$WORK/reasons" && VCACHE_ROOTS="$WORK/reasons=proj" "$VCACHE" gcc -c r.c -o r.o ) 2>/dev/null
+( cd "$WORK/reasons" && "$VCACHE" cc r.o -o r ) 2>/dev/null
+( cd "$WORK/reasons" && "$VCACHE" gcc -E r.c -o r.i ) 2>/dev/null
+expected_uncacheable=2
+expected_block="$(printf 'uncacheable         2\n%s\n%s' \
+  "$(reason_row link 1)" "$(reason_row 'preprocess only' 1)")"
+if command -v rustc >/dev/null 2>&1; then
+  printf 'pub fn f() -> i32 { 3 }\n' > "$WORK/reasons/lib.rs"
+  ( cd "$WORK/reasons" && "$VCACHE" rustc --crate-name reasons --crate-type lib \
+      --emit=link lib.rs ) 2>/dev/null
+  expected_uncacheable=3
+  expected_block="$(printf 'uncacheable         3\n%s\n%s\n%s' "$(reason_row link 1)" \
+    "$(reason_row 'no --out-dir' 1)" "$(reason_row 'preprocess only' 1)")"
+else
+  skipped "rustc without --out-dir (no rustc on PATH)"
+fi
+
+check "the compile missed once" "$(misses)" "1"
+check "and hit once" "$(hits)" "1"
+check "and stored one entry" "$(stat_of 'entries stored')" "1"
+check "the link, -E and rustc runs are uncacheable" "$(uncacheable)" "$expected_uncacheable"
+check "nothing failed to preprocess" "$(stat_of 'preprocess failed')" "0"
+check "each uncacheable run is listed under its reason" "$(uncacheable_block)" "$expected_block"
+check "no passthrough row when nothing fell back" \
+  "$("$VCACHE" --show-stats | grep -c '^passthrough' || true)" "0"
+check "the stats file keeps the nine positional lines first" \
+  "$(head -9 "$VCACHE_DIR/stats" | grep -cE '^[0-9]+$')" "9"
+check "followed by one reason line per reason" \
+  "$(tail -n +10 "$VCACHE_DIR/stats" | grep -cE $'^reason\t[^\t]+\t[0-9]+$')" \
+  "$((expected_uncacheable))"
+"$VCACHE" --zero-stats >/dev/null
+check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"
+
+# --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

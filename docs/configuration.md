@@ -518,8 +518,10 @@ it.
 `vcache --trim` sweeps every shard on demand; `vcache --clear` empties the cache
 and resets counters.
 
-Statistics live in `<dir>/stats` and are updated under `flock(2)`. Memoised
-compiler fingerprints live in `<dir>/compilers/`.
+Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
+per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
+versions read only the leading counters, and drop the reason lines when they
+next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`.
 
 ## S3 cache
 
@@ -811,10 +813,21 @@ Inspection commands:
 | --- | --- |
 | `vcache --show-config` | The fully resolved configuration, plus any warnings |
 | `vcache --show-roots` | The root mapping for the current directory |
-| `vcache --show-stats` | Counters, hit rate, cache size |
+| `vcache --show-stats` | Counters, why runs were not cached, hit rate, cache size |
 | `vcache --zero-stats` | Reset counters |
 | `vcache --clear` | Delete all entries |
 | `vcache --trim` | Evict until under the size limit |
+
+`--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
+indented under each, plus a *passthrough* row for runs that fell back to the
+compiler after a local failure such as a missing temp directory. A reason is
+shown once it is non-zero, under the same name its `VCACHE_LOG` line uses:
+
+```
+uncacheable         2
+  link                1
+  preprocess only     1
+```
 
 ## Value formats
 

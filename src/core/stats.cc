@@ -6,12 +6,19 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <optional>
 #include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "util/fs.h"
+#include "util/log.h"
 #include "util/str.h"
 
 namespace vcache::core {
@@ -27,29 +34,71 @@ static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                   static_cast<size_t>(Counter::kCount),
               "counter name table out of sync with the Counter enum");
 
+constexpr std::string_view kReasonLinePrefix = "reason\t";
+
 std::string StatsPath(const std::string& cache_dir) {
   return cache_dir + "/stats";
 }
 
-// Text format, one decimal counter per line: trivially inspectable and
-// forward-compatible, since missing trailing lines read as zero.
-Stats ParseStats(const std::string& text) {
-  Stats stats;
-  size_t index = 0;
-  for (const std::string& line : util::Split(text, '\n')) {
-    if (index >= static_cast<size_t>(Counter::kCount)) break;
-    const std::string trimmed = util::TrimWhitespace(line);
-    if (trimmed.empty()) continue;
-    stats.values[index++] = std::strtoull(trimmed.c_str(), nullptr, 10);
+std::optional<Counter> CounterFor(Outcome outcome) {
+  switch (outcome) {
+    case Outcome::kUncacheable: return Counter::kUncacheable;
+    case Outcome::kPreprocessFailed: return Counter::kPreprocessFailed;
+    case Outcome::kPassthrough: return std::nullopt;
   }
-  return stats;
+  return std::nullopt;
 }
 
-std::string RenderStats(const Stats& stats) {
+// Strict, so that a damaged count is dropped rather than read as a prefix.
+std::optional<uint64_t> ParseCount(const std::string& text) {
+  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+    return std::nullopt;
+  }
+  errno = 0;
+  const uint64_t value = std::strtoull(text.c_str(), nullptr, 10);
+  if (errno == ERANGE) return std::nullopt;
+  return value;
+}
+
+// `fields` is what follows kReasonLinePrefix; anything but "name<TAB>count" is
+// skipped.
+void ParseReasonFields(std::string_view fields, Stats* stats) {
+  const std::vector<std::string> name_and_count = util::Split(fields, '\t');
+  if (name_and_count.size() != 2 || name_and_count[0].empty()) return;
+  if (const std::optional<uint64_t> count = ParseCount(name_and_count[1])) {
+    stats->reasons[name_and_count[0]] += *count;
+  }
+}
+
+constexpr size_t kLabelWidth = 20;
+
+std::string PadRight(std::string_view text, size_t width) {
+  std::string out(text);
+  if (out.size() < width) out.append(width - out.size(), ' ');
+  return out;
+}
+
+uint64_t SumReasons(const Stats& stats, Outcome outcome) {
+  uint64_t sum = 0;
+  for (const ReasonInfo& info : kReasons) {
+    if (info.outcome == outcome) sum += stats.GetReason(info.reason);
+  }
+  return sum;
+}
+
+// The outcome's non-zero reasons, largest first, indented under its row.
+std::string FormatReasons(const Stats& stats, Outcome outcome) {
+  std::vector<std::pair<uint64_t, std::string_view>> rows;
+  for (const ReasonInfo& info : kReasons) {
+    if (info.outcome != outcome) continue;
+    if (const uint64_t count = stats.GetReason(info.reason)) rows.emplace_back(count, info.name);
+  }
+  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+    return a.first != b.first ? a.first > b.first : a.second < b.second;
+  });
   std::string out;
-  for (size_t i = 0; i < static_cast<size_t>(Counter::kCount); ++i) {
-    out += std::to_string(stats.values[i]);
-    out.push_back('\n');
+  for (const auto& [count, name] : rows) {
+    out += "  " + PadRight(name, kLabelWidth) + std::to_string(count) + "\n";
   }
   return out;
 }
@@ -92,8 +141,60 @@ bool WithLockedStats(const std::string& cache_dir,
 
 }  // namespace
 
+uint64_t Stats::GetReason(Reason reason) const {
+  auto it = reasons.find(GetReasonInfo(reason).name);
+  return it == reasons.end() ? 0 : it->second;
+}
+
+void Stats::AddReason(Reason reason, uint64_t n) {
+  const ReasonInfo& info = GetReasonInfo(reason);
+  if (std::optional<Counter> counter = CounterFor(info.outcome)) Add(*counter, n);
+  auto it = reasons.find(info.name);
+  if (it == reasons.end()) it = reasons.emplace(std::string(info.name), 0).first;
+  it->second += n;
+}
+
+// Positional counters first, which is all an older version reads. Anything
+// after them that is not a well-formed reason line is ignored.
+Stats ParseStats(const std::string& text) {
+  Stats stats;
+  size_t index = 0;
+  for (const std::string& line : util::Split(text, '\n')) {
+    if (util::StartsWith(line, kReasonLinePrefix)) {
+      ParseReasonFields(std::string_view(line).substr(kReasonLinePrefix.size()), &stats);
+      continue;
+    }
+    if (index >= static_cast<size_t>(Counter::kCount)) continue;
+    const std::string trimmed = util::TrimWhitespace(line);
+    if (trimmed.empty()) continue;
+    stats.values[index++] = std::strtoull(trimmed.c_str(), nullptr, 10);
+  }
+  return stats;
+}
+
+std::string RenderStats(const Stats& stats) {
+  std::string out;
+  for (size_t i = 0; i < static_cast<size_t>(Counter::kCount); ++i) {
+    out += std::to_string(stats.values[i]);
+    out.push_back('\n');
+  }
+  for (const auto& [name, count] : stats.reasons) {
+    if (count == 0) continue;
+    out += std::string(kReasonLinePrefix) + name + "\t" + std::to_string(count) + "\n";
+  }
+  return out;
+}
+
 void RecordCounter(const std::string& cache_dir, Counter counter) {
   WithLockedStats(cache_dir, [counter](Stats* stats) { stats->Add(counter); });
+}
+
+void RecordDecision(const std::string& cache_dir, const Decision& decision) {
+  VCACHE_LOG(std::string(OutcomeName(GetReasonInfo(decision.reason).outcome)) +
+             ": " + decision.Describe());
+  WithLockedStats(cache_dir, [&decision](Stats* stats) {
+    stats->AddReason(decision.reason);
+  });
 }
 
 Stats ReadStats(const std::string& cache_dir) {
@@ -121,6 +222,17 @@ std::string FormatStats(const Stats& stats, const std::string& cache_dir,
     out << kNames[i];
     out.unsetf(std::ios::left);
     out << stats.values[i] << "\n";
+    if (i == static_cast<size_t>(Counter::kUncacheable)) {
+      out << FormatReasons(stats, Outcome::kUncacheable);
+      // Passthrough has no counter of its own, so it appears only once a
+      // reason has been recorded.
+      if (const uint64_t passthrough = SumReasons(stats, Outcome::kPassthrough)) {
+        out << PadRight(OutcomeName(Outcome::kPassthrough), kLabelWidth) << passthrough
+            << "\n" << FormatReasons(stats, Outcome::kPassthrough);
+      }
+    } else if (i == static_cast<size_t>(Counter::kPreprocessFailed)) {
+      out << FormatReasons(stats, Outcome::kPreprocessFailed);
+    }
   }
   out.width(20);
   out.setf(std::ios::left);

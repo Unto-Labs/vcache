@@ -179,7 +179,7 @@ the build proceeds — a shared cache outage never breaks a build.
 
 | Command | Effect |
 | --- | --- |
-| `vcache --show-stats` | hit/miss counters and cache size |
+| `vcache --show-stats` | hit/miss counters, why runs were not cached, and cache size |
 | `vcache --zero-stats` | reset counters |
 | `vcache --clear` | delete all entries |
 | `vcache --trim` | evict until under the size limit |
@@ -251,7 +251,8 @@ Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
 text never mentions), and `rustc` without `--out-dir`/`--emit`. All of these
 fall through to the compiler unchanged, so a build always makes progress.
-`vcache --show-stats` counts them as *uncacheable*.
+`vcache --show-stats` counts them as *uncacheable*, broken down by the rule that
+declined each.
 
 Two things that look like they belong on that list but are cached:
 

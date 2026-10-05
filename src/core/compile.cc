@@ -539,8 +539,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   const args::CompilerArgs parsed = args::Parse(argv);
 
   if (config.dep_scan_policy == DepScanPolicy::kUncacheable) {
-    VCACHE_LOG("dep scan: policy is 'uncacheable'");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kDepScanPolicy);
     return RunPassthrough(argv);
   }
 
@@ -551,12 +550,14 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   std::string native_target;
   if (!parsed.native_flags.empty()) {
     if (config.native_target_policy == NativeTargetPolicy::kUncacheable) {
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetPolicy, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     native_target = ResolveNativeTarget(parsed, compiler_id, cache_dir);
     if (native_target.empty()) {
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetUnresolved, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
   }
@@ -566,7 +567,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // fight over one entry.
   auto source_digest = hash::HashFile(parsed.source);
   if (!source_digest) {
-    VCACHE_LOG("dep scan: cannot read " + parsed.source);
+    RecordDecision(cache_dir, {Reason::kUnreadableSource, parsed.source});
     return RunPassthrough(argv);
   }
 
@@ -639,7 +640,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // ---- miss: run the scan for real ----------------------------------------
 
   auto temp_dir = util::MakeTempDir("vcache-dep-");
-  if (!temp_dir) return RunPassthrough(argv);
+  if (!temp_dir) {
+    RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
   struct TempDirGuard {
     std::string path;
     ~TempDirGuard() { util::RemoveRecursive(path); }
@@ -672,7 +676,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   auto text = util::ReadFile(tmp_out);
   if (!text) {
-    VCACHE_LOG("dep scan: produced no output; rerunning directly");
+    RecordDecision(cache_dir, Reason::kNoDepScanOutput);
     return RunPassthrough(argv);
   }
 
@@ -681,7 +685,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     // Emit what the compiler said rather than nothing, and do not store an
     // entry vcache cannot replay faithfully.
     VCACHE_LOG("dep scan: output did not parse; passing it through unstored");
-    if (!EmitDepOutput(parsed.depfile, *text)) return RunPassthrough(argv);
+    if (!EmitDepOutput(parsed.depfile, *text)) {
+      RecordDecision(cache_dir, {Reason::kDepfileUnwritable, parsed.depfile});
+      return RunPassthrough(argv);
+    }
     RecordCounter(cache_dir, Counter::kStoreFailed);
     return media_fail_exit();
   }
@@ -691,7 +698,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // only gcc's line wrapping differs, and the unwrapped form is the one cargo
   // can also read.
   if (!EmitDepOutput(parsed.depfile, RenderDepFile(*dep))) {
-    VCACHE_LOG("dep scan: could not write " + parsed.depfile);
+    RecordDecision(cache_dir, {Reason::kDepfileUnwritable, parsed.depfile});
     return RunPassthrough(argv);
   }
 
@@ -805,8 +812,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   args::CompilerArgs parsed = args::Parse(argv);
 
   if (!parsed.cacheable()) {
-    VCACHE_LOG("uncacheable: " + *parsed.uncacheable);
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, *parsed.uncacheable);
     return RunPassthrough(argv);
   }
 
@@ -833,8 +839,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                   parsed.incoming_prefix_maps.front().c_str());
         return 1;
       case IncomingMapPolicy::kKeep:
-        VCACHE_LOG("incoming prefix maps kept; not caching");
-        RecordCounter(cache_dir, Counter::kUncacheable);
+        RecordDecision(cache_dir, Reason::kKeptPrefixMaps);
         return RunPassthrough(argv);
       case IncomingMapPolicy::kStrip:
         VCACHE_LOG("stripped incoming prefix maps: " +
@@ -852,16 +857,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   std::string native_target;
   if (!parsed.native_flags.empty()) {
     if (config.native_target_policy == NativeTargetPolicy::kUncacheable) {
-      VCACHE_LOG("uncacheable: native target flags (" +
-                 util::Join(parsed.native_flags, " ") + ") and policy is 'uncacheable'");
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetPolicy, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     native_target = ResolveNativeTarget(parsed, compiler_id, cache_dir);
     if (native_target.empty()) {
-      VCACHE_LOG("uncacheable: could not resolve " +
-                 util::Join(parsed.native_flags, " "));
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetUnresolved, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     VCACHE_LOG("native target " + native_target.substr(0, 16) + " for " +
@@ -870,7 +873,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   auto temp_dir = util::MakeTempDir("vcache-");
   if (!temp_dir) {
-    VCACHE_LOG("could not create temp dir; falling back");
+    RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);
   }
   struct TempDirGuard {
@@ -890,9 +893,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (pp.exit_code != 0) {
     // The compilation itself will fail too; let the compiler produce the real
     // diagnostics rather than reporting a vcache-shaped error.
-    VCACHE_LOG("preprocessing failed with exit code " + std::to_string(pp.exit_code) +
-               ": " + pp.stderr_data.substr(0, 512));
-    RecordCounter(cache_dir, Counter::kPreprocessFailed);
+    RecordDecision(cache_dir, {Reason::kPreprocessorError,
+                               "exit code " + std::to_string(pp.exit_code) + ": " +
+                                   pp.stderr_data.substr(0, 512)});
     return RunPassthrough(argv);
   }
 
@@ -900,7 +903,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const std::string key = ComputeKey(parsed, roots, compiler_id, config,
                                      native_target, preprocessed, &saw_incbin);
   if (key.empty()) {
-    VCACHE_LOG("could not compute cache key; falling back");
+    RecordDecision(cache_dir, Reason::kNoCacheKey);
     return RunPassthrough(argv);
   }
   // The preprocessed text is the whole of what vcache knows about this
@@ -908,9 +911,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // never mentions. Two builds can preprocess identically and still owe
   // different objects, so there is no key that would be honest here.
   if (saw_incbin) {
-    VCACHE_LOG("uncacheable: .incbin names a file the assembler reads, whose "
-               "contents the preprocessed text does not carry");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kIncbin);
     return RunPassthrough(argv);
   }
   VCACHE_LOG("key " + key + " for " + parsed.source + " -> " + parsed.output);
@@ -976,7 +977,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   }
 
   if (!util::LinkOrCopy(tmp_output, parsed.output)) {
-    VCACHE_LOG("could not place object at " + parsed.output + "; rerunning directly");
+    RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.output});
     return RunPassthrough(argv);
   }
 

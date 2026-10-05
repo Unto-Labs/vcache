@@ -25,6 +25,7 @@ namespace {
 
 using core::Counter;
 using core::MapDirection;
+using core::Reason;
 using core::RootMap;
 
 constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v2";
@@ -278,8 +279,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   args::RustcArgs parsed = args::ParseRustc(argv);
   if (!parsed.cacheable()) {
-    VCACHE_LOG("rust uncacheable: " + *parsed.uncacheable);
-    core::RecordCounter(cache_dir, Counter::kUncacheable);
+    core::RecordDecision(cache_dir, *parsed.uncacheable);
     return RunPassthrough(argv);
   }
 
@@ -295,7 +295,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
                   parsed.incoming_prefix_maps.front().c_str());
         return 1;
       case core::IncomingMapPolicy::kKeep:
-        core::RecordCounter(cache_dir, Counter::kUncacheable);
+        core::RecordDecision(cache_dir, Reason::kKeptPrefixMaps);
         return RunPassthrough(argv);
       case core::IncomingMapPolicy::kStrip:
         VCACHE_LOG("rust: stripped incoming remap flags");
@@ -304,7 +304,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   auto temp_dir = util::MakeTempDir("vcache-rs-");
-  if (!temp_dir) return RunPassthrough(argv);
+  if (!temp_dir) {
+    core::RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
   struct TempDirGuard {
     std::string path;
     ~TempDirGuard() { util::RemoveRecursive(path); }
@@ -315,18 +318,20 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   const CrateInputs inputs = CollectCrateInputs(parsed, *temp_dir);
   if (inputs.sources.empty()) {
-    VCACHE_LOG("rust: no dependency information; falling back");
-    core::RecordCounter(cache_dir, Counter::kPreprocessFailed);
+    core::RecordDecision(cache_dir, Reason::kNoRustDepInfo);
     return RunPassthrough(argv);
   }
 
   const std::string key =
       ComputeKey(parsed, roots, rustc_fingerprint, config, inputs);
-  if (key.empty()) return RunPassthrough(argv);
+  if (key.empty()) {
+    core::RecordDecision(cache_dir, Reason::kNoCacheKey);
+    return RunPassthrough(argv);
+  }
   VCACHE_LOG("rust key " + key + " for " + parsed.source);
 
   if (!util::MakeDirs(parsed.out_dir)) {
-    VCACHE_LOG("rust: cannot create out-dir " + parsed.out_dir);
+    core::RecordDecision(cache_dir, {Reason::kOutDirUnwritable, parsed.out_dir});
     return RunPassthrough(argv);
   }
 
@@ -357,7 +362,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // ---- miss: compile into a staging directory -----------------------------
 
   const std::string stage_dir = *temp_dir + "/out";
-  if (!util::MakeDirs(stage_dir)) return RunPassthrough(argv);
+  if (!util::MakeDirs(stage_dir)) {
+    core::RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
 
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
@@ -383,10 +391,13 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   std::vector<storage::BlobFile> files;
   if (!CaptureOutputs(stage_dir, roots, &files)) {
-    VCACHE_LOG("rust: could not capture outputs; rerunning directly");
+    core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
-  if (!RestoreOutputs(files, parsed.out_dir, roots)) return RunPassthrough(argv);
+  if (!RestoreOutputs(files, parsed.out_dir, roots)) {
+    core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
+    return RunPassthrough(argv);
+  }
 
   // Only now, with the artifacts in place. rustc announces each one on stderr
   // as a JSON "artifact" message, and cargo uses those to start a dependent

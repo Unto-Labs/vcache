@@ -74,7 +74,7 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
   RustcArgs result;
   result.argv = argv;
   if (argv.empty()) {
-    result.uncacheable = "empty command line";
+    result.uncacheable = core::Reason::kEmptyCommandLine;
     return result;
   }
   result.compiler = argv[0];
@@ -91,7 +91,7 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       continue;
     }
     if (arg == "-") {
-      result.uncacheable = "reads source from stdin";
+      result.uncacheable = core::Reason::kSourceFromStdin;
       return result;
     }
 
@@ -182,11 +182,11 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
   }
 
   if (inputs.empty()) {
-    result.uncacheable = "no input file";
+    result.uncacheable = core::Reason::kNoInputFile;
     return result;
   }
   if (inputs.size() > 1) {
-    result.uncacheable = "multiple input files";
+    result.uncacheable = core::Reason::kMultipleInputs;
     return result;
   }
   result.source = inputs[0];
@@ -194,21 +194,21 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
   if (result.out_dir.empty()) {
     // Without --out-dir rustc writes into the cwd under names derived from the
     // crate, which vcache cannot capture reliably.
-    result.uncacheable = "no --out-dir";
+    result.uncacheable = core::Reason::kNoOutDir;
     return result;
   }
   if (saw_explicit_output) {
-    result.uncacheable = "explicit -o is not supported";
+    result.uncacheable = core::Reason::kExplicitOutput;
     return result;
   }
   if (result.emit_kinds.empty()) {
-    result.uncacheable = "no --emit; cannot predict outputs";
+    result.uncacheable = core::Reason::kNoEmit;
     return result;
   }
   for (const std::string& kind : result.emit_kinds) {
     // `--emit=asm=path` style targets write outside --out-dir.
     if (kind.find('=') != std::string::npos) {
-      result.uncacheable = "--emit with an explicit path is not supported";
+      result.uncacheable = core::Decision(core::Reason::kEmitWithPath, kind);
       return result;
     }
   }

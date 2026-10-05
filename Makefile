@@ -126,12 +126,20 @@ INCLUDES := -I$(SRC) -I$(BOOST_INC) -I$(BLAKE3_DIR) -I$(TOMLPP_INC) $(CURL_CFLAG
 # Both features are recent, so detect rather than assume: -gz=zstd needs a gcc
 # built with zstd support (13+) and binutils 2.40+, and LTO needs a working
 # linker plugin. A toolchain without them still builds, just larger.
+#
+# The static C++ runtime is probed too: distributions ship libstdc++.a as a
+# separate package (libstdc++-static on Fedora and RHEL) that most hosts lack,
+# and without it the link fails with "cannot find -lstdc++".
 
 PROBE_SRC := $(shell mktemp --suffix=.cc 2>/dev/null || echo /tmp/vcache-probe.cc)
 $(shell echo 'int main(){return 0;}' > $(PROBE_SRC))
 
 HAVE_GZ_ZSTD := $(shell $(CXX) -ggdb3 -gz=zstd -c $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
 HAVE_LTO     := $(shell $(CXX) -flto=auto -O2 $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
+ifneq ($(HOST_OS),Darwin)
+HAVE_STATIC_RT := $(shell $(CXX) -static-libstdc++ -static-libgcc $(PROBE_SRC) -o /dev/null \
+                    >/dev/null 2>&1 && echo 1)
+endif
 
 # ---- optimisation, debug info and LTO ---------------------------------------
 
@@ -186,7 +194,9 @@ ASFLAGS  := -g $(DEBUG_FMT)
 
 # Static where practical, as the plan asks. Only libc, libm and the loader are
 # dynamic; libm comes in via tcmalloc's use of log2. libcurl is not linked at
-# all -- it is dlopen'd only when an S3 layer is constructed.
+# all -- it is dlopen'd only when an S3 layer is constructed. Where the probe
+# finds no static libstdc++, libstdc++ and libgcc_s are dynamic too: two more
+# DT_NEEDED entries is a better outcome than no binary.
 #
 # LTO flags must be repeated at link time, and the optimisation level with them,
 # since that is when code generation actually happens.
@@ -203,7 +213,14 @@ ifeq ($(HOST_OS),Darwin)
 LDFLAGS  := -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) -Wl,-dead_strip
 LDLIBS   := $(TCMALLOC_A)
 else
-LDFLAGS  := -static-libstdc++ -static-libgcc -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) \
+ifeq ($(HAVE_STATIC_RT),1)
+STATIC_RT := -static-libstdc++ -static-libgcc
+$(info vcache: linking libstdc++ and libgcc statically)
+else
+STATIC_RT :=
+$(info vcache: no static libstdc++ found, linking libstdc++ dynamically)
+endif
+LDFLAGS  := $(STATIC_RT) -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) \
             -Wl,--gc-sections -Wl,--as-needed -Wl,-O1
 # -ldl is a no-op on glibc 2.34+, where dlopen moved into libc; --as-needed drops
 # it from DT_NEEDED. Kept for older glibc, which needs it for dlopen.

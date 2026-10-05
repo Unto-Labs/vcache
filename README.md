@@ -238,6 +238,10 @@ request. Two changes removed them:
 
 Process startup went from 6.1 ms to 3.0 ms as a result.
 
+A toolchain without the static libstdc++ archive (`libstdc++-static` on Fedora
+and RHEL) gets a dynamically linked libstdc++ instead, which adds
+`libstdc++.so.6` and `libgcc_s.so.1` to the list above.
+
 ## What is not cached
 
 Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
@@ -283,6 +287,8 @@ including the two compiler behaviours that make the naive approach fail.
 Release builds use `-O3 -ggdb3`, LTO, and zstd-compressed debug info. Both LTO
 and `-gz=zstd` are probed for at configure time, so a toolchain without them
 still builds — just larger. `make BUILD=debug` gives `-O0 -ggdb3` with no LTO.
+`-static-libstdc++ -static-libgcc` is probed the same way, and `make` prints
+which of static or dynamic libstdc++ it chose.
 
 Effect on the shipped binary, which keeps full `-ggdb3` debug info throughout:
 
@@ -313,7 +319,8 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
   exactly what Spirit X3 opens. `make boost-subset` regenerates it against a
   full Boost tree if an include ever reaches further. Only gperftools is
   downloaded at setup time; everything else is committed.
-- Statically linked apart from libc and libcurl.
+- Statically linked apart from libc and libcurl, and libstdc++ where the
+  toolchain has no static archive of it.
 - Cache entries carry a BLAKE3 checksum; a corrupt entry reads as a miss rather
   than yielding a bad object.
 

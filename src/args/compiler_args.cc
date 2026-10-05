@@ -30,6 +30,7 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
       "-aux-info",   "-B",          "--param",     "-T",
       "-u",          "-z",          "-target",     "--sysroot",
       "-iframework", "-F",          "-system-header-prefix",
+      "-include-pch",
   };
   return *kSet;
 }
@@ -558,8 +559,11 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     // .pcm records the paths of the modules *it* imports: hashing the one file
     // named on the command line would not cover the transitive set, and the
     // preprocessor does not expand `import` the way it expands `#include`.
+    //
+    // -fpch-preprocess: -E names the .gch, not the header text; .gch bytes vary.
     if (arg == "-save-temps" || StartsWith(arg, "-save-temps=") ||
-        arg == "-fsyntax-only" || StartsWith(arg, "-specs=") ||
+        arg == "-fsyntax-only" || arg == "-fpch-preprocess" ||
+        StartsWith(arg, "-specs=") ||
         StartsWith(arg, "-fprofile-generate") || StartsWith(arg, "-fprofile-use") ||
         StartsWith(arg, "-fauto-profile") || arg == "-frepo" ||
         StartsWith(arg, "-fmodules") || StartsWith(arg, "-fmodule-file=") ||

@@ -51,11 +51,12 @@ is a hit at all when a ccache hit would not have been.
 
 ## Quick start
 
-Prerequisites: a C++20 compiler, `make`, `curl`, and **libcurl development
-headers** — `libcurl4-openssl-dev` on Debian/Ubuntu, `libcurl-devel` on Fedora
-and RHEL, already present in the macOS SDK. vcache loads libcurl at runtime with
-`dlopen`, so the shared library is only needed if you use the S3 layer, but
-`curl/curl.h` is required to build either way.
+Prerequisites: a C++20 compiler, `make` and `curl`. vcache loads libcurl at
+runtime with `dlopen`, so the shared library is only needed if you use the S3
+layer. libcurl's development headers (`libcurl4-openssl-dev` on Debian/Ubuntu,
+`libcurl-devel` on Fedora and RHEL, already present in the macOS SDK) are used
+when installed; without them the build falls back to the few declarations it
+needs, vendored in `third-party/curl`.
 
 ```console
 $ ./third-party/fetch.sh     # builds tcmalloc (one time)
@@ -288,7 +289,9 @@ Release builds use `-O3 -ggdb3`, LTO, and zstd-compressed debug info. Both LTO
 and `-gz=zstd` are probed for at configure time, so a toolchain without them
 still builds — just larger. `make BUILD=debug` gives `-O0 -ggdb3` with no LTO.
 `-static-libstdc++ -static-libgcc` is probed the same way, and `make` prints
-which of static or dynamic libstdc++ it chose.
+which of static or dynamic libstdc++ it chose. So is `curl/curl.h`: without it,
+`make` says so and builds against `third-party/curl`, and S3 works as before
+wherever libcurl is installed at runtime.
 
 Effect on the shipped binary, which keeps full `-ggdb3` debug info throughout:
 
@@ -374,9 +377,10 @@ carries that licence text verbatim:
 | BLAKE3 1.5.4 | Apache 2.0 with LLVM exception | [third-party/blake3/LICENSE_A2](third-party/blake3/LICENSE_A2) |
 | toml++ 3.4.0 | MIT | [third-party/tomlplusplus/LICENSE](third-party/tomlplusplus/LICENSE) |
 | Boost 1.86.0 subset | Boost Software License 1.0 | [third-party/boost/LICENSE](third-party/boost/LICENSE) |
+| curl 8.14.1 `curl.h` subset | curl licence | [third-party/curl/COPYING](third-party/curl/COPYING) |
 | gperftools 2.16 | BSD 3-clause | fetched at build time, not committed; licence ships in the tarball |
 
-All four are permissive and impose no term Apache 2.0 does not already
+All five are permissive and impose no term Apache 2.0 does not already
 accommodate, which is what the combination requires: their notice-retention
 obligations sit comfortably inside Apache 2.0's own attribution rules, and the
 combined binary ships under Apache 2.0 with the vendored notices intact.

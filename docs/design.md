@@ -136,12 +136,15 @@ constructor and reached through a resolved function-pointer table
 vendored in `hash/sha256.cc`, since SigV4 needed exactly three OpenSSL
 functions. The result is four `ldd` entries and 3.0 ms of startup.
 
-Two details worth knowing if you touch this code. `curl/typecheck-gcc.h`
+Three details worth knowing if you touch this code. `curl/typecheck-gcc.h`
 redefines `curl_easy_setopt` and `curl_easy_getinfo` as macros, which would
 rewrite calls made through function pointers, so `curl_api.h` defines
-`CURL_DISABLE_TYPECHECK` before including the header. And the loader tries
-several sonames (`libcurl.so.4`, `libcurl-gnutls.so.4`, ...) because Debian and
-Ubuntu ship TLS-backend-specific builds under different names.
+`CURL_DISABLE_TYPECHECK` before including the header. The loader tries several
+sonames (`libcurl.so.4`, `libcurl-gnutls.so.4`, ...) because Debian and Ubuntu
+ship TLS-backend-specific builds under different names. And on a host without
+curl's headers the build uses `third-party/curl` instead, which declares only
+the types and constants vcache uses, so a new `CURLOPT_` has to be added there
+as well.
 
 The vendored SHA-256 is not a general-purpose crypto primitive and makes no
 constant-time claims: it signs outbound requests with a key the process already

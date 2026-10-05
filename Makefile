@@ -77,8 +77,10 @@ TCMALLOC_A  := $(TP)/gperftools/build/libtcmalloc_minimal.a \
 
 # libcurl headers only: the library itself is dlopen'd at runtime, so it is not
 # a link-time dependency. See src/storage/curl_api.h for why. Multiarch puts the
-# headers outside the default include path on Debian/Ubuntu.
-CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+# headers outside the default include path on Debian/Ubuntu. Where they are not
+# installed at all, the probe below falls back to third-party/curl.
+PKG_CONFIG  ?= pkg-config
+CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 
 # ---- BLAKE3 architecture selection ------------------------------------------
 #
@@ -130,6 +132,10 @@ INCLUDES := -I$(SRC) -I$(BOOST_INC) -I$(BLAKE3_DIR) -I$(TOMLPP_INC) $(CURL_CFLAG
 # The static C++ runtime is probed too: distributions ship libstdc++.a as a
 # separate package (libstdc++-static on Fedora and RHEL) that most hosts lack,
 # and without it the link fails with "cannot find -lstdc++".
+#
+# So are curl's headers. pkg-config's silence proves nothing -- it prints no
+# flags for headers already on the default path, and a host can have the
+# headers without libcurl.pc -- so ask the compiler.
 
 PROBE_SRC := $(shell mktemp --suffix=.cc 2>/dev/null || echo /tmp/vcache-probe.cc)
 $(shell echo 'int main(){return 0;}' > $(PROBE_SRC))
@@ -139,6 +145,16 @@ HAVE_LTO     := $(shell $(CXX) -flto=auto -O2 $(PROBE_SRC) -o /dev/null >/dev/nu
 ifneq ($(HOST_OS),Darwin)
 HAVE_STATIC_RT := $(shell $(CXX) -static-libstdc++ -static-libgcc $(PROBE_SRC) -o /dev/null \
                     >/dev/null 2>&1 && echo 1)
+endif
+HAVE_CURL_H  := $(shell $(CXX) $(CURL_CFLAGS) -include curl/curl.h -fsyntax-only $(PROBE_SRC) \
+                  >/dev/null 2>&1 && echo 1)
+
+ifneq ($(HAVE_CURL_H),1)
+  # Only the types and constants vcache uses, which is all a dlopen'd libcurl
+  # needs at compile time. Nothing else is lost: S3 still works wherever the
+  # shared library is installed at runtime.
+  INCLUDES += -I$(TP)/curl/include
+  $(info vcache: curl/curl.h not found, using the subset in third-party/curl)
 endif
 
 # ---- optimisation, debug info and LTO ---------------------------------------

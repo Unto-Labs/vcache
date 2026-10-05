@@ -12,6 +12,7 @@
 
 #include "args/compiler_args.h"
 #include "core/depfile.h"
+#include "core/manifest.h"
 #include "core/preprocessed.h"
 #include "core/stats.h"
 #include "hash/hasher.h"
@@ -410,18 +411,10 @@ namespace {
 constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v1";
 constexpr std::string_view kManifestHeader = "vcache-depmanifest-2";
 
-// How many header states one manifest remembers. A manifest maps a command line
-// to several possible answers, one per set of header contents seen, because the
-// key cannot include what it has not read yet. Without that, alternating
-// between two branches would miss every time: the entry for the state you just
-// left is the one that gets overwritten. Eight covers branch-switching; the
-// cost of a stale tail entry is one wasted hash pass.
-constexpr size_t kMaxManifestEntries = 8;
-
 // One remembered state: the files a scan read, and where its answer is stored.
 struct DepManifestEntry {
   std::string result_key;
-  std::vector<std::pair<std::string, std::string>> files;  // canonical path, digest
+  std::vector<ManifestFile> files;
 };
 
 // Everything on the command line that can change which files a dependency scan
@@ -461,8 +454,7 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
 }
 
 // A header line, then per entry an "entry <key>" line followed by one
-// "<hex digest> <canonical path>" line per file. The digest comes first so a
-// path containing spaces still parses by taking the rest of the line.
+// RenderManifestFile line per file.
 std::string RenderManifest(const std::vector<DepManifestEntry>& entries) {
   std::string out(kManifestHeader);
   out.push_back('\n');
@@ -470,10 +462,8 @@ std::string RenderManifest(const std::vector<DepManifestEntry>& entries) {
     out += "entry ";
     out += entry.result_key;
     out.push_back('\n');
-    for (const auto& [path, digest] : entry.files) {
-      out += digest;
-      out.push_back(' ');
-      out += path;
+    for (const ManifestFile& file : entry.files) {
+      out += RenderManifestFile(file);
       out.push_back('\n');
     }
   }
@@ -493,29 +483,9 @@ bool ParseManifest(const std::string& text, std::vector<DepManifestEntry>* entri
       continue;
     }
     if (entries->empty()) return false;
-    const size_t space = line.find(' ');
-    if (space != hash::kDigestHexLen) return false;
-    entries->back().files.emplace_back(line.substr(space + 1), line.substr(0, space));
-  }
-  return true;
-}
-
-// True when every recorded file still hashes to what the manifest says. A file
-// that has been deleted, changed or replaced makes this false, and the entry is
-// then not used -- which is the whole guarantee behind this mode.
-bool ManifestStillHolds(const std::vector<std::pair<std::string, std::string>>& files,
-                        const RootMap& roots) {
-  for (const auto& [canonical_path, digest] : files) {
-    const std::string local = roots.Localize(canonical_path);
-    auto actual = hash::HashFile(local);
-    if (!actual) {
-      VCACHE_LOG("dep manifest: " + local + " is gone");
-      return false;
-    }
-    if (*actual != digest) {
-      VCACHE_LOG("dep manifest: " + local + " changed");
-      return false;
-    }
+    ManifestFile file;
+    if (!ParseManifestFile(line, &file)) return false;
+    entries->back().files.push_back(std::move(file));
   }
   return true;
 }
@@ -616,7 +586,12 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   if (!config.recache && cache != nullptr) {
     for (const DepManifestEntry& entry : entries) {
-      if (!ManifestStillHolds(entry.files, roots)) continue;
+      // A file that has been deleted, changed or replaced rules the entry out,
+      // which is the whole guarantee behind this mode.
+      if (auto stale = FindStaleManifestFile(entry.files, roots)) {
+        VCACHE_LOG("dep manifest: " + *stale);
+        continue;
+      }
       storage::GetResult result = cache->Get(entry.result_key);
       media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
       storage::Blob blob;
@@ -709,7 +684,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // Every prerequisite becomes a manifest entry. -MP's phony rules carry no
   // prerequisites and contribute nothing, which is correct: they name the same
   // headers the first rule already lists.
-  std::vector<std::pair<std::string, std::string>> files;
+  std::vector<ManifestFile> files;
   for (const DepRule& rule : dep->rules) {
     for (const std::string& prereq : rule.prerequisites) {
       auto digest = hash::HashFile(prereq);
@@ -750,19 +725,11 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     return media_fail_exit();
   }
 
-  // Newest first, so the states in active use stay ahead of the tail that gets
-  // dropped, and so lookup checks the likely match before hashing for others.
   DepManifestEntry fresh;
   fresh.result_key = result_key;
   fresh.files = std::move(files);
-
-  std::vector<DepManifestEntry> updated;
-  updated.push_back(std::move(fresh));
-  for (DepManifestEntry& entry : entries) {
-    if (entry.result_key == result_key) continue;  // superseded
-    if (updated.size() >= kMaxManifestEntries) break;
-    updated.push_back(std::move(entry));
-  }
+  const std::vector<DepManifestEntry> updated = PrependManifestState(
+      std::move(fresh), std::move(entries), &DepManifestEntry::result_key);
 
   storage::Blob manifest_blob;
   manifest_blob.dep_manifest = RenderManifest(updated);

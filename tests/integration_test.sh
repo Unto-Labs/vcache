@@ -707,6 +707,90 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9d. Rust: manifest-verified lookups skip the dep-info run"
+
+# rustc's dep-info run expands every macro, so on a hit it can cost more than
+# everything else vcache does. A remembered state whose files, env values and
+# extern digests all still match answers the lookup without it.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-man-a rust-man-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+mod helper;
+pub const DATA: &str = include_str!("data.txt");
+pub const COMMIT: Option<&str> = option_env!("DEMO_UNSET");
+pub fn value() -> u32 { helper::value() }
+EOF
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/helper.rs"
+    echo 'hello' > "$WORK/$tree/src/data.txt"
+  done
+  manlog="$WORK/rust-man.log"
+  rust_man() {  # $1 = tree; each run gets a fresh log
+    : > "$manlog"
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=mancrate" VCACHE_LOG="$manlog" \
+        "$VCACHE" rustc --crate-name man --edition 2021 --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) 2>/dev/null
+  }
+  dep_info_runs() { grep -c 'rust dep-info:' "$manlog"; }
+  logged() { grep -cF "$1" "$manlog"; }
+
+  rust_man rust-man-a
+  check "first manifest-mode compile is a miss" "$(misses)" "1"
+  check "a miss asks rustc for dep-info" "$(dep_info_runs)" "1"
+  check "the miss records one state" "$(logged 'rust manifest: stored 1 states')" "1"
+  cp "$WORK/rust-man-a/out/libman.rlib" "$WORK/rust-man-a.rlib"
+
+  rust_man rust-man-a
+  check "an unchanged crate hits" "$(hits)" "1"
+  check "the hit skips the dep-info run" "$(dep_info_runs)" "0"
+  check "the hit names the state that matched" "$(logged 'rust manifest hit: state 1 of 1')" "1"
+
+  echo 'pub fn value() -> u32 { 43 }' > "$WORK/rust-man-a/src/helper.rs"
+  rust_man rust-man-a
+  check "an edited module misses" "$(misses)" "2"
+  check "the rejection names the edited module" \
+    "$(logged 'state 1 of 1 rejected: src/helper.rs changed')" "1"
+  check "the manifest now holds two states" "$(logged 'rust manifest: stored 2 states')" "1"
+
+  echo 'pub fn value() -> u32 { 42 }' > "$WORK/rust-man-a/src/helper.rs"
+  rust_man rust-man-a
+  check "reverting the module hits" "$(hits)" "2"
+  check "the reverted hit skips the dep-info run" "$(dep_info_runs)" "0"
+  check "the reverted hit uses the second state" "$(logged 'rust manifest hit: state 2 of 2')" "1"
+
+  echo 'changed' > "$WORK/rust-man-a/src/data.txt"
+  rust_man rust-man-a
+  check "an edited include_str! file misses" "$(misses)" "3"
+  check "the rejection names the included file" \
+    "$(logged 'state 1 of 2 rejected: src/data.txt changed')" "1"
+  echo 'hello' > "$WORK/rust-man-a/src/data.txt"
+
+  DEMO_UNSET=x rust_man rust-man-a
+  check "setting a variable the crate reads misses" "$(misses)" "4"
+  check "the rejection names the variable" \
+    "$(logged "state 1 of 3 rejected: env DEMO_UNSET is 'x', was unset")" "1"
+
+  VCACHE_RUST_DEP_INFO=always rust_man rust-man-a
+  check "rust_dep_info=always still hits" "$(hits)" "3"
+  check "rust_dep_info=always runs dep-info" "$(dep_info_runs)" "1"
+  check "rust_dep_info=always leaves the manifest alone" "$(logged 'rust manifest')" "0"
+
+  rust_man rust-man-b
+  check "a second directory hits" "$(hits)" "4"
+  check "the second directory skips the dep-info run" "$(dep_info_runs)" "0"
+  if cmp -s "$WORK/rust-man-a.rlib" "$WORK/rust-man-b/out/libman.rlib"; then
+    ok "the manifest hit restores a byte-identical rlib"
+  else
+    bad "the manifest hit restores a byte-identical rlib"
+  fi
+  check "show-config reports the policy" \
+    "$(VCACHE_RUST_DEP_INFO=always "$VCACHE" --show-config | grep -c 'rust dep-info: *always')" "1"
+else
+  skipped "rustc not installed"
+fi
+
+# --------------------------------------------------------------------------
 section "10. cache management commands"
 
 reset_cache

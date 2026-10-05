@@ -285,6 +285,10 @@ preprocessing and `--extern` dependencies hashed by content rather than path.
 The variables that dep-info says the crate read through `env!`/`option_env!` go
 into the key with their raw values, so an unset or path-free variable still hits
 across directories.
+Dep-info expands every macro, so a lookup first checks a manifest of earlier
+dep-info runs, re-hashing the files each one recorded, and runs rustc only when
+none still matches — see
+[`rust_dep_info`](docs/configuration.md#rust_dep_info).
 
 `docs/preprocessor-problem.md` records the measurements this design rests on,
 including the two compiler behaviours that make the naive approach fail.
@@ -339,11 +343,11 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
 $ make test
 ```
 
-380 unit assertions and 248 integration assertions, covering cross-directory
+451 unit assertions and 309 integration assertions, covering cross-directory
 hits, out-of-tree builds, dependency-file replay, diagnostics replay,
 uncacheable fallback, masquerade mode, Rust, cache management, `-march=native`
-resolution, dependency-scan manifests, kbuild-shaped `-Wp,` command lines,
-`.incbin`, and the S3 layer against a mock object store. SigV4 is checked
+resolution, dependency-scan and Rust dep-info manifests, kbuild-shaped `-Wp,`
+command lines, `.incbin`, and the S3 layer against a mock object store. SigV4 is checked
 against AWS's documented signing-key vector and an independent reference
 implementation.
 

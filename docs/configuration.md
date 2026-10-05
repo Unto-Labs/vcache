@@ -88,6 +88,7 @@ timeout        = 30                # seconds
 | `vcache.incoming_prefix_maps` | `VCACHE_INCOMING_PREFIX_MAPS` | `--vcache-incoming-prefix-maps=`, `--vcache-allow-prefix-maps` | `error` |
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
+| `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
 | `vcache.hash_env_vars` | `VCACHE_HASH_ENV_VARS` | — | none |
@@ -779,6 +780,58 @@ in the key. It is specifically *creating a file that shadows an existing one*
 that this mode cannot see, which is the same trade ccache's direct mode makes.
 `-MG`, which lets a dependency name a file that does not exist yet, is not
 cached at all for the same reason.
+
+### `rust_dep_info`
+
+A Rust lookup has to know which files the crate reads before it can compute the
+key, and the only way to ask is `rustc --emit=dep-info`. That run expands every
+macro, so on a macro-heavy crate it costs seconds: for asupersync 0.4.2 it was
+7.3 s per hit, against a 108 s compile. Once everything is cached, those runs
+are most of what is left of a warm Rust build.
+
+By default vcache answers from a **manifest** instead, the same way
+[`dep_scan`](#dep_scan) does. The manifest key covers what is known before
+rustc runs: the toolchain, the roots, the key flags, `--emit`, the crate root's
+canonical path and contents, the names of the `--extern` crates, and any
+`hash_env_vars`. The manifest remembers up to eight states, one per dep-info
+run. Each holds the files that run listed with their digests, the variables
+the crate read (with their raw values or unset), the digest of each `--extern`
+dependency, and the full key those inputs produced. A lookup re-hashes the
+files of each state, compares the variables and extern digests with this
+invocation, and uses the first state that matches in full. Nothing is trusted
+on mtime. A rebuilt dependency adds a state rather than a second manifest, and
+a state that matches moves to the front, so the eight kept are the ones
+used most recently.
+
+Any mismatch, a missing manifest, or a state whose entry is gone falls back to
+the dep-info run, which then records its state. A manifest hit counts as an
+ordinary cache hit.
+
+Measured on `syn` 2 with `features = ["full"]`, the vcache side of a hit,
+including restoring the rlib, went from 166 ms to 53 ms.
+
+| Mode | Meaning |
+| --- | --- |
+| `manifest` *(default)* | Skip the dep-info run when a remembered state still matches. |
+| `always` | Run dep-info on every lookup, and leave the manifest alone. |
+
+```toml
+[vcache]
+rust_dep_info = "always"
+```
+```console
+$ export VCACHE_RUST_DEP_INFO=always
+```
+
+**The limitation worth knowing.** It is the same one `dep_scan` has. A state
+records the files a dep-info run *did* read, so it cannot notice a file that
+was not there at the time. Create a file that changes how a module resolves,
+such as `helper.rs` beside a recorded `helper/mod.rs` (which rustc rejects as
+ambiguous), or one that a proc macro finds by listing a directory, change
+nothing else, and a lookup can still hit with the old answer. Editing a
+`mod` or `include_str!` line does not have this problem, because the crate root
+is in the manifest key and every other source is re-hashed. Changing a flag or
+an extern does not either. Set `always` to make that case exact.
 
 ### `VCACHE_COMPILER_CHECK`
 

@@ -255,6 +255,7 @@ VCACHE_SRCS := \
   $(SRC)/core/roots.cc \
   $(SRC)/core/config.cc \
   $(SRC)/core/depfile.cc \
+  $(SRC)/core/manifest.cc \
   $(SRC)/core/preprocessed.cc \
   $(SRC)/core/stats.cc \
   $(SRC)/core/compile.cc \
@@ -264,6 +265,7 @@ VCACHE_SRCS := \
   $(SRC)/args/link_args.cc \
   $(SRC)/args/rustc_args.cc \
   $(SRC)/rust/rust_compile.cc \
+  $(SRC)/rust/rust_manifest.cc \
   $(SRC)/storage/disk_storage.cc \
   $(SRC)/storage/s3_storage.cc \
   $(SRC)/storage/chain.cc \

@@ -216,7 +216,10 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   of work rather than a switch. This is the main remaining performance win, and
   the key derivation is already factored to accommodate it: the manifest path
   would replace step 4 of the pipeline and reuse everything else, including
-  linemarker-free canonical paths for the recorded include set.
+  linemarker-free canonical paths for the recorded include set. The Rust side
+  already has its equivalent: a manifest of earlier `--emit=dep-info` runs,
+  verified by re-hashing every recorded file, lets a hit skip that run (see
+  `rust_dep_info` in `configuration.md`).
 - **Linking is not cached**, matching ccache and sccache.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.

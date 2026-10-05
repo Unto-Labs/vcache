@@ -535,6 +535,67 @@ void TestDepFile() {
     CheckEq(core::RenderDepFile(*rt), core::RenderDepFile(original),
             "canonicalise/localise round-trips exactly");
   }
+
+  // rustc ends its dep-info with the environment variables the crate read.
+  const std::string rustc_style =
+      "out/demo.d: src/lib.rs src/helper.rs\n"
+      "\n"
+      "src/lib.rs:\n"
+      "\n"
+      "# env-dep:DEMO_UNSET\n"
+      "# env-dep:CARGO_PKG_VERSION=0.4.2\n"
+      "# env-dep:DEMO_ARGS=a=b c\n";
+  auto rs = core::ParseDepFile(rustc_style);
+  Check(rs.has_value(), "parses rustc dep-info with env-dep lines");
+  if (rs) {
+    std::vector<std::string> prereqs;
+    for (const core::DepRule& rule : rs->rules) {
+      prereqs.insert(prereqs.end(), rule.prerequisites.begin(), rule.prerequisites.end());
+    }
+    CheckEq(util::Join(prereqs, " "), "src/lib.rs src/helper.rs",
+            "env-dep lines contribute no prerequisites");
+    Check(rs->rules.size() == 2, "env-dep lines are not rules");
+  }
+}
+
+void TestDepFileEnvDeps() {
+  Section("core::depfile env-dep");
+
+  const std::string text =
+      "out/demo.d: src/lib.rs\n"
+      "\n"
+      "# env-dep:DEMO_UNSET\n"
+      "# env-dep:CARGO_PKG_VERSION=0.4.2\n"
+      "# env-dep:DEMO_ARGS=a=b c:d\n"
+      "# env-dep:DEMO_EMPTY=\n";
+  auto dep = core::ParseDepFile(text);
+  Check(dep.has_value(), "parses");
+  if (!dep) return;
+  Check(dep->env_deps.size() == 4, "four env deps, in file order");
+  if (dep->env_deps.size() != 4) return;
+  CheckEq(dep->env_deps[0].name, "DEMO_UNSET", "unset: name");
+  Check(!dep->env_deps[0].value.has_value(), "unset: no value");
+  CheckEq(dep->env_deps[1].name, "CARGO_PKG_VERSION", "set: name");
+  CheckEq(dep->env_deps[1].value.value_or("<none>"), "0.4.2", "set: value");
+  CheckEq(dep->env_deps[2].name, "DEMO_ARGS", "value splits at the first '='");
+  CheckEq(dep->env_deps[2].value.value_or("<none>"), "a=b c:d",
+          "value keeps later '=', spaces and ':' verbatim");
+  Check(dep->env_deps[3].value.has_value() && dep->env_deps[3].value->empty(),
+        "empty value is set, not unset");
+  Check(dep->rules.size() == 1 && dep->rules[0].prerequisites.size() == 1,
+        "sources exclude env deps");
+
+  // cargo reads the env-dep lines back from the restored file to decide when
+  // the crate is stale, so they must survive a round trip byte for byte.
+  CheckEq(core::RenderDepFile(*dep), text, "env-dep lines render verbatim");
+  core::RootMap roots = MakeRoots({"/home/u/proj=proj"});
+  auto pathy = core::ParseDepFile("a.d: /home/u/proj/a.rs\n\n# env-dep:OUT_DIR=/home/u/proj/out\n");
+  Check(pathy.has_value(), "parses a path-valued env dep");
+  if (pathy) {
+    core::RemapDepFile(&*pathy, roots, core::MapDirection::kCanonicalize);
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/home/u/proj/out", "remapping leaves env values raw");
+  }
 }
 
 void TestPreprocessedNormalization() {
@@ -1805,6 +1866,7 @@ int main() {
   TestStringUtils();
   TestRootMap();
   TestDepFile();
+  TestDepFileEnvDeps();
   TestPreprocessedNormalization();
   TestBlob();
   TestCacheChain();

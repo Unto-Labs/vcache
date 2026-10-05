@@ -255,6 +255,7 @@ VCACHE_SRCS := \
   $(SRC)/core/roots.cc \
   $(SRC)/core/config.cc \
   $(SRC)/core/depfile.cc \
+  $(SRC)/core/manifest.cc \
   $(SRC)/core/preprocessed.cc \
   $(SRC)/core/stats.cc \
   $(SRC)/core/compile.cc \

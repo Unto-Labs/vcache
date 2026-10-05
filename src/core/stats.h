@@ -8,6 +8,7 @@
 // microseconds and never overlaps compilation.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 

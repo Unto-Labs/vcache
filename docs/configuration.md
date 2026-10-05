@@ -641,6 +641,14 @@ target, if any; the sorted set of canonical root targets; codegen-affecting
 flags with paths canonicalised; the preprocessed source text with linemarker
 paths canonicalised; and any variables named in `hash_env_vars`.
 
+For Rust, the sources rustc's `--emit=dep-info` lists stand in for the
+preprocessed text. The same output names every variable the crate read through
+`env!` or `option_env!` (its `# env-dep:` lines), and each goes into the key as
+its name plus its raw value, or a marker for unset. Values are not
+canonicalised, because rustc does not remap them and a path such as `OUT_DIR`
+may end up in the artifact, so a crate that reads a path-valued variable hits
+only where that value is the same.
+
 **Deliberately not in the key:**
 
 - `-I`, `-D`, `-U`, `-include`, `-isystem` and friends. Their entire effect is

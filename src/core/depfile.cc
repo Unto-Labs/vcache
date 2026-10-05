@@ -6,6 +6,7 @@
 #include <boost/spirit/home/x3.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/roots.h"
@@ -71,12 +72,47 @@ std::string Escape(const std::string& path) {
   return out;
 }
 
+// The grammar would read this as a rule with targets "#" and "env-dep", and a
+// value containing ':' would not parse at all, so these lines are lifted out
+// before the grammar runs.
+constexpr std::string_view kEnvDepPrefix = "# env-dep:";
+
+// Moves env-dep lines from `text` into `env_deps`; returns the remaining text.
+std::string ExtractEnvDeps(const std::string& text, std::vector<DepEnv>* env_deps) {
+  std::string rules_text;
+  rules_text.reserve(text.size());
+  size_t pos = 0;
+  while (pos < text.size()) {
+    const size_t eol = text.find('\n', pos);
+    const size_t line_end = eol == std::string::npos ? text.size() : eol;
+    const std::string_view line(text.data() + pos, line_end - pos);
+    if (line.starts_with(kEnvDepPrefix)) {
+      const std::string_view entry = line.substr(kEnvDepPrefix.size());
+      const size_t eq = entry.find('=');
+      DepEnv env;
+      env.name = std::string(entry.substr(0, eq));
+      if (eq != std::string_view::npos) env.value = std::string(entry.substr(eq + 1));
+      env_deps->push_back(std::move(env));
+    } else {
+      rules_text.append(line);
+      if (eol != std::string::npos) rules_text.push_back('\n');
+    }
+    pos = line_end + 1;
+  }
+  return rules_text;
+}
+
 }  // namespace
 
 std::optional<DepFile> ParseDepFile(const std::string& text) {
   DepFile out;
-  auto begin = text.begin();
-  const auto end = text.end();
+  // gcc's .d files take the copy-free path.
+  const std::string rules_text = text.find(kEnvDepPrefix) == std::string::npos
+                                     ? std::string()
+                                     : ExtractEnvDeps(text, &out.env_deps);
+  const std::string& grammar_input = out.env_deps.empty() ? text : rules_text;
+  auto begin = grammar_input.begin();
+  const auto end = grammar_input.end();
   const bool ok =
       x3::phrase_parse(begin, end, dep_file, skipper, out.rules);
   if (!ok || begin != end) return std::nullopt;
@@ -104,6 +140,16 @@ std::string RenderDepFile(const DepFile& dep) {
     for (const std::string& prereq : rule.prerequisites) {
       out.push_back(' ');
       out.append(Escape(prereq));
+    }
+    out.push_back('\n');
+  }
+  if (!dep.env_deps.empty()) out.push_back('\n');
+  for (const DepEnv& env : dep.env_deps) {
+    out.append(kEnvDepPrefix);
+    out.append(env.name);
+    if (env.value) {
+      out.push_back('=');
+      out.append(*env.value);
     }
     out.push_back('\n');
   }

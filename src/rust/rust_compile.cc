@@ -27,7 +27,7 @@ using core::Counter;
 using core::MapDirection;
 using core::RootMap;
 
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v1";
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v2";
 
 int RunPassthrough(const std::vector<std::string>& argv) {
   VCACHE_LOG("rust passthrough: " + util::Join(argv, " "));
@@ -63,11 +63,16 @@ std::string ResolveRustcFingerprint(const std::string& rustc,
   return hash::HashString(banner);
 }
 
-// Asks rustc which files this crate reads. Returns the source paths, or an
-// empty vector on failure.
-std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
-                                            const RootMap& roots,
-                                            const std::string& temp_dir) {
+// What rustc's dep-info says the crate reads.
+struct CrateInputs {
+  std::vector<std::string> sources;
+  std::vector<core::DepEnv> env_deps;
+};
+
+// Asks rustc which files and environment variables this crate reads. Sources
+// are empty on failure.
+CrateInputs CollectCrateInputs(const args::RustcArgs& parsed,
+                               const std::string& temp_dir) {
   const std::string dep_dir = temp_dir + "/depinfo";
   if (!util::MakeDirs(dep_dir)) return {};
 
@@ -86,7 +91,8 @@ std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
     return {};
   }
 
-  std::vector<std::string> sources;
+  CrateInputs inputs;
+  std::vector<std::string>& sources = inputs.sources;
   std::error_code ec;
   for (const auto& entry : fs::directory_iterator(dep_dir, ec)) {
     if (ec) break;
@@ -101,19 +107,23 @@ std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
     for (const core::DepRule& rule : dep->rules) {
       for (const std::string& prereq : rule.prerequisites) sources.push_back(prereq);
     }
+    for (core::DepEnv& env : dep->env_deps) {
+      VCACHE_LOG("rust env-dep " + env.name +
+                 (env.value ? "=" + *env.value : std::string(" (unset)")));
+      inputs.env_deps.push_back(std::move(env));
+    }
   }
 
   // rustc repeats each source across several rules; one hash per file is
   // enough, and a stable order keeps the key deterministic.
   std::sort(sources.begin(), sources.end());
   sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
-  return sources;
+  return inputs;
 }
 
 std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
                        const std::string& rustc_fingerprint,
-                       const core::Config& config,
-                       const std::vector<std::string>& sources) {
+                       const core::Config& config, const CrateInputs& inputs) {
   hash::Hasher hasher;
   hasher.UpdateDelimited(kCacheKeyVersion);
   hasher.UpdateDelimited(rustc_fingerprint);
@@ -129,12 +139,19 @@ std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
   for (const std::string& kind : emit) hasher.UpdateDelimited(kind);
 
   // Every reachable source: canonical path plus contents.
-  for (const std::string& path : sources) {
+  for (const std::string& path : inputs.sources) {
     hasher.UpdateDelimited(roots.Canonicalize(path));
     if (!hasher.UpdateFile(path)) {
       VCACHE_LOG("rust: could not read source " + path);
       return "";
     }
+  }
+
+  // Raw, not canonicalised: rustc does not remap env values, so a path-valued
+  // variable such as OUT_DIR may be baked into the artifact.
+  for (const core::DepEnv& env : inputs.env_deps) {
+    hasher.UpdateDelimited(env.name);
+    hasher.UpdateDelimited(env.value ? "=" + *env.value : std::string("unset"));
   }
 
   // Dependencies by content rather than by path, so a differently located
@@ -296,16 +313,15 @@ int RunRustCompile(const std::vector<std::string>& argv,
   const std::string rustc_fingerprint =
       ResolveRustcFingerprint(parsed.compiler, cache_dir);
 
-  const std::vector<std::string> sources =
-      CollectSourceFiles(parsed, roots, *temp_dir);
-  if (sources.empty()) {
+  const CrateInputs inputs = CollectCrateInputs(parsed, *temp_dir);
+  if (inputs.sources.empty()) {
     VCACHE_LOG("rust: no dependency information; falling back");
     core::RecordCounter(cache_dir, Counter::kPreprocessFailed);
     return RunPassthrough(argv);
   }
 
   const std::string key =
-      ComputeKey(parsed, roots, rustc_fingerprint, config, sources);
+      ComputeKey(parsed, roots, rustc_fingerprint, config, inputs);
   if (key.empty()) return RunPassthrough(argv);
   VCACHE_LOG("rust key " + key + " for " + parsed.source);
 

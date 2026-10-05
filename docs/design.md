@@ -40,6 +40,9 @@ Included:
 - codegen-affecting flags, with any embedded paths canonicalised
 - the preprocessed text, with linemarker paths canonicalised
 - explicitly configured environment variables
+- for Rust, each variable the dep-info reports the crate read through `env!` or
+  `option_env!`, with its raw value or an unset marker. Raw because rustc does
+  not remap env values, so a path-valued one may be baked into the artifact
 
 Deliberately excluded, and why each matters:
 

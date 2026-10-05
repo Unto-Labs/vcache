@@ -279,6 +279,9 @@ Two things that look like they belong on that list but are cached:
 
 Rust follows the same shape, with `--emit=dep-info` standing in for
 preprocessing and `--extern` dependencies hashed by content rather than path.
+The variables that dep-info says the crate read through `env!`/`option_env!` go
+into the key with their raw values, so an unset or path-free variable still hits
+across directories.
 
 `docs/preprocessor-problem.md` records the measurements this design rests on,
 including the two compiler behaviours that make the naive approach fail.
@@ -333,7 +336,7 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
 $ make test
 ```
 
-364 unit assertions and 235 integration assertions, covering cross-directory
+380 unit assertions and 248 integration assertions, covering cross-directory
 hits, out-of-tree builds, dependency-file replay, diagnostics replay,
 uncacheable fallback, masquerade mode, Rust, cache management, `-march=native`
 resolution, dependency-scan manifests, kbuild-shaped `-Wp,` command lines,

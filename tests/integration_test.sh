@@ -590,6 +590,58 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9b. Rust crates that read the environment"
+
+# rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
+# its dep-info. Those are key inputs, not source files to hash.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-env-a rust-env-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+pub const COMMIT: Option<&str> = option_env!("DEMO_UNSET");
+pub const SET: &str = env!("DEMO_SET");
+EOF
+  done
+  envlog="$WORK/rust-env.log"
+  rust_env() {  # $1 = tree; the caller's environment decides DEMO_SET/DEMO_UNSET
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=envcrate" VCACHE_LOG="$envlog" \
+        "$VCACHE" rustc --crate-name demo --edition 2021 --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) 2>/dev/null
+  }
+
+  : > "$envlog"
+  DEMO_SET=1 rust_env rust-env-a
+  check "env-reading crate is a miss, not a passthrough" "$(misses)" "1"
+  check "env deps are not hashed as sources" \
+    "$(grep -c 'could not read source' "$envlog")" "0"
+  check "env deps are logged as env deps" \
+    "$(grep -c 'rust env-dep DEMO_UNSET (unset)' "$envlog")" "1"
+  check "restored dep-info keeps the env-dep lines for cargo" \
+    "$(grep -cx '# env-dep:DEMO_SET=1' "$WORK/rust-env-a/out/demo.d")" "1"
+  cp "$WORK/rust-env-a/out/libdemo.rlib" "$WORK/rust-env-a.rlib"
+
+  DEMO_SET=1 rust_env rust-env-a
+  check "same environment hits" "$(hits)" "1"
+
+  DEMO_SET=2 rust_env rust-env-a
+  check "a changed value misses" "$(misses)" "2"
+
+  DEMO_SET=1 DEMO_UNSET=x rust_env rust-env-a
+  check "setting an unset variable misses" "$(misses)" "3"
+
+  DEMO_SET=1 rust_env rust-env-b
+  check "a second directory hits" "$(hits)" "2"
+  if cmp -s "$WORK/rust-env-a.rlib" "$WORK/rust-env-b/out/libdemo.rlib"; then
+    ok "env-reading rlibs are byte-identical across directories"
+  else
+    bad "env-reading rlibs are byte-identical across directories"
+  fi
+else
+  printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
 section "10. cache management commands"
 
 reset_cache

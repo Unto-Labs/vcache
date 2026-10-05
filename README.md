@@ -208,7 +208,9 @@ warm page cache, median of three):
 
 A vcache hit is ~19× faster than compiling, and ~8× slower than a ccache hit,
 because vcache always runs the preprocessor while ccache's direct mode skips it
-by hashing the source plus a stored manifest of includes.
+by hashing the source plus a stored manifest of includes. A precompiled header
+does not shorten that step: its header is expanded on every lookup, though that
+is small next to the rest of a large translation unit.
 
 The trade is deliberate: vcache competes on **hit rate**, not per-hit latency. A
 ccache hit is faster, but only when ccache hits at all — move the checkout and it

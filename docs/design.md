@@ -216,7 +216,15 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 - **Linking is not cached**, matching ccache and sccache.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
-- **clang** is handled by the same code path as gcc and the flag tables cover
-  both, but the measurements in `preprocessor-problem.md` were taken on gcc
-  13.3.0 only; clang was not installed on the development machine.
+- **Precompiled headers** are covered by the integration tests for clang
+  (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
+  Both hit across directories because `-E` expands the header text, so the key
+  covers the header although the PCH bytes never enter it. gcc's
+  `-fpch-preprocess` swaps that text for a pragma naming the `.gch`, so it is
+  declined.
+- **How a PCH was built is not in the key.** clang accepts a PCH that defines a
+  macro the compile does not, and gcc uses a `.gch` it never checks against an
+  edited header; in both cases the expanded text describes a different
+  compilation from the one that ran. Build PCHs with the flags and headers of
+  the compiles that use them, as build systems do.
 - **GCS** is not implemented. The `Storage` interface is where it would go.

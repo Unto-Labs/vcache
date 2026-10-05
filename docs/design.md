@@ -19,6 +19,7 @@ src/
     compile.*          the C/C++ pipeline
     config.*           TOML + environment configuration
     stats.*            persistent counters
+    reason.h           why a run was not cached: log text and stats key
   rust/
     rust_compile.*     the Rust pipeline
   storage/

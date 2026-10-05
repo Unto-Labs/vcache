@@ -20,8 +20,11 @@
 // see core/link_trace.h.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "core/reason.h"
 
 namespace vcache::args {
 
@@ -48,8 +51,8 @@ struct LinkArgs {
 
   bool is_link = false;
 
-  // Non-empty means "run the real linker and do not cache", with the reason.
-  std::string uncacheable;
+  // Set means "run the real linker and do not cache", with the reason.
+  std::optional<core::Decision> uncacheable;
 };
 
 // `argv[0]` is the driver or linker. Never throws; an unparseable command line

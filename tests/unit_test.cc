@@ -28,6 +28,7 @@
 #include "core/depfile.h"
 #include "core/preprocessed.h"
 #include "core/roots.h"
+#include "core/stats.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "storage/chain.h"
@@ -89,7 +90,7 @@ void TestLinkArgs() {
   Section("args::ParseLink");
 
   auto plain = args::ParseLink({"gcc", "a.o", "b.o", "-o", "app"});
-  Check(plain.is_link && plain.uncacheable.empty(), "a plain link is cacheable");
+  Check(plain.is_link && !plain.uncacheable, "a plain link is cacheable");
   CheckEq(plain.output, "app", "output is found");
   Check(plain.inputs.size() == 2, "both objects are inputs");
 
@@ -103,16 +104,16 @@ void TestLinkArgs() {
   // Declines, each for a reason that would otherwise be a wrong answer.
   auto uuid = args::ParseLink(
       {"gcc", "a.o", "-Wl,--build-id=uuid", "-o", "app"});
-  Check(uuid.is_link && !uuid.uncacheable.empty(),
+  Check(uuid.is_link && uuid.uncacheable.has_value(),
         "--build-id=uuid is declined");
   auto mixed = args::ParseLink({"gcc", "a.o", "b.c", "-o", "app"});
-  Check(mixed.is_link && !mixed.uncacheable.empty(),
+  Check(mixed.is_link && mixed.uncacheable.has_value(),
         "compile-and-link is declined");
   auto devnull = args::ParseLink({"gcc", "a.o", "-o", "/dev/null"});
-  Check(devnull.is_link && !devnull.uncacheable.empty(),
+  Check(devnull.is_link && devnull.uncacheable.has_value(),
         "output to /dev/null is declined");
   auto noout = args::ParseLink({"gcc", "a.o"});
-  Check(noout.is_link && !noout.uncacheable.empty(), "no -o is declined");
+  Check(noout.is_link && noout.uncacheable.has_value(), "no -o is declined");
 
   // Second outputs have to be captured, or a hit returns the binary and
   // silently leaves the companion file missing.
@@ -136,7 +137,7 @@ void TestLinkArgs() {
         "-Xlinker -Map captures its forwarded output");
   auto xlinker_uuid = args::ParseLink(
       {"gcc", "a.o", "-Xlinker", "--build-id=uuid", "-o", "app"});
-  Check(xlinker_uuid.is_link && !xlinker_uuid.uncacheable.empty(),
+  Check(xlinker_uuid.is_link && xlinker_uuid.uncacheable.has_value(),
         "-Xlinker --build-id=uuid is declined");
 
   // Scripts are inputs whose contents matter.
@@ -1218,8 +1219,8 @@ void TestCompilerArgs() {
     const auto pch_pp = args::Parse(
         {"g++", "-c", "-fpch-preprocess", "-include", "h.h", "a.cc", "-o", "a.o"});
     Check(!pch_pp.cacheable(), "-fpch-preprocess is uncacheable");
-    CheckEq(pch_pp.uncacheable.value_or(""), "unsupported flag -fpch-preprocess",
-            "and the reason names the flag");
+    CheckEq(pch_pp.uncacheable ? pch_pp.uncacheable->Describe() : "",
+            "unsupported flag: -fpch-preprocess", "and the reason names the flag");
 
     // clang re-emits the PCH's header text under -E, so these stay cacheable.
     const auto driver_pch =
@@ -1920,6 +1921,116 @@ void TestWriteErrnoIsPreserved() {
   fs::remove_all(dir);
 }
 
+void TestStats() {
+  Section("core::Stats reasons");
+  using core::Counter;
+  using core::Reason;
+
+  const std::string old_format = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+  const core::Stats old_stats = core::ParseStats(old_format);
+  Check(old_stats.Get(Counter::kHitDisk) == 1 && old_stats.Get(Counter::kUncacheable) == 4 &&
+            old_stats.Get(Counter::kCacheMediaError) == 9,
+        "a nine-line file from an older version parses positionally");
+  Check(old_stats.reasons.empty(), "and has no reasons");
+  CheckEq(core::RenderStats(old_stats), old_format, "and renders back byte for byte");
+
+  core::Stats stats;
+  stats.Add(Counter::kMiss, 5);
+  stats.AddReason(Reason::kPreprocessOnly);
+  stats.AddReason(Reason::kPreprocessOnly);
+  stats.AddReason(Reason::kNotCompileOnly);
+  stats.AddReason(Reason::kNoRustDepInfo);
+  stats.AddReason(Reason::kNoTempDir);
+  Check(stats.Get(Counter::kUncacheable) == 3,
+        "an uncacheable reason also counts towards uncacheable");
+  Check(stats.Get(Counter::kPreprocessFailed) == 1,
+        "a preprocess reason also counts towards preprocess failed");
+  Check(stats.GetReason(Reason::kNoTempDir) == 1 && stats.GetReason(Reason::kIncbin) == 0,
+        "a passthrough reason is counted on its own");
+  const std::string rendered = core::RenderStats(stats);
+  CheckEq(rendered,
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n"
+          "reason\tlink\t1\n"
+          "reason\tno rust dep-info\t1\n"
+          "reason\tno temp dir\t1\n"
+          "reason\tpreprocess only\t2\n",
+          "reason lines follow the nine positional counters");
+  const core::Stats reparsed = core::ParseStats(rendered);
+  Check(reparsed.reasons == stats.reasons &&
+            std::equal(std::begin(reparsed.values), std::end(reparsed.values),
+                       std::begin(stats.values)),
+        "ParseStats reads back what RenderStats wrote");
+
+  const core::Stats extended = core::ParseStats(old_format +
+                                                "reason\tlink\t4\n"
+                                                "histogram 1 2 3\n"
+                                                "\n"
+                                                "42\n"
+                                                "reason\tfrom a newer version\t6\n");
+  Check(extended.Get(Counter::kUncacheable) == 4 && extended.Get(Counter::kCacheMediaError) == 9,
+        "unknown trailing lines leave the positional counters alone");
+  Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
+        "unknown trailing lines are ignored");
+  CheckEq(core::RenderStats(extended),
+          old_format + "reason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          "a reason this version does not know is carried through");
+
+  const core::Stats damaged = core::ParseStats(old_format +
+                                               "reason\tlink\tx1\n"
+                                               "reason\tlink\t7x\n"
+                                               "reason\tlink\t-3\n"
+                                               "reason\tlink\t\n"
+                                               "reason\tlink\n"
+                                               "reason\tlink\t1\textra\n"
+                                               "reason\t\t1\n"
+                                               "reason\tlink\t99999999999999999999999\n"
+                                               "reason\tpreprocess only\t2\n");
+  Check(damaged.GetReason(Reason::kNotCompileOnly) == 0,
+        "a reason line with a bad count is ignored");
+  Check(damaged.GetReason(Reason::kPreprocessOnly) == 2 && damaged.reasons.size() == 1,
+        "and the lines after it still parse");
+  Check(damaged.Get(Counter::kUncacheable) == 4, "and the counters are untouched");
+
+  const std::string shown = core::FormatStats(stats, "/c", 0, 1);
+  Check(shown.find("uncacheable         3\n"
+                   "  preprocess only     2\n"
+                   "  link                1\n"
+                   "passthrough         1\n"
+                   "  no temp dir         1\n"
+                   "compile failed      0\n") != std::string::npos,
+        "--show-stats lists reasons under their counter, largest first");
+  Check(shown.find("preprocess failed   1\n"
+                   "  no rust dep-info    1\n"
+                   "cache media errors  0\n") != std::string::npos,
+        "preprocess failures are broken down too");
+  const std::string plain = core::FormatStats(core::Stats{}, "/c", 0, 1);
+  Check(plain.find("passthrough") == std::string::npos && plain.find("\n  ") == std::string::npos,
+        "--show-stats adds nothing while every reason is zero");
+
+  TempCacheDir dir;
+  core::RecordDecision(dir.path(), Reason::kNotCompileOnly);
+  core::RecordDecision(dir.path(), {Reason::kUnsupportedFlag, "-save-temps"});
+  core::RecordCounter(dir.path(), Counter::kMiss);
+  const core::Stats recorded = core::ReadStats(dir.path());
+  Check(recorded.Get(Counter::kUncacheable) == 2 && recorded.Get(Counter::kMiss) == 1 &&
+            recorded.GetReason(Reason::kNotCompileOnly) == 1 &&
+            recorded.GetReason(Reason::kUnsupportedFlag) == 1,
+        "RecordDecision persists the reason and its counter");
+  Check(core::ZeroStats(dir.path()) && core::ReadStats(dir.path()).reasons.empty(),
+        "--zero-stats clears the reasons");
+
+  CheckEq(core::Decision(Reason::kUnsupportedFlag, "-MG").Describe(), "unsupported flag: -MG",
+          "the logged text starts with the reason's table name");
+  Check(args::Parse({"g++", "-E", "a.cc"}).uncacheable->reason == Reason::kPreprocessOnly,
+        "-E is declined as preprocess only");
+  Check(args::Parse({"cc", "a.o", "-o", "a"}).uncacheable->reason == Reason::kNotCompileOnly,
+        "a link through the compile path is declined as link");
+  Check(args::ParseRustc({"rustc", "--emit=link", "a.rs"}).uncacheable->reason == Reason::kNoOutDir,
+        "rustc without --out-dir is declined as no --out-dir");
+  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoLinkOutput,
+        "a link without -o is declined as no -o");
+}
+
 int main() {
   TestStringUtils();
   TestRootMap();
@@ -1948,6 +2059,7 @@ int main() {
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
+  TestStats();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

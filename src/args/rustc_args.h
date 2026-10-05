@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "core/reason.h"
+
 namespace vcache::args {
 
 struct ExternCrate {
@@ -49,7 +51,7 @@ struct RustcArgs {
 
   std::vector<std::string> incoming_prefix_maps;
 
-  std::optional<std::string> uncacheable;
+  std::optional<core::Decision> uncacheable;
   bool cacheable() const { return !uncacheable.has_value(); }
 };
 

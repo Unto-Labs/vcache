@@ -48,19 +48,19 @@ bool LooksLikeLinkInput(const std::string& p) {
 LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
   LinkArgs r;
   if (raw_argv.empty()) {
-    r.uncacheable = "empty command line";
+    r.uncacheable = core::Reason::kEmptyCommandLine;
     return r;
   }
 
   if (!ExpandResponseFiles(raw_argv, &r.argv)) {
-    r.uncacheable = "malformed or too deeply nested @response-file";
+    r.uncacheable = core::Reason::kBadResponseFile;
     return r;
   }
   r.driver = r.argv[0];
 
   bool saw_input = false;
   bool saw_source = false;
-  std::string pending_uncacheable;
+  std::optional<core::Decision> pending_uncacheable;
 
   for (size_t i = 1; i < r.argv.size(); ++i) {
     const std::string& a = r.argv[i];
@@ -73,7 +73,7 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
 
     if (a == "-o") {
       if (i + 1 >= r.argv.size()) {
-        r.uncacheable = "-o with no argument";
+        r.uncacheable = core::Decision(core::Reason::kMissingFlagValue, a);
         return r;
       }
       r.output = r.argv[++i];
@@ -120,22 +120,21 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     // can turn a cache hit into a successful command with a stale map file.
     if (a == "-Xlinker") {
       if (i + 1 >= r.argv.size()) {
-        pending_uncacheable = "-Xlinker with no argument";
+        pending_uncacheable = core::Decision(core::Reason::kMissingFlagValue, a);
         continue;
       }
       const std::string forwarded = r.argv[++i];
       r.key_args.push_back(a);
       r.key_args.push_back(forwarded);
       if (forwarded == "--build-id=uuid") {
-        pending_uncacheable =
-            "--build-id=uuid produces a different binary every run";
+        pending_uncacheable = core::Reason::kBuildIdUuid;
         continue;
       }
       if (forwarded == "-Map" || forwarded == "--Map" ||
           forwarded == "--dependency-file") {
         if (i + 2 >= r.argv.size() || r.argv[i + 1] != "-Xlinker") {
           pending_uncacheable =
-              "an output-producing -Xlinker option has no forwarded value";
+              core::Decision(core::Reason::kMissingFlagValue, a + " " + forwarded);
           continue;
         }
         r.key_args.push_back(r.argv[++i]);
@@ -156,8 +155,7 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     // still a link and the caller has to know that: returning here with
     // is_link false would send it down the compile path instead.
     if (a == "-Wl,--build-id=uuid" || a == "--build-id=uuid") {
-      pending_uncacheable =
-          "--build-id=uuid produces a different binary every run";
+      pending_uncacheable = core::Reason::kBuildIdUuid;
       r.key_args.push_back(a);
       continue;
     }
@@ -205,20 +203,20 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
   if (!saw_input && r.inputs.empty()) return r;  // not a link we recognise
   r.is_link = true;
 
-  if (!pending_uncacheable.empty()) {
+  if (pending_uncacheable) {
     r.uncacheable = pending_uncacheable;
     return r;
   }
   if (saw_source) {
-    r.uncacheable = "compiles and links in one step";
+    r.uncacheable = core::Reason::kCompileAndLink;
     return r;
   }
   if (r.output.empty()) {
-    r.uncacheable = "no -o; the default a.out target is not worth caching";
+    r.uncacheable = core::Reason::kNoLinkOutput;
     return r;
   }
   if (r.output == "/dev/null" || r.output == "-") {
-    r.uncacheable = "output is not a regular file";
+    r.uncacheable = core::Reason::kOutputNotAFile;
     return r;
   }
   return r;

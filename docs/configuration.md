@@ -845,7 +845,7 @@ A build always makes progress.
 input from stdin; no recognised source language; plain `.s` assembly (`.S` is
 cacheable, since it is preprocessed); output to `/dev/null` or `-`;
 an `.incbin` directive anywhere in the preprocessed text (see below);
-`-save-temps`, `-fsyntax-only`,
+`-save-temps`, `-fsyntax-only`, `-fpch-preprocess`,
 `-specs=`, `-frepo`, `-fmodules`, PGO flags (`-fprofile-generate`,
 `-fprofile-use`, `-fprofile-instr-use`, `-fauto-profile`),
 `-fsanitize-blacklist=`; malformed or deeply nested `@response-files`.

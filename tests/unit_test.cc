@@ -1211,6 +1211,25 @@ void TestCompilerArgs() {
         "-save-temps is uncacheable");
   Check(!args::Parse({"g++", "-c", "a.s", "-o", "a.o"}).cacheable(),
         "plain assembly is uncacheable");
+
+  // Precompiled headers. Under -fpch-preprocess the preprocessed text names the
+  // .gch instead of expanding the header, so it no longer stands in for it.
+  {
+    const auto pch_pp = args::Parse(
+        {"g++", "-c", "-fpch-preprocess", "-include", "h.h", "a.cc", "-o", "a.o"});
+    Check(!pch_pp.cacheable(), "-fpch-preprocess is uncacheable");
+    CheckEq(pch_pp.uncacheable.value_or(""), "unsupported flag -fpch-preprocess",
+            "and the reason names the flag");
+
+    // clang re-emits the PCH's header text under -E, so these stay cacheable.
+    const auto driver_pch =
+        args::Parse({"clang++", "-c", "-include-pch", "h.pch", "a.cc", "-o", "a.o"});
+    Check(driver_pch.cacheable(), "-include-pch is cacheable");
+    CheckEq(driver_pch.source, "a.cc", "-include-pch's value is not a source file");
+    const auto cc1_pch = args::Parse({"clang++", "-c", "-Xclang", "-include-pch",
+                                      "-Xclang", "h.pch", "a.cc", "-o", "a.o"});
+    Check(cc1_pch.cacheable(), "-Xclang -include-pch -Xclang h.pch is cacheable");
+  }
   Check(args::Parse({"gcc", "-c", "a.S", "-o", "a.o"}).cacheable(),
         "preprocessed assembly is cacheable");
   Check(!args::Parse({"g++", "-c", "a.cc", "-o", "/dev/null"}).cacheable(),

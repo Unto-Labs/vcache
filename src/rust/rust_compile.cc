@@ -78,7 +78,7 @@ CrateInputs CollectCrateInputs(const args::RustcArgs& parsed,
 
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
-  for (const std::string& arg : parsed.base_args) cmd.push_back(arg);
+  for (const std::string& arg : parsed.dep_info_args) cmd.push_back(arg);
   cmd.push_back("--emit=dep-info");
   cmd.push_back("--out-dir");
   cmd.push_back(dep_dir);

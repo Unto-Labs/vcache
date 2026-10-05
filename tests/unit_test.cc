@@ -1341,6 +1341,45 @@ void TestRustcArgs() {
                                   "-Cdebuginfo=2", "src/main.rs"});
   Check(joined.cacheable(), "parses joined -C form");
 
+  auto has_pair = [](const std::vector<std::string>& args, const std::string& opt,
+                     const std::string& value) {
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+      if (args[i] == opt && args[i + 1] == value) return true;
+    }
+    return false;
+  };
+  auto mentions = [](const std::vector<std::string>& args, const std::string& text) {
+    for (const std::string& arg : args) {
+      if (arg.find(text) != std::string::npos) return true;
+    }
+    return false;
+  };
+  // cargo points -C incremental into the target directory, which differs
+  // between checkouts.
+  const std::vector<std::vector<std::string>> incremental_spellings = {
+      {"-C", "incremental=/a/b"}, {"-Cincremental=/a/b"}};
+  for (const std::vector<std::string>& spelling : incremental_spellings) {
+    const std::string form = spelling.size() == 2 ? "separate" : "joined";
+    std::vector<std::string> argv = {"rustc", "--emit=link", "--out-dir", "o",
+                                     "-C", "opt-level=3"};
+    argv.insert(argv.end(), spelling.begin(), spelling.end());
+    argv.push_back("src/lib.rs");
+    auto inc = args::ParseRustc(argv);
+    Check(inc.cacheable(), form + " -C incremental is cacheable");
+    Check(has_pair(inc.base_args, "-C", "incremental=/a/b"),
+          form + " -C incremental reaches rustc");
+    Check(!mentions(inc.key_args, "/a/b"),
+          form + " -C incremental directory stays out of the key");
+    Check(has_pair(inc.key_args, "-C", "incremental"),
+          form + " -C incremental still marks the key as incremental");
+    Check(has_pair(inc.key_args, "-C", "opt-level=3"),
+          form + " -C incremental leaves other -C options in the key");
+    Check(!mentions(inc.dep_info_args, "incremental"),
+          form + " -C incremental is left off the dep-info run");
+    Check(has_pair(inc.dep_info_args, "-C", "opt-level=3"),
+          form + " -C incremental leaves other -C options on the dep-info run");
+  }
+
   Check(!args::ParseRustc({"rustc", "--emit=link", "src/lib.rs"}).cacheable(),
         "no --out-dir is uncacheable");
   Check(!args::ParseRustc({"rustc", "--out-dir", "o", "src/lib.rs"}).cacheable(),

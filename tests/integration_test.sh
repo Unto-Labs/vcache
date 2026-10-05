@@ -642,6 +642,71 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9c. Rust: the incremental directory is not part of the key"
+
+# cargo passes -C incremental=<target-dir>/<profile>/incremental to every
+# workspace crate, so two target directories are two checkouts here. Only the
+# crate is under a root; the incremental directories are not.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/rust-inc/src"
+  cat > "$WORK/rust-inc/src/lib.rs" <<'EOF'
+pub fn twice(x: u32) -> u32 { x * 2 }
+pub fn label(x: u32) -> String { format!("value {x}") }
+EOF
+  # rust_inc TARGET [extra rustc args...]
+  rust_inc() {
+    local target=$1; shift
+    ( cd "$WORK/rust-inc" && VCACHE_ROOTS="$WORK/rust-inc=crate" \
+        VCACHE_LOG="$WORK/$target.log" \
+        "$VCACHE" rustc --crate-name inc --crate-type lib -C debuginfo=2 \
+        --emit=dep-info,metadata,link --out-dir "$WORK/$target/deps" "$@" \
+        src/lib.rs ) 2>/dev/null
+  }
+  rust_key_of() { sed -n 's/.*rust key \([0-9a-f]*\) for .*/\1/p' "$WORK/$1.log" | head -1; }
+
+  rust_inc inc-t1 -C "incremental=$WORK/inc-t1/incremental"
+  check "first incremental compile is a miss" "$(misses)" "1"
+  check "the miss leaves rustc's incremental state in its own directory" \
+    "$([[ -n "$(ls -A "$WORK/inc-t1/incremental" 2>/dev/null)" ]] && echo yes)" "yes"
+
+  rust_inc inc-t2 -Cincremental="$WORK/inc-t2/incremental"
+  check "a different incremental directory still hits" "$(hits)" "1"
+  check "the key ignores the incremental directory" \
+    "$(rust_key_of inc-t2)" "$(rust_key_of inc-t1)"
+  for artifact in libinc.rlib libinc.rmeta; do
+    if cmp -s "$WORK/inc-t1/deps/$artifact" "$WORK/inc-t2/deps/$artifact"; then
+      ok "restored $artifact is byte-identical to the compiled one"
+    else
+      bad "restored $artifact is byte-identical to the compiled one"
+    fi
+  done
+  check "restored dep-info matches the compiled one apart from its directory" \
+    "$(sed "s#$WORK/inc-t1/#$WORK/inc-t2/#g" "$WORK/inc-t1/deps/inc.d")" \
+    "$(cat "$WORK/inc-t2/deps/inc.d")"
+  # The entry holds the --emit artifacts only; rustc's session state is never
+  # captured, so a hit has none to restore.
+  check "a hit restores exactly the emitted artifacts" \
+    "$(cd "$WORK/inc-t2/deps" && find . -mindepth 1 | sort | tr '\n' ' ')" \
+    "./inc.d ./libinc.rlib ./libinc.rmeta "
+  check "a hit does not create the incremental directory" \
+    "$([[ -e "$WORK/inc-t2/incremental" ]] && echo exists || echo absent)" "absent"
+
+  # Incremental mode raises rustc's default codegen-unit count, which changes
+  # the objects, so whether it is on stays in the key: a non-incremental compile
+  # of the same crate gets its own entry.
+  rust_inc inc-t3
+  check "a non-incremental compile does not share the incremental entry" "$(misses)" "2"
+  if [[ -n "$(rust_key_of inc-t3)" && "$(rust_key_of inc-t3)" != "$(rust_key_of inc-t1)" ]]; then
+    ok "the key records whether incremental is on"
+  else
+    bad "the key records whether incremental is on"
+  fi
+else
+  skipped "rustc not installed"
+fi
+
+# --------------------------------------------------------------------------
 section "10. cache management commands"
 
 reset_cache

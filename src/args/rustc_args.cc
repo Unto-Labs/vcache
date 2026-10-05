@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "args/rustc_args.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 #include "core/roots.h"
@@ -32,6 +33,12 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
 // deliberately kept out of the cache key.
 bool IsSearchPathOption(const std::string& opt) {
   return opt == "-L" || opt == "--sysroot" || opt == "--out-dir";
+}
+
+// -C incremental=DIR names where rustc keeps session state, which like a search
+// path moves with the target directory; only whether it is on changes codegen.
+bool IsIncrementalDir(const std::string& opt, const std::string& value) {
+  return opt == "-C" && StartsWith(value, "incremental=");
 }
 
 // Splits "-Cdebuginfo=2" or "--emit=link" into option and value.
@@ -74,6 +81,7 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
 
   std::vector<std::string> inputs;
   bool saw_explicit_output = false;
+  std::vector<size_t> incremental_positions;  // into base_args
 
   for (size_t i = 1; i < argv.size(); ++i) {
     const std::string& arg = argv[i];
@@ -145,6 +153,15 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       continue;
     }
 
+    if (IsIncrementalDir(opt, value)) {
+      incremental_positions.push_back(result.base_args.size());
+      result.base_args.push_back(opt);
+      result.base_args.push_back(value);
+      result.key_args.push_back(opt);
+      result.key_args.push_back("incremental");
+      continue;
+    }
+
     if (opt == "--crate-name") result.crate_name = value;
 
     result.base_args.push_back(opt);
@@ -153,6 +170,15 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       result.key_args.push_back(opt);
       result.key_args.push_back(value);
     }
+  }
+
+  for (size_t i = 0; i < result.base_args.size(); ++i) {
+    if (std::find(incremental_positions.begin(), incremental_positions.end(), i) !=
+        incremental_positions.end()) {
+      ++i;
+      continue;
+    }
+    result.dep_info_args.push_back(result.base_args[i]);
   }
 
   if (inputs.empty()) {

@@ -856,6 +856,16 @@ Additionally, `incoming_prefix_maps = "keep"` makes any affected compilation
 uncacheable, and any internal failure (preprocessing error, temp-directory
 failure, unreadable output) falls back to a plain compiler run.
 
+`-C incremental=DIR` is cached. cargo passes it to every workspace crate in a
+profile with incremental on, pointing into the target directory, so DIR is kept
+out of the key the way `--out-dir` is and two target directories share entries.
+Whether incremental is on stays in the key: it raises rustc's default
+codegen-unit count, which changes the objects, so an incremental and a
+non-incremental build of one crate get separate entries. An entry holds the
+`--emit` artifacts only, never rustc's session state. A miss leaves that state
+in DIR as usual; a hit leaves DIR untouched, so the first edit to that crate
+after a hit compiles it from scratch once.
+
 ## Worked examples
 
 ### A single developer machine

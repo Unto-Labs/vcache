@@ -33,14 +33,19 @@ struct RustcArgs {
   std::vector<std::string> emit_kinds;  // parsed from --emit
   std::vector<ExternCrate> externs;
 
-  // Flags that belong in the cache key. Search paths and the output directory
-  // are excluded: they change between checkouts without changing the result,
-  // and the --extern contents already pin what was actually linked.
+  // Flags that belong in the cache key. Search paths, the output directory and
+  // the -C incremental directory are excluded: they change between checkouts
+  // without changing the result, and the --extern contents already pin what
+  // was actually linked.
   std::vector<std::string> key_args;
 
   // Command line minus --out-dir, --emit and incoming remap flags; vcache
   // supplies those itself.
   std::vector<std::string> base_args;
+
+  // base_args minus -C incremental: a dep-info-only run would otherwise leave
+  // an unfinished session in the incremental directory, even on a hit.
+  std::vector<std::string> dep_info_args;
 
   std::vector<std::string> incoming_prefix_maps;
 

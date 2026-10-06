@@ -1372,6 +1372,91 @@ check "and still writes the dependency file" "$([[ -s "$WORK/off.d" ]] && echo y
     "$VCACHE" gcc -M -I inc src/missing.c -o "$WORK/bad.d" ) 2>/dev/null
 check "a scan of a missing source fails" "$?" "1"
 
+# The source's path is part of the question, not only its content. Identical
+# sources reached by different canonical paths must not share a state: the
+# recorded headers still name the first directory and still verify, so the
+# second would be served the first one's dependency list.
+mkdir -p "$WORK/depsrc/a" "$WORK/depsrc/b" "$WORK/depsrc/c" "$WORK/depsrc/d"
+for tree in a b c d; do
+  printf '#include "x.h"\nint v = V;\n' > "$WORK/depsrc/$tree/main.c"
+done
+printf '#define V 1\n' > "$WORK/depsrc/a/x.h"
+printf '#define V 2\n/* different size */\n' > "$WORK/depsrc/b/x.h"
+cp "$WORK/depsrc/a/x.h" "$WORK/depsrc/c/x.h"
+cp "$WORK/depsrc/a/x.h" "$WORK/depsrc/d/x.h"
+
+# One word per line, so vcache's unwrapped rendering compares equal to gcc's.
+dep_words() { tr -d '\\' < "$1" | tr -s ' \t\n' '\n' | sed '/^$/d'; }
+
+# Runs the compiler itself in the same place, and checks vcache's answer
+# against it word for word.
+#   check_depsrc_answer LABEL DIR OUTFILE args...
+check_depsrc_answer() {
+  local label=$1 dir=$2 out=$3; shift 3
+  ( cd "$dir" && gcc "$@" ) > "$WORK/depsrc-expected.d" 2>/dev/null
+  if [[ -s "$out" ]] &&
+     [[ "$(dep_words "$out")" == "$(dep_words "$WORK/depsrc-expected.d")" ]]; then
+    ok "$label"
+  else
+    bad "$label (got: $(tr '\n' ' ' < "$out"))"
+  fi
+}
+
+for mode in "-MM" "-M -MP"; do
+  read -ra mflags <<< "$mode"
+
+  reset_cache
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" a/main.c ) > "$WORK/ps-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b.d" 2>/dev/null
+  check "$mode: from a parent directory, b/main.c misses after a/main.c" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc" "$WORK/ps-b.d" "${mflags[@]}" b/main.c
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b2.d" 2>/dev/null
+  check "$mode: repeating b hits its own state" "$(hits)" "1"
+  check_depsrc_answer "$mode: and replays b's dependency list" \
+    "$WORK/depsrc" "$WORK/ps-b2.d" "${mflags[@]}" b/main.c
+  printf '#define V 3\n' > "$WORK/depsrc/b/x.h"
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b3.d" 2>/dev/null
+  check "$mode: editing b/x.h invalidates b's state" "$(misses)" "3"
+  printf '#define V 2\n/* different size */\n' > "$WORK/depsrc/b/x.h"
+
+  reset_cache
+  ( cd "$WORK/depsrc/a" && VCACHE_ROOTS="$WORK/depsrc=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/a/main.c" ) > "$WORK/or-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc/b" && VCACHE_ROOTS="$WORK/depsrc=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/b/main.c" ) > "$WORK/or-b.d" 2>/dev/null
+  check "$mode: one root over both, b misses after a" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc/b" "$WORK/or-b.d" "${mflags[@]}" "$WORK/depsrc/b/main.c"
+
+  reset_cache
+  ( cd "$WORK/depsrc/a" && VCACHE_MAP_CWD=0 \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/a/main.c" ) > "$WORK/nr-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc/b" && VCACHE_MAP_CWD=0 \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/b/main.c" ) > "$WORK/nr-b.d" 2>/dev/null
+  check "$mode: with no roots at all, b misses after a" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc/b" "$WORK/nr-b.d" "${mflags[@]}" "$WORK/depsrc/b/main.c"
+
+  # The sharing that is intended: one relative path under the mapped cwd, and
+  # per-checkout roots naming both copies by one canonical path.
+  reset_cache
+  ( cd "$WORK/depsrc/c" && "$VCACHE" gcc "${mflags[@]}" main.c ) > "$WORK/rel-c.d" 2>/dev/null
+  ( cd "$WORK/depsrc/d" && "$VCACHE" gcc "${mflags[@]}" main.c ) > "$WORK/rel-d.d" 2>/dev/null
+  check "$mode: the same relative path in a copied tree still hits" "$(hits)" "1"
+  check_depsrc_answer "$mode: and replays the local dependency list" \
+    "$WORK/depsrc/d" "$WORK/rel-d.d" "${mflags[@]}" main.c
+
+  reset_cache
+  ( cd "$WORK/depsrc/c" && VCACHE_ROOTS="$WORK/depsrc/c=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/c/main.c" ) > "$WORK/pc-c.d" 2>/dev/null
+  ( cd "$WORK/depsrc/d" && VCACHE_ROOTS="$WORK/depsrc/d=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/d/main.c" ) > "$WORK/pc-d.d" 2>/dev/null
+  check "$mode: per-checkout roots still hit" "$(hits)" "1"
+  check_depsrc_answer "$mode: and the restored paths name this checkout" \
+    "$WORK/depsrc/d" "$WORK/pc-d.d" "${mflags[@]}" "$WORK/depsrc/d/main.c"
+done
+
 # --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"
 

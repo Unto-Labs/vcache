@@ -25,6 +25,7 @@
 #include "core/link_trace.h"
 #include "args/link_args.h"
 #include "args/rustc_args.h"
+#include "core/compile.h"
 #include "core/config.h"
 #include "core/depfile.h"
 #include "core/preprocessed.h"
@@ -1422,6 +1423,42 @@ std::string StateKey(int i) {
   return std::string(hash::kDigestHexLen - 1, '0') + "0123456789abcdef"[i];
 }
 
+void TestDepScanKeyArgs() {
+  Section("core::DepScanKeyArgs");
+
+  const auto key_args = [](const std::vector<std::string>& argv,
+                           const core::RootMap& roots) {
+    return util::Join(core::DepScanKeyArgs(args::Parse(argv), roots,
+                                           /*keep_link_args=*/false),
+                      "\n");
+  };
+
+  const core::RootMap no_roots = MakeRoots({});
+  CheckEq(key_args({"gcc", "-MM", "a/main.c"}, no_roots),
+          key_args({"gcc", "-MM", "a/main.c"}, no_roots),
+          "the same source path gives the same key material");
+  Check(key_args({"gcc", "-MM", "a/main.c"}, no_roots) !=
+            key_args({"gcc", "-MM", "b/main.c"}, no_roots),
+        "different relative source paths give different key material");
+  Check(key_args({"gcc", "-M", "/home/u/a/main.c"}, no_roots) !=
+            key_args({"gcc", "-M", "/home/u/b/main.c"}, no_roots),
+        "different absolute source paths give different key material");
+
+  const core::RootMap one_root = MakeRoots({"/home/u=proj"});
+  Check(key_args({"gcc", "-M", "/home/u/a/main.c"}, one_root) !=
+            key_args({"gcc", "-M", "/home/u/b/main.c"}, one_root),
+        "two sources under one root stay apart");
+
+  // Per-checkout roots name both copies by one canonical path, so they share.
+  CheckEq(key_args({"gcc", "-M", "/home/u/a/main.c"}, MakeRoots({"/home/u/a=proj"})),
+          key_args({"gcc", "-M", "/home/u/b/main.c"}, MakeRoots({"/home/u/b=proj"})),
+          "per-checkout roots give one canonical source path");
+
+  CheckEq(key_args({"gcc", "-MM", "main.c", "-MF", "a.d"}, no_roots),
+          key_args({"gcc", "-MM", "main.c", "-MF", "b.d"}, no_roots),
+          "where the answer goes is not key material");
+}
+
 void TestRustManifest() {
   Section("rust::manifest");
 
@@ -2190,6 +2227,7 @@ int main() {
   TestLinkArgs();
   TestCompilerArgs();
   TestClangArgs();
+  TestDepScanKeyArgs();
   TestRustcArgs();
   TestSigV4();
   TestS3ResponseParsing();

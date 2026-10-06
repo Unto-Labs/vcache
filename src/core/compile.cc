@@ -408,7 +408,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v1";
+constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v2";
 constexpr std::string_view kManifestHeader = "vcache-depmanifest-2";
 
 // One remembered state: the files a scan read, and where its answer is stored.
@@ -417,14 +417,8 @@ struct DepManifestEntry {
   std::vector<ManifestFile> files;
 };
 
-// Everything on the command line that can change which files a dependency scan
-// reads or what it writes about them. Unlike a compile there is no preprocessed
-// text to stand in for -I/-D, so those go in verbatim -- canonicalised, so two
-// checkouts still agree.
-//
-// Left out: the compiler itself (its identity is hashed separately) and the
-// flags naming where the answer goes, since the answer's content does not
-// depend on them.
+}  // namespace
+
 std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
                                         const RootMap& roots,
                                         bool keep_link_args) {
@@ -443,15 +437,12 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
       if (args::LinkOnlyFlagTakesValue(arg) && i + 1 < parsed.argv.size()) ++i;
       continue;
     }
-    if (arg == parsed.source) {
-      // The path is irrelevant once canonicalised; the content is hashed below.
-      out.push_back("--vcache-source");
-      continue;
-    }
     out.push_back(roots.Canonicalize(arg));
   }
   return out;
 }
+
+namespace {
 
 // A header line, then per entry an "entry <key>" line followed by one
 // RenderManifestFile line per file.

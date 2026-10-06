@@ -753,10 +753,14 @@ text, and for a `-M` run the preprocessor *is* the work. Measured on one
 Preprocessing to save preprocessing is a losing trade, so these are cached
 against a **manifest** instead. The key covers the command line — including
 `-I`, `-D` and friends verbatim, since there is no preprocessed text to stand in
-for them — plus the compiler, the resolved native target, and the source's
-contents. The entry stores every file the scan read with its digest, and a hit
-is served only once all of them still hash the same. Nothing is trusted on
-mtime.
+for them — plus the compiler, the resolved native target, the roots, any
+`hash_env_vars`, and the source's canonical path and contents. Paths are
+canonicalised through the roots, so per-checkout roots, or the same relative
+path under each checkout's mapped working directory, still share an entry.
+Identical sources at different canonical paths do not, since their includes
+resolve to different files. The entry stores every file the scan read with its
+digest, and a hit is served only once all of them still hash the same. Nothing
+is trusted on mtime.
 
 One manifest holds up to eight remembered header states, so alternating between
 two branches keeps hitting rather than overwriting one state with the other.

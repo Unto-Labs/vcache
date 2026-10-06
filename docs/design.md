@@ -69,6 +69,23 @@ objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
 profiles, plugins, the randstruct layout seed — are hashed by content instead,
 since there the flag at least names the file.
 
+A `-M`/`-MM` dependency scan has no preprocessed text, so its manifest key is
+built from what is known before the scan runs:
+
+- its own key-format version
+- compiler identity and the resolved native target
+- the sorted set of canonical root targets
+- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim
+  and every path canonicalised
+- the source's **canonical path** and its contents. The path matters because
+  headers are found relative to the source: identical sources reached by
+  different canonical paths read different files, and a state recorded for one
+  would still verify for the other
+- explicitly configured environment variables
+
+Each state under that key lists the files the scan read with their digests, and
+is served only while all of them still match.
+
 ## Compiler identity
 
 `VCACHE_COMPILER_CHECK` selects:

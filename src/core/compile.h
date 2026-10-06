@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "args/compiler_args.h"
 #include "core/config.h"
 #include "core/roots.h"
 #include "storage/chain.h"
@@ -79,6 +80,21 @@ bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
 // routed to RunDepScan instead.
 int RunCompile(const std::vector<std::string>& argv, const Config& config,
                const RootMap& roots, storage::CacheChain* cache);
+
+// Everything on the command line that can change which files a dependency scan
+// reads or what it writes about them, as hashed into the dep-scan manifest key.
+// Unlike a compile there is no preprocessed text to stand in for -I/-D, so those
+// go in verbatim -- canonicalised, so two checkouts still agree.
+//
+// The source path stays in, canonicalised: headers are found relative to it, so
+// the same content at another canonical path can read other files.
+//
+// Left out: the compiler itself (its identity is hashed separately) and the
+// flags naming where the answer goes, since the answer's content does not
+// depend on them.
+std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
+                                        const RootMap& roots,
+                                        bool keep_link_args);
 
 // Runs one dependency-only (-M/-MM) invocation.
 //

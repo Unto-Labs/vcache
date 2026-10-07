@@ -5,6 +5,7 @@
 #include <boost/fusion/include/adapt_struct.hpp>
 #include <boost/spirit/home/x3.hpp>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -156,7 +157,8 @@ std::string RenderDepFile(const DepFile& dep) {
   return out;
 }
 
-void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction) {
+void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction,
+                  const std::vector<std::string>& path_env_vars) {
   auto map_one = [&](std::string& path) {
     path = (direction == MapDirection::kCanonicalize) ? roots.Canonicalize(path)
                                                       : roots.Localize(path);
@@ -164,6 +166,12 @@ void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction) {
   for (DepRule& rule : dep->rules) {
     for (std::string& t : rule.targets) map_one(t);
     for (std::string& p : rule.prerequisites) map_one(p);
+  }
+  for (DepEnv& env : dep->env_deps) {
+    if (env.value && std::find(path_env_vars.begin(), path_env_vars.end(), env.name) !=
+                         path_env_vars.end()) {
+      map_one(*env.value);
+    }
   }
 }
 

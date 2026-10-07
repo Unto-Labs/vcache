@@ -599,6 +599,13 @@ void TestDepFileEnvDeps() {
     core::RemapDepFile(&*pathy, roots, core::MapDirection::kCanonicalize);
     CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
             "/home/u/proj/out", "remapping leaves env values raw");
+    core::RemapDepFile(&*pathy, roots, core::MapDirection::kCanonicalize, {"OUT_DIR"});
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/vcache/proj/out", "a listed path env value is canonicalised");
+    core::RemapDepFile(&*pathy, MakeRoots({"/work/b=proj"}), core::MapDirection::kLocalize,
+                       {"OUT_DIR"});
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/work/b/out", "a listed path env value is localised on restore");
   }
 }
 
@@ -1537,7 +1544,7 @@ void TestRustManifest() {
   ::setenv("VCACHE_UT_EMPTY", "", 1);
   auto mismatch = [&](const std::vector<rust::RustExtern>& externs,
                       const core::RootMap& with_roots) {
-    return rust::FindRustStateMismatch(state, externs, with_roots).value_or("");
+    return rust::FindRustStateMismatch(state, externs, with_roots, {}).value_or("");
   };
   CheckEq(mismatch(state.externs, roots), "", "an unchanged state matches");
   CheckEq(mismatch(state.externs, MakeRoots({other_root + "=crate"})), "",
@@ -1576,6 +1583,35 @@ void TestRustManifest() {
   CheckEq(mismatch(extra, roots), "the --extern set differs",
           "a different extern set rejects the state");
   CheckEq(mismatch(state.externs, roots), "", "the restored inputs match again");
+
+  // ---- path-valued env deps ----
+  const std::vector<std::string> out_dir_only = {"OUT_DIR"};
+  const core::RootMap other_roots = MakeRoots({other_root + "=crate"});
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", root + "/out", out_dir_only, roots)
+              .value_or("unset"),
+          "/vcache/crate/out", "a listed path env dep is keyed canonically");
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", root + "/out", {}, roots).value_or("unset"),
+          root + "/out", "an unlisted env dep is keyed raw");
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", std::nullopt, out_dir_only, roots)
+              .value_or("unset"),
+          "unset", "an unset listed env dep stays unset");
+  rust::RustManifestState with_out_dir = state;
+  with_out_dir.env_deps.push_back(
+      {"OUT_DIR", rust::KeyedEnvDepValue("OUT_DIR", root + "/out", out_dir_only, roots)});
+  ::setenv("OUT_DIR", (other_root + "/out").c_str(), 1);
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, out_dir_only)
+              .value_or(""),
+          "", "a listed OUT_DIR matches from another checkout");
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, {})
+              .value_or(""),
+          "env OUT_DIR is '" + other_root + "/out', was '/vcache/crate/out'",
+          "an unlisted OUT_DIR is compared raw");
+  ::setenv("OUT_DIR", "/elsewhere/out", 1);
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, out_dir_only)
+              .value_or(""),
+          "env OUT_DIR is '/elsewhere/out', was '/vcache/crate/out'",
+          "a listed OUT_DIR outside every root still rejects the state");
+  ::unsetenv("OUT_DIR");
 
   // ---- the cap ----
   std::vector<rust::RustManifestState> states;

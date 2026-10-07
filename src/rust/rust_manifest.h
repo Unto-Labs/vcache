@@ -42,13 +42,23 @@ bool ParseRustManifest(const std::string& text, std::vector<RustManifestState>* 
 // rustc escapes backslash, newline and carriage return in an env-dep value.
 std::string EscapeEnvDepValue(const std::string& value);
 
+// The form an env-dep value is keyed and compared in: canonicalised for a
+// variable named in `path_env_vars`, raw for any other. `escaped_value` is as
+// rustc writes it.
+std::optional<std::string> KeyedEnvDepValue(const std::string& name,
+                                            std::optional<std::string> escaped_value,
+                                            const std::vector<std::string>& path_env_vars,
+                                            const core::RootMap& roots);
+
 // Returns nullopt while `state` still describes this invocation: the same
-// extern digests, the same environment values, and every recorded file hashing
-// the same at its localised path. Otherwise says what differs. Cheap checks run
-// first, so a rebuilt dependency is rejected before any file is hashed.
+// extern digests, the same environment values (keyed as KeyedEnvDepValue does),
+// and every recorded file hashing the same at its localised path. Otherwise
+// says what differs. Cheap checks run first, so a rebuilt dependency is
+// rejected before any file is hashed.
 std::optional<std::string> FindRustStateMismatch(const RustManifestState& state,
                                                  const std::vector<RustExtern>& externs,
-                                                 const core::RootMap& roots);
+                                                 const core::RootMap& roots,
+                                                 const std::vector<std::string>& path_env_vars);
 
 // Puts `fresh` first, dropping an older state with the same key and anything
 // past the cap. Re-recording a state that matched moves it to the front, so

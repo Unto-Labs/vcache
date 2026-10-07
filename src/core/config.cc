@@ -161,6 +161,10 @@ void ApplyTomlFile(const std::string& path, Config* config) {
          TomlStringArray(*vc, "hash_env_vars", &config->warnings)) {
       config->extra_env_vars.push_back(std::move(name));
     }
+    for (std::string& name :
+         TomlStringArray(*vc, "rust_path_env_vars", &config->warnings)) {
+      config->rust_path_env_vars.push_back(std::move(name));
+    }
     if (auto v = TomlString(*vc, "incoming_prefix_maps")) {
       if (!ParseIncomingMapPolicy(*v, &config->incoming_map_policy)) {
         config->warnings.push_back(
@@ -248,6 +252,11 @@ void ApplyEnvironment(Config* config) {
   if (auto v = Env("VCACHE_HASH_ENV_VARS")) {
     for (std::string& name : util::Split(*v, ',', /*skip_empty=*/true)) {
       config->extra_env_vars.push_back(util::TrimWhitespace(name));
+    }
+  }
+  if (auto v = Env("VCACHE_RUST_PATH_ENV_VARS")) {
+    for (std::string& name : util::Split(*v, ',', /*skip_empty=*/true)) {
+      config->rust_path_env_vars.push_back(util::TrimWhitespace(name));
     }
   }
 
@@ -417,6 +426,9 @@ std::string DescribeConfig(const Config& config) {
   out << "disabled:         " << (config.disabled ? "yes" : "no") << "\n";
   if (!config.extra_env_vars.empty()) {
     out << "hashed env vars:  " << util::Join(config.extra_env_vars, ", ") << "\n";
+  }
+  if (!config.rust_path_env_vars.empty()) {
+    out << "rust path env:    " << util::Join(config.rust_path_env_vars, ", ") << "\n";
   }
   for (const std::string& w : config.warnings) out << "warning: " << w << "\n";
   return out.str();

@@ -642,6 +642,63 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9b2. Rust: path-valued env deps named in VCACHE_RUST_PATH_ENV_VARS"
+
+# A crate with a build script include!s generated code from OUT_DIR, which cargo
+# points into each checkout's own target directory. Listed, the value is keyed
+# canonically and the crate hits from another checkout; a crate that bakes the
+# value into its artifact is never stored.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-out-a rust-out-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/target/out" "$WORK/$tree/deps"
+    echo 'pub fn answer() -> u32 { 42 }' > "$WORK/$tree/target/out/gen.rs"
+    echo 'include!(concat!(env!("OUT_DIR"), "/gen.rs"));' > "$WORK/$tree/src/lib.rs"
+    echo 'pub const DIR: &str = env!("OUT_DIR");' > "$WORK/$tree/src/baked.rs"
+  done
+  outlog="$WORK/rust-out.log"
+  # rust_out TREE SOURCE [env assignments...]
+  rust_out() {
+    local tree=$1 source=$2; shift 2
+    ( cd "$WORK/$tree" && env OUT_DIR="$WORK/$tree/target/out" VCACHE_LOG="$outlog" \
+        VCACHE_ROOTS="$WORK/$tree=crate:$WORK/$tree/target=target" "$@" \
+        "$VCACHE" rustc --crate-name "$(basename "$source" .rs)" --edition 2021 \
+        --crate-type lib --emit=dep-info,link --out-dir "$WORK/$tree/deps" "src/$source" ) 2>/dev/null
+  }
+
+  rust_out rust-out-a lib.rs
+  rust_out rust-out-b lib.rs
+  check "unlisted, OUT_DIR keeps another checkout from hitting" "$(misses)" "2"
+
+  reset_cache
+  rust_out rust-out-a lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  rust_out rust-out-b lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "listed, OUT_DIR hits from another checkout" "$(hits)" "1"
+  if cmp -s "$WORK/rust-out-a/deps/liblib.rlib" "$WORK/rust-out-b/deps/liblib.rlib"; then
+    ok "the served rlib is byte-identical to the compiled one"
+  else
+    bad "the served rlib is byte-identical to the compiled one"
+  fi
+  check "the restored dep-info names this checkout's OUT_DIR for cargo" \
+    "$(grep -cx "# env-dep:OUT_DIR=$WORK/rust-out-b/target/out" "$WORK/rust-out-b/deps/lib.d")" "1"
+  check "and its generated source" \
+    "$(grep -c "^$WORK/rust-out-b/target/out/gen.rs:" "$WORK/rust-out-b/deps/lib.d")" "1"
+  rust_out rust-out-b lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "the restored checkout then hits through the manifest" "$(hits)" "2"
+
+  reset_cache
+  rust_out rust-out-a baked.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "a crate that bakes OUT_DIR in is not stored" \
+    "$("$VCACHE" --show-stats | sed -n 's/^ *env path in output *//p')" "1"
+  rust_out rust-out-b baked.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "so another checkout compiles its own" "$(misses)" "2"
+  check "and its rlib holds its own path" \
+    "$(grep -qa "$WORK/rust-out-b/target/out" "$WORK/rust-out-b/deps/libbaked.rlib" && echo yes)" "yes"
+else
+  printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
 section "9c. Rust: the incremental directory is not part of the key"
 
 # cargo passes -C incremental=<target-dir>/<profile>/incremental to every

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rust/rust_manifest.h"
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "hash/hasher.h"
@@ -103,9 +104,21 @@ std::string EscapeEnvDepValue(const std::string& value) {
   return out;
 }
 
+std::optional<std::string> KeyedEnvDepValue(const std::string& name,
+                                            std::optional<std::string> escaped_value,
+                                            const std::vector<std::string>& path_env_vars,
+                                            const core::RootMap& roots) {
+  if (escaped_value &&
+      std::find(path_env_vars.begin(), path_env_vars.end(), name) != path_env_vars.end()) {
+    return roots.Canonicalize(*escaped_value);
+  }
+  return escaped_value;
+}
+
 std::optional<std::string> FindRustStateMismatch(const RustManifestState& state,
                                                  const std::vector<RustExtern>& externs,
-                                                 const core::RootMap& roots) {
+                                                 const core::RootMap& roots,
+                                                 const std::vector<std::string>& path_env_vars) {
   if (state.externs.size() != externs.size()) return "the --extern set differs";
   for (size_t i = 0; i < externs.size(); ++i) {
     if (state.externs[i].name != externs[i].name) return "the --extern set differs";
@@ -115,8 +128,10 @@ std::optional<std::string> FindRustStateMismatch(const RustManifestState& state,
   }
   for (const core::DepEnv& env : state.env_deps) {
     const char* raw = std::getenv(env.name.c_str());
-    const std::optional<std::string> now =
-        raw != nullptr ? std::optional<std::string>(EscapeEnvDepValue(raw)) : std::nullopt;
+    const std::optional<std::string> now = KeyedEnvDepValue(
+        env.name,
+        raw != nullptr ? std::optional<std::string>(EscapeEnvDepValue(raw)) : std::nullopt,
+        path_env_vars, roots);
     if (now != env.value) {
       return "env " + env.name + " is " + (now ? "'" + *now + "'" : std::string("unset")) +
              ", was " + (env.value ? "'" + *env.value + "'" : std::string("unset"));

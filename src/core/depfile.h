@@ -46,12 +46,13 @@ std::optional<DepFile> ParseDepFile(const std::string& text);
 // followed by any env-dep lines exactly as rustc wrote them.
 std::string RenderDepFile(const DepFile& dep);
 
-// Rewrites every target and prerequisite through the root mapping. Env-dep
-// values are left alone: the cache key holds them raw, so a hit already has the
-// local value.
+// Rewrites every target and prerequisite through the root mapping, plus the
+// values of the env deps named in `path_env_vars`. Other env-dep values are left
+// alone: the cache key holds them raw, so a hit already has the local value.
 // `direction` decides which way: kCanonicalize for storing, kLocalize for
 // restoring into the current working tree.
 enum class MapDirection { kCanonicalize, kLocalize };
-void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction);
+void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction,
+                  const std::vector<std::string>& path_env_vars = {});
 
 }  // namespace vcache::core

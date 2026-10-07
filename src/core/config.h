@@ -147,6 +147,12 @@ struct Config {
   // where a variable affects codegen (SOURCE_DATE_EPOCH, for example).
   std::vector<std::string> extra_env_vars;
 
+  // Variables a Rust crate reads through env! whose values are paths, such as
+  // OUT_DIR. Their values join the key canonicalised, so a crate that only
+  // include!s from one hits across checkouts. Opt-in: a crate may bake the
+  // value into its artifact, and then the entry is not stored.
+  std::vector<std::string> rust_path_env_vars;
+
   // Path the config was loaded from, for --show-config. Empty if defaults only.
   std::string loaded_from;
 

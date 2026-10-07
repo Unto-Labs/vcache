@@ -61,6 +61,7 @@ cwd_name             = "cwd"
 incoming_prefix_maps = "error"     # error | strip | keep
 read_only            = false
 hash_env_vars        = []
+rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 
 [cache.disk]
 enabled = true
@@ -92,6 +93,7 @@ timeout        = 30                # seconds
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
 | `vcache.hash_env_vars` | `VCACHE_HASH_ENV_VARS` | — | none |
+| `vcache.rust_path_env_vars` | `VCACHE_RUST_PATH_ENV_VARS` | — | none |
 | `cache.disk.enabled` | `VCACHE_DISK` | — | `true` |
 | `cache.disk.dir` | `VCACHE_DIR` | — | `$XDG_CACHE_HOME/vcache`, else `~/.cache/vcache` |
 | `cache.disk.size` | `VCACHE_CACHE_SIZE` | — | `10G` |
@@ -650,7 +652,8 @@ preprocessed text. The same output names every variable the crate read through
 its name plus its raw value, or a marker for unset. Values are not
 canonicalised, because rustc does not remap them and a path such as `OUT_DIR`
 may end up in the artifact, so a crate that reads a path-valued variable hits
-only where that value is the same.
+only where that value is the same, unless the variable is named in
+`rust_path_env_vars`.
 
 **Deliberately not in the key:**
 
@@ -695,6 +698,30 @@ hash_env_vars = ["SOURCE_DATE_EPOCH"]
 ```console
 $ export VCACHE_HASH_ENV_VARS=SOURCE_DATE_EPOCH,BUILD_FLAVOUR   # comma-separated
 ```
+
+### `rust_path_env_vars`
+
+cargo sets `OUT_DIR` for every crate with a build script to a directory inside
+that checkout's target directory, and the usual crate reads it only to
+`include!` generated code. Keyed raw, every such crate misses in every other
+checkout. Naming the variable here keys its value canonicalised through the
+roots, so with the target directory under a root the crate hits elsewhere:
+
+```toml
+[vcache]
+rust_path_env_vars = ["OUT_DIR"]
+```
+```console
+$ export VCACHE_RUST_PATH_ENV_VARS=OUT_DIR   # comma-separated
+```
+
+The value is canonicalised wherever it is compared: in the key, in the Rust
+manifest, and in the `# env-dep:` line of the cached dep-info, which a hit
+localises again so cargo sees this checkout's own value. A crate can still bake
+the value into its artifact, as `const DIR: &str = env!("OUT_DIR")` does. After
+each compile vcache looks for the local value in every output and in rustc's
+diagnostics, and if it is there the entry is not stored; `--show-stats` counts
+those runs as `env path in output`. A value outside every root is keyed as it is.
 
 ### `native_target`
 
@@ -899,6 +926,7 @@ alone. In TOML, use real booleans.
 | --- | --- | --- |
 | `VCACHE_ROOTS` | `:` (like `PATH`) | array of strings |
 | `VCACHE_HASH_ENV_VARS` | `,` | array of strings |
+| `VCACHE_RUST_PATH_ENV_VARS` | `,` | array of strings |
 
 **Paths** expand a leading `~/` using `$HOME`.
 

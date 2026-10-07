@@ -198,8 +198,9 @@ std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
     hasher.UpdateDelimited(digest);
   }
 
-  // Raw, not canonicalised: rustc does not remap env values, so a path-valued
-  // variable such as OUT_DIR may be baked into the artifact.
+  // Raw unless named in rust_path_env_vars: rustc does not remap env values,
+  // so a path-valued variable such as OUT_DIR may be baked into the artifact.
+  // A canonicalised one is checked for that before its entry is stored.
   for (const core::DepEnv& env : inputs.env_deps) {
     hasher.UpdateDelimited(env.name);
     hasher.UpdateDelimited(env.value ? "=" + *env.value : std::string("unset"));
@@ -288,6 +289,7 @@ void SubstituteDir(core::DepFile* dep, const std::string& from,
 // Collects every file produced under `dir` as a blob file set, canonicalising
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
+                    const std::vector<std::string>& path_env_vars,
                     std::vector<storage::BlobFile>* files) {
   std::error_code ec;
   for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
@@ -311,7 +313,7 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     // gcc does not to .d files, so it has to be rewritten explicitly.
     if (util::EndsWith(file.name, ".d")) {
       if (auto dep = core::ParseDepFile(*contents)) {
-        core::RemapDepFile(&*dep, roots, MapDirection::kCanonicalize);
+        core::RemapDepFile(&*dep, roots, MapDirection::kCanonicalize, path_env_vars);
         SubstituteDir(&*dep, dir, std::string(kOutDirPlaceholder));
         file.contents = core::RenderDepFile(*dep);
       } else {
@@ -327,13 +329,14 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
 
 // Writes a captured file set into the real output directory.
 bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
-                    const std::string& out_dir, const RootMap& roots) {
+                    const std::string& out_dir, const RootMap& roots,
+                    const std::vector<std::string>& path_env_vars) {
   for (const storage::BlobFile& file : files) {
     const std::string target = out_dir + "/" + file.name;
     std::string contents = file.contents;
     if (util::EndsWith(file.name, ".d")) {
       if (auto dep = core::ParseDepFile(contents)) {
-        core::RemapDepFile(&*dep, roots, MapDirection::kLocalize);
+        core::RemapDepFile(&*dep, roots, MapDirection::kLocalize, path_env_vars);
         SubstituteDir(&*dep, std::string(kOutDirPlaceholder), out_dir);
         contents = core::RenderDepFile(*dep);
       }
@@ -357,13 +360,34 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   return true;
 }
 
+// Names the first path-valued env dep whose local value, which the key left out,
+// still appears in the entry: another checkout must not be served this path.
+std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& env_deps,
+                                               const std::vector<std::string>& path_env_vars,
+                                               const RootMap& roots, const storage::Blob& blob) {
+  for (const core::DepEnv& env : env_deps) {
+    if (!env.value || std::find(path_env_vars.begin(), path_env_vars.end(), env.name) ==
+                          path_env_vars.end()) {
+      continue;
+    }
+    const char* raw = std::getenv(env.name.c_str());
+    if (raw == nullptr || *raw == '\0' || roots.Canonicalize(raw) == raw) continue;
+    const std::string_view local(raw);
+    if (blob.stderr_text.find(local) != std::string::npos) return env.name;
+    for (const storage::BlobFile& file : blob.files) {
+      if (file.contents.find(local) != std::string::npos) return env.name + " in " + file.name;
+    }
+  }
+  return std::nullopt;
+}
+
 // Restores a cached entry and replays its diagnostics. False if the entry is
 // unusable, in which case the caller recompiles.
 bool ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed,
-              const RootMap& roots) {
+              const RootMap& roots, const std::vector<std::string>& path_env_vars) {
   storage::Blob blob;
   if (!storage::DeserializeBlob(got.value, &blob) || blob.files.empty() ||
-      !RestoreOutputs(blob.files, parsed.out_dir, roots)) {
+      !RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars)) {
     return false;
   }
   if (!blob.stderr_text.empty()) {
@@ -455,13 +479,14 @@ int RunRustCompile(const std::vector<std::string>& argv,
     for (size_t i = 0; i < states.size(); ++i) {
       const std::string which =
           "state " + std::to_string(i + 1) + " of " + std::to_string(states.size());
-      if (auto mismatch = FindRustStateMismatch(states[i], *externs, roots)) {
+      if (auto mismatch = FindRustStateMismatch(states[i], *externs, roots,
+                                                config.rust_path_env_vars)) {
         VCACHE_LOG("rust manifest: " + which + " rejected: " + *mismatch);
         continue;
       }
       storage::GetResult got = cache->Get(states[i].key);
       media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
-      if (!got.hit || !ServeHit(got, parsed, roots)) {
+      if (!got.hit || !ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
         VCACHE_LOG("rust manifest: " + which + " matched but its entry is " +
                    (got.hit ? "unusable" : "gone"));
         continue;
@@ -493,7 +518,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   RustManifestState fresh;
   fresh.files = std::move(*source_files);
-  fresh.env_deps = inputs.env_deps;
+  for (const core::DepEnv& env : inputs.env_deps) {
+    fresh.env_deps.push_back(
+        {env.name, KeyedEnvDepValue(env.name, env.value, config.rust_path_env_vars, roots)});
+  }
   fresh.externs = *externs;
   fresh.key = ComputeKey(parsed, roots, rustc_fingerprint, config, fresh);
   const std::string& key = fresh.key;
@@ -510,7 +538,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
-      if (ServeHit(got, parsed, roots)) {
+      if (ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
@@ -552,11 +580,11 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   std::vector<storage::BlobFile> files;
-  if (!CaptureOutputs(stage_dir, roots, &files)) {
+  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars, &files)) {
     core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
-  if (!RestoreOutputs(files, parsed.out_dir, roots)) {
+  if (!RestoreOutputs(files, parsed.out_dir, roots, config.rust_path_env_vars)) {
     core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
     return RunPassthrough(argv);
   }
@@ -582,6 +610,12 @@ int RunRustCompile(const std::vector<std::string>& argv,
   storage::Blob blob;
   blob.files = std::move(files);
   blob.stderr_text = roots.CanonicalizeText(compiled.stderr_data);
+
+  if (auto leaked = FindEnvPathInOutput(inputs.env_deps, config.rust_path_env_vars, roots,
+                                        blob)) {
+    core::RecordDecision(cache_dir, {Reason::kEnvPathInOutput, *leaked});
+    return compiled.exit_code;
+  }
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
 

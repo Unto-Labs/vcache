@@ -4776,7 +4776,30 @@ void TestUploadGeneration() {
     waiter.join();
     Check(released, "the waiter is released by finish of v1 even when v3 is in flight");
     Check(wake.in_flight("w"), "v3 stays in flight after v1 finishes");
+    Check(wake.TakeRefusal(refusal_id), "taking the refusal reports it was overtaken");
+    CheckEq(std::to_string(wake.refusal_count()), "0",
+            "a finished refusal leaves no record");
   }
+
+  // Finish of a superseded flight clears generation_, so the next store starts
+  // again at 1. That store is a new flight and must not keep the old refusal
+  // waiting.
+  daemon::UploadQueue reset_flight(journal, 10);
+  Check(reset_flight.Enqueue("s", v1, false), "the reset store is queued");
+  auto reset_item = reset_flight.TakeReady(now, &soonest);
+  uint64_t reset_refusal = 0;
+  Check(!reset_flight.Enqueue("s", big, false, nullptr, nullptr, &reset_refusal),
+        "the reset re-put is refused");
+  if (reset_item) {
+    Check(!reset_flight.Finish(*reset_item), "finishing the superseded flight drops it");
+  }
+  const auto v_next = std::make_shared<const std::string>("vn");
+  Check(reset_flight.Enqueue("s", v_next, false), "a store after the drop is accepted");
+  auto next_item = reset_flight.TakeReady(now, &soonest);
+  Check(next_item.has_value() && reset_flight.in_flight("s"),
+        "the later store is in flight");
+  Check(!reset_flight.RefusalStillInFlight(reset_refusal),
+        "a new flight does not keep the old refusal waiting");
 }
 
 void TestHeldHitLayer() {

@@ -49,10 +49,14 @@ class UploadQueue {
                bool* merged = nullptr, bool* in_flight_state = nullptr,
                uint64_t* refusal_id = nullptr, bool* dropped_waiting = nullptr);
 
-  // True while the upload that was in flight at `refusal_id` has not been
-  // finished or re-queued. A newer generation of the same key does not count.
+  // True while the same flight recorded for `refusal_id` is still in flight.
+  // A later flight of the key, even one whose generation restarted at 1, does
+  // not count.
   bool RefusalStillInFlight(uint64_t refusal_id) const;
   bool RefusalOvertaken(uint64_t refusal_id) const;
+  // Reports whether the refusal was overtaken and drops its record.
+  bool TakeRefusal(uint64_t refusal_id);
+  size_t refusal_count() const { return refusals_.size(); }
 
   // The next item whose retry time has passed, or nullopt. Sets `soonest`
   // to the earliest retry when nothing is ready yet.
@@ -89,10 +93,10 @@ class UploadQueue {
     bool counted_outside_held = false;
   };
 
-  // One refused re-put waiting on a particular in-flight generation.
+  // One refused re-put waiting on one flight. `flight_id` is never reused.
   struct FlightRefusal {
-    uint64_t id = 0;
-    uint64_t waited_generation = 0;
+    std::string key;
+    uint64_t flight_id = 0;
     bool overtaken = false;
   };
 
@@ -112,11 +116,12 @@ class UploadQueue {
   std::map<std::string, UploadItem> waiting_;
   std::map<std::string, uint64_t> generation_;
   std::set<std::string> in_flight_;
-  std::map<std::string, uint64_t> in_flight_generation_;
+  std::map<std::string, uint64_t> in_flight_id_;
   std::set<std::string> superseded_;
   std::set<std::string> recount_on_requeue_;
-  std::map<std::string, std::vector<FlightRefusal>> refusals_;
+  std::map<uint64_t, FlightRefusal> refusals_;
   uint64_t next_refusal_id_ = 1;
+  uint64_t next_flight_id_ = 1;
   std::map<std::string, FlightPin> flight_pin_;
   std::map<std::string, std::shared_ptr<const std::string>> held_;
   uint64_t held_bytes_ = 0;

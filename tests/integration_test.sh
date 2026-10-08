@@ -62,6 +62,7 @@ release_pause_fifo() {  # $1 fifo, $2 pid, $3 waiting (1 or 0)
     if (( n >= 50 )); then
       kill "$wpid" 2>/dev/null || true
       wait "$wpid" 2>/dev/null || true
+      bad "pause fifo write timed out"
       return
     fi
     sleep 0.05
@@ -1850,7 +1851,29 @@ except Exception: sys.exit(1)
   export MOCK_S3_SLOW_UNDER_BYTES=10
   export MOCK_S3_SLOW_UNDER_EXTRA_MS=1500
 
+  upload_identity() {
+    "$VCACHE" --daemon-status 2>/dev/null | awk '
+      $1=="uploads" && $2=="queued" {q=$NF}
+      $1=="completed" {c=$NF}
+      $1=="bytes" {seen_bytes=1}
+      $1=="failed" && seen_bytes {f=$NF}
+      $1=="skipped" {s=$NF}
+      $1=="pending" {p=$NF}
+      $1=="uploads" && $2=="superseded" {u=$NF}
+      END {
+        sum = c+0 + f+0 + s+0 + p+0 + u+0
+        if (q+0 == sum) print "yes"
+        else print q "!=" sum
+      }'
+  }
   start_order_s3() {  # $1 storage dir
+    # The shell still tracks the previous mock. Leaving it running leaks a
+    # server whose storage dir this section has already finished.
+    if [[ -n "${S3PID:-}" ]]; then
+      kill "$S3PID" 2>/dev/null || true
+      wait "$S3PID" 2>/dev/null || true
+      S3PID=
+    fi
     S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
     S3DIR="$1"
     python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
@@ -1886,6 +1909,7 @@ except Exception: sys.exit(1)
   check "the blocker upload is in flight" "$(wait_started "$blocker_obj")" "1"
   printf 'v1v1' | "$VCACHE" --test-put "$queued_key"
   printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$queued_key"
+  check "a drained queued refusal keeps the upload identity" "$(upload_identity)" "yes"
   "$VCACHE" --stop-daemon >/dev/null
   queued_obj="$S3DIR/${queued_key:0:2}__${queued_key:2}"
   check "a refused re-put of a queued value leaves the newer value in s3" \
@@ -1909,20 +1933,7 @@ except Exception: sys.exit(1)
   done
   check "a refused in-flight re-put is marked superseded" "$flight_marked" "1"
   wait "$flight_put"
-  upload_identity=$("$VCACHE" --daemon-status 2>/dev/null | awk '
-    $1=="uploads" && $2=="queued" {q=$NF}
-    $1=="completed" {c=$NF}
-    $1=="bytes" {seen_bytes=1}
-    $1=="failed" && seen_bytes {f=$NF}
-    $1=="skipped" {s=$NF}
-    $1=="pending" {p=$NF}
-    $1=="uploads" && $2=="superseded" {u=$NF}
-    END {
-      sum = c+0 + f+0 + s+0 + p+0 + u+0
-      if (q+0 == sum) print "yes"
-      else print q "!=" sum
-    }')
-  check "a drained in-flight refusal keeps the upload identity" "$upload_identity" "yes"
+  check "a drained in-flight refusal keeps the upload identity" "$(upload_identity)" "yes"
   "$VCACHE" --stop-daemon >/dev/null
   check "a refused re-put of an in-flight value leaves the newer value in s3" \
     "$(cat "$flight_obj" 2>/dev/null)" "V2VALUE-0123456789"
@@ -1945,11 +1956,38 @@ except Exception: sys.exit(1)
   check "the overtaken refusal is waiting" "$overtake_marked" "1"
   printf 'v3v3' | "$VCACHE" --test-put "$overtake_key"
   wait "$overtake_put"
+  overtake_drained=0
+  for _ in $(seq 1 120); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then overtake_drained=1; break; fi
+    sleep 0.05
+  done
+  check "the overtaken uploads have drained" "$overtake_drained" "1"
+  check "an overtaken refusal is not uploaded" "$(daemon_stat 'completed')" "2"
+  check "a drained overtake keeps the upload identity" "$(upload_identity)" "yes"
   "$VCACHE" --stop-daemon >/dev/null
   check "a newer accepted store is what s3 keeps" \
     "$(cat "$overtake_obj" 2>/dev/null)" "v3v3"
   kill "$S3PID" 2>/dev/null || true
   wait "$S3PID" 2>/dev/null || true
+
+  # V1's put fails three times while V2 is refused against that flight. The
+  # drop is a skip, and V2's put is the one that lands.
+  export MOCK_S3_TRANSIENT_PUT_FAILURES=3
+  start_order_s3 "$WORK/refuse-retry-s3"
+  retry_key=dddddddddddddddddddddddddddddddd
+  printf 'v1v1' | "$VCACHE" --test-put "$retry_key"
+  retry_obj="$S3DIR/${retry_key:0:2}__${retry_key:2}"
+  check "the superseded retry upload has started" "$(wait_started "$retry_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$retry_key"
+  check "a superseded retry keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a superseded retry leaves the newer value in s3" \
+    "$(cat "$retry_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset MOCK_S3_TRANSIENT_PUT_FAILURES
+  check "the flight mock is gone" \
+    "$(pgrep -f "$WORK/[r]efuse-flight-s3" >/dev/null && echo yes || echo no)" "no"
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
         VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES \

@@ -57,7 +57,6 @@ void PauseBeforeManifestPut() {
       bound_ms = static_cast<int>(parsed);
     }
   }
-  const int kBoundMs = bound_ms;
   const auto started = std::chrono::steady_clock::now();
   pollfd pfd {};
   pfd.fd = fd;
@@ -66,11 +65,11 @@ void PauseBeforeManifestPut() {
   for (;;) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
-    if (elapsed.count() >= kBoundMs) {
+    if (elapsed.count() >= bound_ms) {
       rc = 0;
       break;
     }
-    rc = ::poll(&pfd, 1, static_cast<int>(kBoundMs - elapsed.count()));
+    rc = ::poll(&pfd, 1, static_cast<int>(bound_ms - elapsed.count()));
     if (rc < 0 && errno == EINTR) continue;
     break;
   }

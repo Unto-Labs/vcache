@@ -442,7 +442,6 @@ class Server {
 
   // Upload queue, also under `mutex_`.
   UploadQueue uploads_;
-  int in_flight_ = 0;
   bool workers_stop_ = false;
   std::vector<std::thread> workers_;
 
@@ -649,7 +648,6 @@ void Server::UploadWorker() {
       continue;
     }
     UploadItem item = std::move(*ready);
-    ++in_flight_;
     lock.unlock();
 
     std::string from_disk;
@@ -683,7 +681,6 @@ void Server::UploadWorker() {
     }
 
     lock.lock();
-    --in_flight_;
     if (done) {
       bool count_requeue = false;
       if (uploads_.Finish(item, &count_requeue)) {
@@ -1336,7 +1333,7 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
         if (refused_in_flight) {
           WaitForRefusal(refusal_id, key);
           std::lock_guard<std::mutex> lock(mutex_);
-          overtaken = uploads_.RefusalOvertaken(refusal_id);
+          overtaken = uploads_.TakeRefusal(refusal_id);
         }
         if (overtaken) {
           stored = true;
@@ -1347,9 +1344,9 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
             stored = true;
             counters_.uploads_done++;
             counters_.upload_bytes += value->size();
-          } else if (s3->failed()) {
+          } else {
             counters_.uploads_failed++;
-            errors.push_back("s3: " + s3->last_error());
+            if (s3->failed()) errors.push_back("s3: " + s3->last_error());
           }
           ReleaseS3(std::move(s3));
         }
@@ -1457,8 +1454,8 @@ std::string Server::StatusText() {
   s += row("  failed", n(counters_.uploads_failed));
   s += row("  skipped", n(counters_.uploads_skipped));
   s += row("  pending", std::to_string(pending));
-  s += row("uploads superseded", std::to_string(superseded));
   s += row("  held in memory", std::to_string(held) + " bytes");
+  s += row("uploads superseded", std::to_string(superseded));
   s += jobserver_status;
   return s;
 }
@@ -1611,7 +1608,9 @@ bool Server::Idle() const {
   const int limit_seconds = IdleLimitSeconds();
   if (limit_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!connections_.empty() || !uploads_.empty() || in_flight_ != 0) return false;
+  if (!connections_.empty() || !uploads_.empty() || uploads_.in_flight_count() != 0) {
+    return false;
+  }
   return Clock::now() - last_activity_ > std::chrono::seconds(limit_seconds);
 }
 
@@ -1700,7 +1699,7 @@ void Server::Shutdown() {
     cv_.wait_for(lock, std::chrono::seconds(5), [&] { return others() == 0; });
   }
 
-  const size_t pending = uploads_.size() + static_cast<size_t>(in_flight_);
+  const size_t pending = uploads_.size() + uploads_.in_flight_count();
   if (pending > 0) log_.Line("draining " + std::to_string(pending) + " uploads");
   workers_stop_ = true;
   cv_.notify_all();

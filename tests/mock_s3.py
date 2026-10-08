@@ -199,6 +199,16 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         if not self._check_headers(body):
             return
+        path = self._object_path()
+        if path is None:
+            self.send_error(400, "bad key")
+            return
+        # A refused re-put has to see that this attempt started, including
+        # when the attempt answers 503 and never writes the object.
+        apply_after = os.environ.get("MOCK_S3_APPLY_AFTER_LATENCY") == "1"
+        if apply_after:
+            with open(path + ".started", "w", encoding="ascii"):
+                pass
         # MOCK_S3_TRANSIENT_PUT_FAILURES=N makes the first N PUTs answer 503
         # SlowDown, which is what a real bucket does when it is shedding load
         # rather than rejecting the request. Counted per object so a test can
@@ -217,21 +227,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-        path = self._object_path()
-        if path is None:
-            self.send_error(400, "bad key")
-            return
         # The object appears when the request finishes, not when it arrives, so
         # a slow upload that started first can still be the value left behind.
-        if os.environ.get("MOCK_S3_APPLY_AFTER_LATENCY") == "1":
+        if apply_after:
             delay = LATENCY_S
             slow_under = int(os.environ.get("MOCK_S3_SLOW_UNDER_BYTES", "0") or "0")
             slow_extra = int(os.environ.get("MOCK_S3_SLOW_UNDER_EXTRA_MS", "0") or "0")
             if slow_under and len(body) < slow_under:
                 delay += slow_extra / 1000.0
-            started = path + ".started"
-            with open(started, "w", encoding="ascii"):
-                pass
             if delay:
                 time.sleep(delay)
             self._latency_applied = True

@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -1127,12 +1128,19 @@ struct SessionDaemon {
   pid_t pid = -1;
 
   explicit SessionDaemon(int idle_seconds = 0, bool single_flight = false,
-                         bool block_put = false) {
+                         bool block_put = false, uint64_t mem_available_kb = 0) {
     directory = util::MakeTempDir("vcache-session-test-").value_or("");
     if (directory.empty()) return;
     config.disk.dir = directory + "/cache";
     config.daemon.idle_timeout_seconds = idle_seconds;
     config.daemon.single_flight = single_flight;
+    if (mem_available_kb > 0) {
+      const std::string meminfo = "MemAvailable: " + std::to_string(mem_available_kb) + " kB\n";
+      const int mem_fd = ::open((directory + "/meminfo").c_str(), O_WRONLY | O_CREAT, 0600);
+      if (mem_fd < 0) return;
+      ::write(mem_fd, meminfo.data(), meminfo.size());
+      ::close(mem_fd);
+    }
     if (block_put && ::mkfifo((directory + "/put-gate").c_str(), 0600) != 0) return;
     int ready_pipe[2];
     if (::pipe(ready_pipe) != 0) return;
@@ -1142,6 +1150,11 @@ struct SessionDaemon {
       if (block_put) {
         ::setenv("VCACHE_DAEMON_TEST_BLOCK_PUT", (directory + "/put-gate").c_str(), 1);
         ::setenv("VCACHE_LOG", (directory + "/put-log").c_str(), 1);
+        util::InitLogging();
+      }
+      if (mem_available_kb > 0) {
+        ::setenv("VCACHE_DAEMON_MEMINFO", (directory + "/meminfo").c_str(), 1);
+        ::setenv("VCACHE_LOG", (directory + "/memory-log").c_str(), 1);
         util::InitLogging();
       }
       ::_exit(daemon::RunServer(config, ready_pipe[1]));
@@ -1430,6 +1443,7 @@ struct LeasePeer {
   uint64_t last_holder_pid = 0;
   uint64_t last_waited_ms = 0;
   bool request_pending = false;
+  pid_t compiler_pid = -1;
 
   explicit LeasePeer(const SessionDaemon& server) {
     int control[2];
@@ -1443,6 +1457,8 @@ struct LeasePeer {
       timeval session_timeout{5, 0};
       ::setsockopt(session_fd, SOL_SOCKET, SO_RCVTIMEO, &session_timeout,
                    sizeof(session_timeout));
+      pid_t worker_pid = -1;
+      int worker_stop_fd = -1;
       while (daemon::RecvFrame(control[1], &reply)) {
         if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 251) {
           std::string hello_reply;
@@ -1465,6 +1481,51 @@ struct LeasePeer {
           const bool sent = ::sendmsg(control[1], &message, 0) == 1;
           if (put_fd >= 0) ::close(put_fd);
           if (!sent) break;
+          continue;
+        }
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 253) {
+          daemon::Reader worker_request(reply);
+          uint8_t code = 0;
+          uint64_t rss_kb = 0;
+          if (!worker_request.U8(&code) || !worker_request.U64(&rss_kb) ||
+              rss_kb > 65536) ::_exit(2);
+          int worker_ready[2], worker_stop[2];
+          if (::pipe(worker_ready) != 0 || ::pipe(worker_stop) != 0) ::_exit(2);
+          worker_pid = ::fork();
+          if (worker_pid == 0) {
+            ::close(control[1]);
+            ::close(session_fd);
+            ::close(worker_ready[0]);
+            ::close(worker_stop[1]);
+            std::vector<char> memory(rss_kb * 1024, 'm');
+            for (size_t page = 0; page < memory.size(); page += 4096) memory[page] = 'r';
+            ::write(worker_ready[1], "R", 1);
+            pollfd stop{worker_stop[0], POLLIN, 0};
+            ::poll(&stop, 1, 10000);
+            ::_exit(0);
+          }
+          ::close(worker_ready[1]);
+          ::close(worker_stop[0]);
+          worker_stop_fd = worker_stop[1];
+          pollfd ready{worker_ready[0], POLLIN, 0};
+          char code_ready = 0;
+          const bool started = ::poll(&ready, 1, 1000) > 0 &&
+                               ::read(worker_ready[0], &code_ready, 1) == 1;
+          ::close(worker_ready[0]);
+          daemon::Writer worker_reply;
+          worker_reply.U64(started ? worker_pid : 0);
+          if (!daemon::SendFrame(control[1], worker_reply.data())) break;
+          continue;
+        }
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 252) {
+          if (worker_pid > 0) {
+            ::kill(worker_pid, SIGKILL);
+            ::waitpid(worker_pid, nullptr, 0);
+            worker_pid = -1;
+          }
+          if (worker_stop_fd >= 0) ::close(worker_stop_fd);
+          worker_stop_fd = -1;
+          if (!daemon::SendFrame(control[1], std::string(1, '\0'))) break;
           continue;
         }
         if (!reply.empty() && reply[0] == '\0') {
@@ -1497,6 +1558,7 @@ struct LeasePeer {
   ~LeasePeer() { Close(); }
 
   void Close() {
+    if (compiler_pid > 0) StopCompiler();
     if (control_fd >= 0) ::close(control_fd);
     control_fd = -1;
     if (pid > 0) {
@@ -1510,6 +1572,16 @@ struct LeasePeer {
     daemon::Writer request;
     request.U8(7);
     request.Str(key);
+    request.U64(bound_ms);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending;
+  }
+
+  bool Reserve(uint64_t estimate_kb, uint64_t bound_ms = 3000) {
+    daemon::Writer request;
+    request.U8(9);
+    request.Str(std::string(64, 'a'));
+    request.U64(estimate_kb);
     request.U64(bound_ms);
     request_pending = daemon::SendFrame(control_fd, request.data());
     return request_pending;
@@ -1534,6 +1606,51 @@ struct LeasePeer {
     int put_fd = -1;
     std::memcpy(&put_fd, CMSG_DATA(descriptor), sizeof(put_fd));
     return put_fd;
+  }
+
+  bool MemoryOutcome(uint8_t expected, int timeout_ms = 1000) {
+    pollfd ready{control_fd, POLLIN, 0};
+    std::string reply;
+    if (::poll(&ready, 1, timeout_ms) <= 0 || !daemon::RecvFrame(control_fd, &reply)) return false;
+    request_pending = false;
+    daemon::Reader in(reply);
+    uint8_t status = 0;
+    return in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
+           in.U8(&last_outcome) && last_outcome == expected &&
+           in.U64(&last_waited_ms) && in.done();
+  }
+
+  bool Spawned(pid_t reported_pid) {
+    daemon::Writer request;
+    request.U8(10);
+    request.U64(reported_pid);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending && Released();
+  }
+
+  pid_t StartCompiler(uint64_t rss_kb) {
+    daemon::Writer request;
+    request.U8(253);
+    request.U64(rss_kb);
+    std::string reply;
+    uint64_t worker_pid = 0;
+    if (!daemon::SendFrame(control_fd, request.data()) ||
+        !daemon::RecvFrame(control_fd, &reply)) return -1;
+    daemon::Reader in(reply);
+    if (!in.U64(&worker_pid) || !in.done()) return -1;
+    compiler_pid = static_cast<pid_t>(worker_pid);
+    return compiler_pid;
+  }
+
+  void StopCompiler() {
+    if (compiler_pid <= 0) return;
+    daemon::Writer request;
+    request.U8(252);
+    std::string reply;
+    if (!daemon::SendFrame(control_fd, request.data()) || !daemon::RecvFrame(control_fd, &reply)) {
+      ::kill(compiler_pid, SIGKILL);
+    }
+    compiler_pid = -1;
   }
 
   bool Release(const std::string& key, bool stored) {
@@ -1848,6 +1965,235 @@ void TestKeyLeasePutClose() {
           "Put barrier logs its bounded wait length");
     if (gate_fd >= 0) ::close(gate_fd);
   }
+}
+
+void TestMemoryAdmission() {
+  Section("daemon::admission");
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server), head(server), small(server);
+    Check(holder.Reserve(6144) && holder.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 6144), "a fitting estimate is reserved");
+    head.Reserve(4096);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              head.NoReply(), "an estimate exceeding remaining memory queues");
+    small.Reserve(1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 2); }, 1000) &&
+              small.NoReply(), "a smaller reservation never jumps the FIFO head");
+    holder.Close();
+    Check(head.MemoryOutcome(0) && small.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 5120),
+          "session close releases memory and grants queued requests in order");
+    const std::string log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    Check(log.find("reserve: granted 4096 kB") < log.find("reserve: granted 1024 kB") &&
+              log.find("reserve: waiting (") != std::string::npos,
+          "FIFO grant order and wait arithmetic appear in VCACHE_LOG");
+    Check(LeaseStat(server, "reserve waits", 2), "each queued request counts one reserve wait");
+    LeasePeer bounded(server);
+    bounded.Reserve(6144, 75);
+    Check(bounded.MemoryOutcome(1, 750) && bounded.last_waited_ms >= 75 &&
+              LeaseStat(server, "memory reserved", 5120) &&
+              LeaseStat(server, "memory waiting", 0),
+          "a memory bound runs unreserved without changing held reservations");
+    head.Close();
+    small.Close();
+    LeasePeer next(server);
+    Check(next.Reserve(8192) && next.MemoryOutcome(0),
+          "release is applied before a new reserve in the same turn");
+  }
+  {
+    SessionDaemon server(0, false, false, 5 * 1024 * 1024);
+    LeasePeer first(server), second(server), third(server);
+    Check(first.Reserve(2 * 1024 * 1024) && first.MemoryOutcome(0) &&
+              second.Reserve(2 * 1024 * 1024) && second.MemoryOutcome(0),
+          "stale 5 GB meminfo grants the first two 2 GB estimates");
+    third.Reserve(2 * 1024 * 1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              third.NoReply() && LeaseStat(server, "memory reserved", 4 * 1024 * 1024),
+          "unrealised reservations queue the third grant despite stale meminfo");
+    Check(first.Spawned(2000000000), "an invisible compiler pid selects conservative fallback");
+    Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(
+              "whole estimate unrealised for 10000 ms") != std::string::npos,
+          "an invisible compiler logs its ten-second conservative fallback");
+    Check(PollUntil([&] { return server.Sessions(3); }, 1000) &&
+              LeaseStat(server, "memory reserved", 4 * 1024 * 1024) && third.NoReply(650),
+          "a failed proc read never releases a live session's reservation");
+    first.Close();
+    Check(third.MemoryOutcome(0), "closing the fallback session releases its reservation");
+  }
+  {
+    SessionDaemon server(0, false, false, 1024 * 1024);
+    LeasePeer alone(server);
+    Check(alone.Reserve(2 * 1024 * 1024) && alone.MemoryOutcome(0),
+          "always-one grants a 2 GB estimate on a 1 GB machine when alone");
+    alone.Close();
+    LeasePeer defaults(server);
+    Check(defaults.Reserve(0) && defaults.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 2097152),
+          "a zero estimate uses the default compile cost");
+  }
+  {
+    SessionDaemon server(0, false, false, 50000);
+    LeasePeer first(server), second(server);
+    first.Reserve(32768);
+    Check(first.MemoryOutcome(0), "RSS fixture obtains the first reservation");
+    const pid_t compiler_pid = first.StartCompiler(16384);
+    Check(compiler_pid > 0 && first.Spawned(compiler_pid),
+          "CompilerSpawned reports a visible child of the session peer");
+    auto pid_descriptors = [&] {
+      size_t count = 0;
+      std::error_code error;
+      for (const auto& entry : std::filesystem::directory_iterator(
+               "/proc/" + std::to_string(server.pid) + "/fd", error)) {
+        if (std::filesystem::read_symlink(entry.path(), error) == "anon_inode:[pidfd]") ++count;
+      }
+      return count;
+    };
+    const size_t original_pid_descriptors = pid_descriptors();
+    Check(first.Spawned(compiler_pid) && pid_descriptors() == original_pid_descriptors,
+          "repeated compiler notifications retain exactly one pid descriptor");
+    Check(first.Spawned(2000000000) && LeaseStat(server, "memory realised", 0),
+          "a replacement invisible pid starts with the whole estimate unrealised");
+    Check(first.Spawned(compiler_pid), "a visible compiler can replace the fallback pid");
+    second.Reserve(32768);
+    Check(second.MemoryOutcome(0, 1500),
+          "realised RSS reduces unrealised memory without double counting MemAvailable");
+    Check(PollUntil([&] {
+      const std::string status = server.Status();
+      const size_t row = status.find("memory realised");
+      return row != std::string::npos &&
+             std::strtoull(status.c_str() + row + 15, nullptr, 10) >= 16384;
+    }, 1000), "memory realised status reports sampled RSS");
+    first.StopCompiler();
+    Check(PollUntil([&] { return LeaseStat(server, "memory reserved", 32768); }, 1500) &&
+              server.Sessions(2), "confirmed compiler exit releases memory before session close");
+    second.Close();
+    Check(first.Reserve(1024) && first.MemoryOutcome(0), "an overshoot fixture reserves 1024 kB");
+    const pid_t overshoot_pid = first.StartCompiler(4096);
+    first.Spawned(overshoot_pid);
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                 "rss overshoot") != std::string::npos;
+    }, 1500), "RSS above the estimate is clamped and logged as an overshoot");
+    LeasePeer after_overshoot(server);
+    Check(after_overshoot.Reserve(50000) && after_overshoot.MemoryOutcome(0, 1000),
+          "RSS above the estimate contributes zero unrealised memory to the next grant");
+    first.StopCompiler();
+  }
+  {
+    SessionDaemon server(0, false, false, 1024);
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(1024);
+    holder.MemoryOutcome(0);
+    queued.Reserve(1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "memory-rise fixture queues a reservation");
+    const int mem_fd = ::open((server.directory + "/meminfo").c_str(), O_WRONLY | O_TRUNC);
+    if (mem_fd >= 0) {
+      const std::string meminfo = "MemAvailable: 2048 kB\n";
+      ::write(mem_fd, meminfo.data(), meminfo.size());
+      ::close(mem_fd);
+    }
+    Check(queued.MemoryOutcome(0, 1500) && LeaseStat(server, "memory reserved", 2048),
+          "rising MemAvailable grants the FIFO head within one sample interval");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server);
+    holder.Reserve(8192);
+    holder.MemoryOutcome(0);
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    bool reserved = false;
+    std::atomic<bool> finished{false};
+    std::thread reserve([&] {
+      if (session) reserved = session->ReserveMemory(std::string(64, 'a'), 1024);
+      finished = true;
+    });
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "an enabled client reserves through a daemon started with admission off");
+    bool timeout_has_margin = false;
+    for (int fd = 0; fd < 256; ++fd) {
+      timeval timeout{};
+      socklen_t size = sizeof(timeout);
+      if (::getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, &size) == 0 &&
+          timeout.tv_sec == 615) timeout_has_margin = true;
+    }
+    Check(timeout_has_margin, "reserve receive timeout has the required 15 second margin");
+    holder.Close();
+    const bool received = PollUntil([&] { return finished.load(); }, 1000);
+    if (!received && server.pid > 0) ::kill(server.pid, SIGTERM);
+    reserve.join();
+    Check(received && reserved, "the client receives granted after the earlier reservation ends");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server), head(server), later(server);
+    holder.Reserve(6144);
+    holder.MemoryOutcome(0);
+    head.Reserve(4096, 100);
+    PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000);
+    later.Reserve(1024);
+    Check(head.MemoryOutcome(1, 1000) && later.MemoryOutcome(0, 1000) &&
+              LeaseStat(server, "memory reserved", 7168),
+          "an expired FIFO head is removed before the next fitting request is granted");
+  }
+  {
+    SessionDaemon server(0, false, false, 2048);
+    LeasePeer holder(server);
+    holder.Reserve(2048);
+    holder.MemoryOutcome(0);
+    holder.Spawned(2000000000);
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    bool reserved = false;
+    std::atomic<bool> answered{false};
+    const auto started = std::chrono::steady_clock::now();
+    std::thread reserve([&] {
+      if (session) reserved = session->ReserveMemory(std::string(64, 'a'), 2048, 12000);
+      answered = true;
+    });
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              LeaseStat(server, "memory realised", 0),
+          "an invisible pid keeps the whole estimate unrealised initially");
+    Check(PollUntil([&] { return answered.load(); }, 11000) && reserved &&
+              std::chrono::steady_clock::now() - started >= std::chrono::seconds(9) &&
+              LeaseStat(server, "memory realised", 2048) &&
+              LeaseStat(server, "memory reserved", 4096),
+          "the ten-second pid fallback realises its estimate and grants the queued head");
+    reserve.join();
+  }
+  {
+    SessionDaemon disabled;
+    LeasePeer peer(disabled);
+    Check(peer.Reserve(1024) && peer.MemoryOutcome(0),
+          "a switch-free daemon always serves an enabled client's reserve");
+  }
+}
+
+void TestRunSpawnCallback() {
+  Section("util::Run spawn callback");
+  int calls = 0;
+  pid_t spawned_pid = 0;
+  util::ProcOptions options{.capture_stdout = true, .capture_stderr = true};
+  options.on_spawn = [&](int pid) {
+    ++calls;
+    spawned_pid = pid;
+    Check(pid > 0 && ::kill(pid, 0) == 0,
+          "spawn callback receives the live child pid in the parent");
+  };
+  const auto result = util::Run({"sh", "-c", "printf out; printf err >&2; exit 7"}, options);
+  Check(calls == 1 && spawned_pid > 0 && result.exit_code == 7 &&
+            result.stdout_data == "out" && result.stderr_data == "err",
+        "spawn notification preserves exit status and concurrent pipe capture");
+  calls = 0;
+  const auto absent = util::Run({}, options);
+  Check(calls == 0 && absent.exit_code == -1 && absent.wall_ms == 0 && absent.max_rss_kb == 0,
+        "a process that was never spawned has no notification or cost");
 }
 
 void TestLeaseReviewFixes() {
@@ -3710,16 +4056,82 @@ void TestJobserver() {
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }
 
+void TestMemoryEstimates() {
+  Section("daemon::admission estimates");
+  TempCacheDir cache;
+  core::Config config;
+  config.disk.dir = cache.path();
+  const std::string missing_key(64, 'f');
+  Check(daemon::MemoryEstimateKb(config, missing_key, false) == 2097152 &&
+            daemon::MemoryEstimateKb(config, missing_key, true) == 4194304,
+        "missing cost records use separate compile and link defaults");
+  config.daemon.mode = core::DaemonMode::kOn;
+  config.daemon.admission = true;
+  const std::string description = core::DescribeConfig(config);
+  Check(description.find("  admission:      on\n") != std::string::npos &&
+            description.find("  compile kB:     2097152\n") != std::string::npos &&
+            description.find("  link kB:        4194304\n") != std::string::npos,
+        "show-config reports client admission and its separate kilobyte defaults");
+  const auto roots = MakeRoots({cache.path() + "=project"});
+  const std::string source = cache.path() + "/source.cc";
+  const std::string key = core::ComputeCostKey("compile", source, "c++", {"-O2"}, roots);
+  for (uint64_t rss_kb : {20000, 5000}) {
+    util::ProcResult proc;
+    proc.max_rss_kb = rss_kb;
+    proc.wall_ms = 1000;
+    core::RecordCompileCost(cache.path(), "compile", source, "c++", {"-O2"}, roots, proc);
+  }
+  Check(daemon::MemoryEstimateKb(config, key, false) == 20000,
+        "the largest production-written RSS observation supplies the estimate");
+  const std::string link_source = cache.path() + "/program";
+  util::ProcResult zero;
+  zero.wall_ms = 1;
+  core::RecordCompileCost(cache.path(), "link", link_source, "", {}, roots, zero);
+  const std::string zero_key = core::ComputeCostKey("link", link_source, "", {}, roots);
+  Check(daemon::MemoryEstimateKb(config, zero_key, true) == 4194304,
+        "a zero-RSS cost record uses the link default");
+
+  std::map<std::string, std::optional<std::string>> saved;
+  for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_DEFAULT_COMPILE_KB",
+                                  "VCACHE_DAEMON_DEFAULT_LINK_KB"}) {
+    const char* value = std::getenv(name.c_str());
+    saved[name] = value ? std::optional<std::string>(value) : std::nullopt;
+    ::unsetenv(name.c_str());
+  }
+  const std::string path = cache.path() + "/config.toml";
+  util::WriteFileAtomic(path, "[daemon]\ndefault_compile_kb = 77\ndefault_link_kb = 88\n");
+  ::setenv("VCACHE_CONFIG", path.c_str(), 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 77 &&
+            core::LoadConfig().daemon.default_link_kb == 88,
+        "the admission default configuration keys load as kilobytes");
+  ::setenv("VCACHE_DAEMON_DEFAULT_COMPILE_KB", "99", 1);
+  ::setenv("VCACHE_DAEMON_DEFAULT_LINK_KB", "111", 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 99 &&
+            core::LoadConfig().daemon.default_link_kb == 111,
+        "admission default environment variables override configuration");
+  ::setenv("VCACHE_DAEMON_DEFAULT_COMPILE_KB", "0", 1);
+  ::setenv("VCACHE_DAEMON_DEFAULT_LINK_KB", "18446744073709551616", 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 77 &&
+            core::LoadConfig().daemon.default_link_kb == 88,
+        "zero and overflowing defaults leave the configured positive estimates");
+  for (const auto& [name, value] : saved) {
+    if (value) ::setenv(name.c_str(), value->c_str(), 1);
+    else ::unsetenv(name.c_str());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc >= 7 && std::string(argv[1]) == "--write-lease-cost-fixture") {
+  if (argc >= 7 && (std::string(argv[1]) == "--write-lease-cost-fixture" ||
+                    std::string(argv[1]) == "--write-admission-cost-fixture")) {
+    const bool admission = std::string(argv[1]) == "--write-admission-cost-fixture";
     const std::string cache_dir = argv[2];
     const auto roots = MakeRoots({argv[3]});
     const std::string operation = argv[4];
     util::ProcResult proc;
-    proc.wall_ms = std::strtoull(argv[5], nullptr, 10);
-    proc.max_rss_kb = 4096;
+    proc.wall_ms = admission ? 1000 : std::strtoull(argv[5], nullptr, 10);
+    proc.max_rss_kb = admission ? std::strtoull(argv[5], nullptr, 10) : 4096;
     const std::vector<std::string> command(argv + 6, argv + argc);
     std::string source, language;
     std::vector<std::string> key_args;
@@ -3759,6 +4171,8 @@ int main(int argc, char** argv) {
   TestKeyLeases();
   TestKeyLeaseValidation();
   TestKeyLeasePutClose();
+  TestMemoryAdmission();
+  TestRunSpawnCallback();
   TestLeaseReviewFixes();
   TestLeaseOrphanPut();
   TestHasher();
@@ -3787,6 +4201,7 @@ int main(int argc, char** argv) {
   TestRustManifest();
   TestRunRusage();
   TestCost();
+  TestMemoryEstimates();
   TestRustcFingerprint();
   TestJobserver();
 

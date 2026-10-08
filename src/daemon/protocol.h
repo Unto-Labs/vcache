@@ -28,6 +28,7 @@ namespace vcache::daemon {
 // cleanly instead of misparsing each other.
 constexpr uint64_t kProtocolVersion = 2;
 constexpr int kReplyTimeoutSeconds = 300;
+constexpr uint64_t kMemoryWaitBoundMs = 600000;
 
 enum class Op : uint8_t {
   kHello = 1,     // u64 version, str fingerprint
@@ -38,9 +39,12 @@ enum class Op : uint8_t {
   kSessionOpen = 6,  // (nothing); keeps this connection for the compile's lifetime
   kLeaseAcquire = 7,  // str key, u64 bound_ms
   kLeaseRelease = 8,  // str key, u8 outcome (stored = 0, failed = 1)
+  kMemoryReserve = 9,  // str cost_key, u64 estimate_kb, u64 bound_ms
+  kCompilerSpawned = 10,  // u64 compiler pid
 };
 
 enum class LeaseOutcome : uint8_t { kGranted = 0, kStored = 1, kCompile = 2 };
+enum class MemoryOutcome : uint8_t { kGranted = 0, kBound = 1 };
 enum class LeaseCompileReason : uint8_t {
   kNone = 0, kHolderFailed = 1, kHolderGone = 2, kBound = 3, kShutdown = 4,
 };

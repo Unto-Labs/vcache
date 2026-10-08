@@ -927,7 +927,17 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       BuildCompileCommand(parsed, roots, tmp_output, tmp_depfile);
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
-  util::ProcResult compiled = util::Run(compile_cmd, {.capture_stderr = true});
+  util::ProcOptions compile_options{.capture_stderr = true};
+  if (session && config.daemon.admission) {
+    const auto cost_key = ComputeCostKey("compile", parsed.source,
+        args::LanguageName(parsed.language), parsed.key_args, roots);
+    session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
+    compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+  } else if (config.daemon.admission && !config.read_only &&
+             config.daemon.mode != DaemonMode::kOff) {
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
+  util::ProcResult compiled = util::Run(compile_cmd, compile_options);
   // Recorded on a failed compile too: an OOM kill is the sample that matters
   // most, and the cost file is not the cache entry.
   RecordCompileCost(cache_dir, "compile", parsed.source,

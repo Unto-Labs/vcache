@@ -3061,6 +3061,20 @@ else
   bad "single-flight integration requires python3"
 fi
 
+section "10c. Memory admission"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+    "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
+  admission_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/admission.report"
+  check "memory admission integration driver completes" "$admission_test_exit" "0"
+  if [[ "$admission_test_exit" != 0 ]]; then cat "$WORK/admission.errors"; fi
+else
+  bad "memory admission integration requires python3"
+fi
+
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -18,6 +18,7 @@ namespace vcache::daemon {
 uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms);
 uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms);
 uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key);
+uint64_t MemoryEstimateKb(const core::Config& config, const std::string& cost_key, bool link);
 
 class CompileSessionHandle {
  public:
@@ -26,6 +27,9 @@ class CompileSessionHandle {
   CompileSessionHandle& operator=(const CompileSessionHandle&) = delete;
   LeaseOutcome AcquireLease(const std::string& key, uint64_t bound_ms);
   void ReleaseLease(bool stored);
+  bool ReserveMemory(const std::string& cost_key, uint64_t estimate_kb,
+                     uint64_t bound_ms = kMemoryWaitBoundMs);
+  void CompilerSpawned(int pid);
 
  private:
   friend class DaemonClient;
@@ -35,6 +39,7 @@ class CompileSessionHandle {
 
   int fd_;
   std::string leased_key_;
+  bool memory_reserved_ = false;
   const std::chrono::steady_clock::time_point opened_at_ = std::chrono::steady_clock::now();
 };
 

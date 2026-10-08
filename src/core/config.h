@@ -131,6 +131,13 @@ struct DaemonConfig {
   // Unix socket path. Empty derives one from the cache directory, so two
   // caches never share a daemon by accident.
   std::string socket;
+
+  // Fixed GNU-make fifo of job slots for every build on this machine.
+  // Off until a build script exports the line from --jobserver-env.
+  // jobserver_jobs == 0 means "online CPUs"; an explicit 0 or a negative
+  // value is a warning and the same default.
+  bool jobserver = false;
+  int jobserver_jobs = 0;
 };
 
 struct Config {

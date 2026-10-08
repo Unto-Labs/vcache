@@ -163,6 +163,17 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlString(*d, "socket")) {
       config->daemon.socket = util::ExpandTilde(*v);
     }
+    if (auto v = TomlBool(*d, "jobserver")) config->daemon.jobserver = *v;
+    if (auto v = TomlInt(*d, "jobserver_jobs")) {
+      if (*v > 0) {
+        config->daemon.jobserver_jobs = static_cast<int>(*v);
+      } else {
+        config->warnings.push_back(
+            "daemon.jobserver_jobs: " + std::to_string(*v) +
+            " is not a pool size; using online CPUs");
+        config->daemon.jobserver_jobs = 0;
+      }
+    }
   }
 
   if (auto vc = root["vcache"].as_table()) {
@@ -330,6 +341,22 @@ void ApplyEnvironment(Config* config) {
   if (auto v = Env("VCACHE_DAEMON_SOCKET")) {
     config->daemon.socket = util::ExpandTilde(*v);
   }
+  config->daemon.jobserver = EnvBool("VCACHE_DAEMON_JOBSERVER", config->daemon.jobserver);
+  if (auto v = Env("VCACHE_DAEMON_JOBSERVER_JOBS")) {
+    char* end = nullptr;
+    const long n = std::strtol(v->c_str(), &end, 10);
+    if (end == v->c_str() || *end != '\0') {
+      config->warnings.push_back(
+          "VCACHE_DAEMON_JOBSERVER_JOBS: expected a job count, got '" + *v + "'");
+    } else if (n <= 0) {
+      config->warnings.push_back(
+          "VCACHE_DAEMON_JOBSERVER_JOBS: " + *v +
+          " is not a pool size; using online CPUs");
+      config->daemon.jobserver_jobs = 0;
+    } else {
+      config->daemon.jobserver_jobs = static_cast<int>(n);
+    }
+  }
 
   if (auto v = Env("VCACHE_DEP_SCAN")) {
     if (!ParseDepScanPolicy(*v, &config->dep_scan_policy)) {
@@ -494,6 +521,13 @@ std::string DescribeConfig(const Config& config) {
     out << "  upload threads: " << config.daemon.upload_threads << "\n";
     if (!config.daemon.socket.empty()) {
       out << "  socket:         " << config.daemon.socket << "\n";
+    }
+    out << "  jobserver:      " << (config.daemon.jobserver ? "on" : "off") << "\n";
+    if (config.daemon.jobserver) {
+      out << "  jobserver jobs: "
+          << (config.daemon.jobserver_jobs > 0 ? std::to_string(config.daemon.jobserver_jobs)
+                                               : "online CPUs")
+          << "\n";
     }
   }
   out << "roots:            "

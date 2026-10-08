@@ -24,6 +24,7 @@
 #include "core/roots.h"
 #include "core/stats.h"
 #include "daemon/client.h"
+#include "daemon/jobserver.h"
 #include "daemon/protocol.h"
 #include "daemon/server.h"
 #include "rust/rust_compile.h"
@@ -70,6 +71,8 @@ void PrintUsage() {
       "      --daemon-foreground\n"
       "                        run the daemon in the foreground (systemd,\n"
       "                        launchd, debugging)\n"
+      "      --jobserver-env   print MAKEFLAGS for the daemon's jobserver,\n"
+      "                        or exit 1 when it has no pool\n"
       "\n"
       "Root mapping (the point of vcache):\n"
       "  --vcache-root=PATH[=TARGET]   repeatable; may also be given as\n"
@@ -98,7 +101,8 @@ void PrintUsage() {
       "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, VCACHE_S3_TTL_DAYS,\n"
       "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,\n"
       "  VCACHE_DAEMON (off|on|auto), VCACHE_DAEMON_IDLE_TIMEOUT,\n"
-      "  VCACHE_DAEMON_UPLOAD_THREADS, VCACHE_DAEMON_SOCKET\n"
+      "  VCACHE_DAEMON_UPLOAD_THREADS, VCACHE_DAEMON_SOCKET,\n"
+      "  VCACHE_DAEMON_JOBSERVER, VCACHE_DAEMON_JOBSERVER_JOBS\n"
       "\n"
       "Config file: $VCACHE_CONFIG, ~/.config/vcache/config.toml, or\n"
       "             /etc/vcache/config.toml\n"
@@ -210,6 +214,22 @@ int StopDaemon(const vcache::core::Config& config) {
   if (failed > 0 && config.error_on_cache_media_failure) {
     return vcache::core::kCacheMediaFailureExit;
   }
+  return 0;
+}
+
+int JobserverEnv(const vcache::core::Config& config) {
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  std::string text;
+  if (client == nullptr || !client->Status(&text) ||
+      text.find("jobserver tokens total") == std::string::npos) {
+    ::fprintf(stderr, "vcache: no jobserver (%s)\n",
+              client == nullptr ? why.c_str() : "the daemon has no pool");
+    return 1;
+  }
+  const std::string line = vcache::daemon::JobserverMakeFlagsLine(
+      vcache::daemon::StateDir(config) + "/jobserver.fifo");
+  std::fputs(line.c_str(), stdout);
   return 0;
 }
 
@@ -404,6 +424,7 @@ int main(int argc, char** argv) {
     if (first == "--stop-daemon") return StopDaemon(config);
     if (first == "--daemon-status") return DaemonStatus(config);
     if (first == "--daemon-foreground") return RunDaemonForeground(config);
+    if (first == "--jobserver-env") return JobserverEnv(config);
     if (first == "--show-config") {
       std::fputs(vcache::core::DescribeConfig(config).c_str(), stdout);
       return 0;

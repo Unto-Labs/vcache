@@ -647,6 +647,13 @@ A client that differs is refused and runs in-process. Because uploads are
 asynchronous, `--error-on-cache-media-failure` reports a failed upload when
 `vcache --stop-daemon` runs, not during the compile.
 
+`daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots
+that make, ninja and cargo share. `daemon.jobserver_jobs`
+(`VCACHE_DAEMON_JOBSERVER_JOBS`) is the number of '+' tokens; unset means
+the machine's online CPUs, and 0 or a negative value warns and does the same.
+`vcache --jobserver-env` prints the `MAKEFLAGS` line, or exits 1 when no pool
+is running. See [daemon.md](daemon.md) for the protocol and the tool versions.
+
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.
 

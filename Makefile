@@ -273,7 +273,8 @@ VCACHE_SRCS := \
   $(SRC)/storage/curl_api.cc \
   $(SRC)/daemon/protocol.cc \
   $(SRC)/daemon/client.cc \
-  $(SRC)/daemon/server.cc
+  $(SRC)/daemon/server.cc \
+  $(SRC)/daemon/jobserver.cc
 
 MAIN_SRC := $(SRC)/main.cc
 

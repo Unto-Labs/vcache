@@ -1490,6 +1490,129 @@ fi
 unset VCACHE_DAEMON VCACHE_DAEMON_IDLE_TIMEOUT
 
 # --------------------------------------------------------------------------
+section "10d. Jobserver"
+
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+check "jobserver is off by default" \
+  "$("$VCACHE" --start-daemon >/dev/null && [[ ! -p "$VCACHE_DIR/daemon/jobserver.fifo" ]] && echo yes)" "yes"
+check "--jobserver-env without a pool exits 1" \
+  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+
+export VCACHE_DAEMON_JOBSERVER=1
+export VCACHE_DAEMON_JOBSERVER_JOBS=2
+export VCACHE_DAEMON_IDLE_TIMEOUT=60
+check "a jobserver daemon starts" \
+  "$("$VCACHE" --start-daemon | grep -c 'daemon started')" "1"
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+check "the jobserver fifo exists" "$([[ -p "$JS_FIFO" ]] && echo yes)" "yes"
+check "jobserver tokens total" "$(daemon_stat 'jobserver tokens total')" "2"
+check "jobserver tokens free" "$(daemon_stat 'jobserver tokens free')" "2"
+check "jobserver tokens withdrawn" "$(daemon_stat 'jobserver tokens withdrawn')" "0"
+check "--jobserver-env prints the fifo MAKEFLAGS line" \
+  "$("$VCACHE" --jobserver-env)" "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
+
+mkdir -p "$WORK/js"
+cat > "$WORK/js/tick.sh" << 'EOF'
+#!/bin/sh
+file=$1
+exec 9>>"$file.lock"
+flock 9
+cur=0; max=0
+if read -r cur max < "$file"; then :; fi
+cur=$((cur + 1))
+if [ "$cur" -gt "$max" ]; then max=$cur; fi
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+sleep 1
+flock 9
+cur=0; max=0
+read -r cur max < "$file"
+cur=$((cur - 1))
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+EOF
+chmod +x "$WORK/js/tick.sh"
+cat > "$WORK/js/Makefile" << 'EOF'
+.PHONY: all t1 t2 t3 t4 t5 t6
+all: t1 t2 t3 t4 t5 t6
+t1 t2 t3 t4 t5 t6:
+	sh tick.sh count
+EOF
+cat > "$WORK/js/build.ninja" << 'EOF'
+rule tick
+  command = sh tick.sh count
+build t1: tick
+build t2: tick
+build t3: tick
+build t4: tick
+build t5: tick
+build t6: tick
+build all: phony t1 t2 t3 t4 t5 t6
+default all
+EOF
+
+js_max() { awk '{ print $2 }' "$WORK/js/count"; }
+# The printed line contains a space. An unquoted $(...) splits it, and env
+# then keeps only MAKEFLAGS=-j. Quoting passes the whole assignment.
+js_flags=$("$VCACHE" --jobserver-env)
+printf '0 0\n' > "$WORK/js/count"
+mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
+check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
+check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+
+# PATH ninja on this machine is a wrapper that appends -j, which makes ninja
+# ignore the fifo. The real client is /usr/bin/ninja.
+ninja_bin=/usr/bin/ninja
+if [[ -x "$ninja_bin" ]] && \
+   [[ "$(printf '%s\n' 1.13 "$("$ninja_bin" --version)" | sort -V | head -1)" == "1.13" ]]; then
+  printf '0 0\n' > "$WORK/js/count"
+  nj_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" "$3" >/dev/null' _ \
+    "$WORK/js" "$js_flags" "$ninja_bin")
+  check "ninja under the jobserver finishes" "$([[ "$nj_out" != *timeout* ]] && echo yes)" "yes"
+  check "ninja under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "ninja >= 1.13 not installed"
+fi
+
+printf '0 0\n' > "$WORK/js/count"
+( cd "$WORK/js" && env -u MAKEFLAGS make -j6 ) >/dev/null
+check "make -j6 without the jobserver runs 6 wide" "$(js_max)" "6"
+
+"$VCACHE" --stop-daemon >/dev/null
+check "stopping the daemon removes the fifo" "$([[ ! -p "$JS_FIFO" ]] && echo yes)" "yes"
+
+# A token held past one idle timeout must not retire the daemon. The second
+# timeout is what retires a pool whose client has gone away with a token.
+reset_cache
+VCACHE_DAEMON_IDLE_TIMEOUT=3 "$VCACHE" --start-daemon >/dev/null
+JS_READY=$(date +%s)
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+JS_PID=$(daemon_pid)
+(
+  exec 3<>"$JS_FIFO"
+  IFS= read -r -n 1 -u 3
+  sleep 8
+  printf '+' >&3
+) &
+JS_HOLDER=$!
+held=0
+for _ in $(seq 1 30); do
+  if [[ "$(daemon_stat 'jobserver tokens free')" == "1" ]]; then held=1; break; fi
+  sleep 0.1
+done
+check "a client holds one jobserver token" "$held" "1"
+while (( $(date +%s) < JS_READY + 4 )); do sleep 0.2; done
+check "the daemon stays up while a token is out past one idle timeout" \
+  "$(kill -0 "$JS_PID" 2>/dev/null && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+kill "$JS_HOLDER" 2>/dev/null || true
+wait "$JS_HOLDER" 2>/dev/null || true
+unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
+
+# --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"
 
 # vcache runs once per compilation, so every DT_NEEDED entry is mapped and

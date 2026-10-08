@@ -343,10 +343,18 @@ and Rust dep-info runs do not reserve memory. A lease waiter holds no reservatio
 
 The estimate is the highest RSS in the matching cost record. Missing or zero
 records use `daemon.default_compile_kb` (2097152 kB, 2 GiB) or
-`daemon.default_link_kb` (4194304 kB, 4 GiB). Every 500 ms the daemon reads
+`daemon.default_link_kb` (4194304 kB, 4 GiB). For later requests with the same
+cost key, the daemon raises that estimate to at least its previously observed
+peak sum of the live tree's RSS. It keeps those peaks in memory until restart;
+the cost files and `--show-costs` still report `wait4`'s largest descendant
+peak, which can be smaller than the simultaneous tree sum. Admission
+measurements use the daemon's granted estimate in kB and its sampled tree sum.
+Every 500 ms the daemon reads
 `MemAvailable`, then sums `VmRSS` over each compiler's live process tree,
 including children and grandchildren. A spawn samples only the new tree
 with a fresh memory reading. Process reads run outside the shared server lock.
+An exited or unreadable descendant contributes zero while the rest of the tree
+is sampled; an unreadable root retains the previous realised value.
 
 ```
 unrealised_kb = sum(max(0, estimate_kb - realised_kb))
@@ -358,8 +366,9 @@ from each reservation's unrealised amount. Grants follow strict FIFO order;
 a small request cannot pass a larger head request. An estimate above available
 RAM can start when no reservation is held, allowing at least one job to proceed.
 Session close or confirmed compiler exit releases the reservation immediately.
-A failed proc read alone retains it. RSS above the estimate contributes zero
-unrealised memory and logs the overshoot. Release logs the tree's peak RSS;
+A failed root proc read alone retains it. RSS above the estimate contributes zero
+unrealised memory and logs only the first overshoot. Release logs the tree's peak RSS,
+or `unsampled` when no visible tree was sampled;
 steady samples do not write per-tick lines. If `MemAvailable` is unreadable,
 the daemon logs once and retains its last good value, deferring new sampled RSS
 realisation until a fresh memory reading succeeds. With no good reading yet,
@@ -370,7 +379,10 @@ as its parent. Otherwise the daemon logs the pid mismatch and treats the whole
 estimate as unrealised for ten seconds, then as realised. This fallback allows
 clients in another pid namespace to proceed without sampling an unrelated pid.
 
-Waiting is bounded to ten minutes by default. A bound reply, refusal, disconnect
+The server caps every reserve wait at ten minutes, including larger client
+requests. The holder's queue time can pause a lease deadline by at most another
+600 seconds, so a lease waiter waits at most 900 seconds in total.
+A bound reply, refusal, disconnect
 or daemon shutdown runs the compiler unreserved. Decision logs contain the
 estimate, elapsed wait and admission arithmetic. `--daemon-status` adds
 `memory reserved`, `memory realised`, `memory waiting`, `reserve waits` and

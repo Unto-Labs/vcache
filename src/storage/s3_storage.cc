@@ -279,7 +279,9 @@ S3Storage::S3Storage(core::S3CacheConfig config) : config_(std::move(config)) {
   read_only_ = config_.no_credentials;
 }
 
-S3Storage::~S3Storage() = default;
+S3Storage::~S3Storage() {
+  if (handle_ != nullptr) curl_->easy_cleanup(handle_);
+}
 
 std::string S3Storage::ObjectKey(const std::string& key) const {
   std::string prefix = config_.prefix;
@@ -406,8 +408,17 @@ bool S3Storage::RequestOnce(const std::string& method,
   FormatTimes(&amz_date, &date_stamp);
   const std::string payload_hash = sigv4::Sha256Hex(payload);
 
-  CURL* curl = curl_->easy_init();
+  // A reused handle keeps its connection cache across easy_reset, which
+  // clears every option set below but not the open connections.
+  CURL* curl = nullptr;
+  if (reuse_connection_ && handle_ != nullptr) {
+    curl = handle_;
+    curl_->easy_reset(curl);
+  } else {
+    curl = curl_->easy_init();
+  }
   if (curl == nullptr) return false;
+  if (reuse_connection_) handle_ = curl;
 
   struct curl_slist* headers = nullptr;
   headers = curl_->slist_append(headers, ("x-amz-date: " + amz_date).c_str());
@@ -460,7 +471,7 @@ bool S3Storage::RequestOnce(const std::string& method,
   curl_->easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
   last_status_ = status;
   curl_->slist_free_all(headers);
-  curl_->easy_cleanup(curl);
+  if (!reuse_connection_) curl_->easy_cleanup(curl);
 
   if (rc != CURLE_OK) {
     const std::string detail = method + " " + canonical_uri_path + ": " +

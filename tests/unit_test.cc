@@ -28,6 +28,7 @@
 #include "core/depfile.h"
 #include "core/preprocessed.h"
 #include "core/roots.h"
+#include "daemon/protocol.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "storage/chain.h"
@@ -813,6 +814,206 @@ void TestCacheChain() {
     Check(!got.hit, "an entry in no layer is a miss");
     Check(got.layer.empty(), "a miss names no serving layer");
     Check(got.errors.empty(), "a miss is not a media error");
+  }
+}
+
+// A remote that answers until told to break, as a daemon that dies mid-build
+// would. Counts calls so a test can see the chain stop asking it.
+class FakeRemote : public storage::RemoteCache {
+ public:
+  explicit FakeRemote(bool* broken) : broken_(broken) {}
+  std::string Name() const override { return "daemon"; }
+  bool Get(const std::string& key, storage::GetResult* result) override {
+    if (*broken_) return false;
+    auto it = entries_.find(key);
+    if (it == entries_.end()) return true;
+    result->hit = true;
+    result->value = it->second;
+    result->layer = "s3";
+    return true;
+  }
+  bool Put(const std::string& key, const std::string& value,
+           storage::PutResult* result) override {
+    if (*broken_) return false;
+    entries_[key] = value;
+    result->stored = true;
+    return true;
+  }
+
+ private:
+  bool* broken_;
+  std::map<std::string, std::string> entries_;
+};
+
+void TestCacheChainRemote() {
+  Section("storage::CacheChain with a remote (daemon)");
+
+  bool broken = false;
+  auto remote = std::make_unique<FakeRemote>(&broken);
+  FakeStorage* local_ptr = nullptr;
+  int builds = 0;
+
+  storage::CacheChain chain;
+  chain.SetRemote(std::move(remote), [&](storage::CacheChain* c) {
+    ++builds;
+    auto local = std::make_unique<FakeStorage>("disk");
+    local_ptr = local.get();
+    c->AddLayer(std::move(local));
+  });
+  Check(!chain.empty(), "a chain with only a remote is not empty");
+  Check(builds == 0, "local layers are not built while the remote answers");
+
+  Check(chain.Put("abcdef", "blob").stored, "a store goes to the remote");
+  const storage::GetResult hit = chain.Get("abcdef");
+  Check(hit.hit && hit.value == "blob", "a lookup is answered by the remote");
+  CheckEq(hit.layer, "s3", "and keeps the layer the remote reported, for stats");
+
+  // The daemon dies. The compile must carry on with its own layers rather than
+  // fail, and stop asking the dead remote.
+  broken = true;
+  const storage::GetResult miss = chain.Get("abcdef");
+  Check(!miss.hit, "a lookup after the remote breaks is a miss, not an error");
+  Check(miss.errors.empty(), "and reports no media error for the remote");
+  Check(builds == 1 && local_ptr != nullptr, "the local layers are built once");
+  Check(chain.Put("abcdef", "blob2").stored, "a store after that reaches the local layer");
+  Check(local_ptr->Has("abcdef"), "which now holds the entry");
+  Check(!chain.remote(), "the broken remote is dropped");
+  chain.Get("abcdef");
+  Check(builds == 1, "and the local layers are not rebuilt");
+}
+
+void TestDaemonProtocol() {
+  Section("daemon::protocol");
+
+  {
+    daemon::Writer w;
+    w.U8(7);
+    w.U64(0x0102030405060708ull);
+    w.Str(std::string("a\0b", 3));
+    w.StrList({"one", "", "three"});
+    daemon::Reader r(w.data());
+    uint8_t u8 = 0;
+    uint64_t u64 = 0;
+    std::string str;
+    std::vector<std::string> list;
+    Check(r.U8(&u8) && u8 == 7, "u8 round-trips");
+    Check(r.U64(&u64) && u64 == 0x0102030405060708ull, "u64 round-trips");
+    Check(r.Str(&str) && str == std::string("a\0b", 3),
+          "a string with an embedded NUL round-trips");
+    Check(r.StrList(&list) && list.size() == 3 && list[1].empty() && list[2] == "three",
+          "a string list round-trips, empty elements included");
+    Check(r.done(), "and the reader ends exactly at the end");
+  }
+
+  // Every truncation of a valid frame must be rejected, never read past.
+  {
+    daemon::Writer w;
+    w.U8(2);
+    w.Str("abcdef0123");
+    w.StrList({"x", "yz"});
+    const std::string full = w.data();
+    bool all_rejected = true;
+    for (size_t n = 0; n < full.size(); ++n) {
+      const std::string cut = full.substr(0, n);
+      daemon::Reader r(cut);
+      uint8_t op = 0;
+      std::string key;
+      std::vector<std::string> list;
+      const bool ok = r.U8(&op) && r.Str(&key) && r.StrList(&list) && r.done();
+      if (ok) all_rejected = false;
+    }
+    Check(all_rejected, "every truncated frame is rejected");
+  }
+
+  // A length that claims more than the frame holds must fail without trying
+  // to allocate it.
+  {
+    daemon::Writer w;
+    w.U64(~0ull);
+    daemon::Reader r(w.data());
+    std::string s;
+    Check(!r.Str(&s), "a string length past the end is rejected");
+    daemon::Reader r2(w.data());
+    std::vector<std::string> list;
+    Check(!r2.StrList(&list), "a list count past the end is rejected");
+  }
+
+  // The fingerprint is what stops a daemon serving a client from the wrong
+  // cache. Same configuration agrees; each setting that moves entries does not.
+  {
+    core::Config a;
+    a.disk.dir = "/tmp/vcache-fp";
+    core::Config b = a;
+    CheckEq(daemon::FingerprintMismatch(daemon::ConfigFingerprint(a),
+                                        daemon::ConfigFingerprint(b)),
+            "", "identical configurations agree");
+
+    b.disk.dir = "/tmp/vcache-other";
+    const std::string why = daemon::FingerprintMismatch(daemon::ConfigFingerprint(a),
+                                                        daemon::ConfigFingerprint(b));
+    Check(util::StartsWith(why, "disk.dir:"), "a different cache directory is named: " + why);
+
+    core::Config c = a;
+    c.s3.enabled = true;
+    c.s3.bucket = "bucket";
+    core::Config d = c;
+    d.s3.prefix = "other/";
+    Check(util::StartsWith(daemon::FingerprintMismatch(daemon::ConfigFingerprint(c),
+                                                       daemon::ConfigFingerprint(d)),
+                           "s3.prefix:"),
+          "a different s3 prefix is named");
+    Check(!daemon::FingerprintMismatch(daemon::ConfigFingerprint(a),
+                                       daemon::ConfigFingerprint(c)).empty(),
+          "s3 on in one and off in the other disagrees");
+
+    core::Config e = c;
+    e.s3.access_key = "AKIDONE";
+    core::Config f = c;
+    f.s3.access_key = "AKIDTWO";
+    Check(util::StartsWith(daemon::FingerprintMismatch(daemon::ConfigFingerprint(e),
+                                                       daemon::ConfigFingerprint(f)),
+                           "s3.identity:"),
+          "different credentials disagree");
+    Check(daemon::ConfigFingerprint(e).find("AKIDONE") == std::string::npos,
+          "and the access key itself is not in the fingerprint");
+
+    core::Config g = a;
+    g.read_only = true;
+    Check(!daemon::FingerprintMismatch(daemon::ConfigFingerprint(a),
+                                       daemon::ConfigFingerprint(g)).empty(),
+          "read-only disagrees, since the daemon backfills on the client's behalf");
+  }
+
+  // sockaddr_un holds about a hundred bytes; a deep cache directory falls back
+  // to a short path rather than failing to bind.
+  {
+    core::Config shallow;
+    shallow.disk.dir = "/tmp/c";
+    CheckEq(daemon::SocketPath(shallow), "/tmp/c/daemon/sock",
+            "a short cache directory keeps its socket inside it");
+
+    core::Config deep;
+    deep.disk.dir = "/tmp/" + std::string(150, 'd');
+    const std::string path = daemon::SocketPath(deep);
+    Check(path.size() < 100 && util::StartsWith(path, "/tmp/vcache-"),
+          "a deep one falls back to a short path: " + path);
+    core::Config deep2 = deep;
+    deep2.disk.dir += "2";
+    Check(daemon::SocketPath(deep2) != path, "and two deep caches still get two sockets");
+
+    core::Config explicit_socket = deep;
+    explicit_socket.daemon.socket = "/tmp/explicit.sock";
+    CheckEq(daemon::SocketPath(explicit_socket), "/tmp/explicit.sock",
+            "an explicit socket wins");
+  }
+
+  {
+    core::DaemonMode mode = core::DaemonMode::kOff;
+    Check(core::ParseDaemonMode("auto", &mode) && mode == core::DaemonMode::kAuto,
+          "daemon mode 'auto' parses");
+    Check(core::ParseDaemonMode("1", &mode) && mode == core::DaemonMode::kOn,
+          "daemon mode '1' means on");
+    Check(!core::ParseDaemonMode("sometimes", &mode), "an unknown mode is rejected");
   }
 }
 
@@ -1808,6 +2009,8 @@ int main() {
   TestPreprocessedNormalization();
   TestBlob();
   TestCacheChain();
+  TestCacheChainRemote();
+  TestDaemonProtocol();
   TestHasher();
   TestSha256();
   TestLinkArgs();

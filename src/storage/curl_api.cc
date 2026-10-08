@@ -83,6 +83,7 @@ void DoLoad() {
   ok &= Resolve(handle, "curl_easy_perform", &api->easy_perform, g_error);
   ok &= Resolve(handle, "curl_easy_getinfo", &api->easy_getinfo, g_error);
   ok &= Resolve(handle, "curl_easy_cleanup", &api->easy_cleanup, g_error);
+  ok &= Resolve(handle, "curl_easy_reset", &api->easy_reset, g_error);
   ok &= Resolve(handle, "curl_easy_strerror", &api->easy_strerror, g_error);
   ok &= Resolve(handle, "curl_slist_append", &api->slist_append, g_error);
   ok &= Resolve(handle, "curl_slist_free_all", &api->slist_free_all, g_error);

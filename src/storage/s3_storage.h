@@ -63,6 +63,13 @@ class S3Storage : public Storage {
 
   void set_read_only(bool read_only) { read_only_ = read_only; }
 
+  // Keeps one libcurl handle for the life of this object instead of creating
+  // one per request, so consecutive requests reuse the TCP connection and TLS
+  // session. Pointless in a compile, which makes one or two requests and
+  // exits; it is what the daemon's long-lived layers are for. Not thread-safe:
+  // the handle belongs to whichever thread owns this object.
+  void set_reuse_connection(bool reuse) { reuse_connection_ = reuse; }
+
   // False when libcurl could not be loaded, in which case this layer can never
   // serve or store anything and the caller should leave it out of the chain.
   bool available() const { return curl_ != nullptr; }
@@ -119,6 +126,8 @@ class S3Storage : public Storage {
   bool read_only_ = false;
   long last_status_ = 0;
   bool denial_diagnosed_ = false;
+  bool reuse_connection_ = false;
+  CURL* handle_ = nullptr;  // kept across requests when reuse_connection_
   TrimResult last_trim_;
 };
 

@@ -13,22 +13,56 @@ Signature *validity* is covered by known-answer tests in the unit suite; this
 server checks request shape and round-tripping.
 
 Usage: mock_s3.py <port> <storage-dir>
+
+For benchmarks, two settings make it behave more like a distant bucket:
+MOCK_S3_LATENCY_MS delays every response, standing in for the round trip, and
+MOCK_S3_HANDSHAKE_MS delays the first request on each connection, standing in
+for TCP and TLS setup. Either one also turns on HTTP/1.1 keep-alive and a
+thread per connection, as a real endpoint has, so a client that reuses its
+connection pays the handshake once. Both default to off, which keeps the
+original single-threaded HTTP/1.0 server the tests were written against.
 """
 
 import hashlib
 import os
+import socket
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 STORAGE = None
 TRANSIENT_PUTS = {}
 
 
+LATENCY_S = int(os.environ.get("MOCK_S3_LATENCY_MS", "0")) / 1000.0
+HANDSHAKE_S = int(os.environ.get("MOCK_S3_HANDSHAKE_MS", "0")) / 1000.0
+REALISTIC = LATENCY_S > 0 or HANDSHAKE_S > 0
+
+
 class Handler(BaseHTTPRequestHandler):
+    if REALISTIC:
+        protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         pass  # keep test output clean
+
+    def setup(self):
+        super().setup()
+        if REALISTIC:
+            # Headers and body go out as two writes. With Nagle on, the body
+            # waits for the client to ACK the headers, which on a reused
+            # connection means its delayed-ACK timer -- a stall a real endpoint
+            # does not have, and one that would penalise exactly the clients
+            # that keep their connections.
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if HANDSHAKE_S:
+            time.sleep(HANDSHAKE_S)
+
+    def end_headers(self):
+        if LATENCY_S:
+            time.sleep(LATENCY_S)
+        super().end_headers()
 
     def _object_path(self):
         # Path-style access: /<bucket>/<key...>
@@ -197,7 +231,8 @@ def main():
     port = int(sys.argv[1])
     STORAGE = sys.argv[2]
     os.makedirs(STORAGE, exist_ok=True)
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    server = ThreadingHTTPServer if REALISTIC else HTTPServer
+    server(("127.0.0.1", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

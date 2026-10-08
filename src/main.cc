@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -21,6 +22,9 @@
 #include "core/config.h"
 #include "core/roots.h"
 #include "core/stats.h"
+#include "daemon/client.h"
+#include "daemon/protocol.h"
+#include "daemon/server.h"
 #include "rust/rust_compile.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
@@ -32,7 +36,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "vcache 1.2.1";
+constexpr const char* kVersion = "vcache 1.3.0";
 
 void PrintUsage() {
   std::printf(
@@ -55,6 +59,15 @@ void PrintUsage() {
       "                        opposed to merely cold); off by default\n"
       "      --trim            evict entries until the cache is under its limit\n"
       "                        (disk; also expires and caps s3 when configured)\n"
+      "\n"
+      "Daemon (see docs/daemon.md):\n"
+      "      --start-daemon    start a cache daemon for this cache in the\n"
+      "                        background; no-op if one is already running\n"
+      "      --stop-daemon     drain the daemon's pending uploads, then stop it\n"
+      "      --daemon-status   show what the running daemon is doing\n"
+      "      --daemon-foreground\n"
+      "                        run the daemon in the foreground (systemd,\n"
+      "                        launchd, debugging)\n"
       "\n"
       "Root mapping (the point of vcache):\n"
       "  --vcache-root=PATH[=TARGET]   repeatable; may also be given as\n"
@@ -81,7 +94,9 @@ void PrintUsage() {
       "  VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE,\n"
       "  VCACHE_COMPILER_CHECK, VCACHE_S3_BUCKET, VCACHE_S3_REGION,\n"
       "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, VCACHE_S3_TTL_DAYS,\n"
-      "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n"
+      "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,\n"
+      "  VCACHE_DAEMON (off|on|auto), VCACHE_DAEMON_IDLE_TIMEOUT,\n"
+      "  VCACHE_DAEMON_UPLOAD_THREADS, VCACHE_DAEMON_SOCKET\n"
       "\n"
       "Config file: $VCACHE_CONFIG, ~/.config/vcache/config.toml, or\n"
       "             /etc/vcache/config.toml\n"
@@ -92,11 +107,10 @@ void PrintUsage() {
       kVersion);
 }
 
-// Builds the cache chain: local disk first, then S3, so a remote hit is
+// Adds the in-process layers: local disk first, then S3, so a remote hit is
 // promoted into the local layer for the rest of the build.
-std::unique_ptr<vcache::storage::CacheChain> BuildChain(
-    const vcache::core::Config& config) {
-  auto chain = std::make_unique<vcache::storage::CacheChain>();
+void AddLocalLayers(const vcache::core::Config& config,
+                    vcache::storage::CacheChain* chain) {
   if (config.disk.enabled) {
     chain->AddLayer(std::make_unique<vcache::storage::DiskStorage>(
         config.disk.dir, config.disk.max_size, config.read_only));
@@ -113,7 +127,104 @@ std::unique_ptr<vcache::storage::CacheChain> BuildChain(
                 s3->load_error().c_str());
     }
   }
+}
+
+// Builds the cache chain. With a daemon to talk to, the chain forwards to it
+// and the local layers are only built if it stops answering -- which also
+// keeps libcurl out of the compile process entirely.
+std::unique_ptr<vcache::storage::CacheChain> BuildChain(
+    const vcache::core::Config& config) {
+  auto chain = std::make_unique<vcache::storage::CacheChain>();
+  if (config.daemon.mode != vcache::core::DaemonMode::kOff &&
+      (config.disk.enabled || config.s3.enabled)) {
+    if (auto client = vcache::daemon::ConnectForCompile(config)) {
+      chain->SetRemote(std::move(client),
+                       [config](vcache::storage::CacheChain* c) {
+                         AddLocalLayers(config, c);
+                       });
+      return chain;
+    }
+  }
+  AddLocalLayers(config, chain.get());
   return chain;
+}
+
+int StartDaemon(const vcache::core::Config& config) {
+  std::string error;
+  const int rc = vcache::daemon::StartDetached(config, &error);
+  const std::string socket = vcache::daemon::SocketPath(config);
+  if (rc == vcache::daemon::kServerOk) {
+    std::printf("vcache daemon started on %s\n", socket.c_str());
+    return 0;
+  }
+  if (rc == vcache::daemon::kServerAlreadyRunning) {
+    std::printf("vcache daemon already running on %s\n", socket.c_str());
+    return 0;
+  }
+  ::fprintf(stderr, "vcache: could not start daemon: %s\n", error.c_str());
+  return 1;
+}
+
+int RunDaemonForeground(const vcache::core::Config& config) {
+  // Set by StartDetached when it execs this; absent when run by hand or by a
+  // service manager, which then has no-one to tell.
+  int ready_fd = -1;
+  if (const char* fd = std::getenv("VCACHE_DAEMON_READY_FD")) {
+    ready_fd = std::atoi(fd);
+    ::unsetenv("VCACHE_DAEMON_READY_FD");
+  }
+  const int rc = vcache::daemon::RunServer(config, ready_fd);
+  if (rc == vcache::daemon::kServerAlreadyRunning && ready_fd < 0) {
+    ::fprintf(stderr, "vcache: a daemon is already running for %s\n",
+              config.disk.dir.c_str());
+  }
+  return rc;
+}
+
+int StopDaemon(const vcache::core::Config& config) {
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  if (client == nullptr) {
+    // One that refused us is running, and is not this configuration's to stop.
+    if (why.find("refused") != std::string::npos) {
+      ::fprintf(stderr, "vcache: %s\n", why.c_str());
+      return 1;
+    }
+    std::printf("no vcache daemon running (%s)\n", why.c_str());
+    return 0;
+  }
+  const uint64_t pid = client->daemon_pid();
+  std::string summary;
+  uint64_t failed = 0;
+  if (!client->Shutdown(&summary, &failed)) {
+    ::fprintf(stderr, "vcache: daemon %llu did not confirm shutdown\n",
+              static_cast<unsigned long long>(pid));
+    return 1;
+  }
+  std::printf("vcache daemon %llu stopped: %s\n",
+              static_cast<unsigned long long>(pid), summary.c_str());
+  // Uploads are asynchronous under the daemon, so this is the first point at
+  // which a failed one can be reported to whoever asked for strictness.
+  if (failed > 0 && config.error_on_cache_media_failure) {
+    return vcache::core::kCacheMediaFailureExit;
+  }
+  return 0;
+}
+
+int DaemonStatus(const vcache::core::Config& config) {
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  std::string text;
+  if (client == nullptr || !client->Status(&text)) {
+    if (why.find("refused") != std::string::npos) {
+      ::fprintf(stderr, "vcache: %s\n", why.c_str());
+    } else {
+      std::printf("no vcache daemon running (%s)\n", why.c_str());
+    }
+    return 1;
+  }
+  std::fputs(text.c_str(), stdout);
+  return 0;
 }
 
 void ReportWarnings(const std::vector<std::string>& warnings) {
@@ -195,6 +306,15 @@ int ShowStats(const vcache::core::Config& config) {
     std::printf("s3 backend         %s (region %s)\n", config.s3.bucket.c_str(),
                 config.s3.region.c_str());
   }
+  // Only when a socket is there to try: --show-stats must stay cheap and must
+  // not start anything.
+  if (vcache::util::FileExists(vcache::daemon::SocketPath(config))) {
+    std::string why;
+    if (auto client = vcache::daemon::DaemonClient::Connect(config, &why)) {
+      std::printf("daemon             running, pid %llu (--daemon-status)\n",
+                  static_cast<unsigned long long>(client->daemon_pid()));
+    }
+  }
   return 0;
 }
 
@@ -271,6 +391,10 @@ int main(int argc, char** argv) {
                   config.disk.dir.c_str());
       return ok ? 0 : 1;
     }
+    if (first == "--start-daemon") return StartDaemon(config);
+    if (first == "--stop-daemon") return StopDaemon(config);
+    if (first == "--daemon-status") return DaemonStatus(config);
+    if (first == "--daemon-foreground") return RunDaemonForeground(config);
     if (first == "--show-config") {
       std::fputs(vcache::core::DescribeConfig(config).c_str(), stdout);
       return 0;

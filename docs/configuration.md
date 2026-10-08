@@ -676,8 +676,9 @@ exits 1 when no pool is running or the path is not a fifo. See
 
 When admission requests wait, the pool withdraws unused shared tokens every
 500 ms, down to `daemon.jobserver_min_jobs`. A floor larger than the pool is
-clamped to its size with a warning. After the queue drains and available memory
-exceeds both default estimates, it restores one token per tick. With no
+clamped to its size with a warning. An invalid floor warns and retains the
+configured positive value. After the queue drains and available memory exceeds
+both default estimates, it restores one token per tick. With no
 admission requests the pool stays fixed. Each top-level build has an implicit
 slot, so concurrent builds can run `N-1 + builds` jobs before withdrawals.
 

@@ -186,9 +186,9 @@ property make's own fifo has. A client that dies holding a token loses it
 until the daemon restarts.
 
 `--daemon-status` shows `jobserver tokens total`, `free` and `withdrawn`.
-Withdrawn stays 0 until the pool can give slots back under memory pressure.
+Withdrawn counts the shared tokens held by the daemon under memory pressure.
 The daemon does not treat a build blocked on the fifo as a connected client,
-so while any token is out it waits through the idle timeout twice before
+so while a build holds any token it waits through the idle timeout twice before
 exiting, and the idle log line names that doubled wait. An explicit 0, a
 negative `jobserver_jobs`, or a value above the platform integer maximum
 warns and uses the online-CPU default. If the fifo cannot be created the
@@ -206,10 +206,13 @@ so a client taking the last byte first makes the daemon retry on a later tick.
 
 When `Q` is zero and available memory exceeds both default memory estimates,
 the daemon returns one token per tick. Shutdown returns all its held tokens
-before closing and removing the fifo. `VCACHE_LOG` and the daemon log include
-`jobserver: withdrew ...` and `jobserver: restored ...`. Status adds the live
+before closing and removing the fifo. The daemon log includes
+`jobserver: withdrew ...` and `jobserver: restored ...`; each is mirrored once
+to `VCACHE_LOG` with the `daemon: ` prefix. Status adds the live
 `jobserver tokens withdrawn` count and lifetime `jobserver tokens restored total`.
 The existing free row still counts fifo bytes plus one implicit slot.
+A daemon that crashes or is killed loses its withdrawn tokens for builds still
+using the old fifo; only builds started after restart receive the full new pool.
 
 Each top-level make, ninja or cargo build owns an implicit slot. With `k`
 concurrent builds, the shared pool permits approximately `N-1-W+k` jobs;

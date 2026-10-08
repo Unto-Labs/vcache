@@ -41,12 +41,12 @@ std::string JobserverMakeFlagsLine(const std::string& fifo_path) {
   return "MAKEFLAGS=-j --jobserver-auth=fifo:" + fifo_path + "\n";
 }
 
-int JobserverTokenChange(int total, int free, int withdrawn, uint64_t waiting,
-                         uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb) {
+int JobserverSignedTokenChange(int total, int free_fifo_bytes, int withdrawn, uint64_t waiting,
+                               uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb) {
   const int floor = std::clamp(min_jobs, 1, std::max(1, total));
-  if (waiting > 0 && free > 0) {
+  if (waiting > 0 && free_fifo_bytes > 0) {
     return -static_cast<int>(std::min<uint64_t>(waiting,
-        std::max(0, std::min(free, total - withdrawn - floor))));
+        std::max(0, std::min(free_fifo_bytes, total - withdrawn - floor))));
   }
   if (waiting == 0 && withdrawn > 0 && available_kb > default_estimate_kb) return 1;
   return 0;

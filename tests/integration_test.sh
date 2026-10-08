@@ -928,6 +928,53 @@ rm -f "$COST_SIG_LOG"
 cost_sig=$(grep -c 'cost: compile .* exit=' "$COST_SIG_LOG" || true)
 check "a compiler killed by a signal is still recorded, with its exit" "$cost_sig" "1"
 
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/cost-rust/src"
+  cat > "$WORK/cost-rust/src/lib.rs" << 'EOF'
+pub fn cost_rust() -> u32 { 1 }
+EOF
+  RLOG="$WORK/cost-rust.log"
+  rm -f "$RLOG"
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rustc miss logs exactly one cost: rustc line" \
+    "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the rust dep-info run is not a cost record" \
+    "$(grep -c 'cost: ' "$RLOG" || true)" "1"
+  check "the rust miss did run dep-info" \
+    "$(grep -c 'rust dep-info:' "$RLOG" || true)" "1"
+  rkey=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$RLOG" | head -1)
+  rentry="$VCACHE_DIR/${rkey:0:2}/${rkey:2}"
+  if grep -a -q 'max_rss_kb: [0-9]' "$rentry" 2>/dev/null; then
+    ok "a rustc blob meta carries max_rss_kb"
+  else
+    bad "a rustc blob meta carries max_rss_kb"
+  fi
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+else
+  skipped "rustc not installed"
+fi
+
+if [[ "$(uname -s)" == Linux ]]; then
+  reset_cache
+  mkdir -p "$WORK/cost-link"
+  printf 'int main(void){return 0;}\n' > "$WORK/cost-link/main.c"
+  gcc -c "$WORK/cost-link/main.c" -o "$WORK/cost-link/main.o"
+  LLOG="$WORK/cost-link.log"
+  rm -f "$LLOG"
+  ( cd "$WORK/cost-link" && VCACHE_LINK_CACHE=1 VCACHE_ROOTS="$WORK/cost-link=proj" \
+      VCACHE_LOG="$LLOG" "$VCACHE" gcc main.o -o main )
+  check "a link logs exactly one cost: link line" \
+    "$(grep -c 'cost: link' "$LLOG" || true)" "1"
+else
+  skipped "link cost records are Linux-only"
+fi
+
 # --------------------------------------------------------------------------
 section "10. cache management commands"
 

@@ -28,8 +28,10 @@ mode_t DefaultFileMode();
 std::optional<std::string> ReadFile(const std::string& path);
 
 // Writes via a temporary file in the same directory followed by rename(2), so a
-// reader never observes a partially written cache entry.
-bool WriteFileAtomic(const std::string& path, std::string_view contents);
+// reader never observes a partially written cache entry. `durable` fsyncs
+// before the rename; cache entries need that, a replaceable statistic does not.
+bool WriteFileAtomic(const std::string& path, std::string_view contents,
+                     bool durable = true);
 
 // Hard-links `from` to `to`, falling back to a copy when the link fails (for
 // example across filesystems). Used to materialise cached objects cheaply.

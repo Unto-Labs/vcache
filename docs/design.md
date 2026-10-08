@@ -124,7 +124,9 @@ gcc or clang driver the figure is the peak of the largest process the driver
 waited for: cc1 or cc1plus, and for an `-flto` link the linker together with
 the LTO jobs it waited for. The value is recorded as reported. macOS counts
 `ru_maxrss` in bytes and Linux in kibibytes; the stored number is kibibytes
-on both.
+on both. It also includes vcache's own resident set at the fork, which on a
+heavy translation unit was 368,068 KiB through vcache against 368,992 KiB for
+the compiler run directly.
 
 The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
 file holds the last eight observations of one codegen class (operation,

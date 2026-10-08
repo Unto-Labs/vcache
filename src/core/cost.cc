@@ -22,40 +22,82 @@ namespace {
 constexpr size_t kMaxCostObservations = 8;
 constexpr size_t kLargestCostKeys = 10;
 
-bool TakesFollowingArg(std::string_view arg) {
-  return arg == "-I" || arg == "-D" || arg == "-U" || arg == "-isystem" ||
-         arg == "-include" || arg == "-o";
-}
-
-// Joined spellings (-Ipath, -DFOO, -isystem/usr/include, -ofoo). -O2 is an
-// optimisation level and must survive; only the lowercase -o output form goes.
-bool IsJoinedDrop(std::string_view arg) {
-  if (util::StartsWith(arg, "-I") || util::StartsWith(arg, "-D") ||
-      util::StartsWith(arg, "-U") || util::StartsWith(arg, "-isystem") ||
-      util::StartsWith(arg, "-include")) {
+// Cargo rewrites `-C metadata` and `-C extra-filename` on a lockfile or feature
+// change. Keeping every flag that is not a path would split one crate's cost
+// estimate across those hashes. The class is therefore an allow-list of the
+// flags that actually change how much memory the compiler uses.
+bool IsKeptCxxFlag(std::string_view arg) {
+  if (util::StartsWith(arg, "-O") || util::StartsWith(arg, "-g") ||
+      util::StartsWith(arg, "-march=") || util::StartsWith(arg, "-mtune=") ||
+      util::StartsWith(arg, "-std=")) {
     return true;
   }
-  return arg.size() > 2 && arg[0] == '-' && arg[1] == 'o';
+  if (!util::StartsWith(arg, "-f")) return false;
+  if (util::StartsWith(arg, "-fdebug-prefix-map") ||
+      util::StartsWith(arg, "-ffile-prefix-map") ||
+      util::StartsWith(arg, "-fmacro-prefix-map")) {
+    return false;
+  }
+  return true;
 }
 
-bool IsPathLike(std::string_view arg) {
-  if (arg.empty()) return false;
-  if (arg.find('/') != std::string_view::npos) return true;
-  if (arg.find('\\') != std::string_view::npos) return true;
-  return arg == "." || arg == ".." || util::StartsWith(arg, "./") ||
-         util::StartsWith(arg, "../");
+bool IsKeptRustCValue(std::string_view value) {
+  return util::StartsWith(value, "opt-level") || util::StartsWith(value, "debuginfo") ||
+         util::StartsWith(value, "codegen-units") || util::StartsWith(value, "lto") ||
+         util::StartsWith(value, "target-cpu");
 }
 
-std::vector<std::string> CostFlagClass(const std::vector<std::string>& key_args) {
+bool IsKeptLinkFlag(std::string_view arg) {
+  return util::StartsWith(arg, "-O") || util::StartsWith(arg, "-flto") ||
+         util::StartsWith(arg, "-fuse-ld=");
+}
+
+// `--edition`, `--crate-type` and `--target`, either joined (`--edition=2021`)
+// or as the flag plus its following argument. `--target-cpu` does not match
+// `--target`: the next character would be `-`, not `=`.
+bool TakeNamedFlag(const std::vector<std::string>& args, size_t* i, std::string_view name,
+                   std::vector<std::string>* kept) {
+  const std::string& arg = args[*i];
+  if (arg == name) {
+    kept->push_back(arg);
+    if (*i + 1 < args.size()) kept->push_back(args[++*i]);
+    return true;
+  }
+  if (util::StartsWith(arg, std::string(name) + "=")) {
+    kept->push_back(arg);
+    return true;
+  }
+  return false;
+}
+
+std::vector<std::string> CostFlagClass(std::string_view operation,
+                                       const std::vector<std::string>& key_args) {
   std::vector<std::string> kept;
   for (size_t i = 0; i < key_args.size(); ++i) {
     const std::string& arg = key_args[i];
-    if (TakesFollowingArg(arg)) {
-      if (i + 1 < key_args.size()) ++i;
+    if (operation == "rustc") {
+      if (arg == "-C" && i + 1 < key_args.size() && IsKeptRustCValue(key_args[i + 1])) {
+        kept.push_back(arg);
+        kept.push_back(key_args[++i]);
+        continue;
+      }
+      if (arg.size() > 2 && util::StartsWith(arg, "-C") &&
+          IsKeptRustCValue(std::string_view(arg).substr(2))) {
+        kept.push_back(arg);
+        continue;
+      }
+      if (TakeNamedFlag(key_args, &i, "--edition", &kept) ||
+          TakeNamedFlag(key_args, &i, "--crate-type", &kept) ||
+          TakeNamedFlag(key_args, &i, "--target", &kept)) {
+        continue;
+      }
       continue;
     }
-    if (IsJoinedDrop(arg) || IsPathLike(arg)) continue;
-    kept.push_back(arg);
+    if (operation == "link") {
+      if (IsKeptLinkFlag(arg)) kept.push_back(arg);
+      continue;
+    }
+    if (IsKeptCxxFlag(arg)) kept.push_back(arg);
   }
   return kept;
 }
@@ -199,7 +241,9 @@ std::string ComputeCostKey(std::string_view operation, const std::string& source
   // making it absolute first, Canonicalize cannot see that it sits under a root.
   hasher.UpdateDelimited(roots.Canonicalize(util::AbsoluteLexical(source_path)));
   hasher.UpdateDelimited(language);
-  for (const std::string& flag : CostFlagClass(key_args)) hasher.UpdateDelimited(flag);
+  for (const std::string& flag : CostFlagClass(operation, key_args)) {
+    hasher.UpdateDelimited(flag);
+  }
   return hasher.Hex();
 }
 
@@ -243,7 +287,9 @@ void RecordCompileCost(const std::string& cache_dir, std::string_view operation,
   }
 
   const std::string path = CostPath(cache_dir, key);
-  if (!util::WriteFileAtomic(path, RenderCostFile(cost))) {
+  // A lost cost file is a missing estimate, not a corrupt object, so skip the
+  // fsync WriteFileAtomic does for cache entries.
+  if (!util::WriteFileAtomic(path, RenderCostFile(cost), /*durable=*/false)) {
     fail(path + ": " + std::strerror(errno));
     return;
   }
@@ -343,6 +389,24 @@ std::string FormatCosts(const std::string& cache_dir) {
     out += "\n";
   }
   return out;
+}
+
+void PruneStaleCostFiles(const std::string& cache_dir) {
+  constexpr uint64_t kCostFileMaxAgeSeconds = 30ull * 24 * 60 * 60;
+  const std::string dir = CostDir(cache_dir);
+  if (!util::IsDirectory(dir)) return;
+  const std::time_t now_clock = std::time(nullptr);
+  if (now_clock < 0) return;
+  const uint64_t now = static_cast<uint64_t>(now_clock);
+  for (const util::FileEntry& entry : util::ListFilesRecursive(dir)) {
+    auto text = util::ReadFile(entry.path);
+    if (!text) continue;
+    const CompileCost cost = ParseCostFile(*text);
+    if (cost.observations.empty()) continue;
+    const uint64_t newest = cost.observations.back().recorded_at_unix;
+    if (newest >= now) continue;
+    if (now - newest > kCostFileMaxAgeSeconds) util::RemoveFile(entry.path);
+  }
 }
 
 }  // namespace vcache::core

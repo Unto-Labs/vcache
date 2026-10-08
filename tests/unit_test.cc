@@ -8,7 +8,9 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2538,9 +2540,22 @@ void TestCost() {
   Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-march=x86-64"}, roots_a) !=
             core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
         "-march stays in the cost key");
-  Check(core::ComputeCostKey("compile", file_a, "c++", {"-C", "opt-level=2"}, roots_a) !=
-            core::ComputeCostKey("compile", file_a, "c++", {"-C", "opt-level=3"}, roots_a),
-        "-C opt-level stays in the cost key");
+  Check(core::ComputeCostKey("rustc", file_a, "rust", {"-C", "opt-level=2"}, roots_a) !=
+            core::ComputeCostKey("rustc", file_a, "rust", {"-C", "opt-level=3"}, roots_a),
+        "-C opt-level stays in the rustc cost key");
+  CheckEq(core::ComputeCostKey("rustc", file_a, "rust",
+                               {"-C", "opt-level=2", "-C", "metadata=aaa", "-C",
+                                "extra-filename=-aaa"},
+                               roots_a),
+          core::ComputeCostKey("rustc", file_a, "rust",
+                               {"-C", "opt-level=2", "-C", "metadata=bbb", "-C",
+                                "extra-filename=-bbb"},
+                               roots_a),
+          "rustc metadata and extra-filename share one cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fdebug-prefix-map=/a=/b"}, roots_a),
+          core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
+          "a debug prefix map is not part of the cost key");
   Check(core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2021"}, roots_a) !=
             core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2018"}, roots_a),
         "--edition stays in the cost key");
@@ -2656,6 +2671,44 @@ void TestCost() {
   logged = util::ReadFile(log_path);
   Check(logged && logged->find("cost: could not record (") != std::string::npos,
         "a cost file that cannot be written is logged and does not fail the record");
+
+  TempCacheDir aged_cache;
+  const core::RootMap aged_roots = MakeRoots({aged_cache.path() + "=proj"});
+  const std::string aged_source = aged_roots.roots().front().path + "/a.cc";
+  util::WriteFileAtomic(aged_source, "int x;");
+  util::ProcResult aged_proc;
+  aged_proc.exit_code = 0;
+  aged_proc.max_rss_kb = 4;
+  aged_proc.wall_ms = 4;
+  core::RecordCompileCost(aged_cache.path(), "compile", aged_source, "c++", {"-O0"}, aged_roots,
+                          aged_proc);
+  core::RecordCompileCost(aged_cache.path(), "compile", aged_source, "c++", {"-O2"}, aged_roots,
+                          aged_proc);
+  const std::string old_key =
+      core::ComputeCostKey("compile", aged_source, "c++", {"-O0"}, aged_roots);
+  const std::string fresh_key =
+      core::ComputeCostKey("compile", aged_source, "c++", {"-O2"}, aged_roots);
+  const std::string old_path = aged_cache.path() + "/costs/" + old_key;
+  auto old_text = util::ReadFile(old_path);
+  Check(old_text.has_value(), "the production writer created the cost file to age");
+  if (old_text) {
+    std::string text = *old_text;
+    if (!text.empty() && text.back() == '\n') text.pop_back();
+    const size_t nl = text.rfind('\n');
+    const std::string line = nl == std::string::npos ? text : text.substr(nl + 1);
+    const size_t sp = line.rfind(' ');
+    const uint64_t forty_days_ago =
+        static_cast<uint64_t>(std::time(nullptr)) - 40ull * 24 * 60 * 60;
+    const std::string aged_line = line.substr(0, sp + 1) + std::to_string(forty_days_ago);
+    const std::string rewritten =
+        (nl == std::string::npos ? std::string() : text.substr(0, nl + 1)) + aged_line + "\n";
+    util::WriteFileAtomic(old_path, rewritten);
+  }
+  storage::DiskStorage trimmer(aged_cache.path(), 1ull << 30, false);
+  trimmer.Trim();
+  Check(!util::FileExists(old_path), "a cost file 40 days old is removed by trim");
+  Check(util::FileExists(aged_cache.path() + "/costs/" + fresh_key),
+        "a cost file from today survives trim");
 }
 
 void TestJobserver() {

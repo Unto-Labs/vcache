@@ -66,4 +66,8 @@ void AppendCostMeta(std::string* meta, uint64_t max_rss_kb, uint64_t wall_ms);
 // Text for `vcache --show-costs`.
 std::string FormatCosts(const std::string& cache_dir);
 
+// Deletes cost files whose newest observation is more than 30 days old.
+// Called from an explicit trim, not from the trim a store may trigger.
+void PruneStaleCostFiles(const std::string& cache_dir);
+
 }  // namespace vcache::core

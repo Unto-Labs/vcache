@@ -114,6 +114,21 @@ bool UploadQueue::RefusalOvertaken(uint64_t refusal_id) const {
   return refusal != nullptr && refusal->overtaken;
 }
 
+void UploadQueue::MarkInFlight(const std::string& key) {
+  in_flight_.insert(key);
+  // generation_ restarts after a superseded finish. The flight id does not,
+  // so a refusal recorded against this attempt cannot latch onto the next one.
+  in_flight_id_[key] = next_flight_id_++;
+}
+
+uint64_t UploadQueue::BeginSync(const std::string& key) {
+  if (in_flight_.count(key) != 0) return 0;
+  uint64_t& gen = generation_[key];
+  ++gen;
+  MarkInFlight(key);
+  return gen;
+}
+
 bool UploadQueue::TakeRefusal(uint64_t refusal_id) {
   const auto it = refusals_.find(refusal_id);
   if (it == refusals_.end()) return false;
@@ -206,10 +221,7 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
   order_.erase(ready);
   UploadItem item = std::move(waiting_.find(key)->second);
   waiting_.erase(key);
-  in_flight_.insert(item.key);
-  // generation_ restarts after a superseded finish. The flight id does not,
-  // so a refusal recorded against this attempt cannot latch onto the next one.
-  in_flight_id_[item.key] = next_flight_id_++;
+  MarkInFlight(item.key);
   if (item.blob) flight_pin_[item.key] = FlightPin{item.blob, false};
   return item;
 }

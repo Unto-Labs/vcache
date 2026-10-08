@@ -1338,6 +1338,11 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
         if (overtaken) {
           stored = true;
         } else {
+          uint64_t sync_generation = 0;
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sync_generation = uploads_.BeginSync(key);
+          }
           counters_.uploads_queued++;
           auto s3 = AcquireS3();
           if (s3->Put(key, *value)) {
@@ -1349,6 +1354,17 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
             if (s3->failed()) errors.push_back("s3: " + s3->last_error());
           }
           ReleaseS3(std::move(s3));
+          if (sync_generation != 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool count_requeue = false;
+            UploadItem finished;
+            finished.key = key;
+            finished.generation = sync_generation;
+            if (uploads_.Finish(finished, &count_requeue)) {
+              if (count_requeue) counters_.uploads_queued++;
+              log_.Line("re-queued " + key + " (rewritten during upload)");
+            }
+          }
         }
       }
     }

@@ -58,6 +58,11 @@ class UploadQueue {
   bool TakeRefusal(uint64_t refusal_id);
   size_t refusal_count() const { return refusals_.size(); }
 
+  // The caller uploads this key itself. A later store then waits or is
+  // re-queued, the same as for a worker upload. The blob is not pinned.
+  // Returns 0 when the key is already in flight.
+  uint64_t BeginSync(const std::string& key);
+
   // The next item whose retry time has passed, or nullopt. Sets `soonest`
   // to the earliest retry when nothing is ready yet.
   std::optional<UploadItem> TakeReady(std::chrono::steady_clock::time_point now,
@@ -108,6 +113,7 @@ class UploadQueue {
   void ForgetQueued(const std::string& key);
   uint64_t SupersedeInFlight(const std::string& key);
   void OvertakeRefusals(const std::string& key);
+  void MarkInFlight(const std::string& key);
   const FlightRefusal* FindRefusal(uint64_t refusal_id) const;
 
   std::string journal_dir_;

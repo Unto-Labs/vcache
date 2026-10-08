@@ -4800,6 +4800,23 @@ void TestUploadGeneration() {
         "the later store is in flight");
   Check(!reset_flight.RefusalStillInFlight(reset_refusal),
         "a new flight does not keep the old refusal waiting");
+
+  daemon::UploadQueue sync_upload(journal, 100);
+  const uint64_t sync_generation = sync_upload.BeginSync("y");
+  Check(sync_generation != 0 && sync_upload.in_flight("y") && sync_upload.held_bytes() == 0,
+        "a synchronous upload is in flight and pins nothing");
+  const auto sync_later = std::make_shared<const std::string>("later");
+  Check(sync_upload.Enqueue("y", sync_later, false),
+        "a store during the synchronous upload is accepted");
+  daemon::UploadItem sync_done;
+  sync_done.key = "y";
+  sync_done.generation = sync_generation;
+  bool sync_requeue = false;
+  Check(sync_upload.Finish(sync_done, &sync_requeue) && sync_requeue,
+        "finishing the synchronous upload re-queues the later store");
+  auto sync_again = sync_upload.TakeReady(now, &soonest);
+  const std::string sync_blob = sync_again && sync_again->blob ? *sync_again->blob : std::string();
+  CheckEq(sync_blob, "later", "the re-queued store is the later value");
 }
 
 void TestHeldHitLayer() {

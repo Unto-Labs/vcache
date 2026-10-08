@@ -1986,6 +1986,24 @@ except Exception: sys.exit(1)
   kill "$S3PID" 2>/dev/null || true
   wait "$S3PID" 2>/dev/null || true
   unset MOCK_S3_TRANSIENT_PUT_FAILURES
+
+  # Both stores miss the held cap, so each would upload on its own. The first
+  # is the slow body. The second must wait for that flight and land last.
+  export MOCK_S3_SLOW_UNDER_BYTES=20
+  start_order_s3 "$WORK/refuse-sync-s3"
+  sync_key=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  sync_obj="$S3DIR/${sync_key:0:2}__${sync_key:2}"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$sync_key" &
+  sync_put=$!
+  check "the first refused upload has started" "$(wait_started "$sync_obj.started")" "1"
+  printf 'V3VALUE-0123456789-later' | "$VCACHE" --test-put "$sync_key"
+  wait "$sync_put"
+  check "ordered synchronous uploads keep the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a later refused upload is what s3 keeps" \
+    "$(cat "$sync_obj" 2>/dev/null)" "V3VALUE-0123456789-later"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
   check "the flight mock is gone" \
     "$(pgrep -f "$WORK/[r]efuse-flight-s3" >/dev/null && echo yes || echo no)" "no"
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \

@@ -73,17 +73,31 @@ bool CompileSessionHandle::ReserveMemory(const std::string& cost_key, uint64_t e
   request.Str(cost_key);
   request.U64(estimate_kb);
   request.U64(bound_ms);
+  Writer extended_request = request;
+  extended_request.U8(kMemoryReserveReplyEstimate);
   timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(bound_ms)), 0};
   ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   std::string reply;
-  const bool answered = Request(request.data(), &reply);
+  std::string refusal;
+  bool reply_has_estimate = true;
+  bool answered = Request(extended_request.data(), &reply, &refusal);
+  // An older daemon rejects the extension before making a reservation.
+  if (!answered && refusal == "invalid memory reserve") {
+    reply_has_estimate = false;
+    answered = Request(request.data(), &reply);
+  } else if (!answered && !refusal.empty()) {
+    Unavailable(refusal);
+  }
   timeout.tv_sec = kReplyTimeoutSeconds;
   if (fd_ >= 0) ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   Reader in(reply);
   uint8_t status = 0, outcome = 0;
-  uint64_t waited_ms = 0;
+  uint64_t waited_ms = 0, granted_estimate_kb = 0;
   if (!answered || !in.U8(&status) || status != static_cast<uint8_t>(Status::kOk) ||
-      !in.U8(&outcome) || outcome > 1 || !in.U64(&waited_ms) || !in.done()) {
+      !in.U8(&outcome) || outcome > 1 || !in.U64(&waited_ms) ||
+      (reply_has_estimate && !in.U64(&granted_estimate_kb)) || !in.done() ||
+      (reply_has_estimate && (outcome == static_cast<uint8_t>(MemoryOutcome::kGranted) ?
+          granted_estimate_kb == 0 : granted_estimate_kb != 0))) {
     if (answered) Unavailable("malformed memory reply");
     VCACHE_LOG("reserve: request waited " + std::to_string(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -93,8 +107,13 @@ bool CompileSessionHandle::ReserveMemory(const std::string& cost_key, uint64_t e
   }
   memory_reserved_ = outcome == static_cast<uint8_t>(MemoryOutcome::kGranted);
   if (memory_reserved_) {
-    VCACHE_LOG("reserve: granted " + std::to_string(estimate_kb) + " kB after " +
-               std::to_string(waited_ms) + " ms");
+    if (reply_has_estimate) {
+      VCACHE_LOG("reserve: granted " + std::to_string(granted_estimate_kb) + " kB after " +
+                 std::to_string(waited_ms) + " ms");
+    } else {
+      VCACHE_LOG("reserve: granted after " + std::to_string(waited_ms) + " ms (requested " +
+                 std::to_string(estimate_kb) + " kB; granted estimate unavailable)");
+    }
   } else {
     VCACHE_LOG("reserve: wait bound reached after " + std::to_string(waited_ms) +
                " ms, running unreserved");

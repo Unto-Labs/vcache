@@ -29,6 +29,8 @@ namespace vcache::daemon {
 constexpr uint64_t kProtocolVersion = 2;
 constexpr int kReplyTimeoutSeconds = 300;
 constexpr uint64_t kMemoryWaitBoundMs = 600000;
+// Opt-in estimate replies preserve the wire format expected by older v2 clients.
+constexpr uint8_t kMemoryReserveReplyEstimate = 1;
 
 enum class Op : uint8_t {
   kHello = 1,     // u64 version, str fingerprint
@@ -39,7 +41,7 @@ enum class Op : uint8_t {
   kSessionOpen = 6,  // (nothing); keeps this connection for the compile's lifetime
   kLeaseAcquire = 7,  // str key, u64 bound_ms
   kLeaseRelease = 8,  // str key, u8 outcome (stored = 0, failed = 1)
-  kMemoryReserve = 9,  // str cost_key, u64 estimate_kb, u64 bound_ms
+  kMemoryReserve = 9,  // str cost_key, u64 estimate_kb, u64 bound_ms, optional u8 reply fields
   kCompilerSpawned = 10,  // u64 compiler pid
 };
 

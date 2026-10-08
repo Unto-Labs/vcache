@@ -1054,9 +1054,12 @@ void Server::HandleMemoryReserve(Reader* in, Writer* out,
                                  const std::shared_ptr<CompileSession>& session) {
   std::string cost_key;
   uint64_t estimate_kb = 0, bound_ms = 0;
+  uint8_t reply_fields = 0;
   if (!session || config_.read_only ||
       !in->Str(&cost_key) || !ValidKey(cost_key) || !in->U64(&estimate_kb) ||
-      !in->U64(&bound_ms) || !in->done()) {
+      !in->U64(&bound_ms) ||
+      (!in->done() && (!in->U8(&reply_fields) ||
+                      reply_fields != kMemoryReserveReplyEstimate)) || !in->done()) {
     out->U8(static_cast<uint8_t>(Status::kError));
     out->Str("invalid memory reserve");
     return;
@@ -1110,6 +1113,11 @@ void Server::HandleMemoryReserve(Reader* in, Writer* out,
   out->U8(static_cast<uint8_t>(Status::kOk));
   out->U8(static_cast<uint8_t>(*waiter->outcome));
   out->U64(waited_ms);
+  if (reply_fields == kMemoryReserveReplyEstimate) {
+    const auto reservation = reservations_.find(session->fd);
+    out->U64(*waiter->outcome == MemoryOutcome::kGranted && reservation != reservations_.end() ?
+                 reservation->second->estimate_kb : 0);
+  }
 }
 
 void Server::HandleCompilerSpawned(Reader* in, Writer* out,

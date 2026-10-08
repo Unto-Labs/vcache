@@ -2736,6 +2736,31 @@ void TestAdmissionBoundsAndTreePeaks() {
     next.Reserve(client_estimate, 3000, key);
     Check(next.MemoryOutcome(0) && memory_reserved(server) >= 65536,
           "the next matching cost key reserves its observed tree-sum peak above wait4 RSS");
+    next.Close();
+    PollUntil([&] { return LeaseStat(server, "memory reserved", 0); }, 1000);
+    const std::string client_log = server.directory + "/granted-estimate-client-log";
+    ::setenv("VCACHE_LOG", client_log.c_str(), 1);
+    util::InitLogging();
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    const bool reserved = session && session->ReserveMemory(key, client_estimate, 1000);
+    const auto granted_kb = memory_reserved(server);
+    Check(reserved && granted_kb >= 65536 &&
+              util::ReadFile(client_log).value_or("").find(
+                  "reserve: granted " + std::to_string(granted_kb) + " kB after ") !=
+                  std::string::npos,
+          "the client logs the server's learned granted estimate rather than requested wait4 RSS");
+    Check(session && session->ReserveMemory(key, 131072, 1000) &&
+              memory_reserved(server) == granted_kb &&
+              util::ReadFile(client_log).value_or("").find("reserve: granted 131072 kB after ") ==
+                  std::string::npos,
+          "a duplicate reserve logs the held grant rather than its new requested estimate");
+    session.reset();
+    ::unsetenv("VCACHE_LOG");
+    util::InitLogging();
+    PollUntil([&] { return LeaseStat(server, "memory reserved", 0); }, 1000);
     unrelated.Reserve(1024);
     Check(unrelated.MemoryOutcome(0) &&
               util::ReadFile(server.directory + "/memory-log").value_or("").find(

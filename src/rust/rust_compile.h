@@ -23,6 +23,11 @@
 
 namespace vcache::rust {
 
+// Hash of `rustc -vV`. The memo that avoids a probe per crate is local; what
+// enters a cache key is only the banner, so two machines still share entries.
+std::string ResolveRustcFingerprint(const std::string& rustc,
+                                    const std::string& cache_dir);
+
 int RunRustCompile(const std::vector<std::string>& argv,
                    const core::Config& config, const core::RootMap& roots,
                    storage::CacheChain* cache);

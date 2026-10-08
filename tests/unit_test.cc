@@ -41,6 +41,7 @@
 #include "daemon/protocol.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
+#include "rust/rust_compile.h"
 #include "rust/rust_manifest.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
@@ -2711,6 +2712,51 @@ void TestCost() {
         "a cost file from today survives trim");
 }
 
+void TestRustcFingerprint() {
+  Section("rust::fingerprint");
+
+  auto scratch = util::MakeTempDir("vcache-rustc-memo-");
+  Check(scratch.has_value(), "rustc memo scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string banner_a =
+      "#!/bin/sh\n"
+      "if [ \"$1\" = \"-vV\" ]; then printf 'release: 9.9.1\\n'; exit 0; fi\n"
+      "exit 0\n";
+  const std::string banner_b =
+      "#!/bin/sh\n"
+      "if [ \"$1\" = \"-vV\" ]; then printf 'release: 9.9.2\\n'; exit 0; fi\n"
+      "exit 0\n";
+  Check(banner_a.size() == banner_b.size(), "the two fake rustc scripts have the same size");
+
+  const std::string rustc = *scratch + "/rustc";
+  const std::string copy = *scratch + "/rustc-copy";
+  auto install = [](const std::string& path, const std::string& text) {
+    util::WriteFileAtomic(path, text);
+    ::chmod(path.c_str(), 0755);
+  };
+  install(rustc, banner_a);
+  const std::string first = rust::ResolveRustcFingerprint(rustc, *scratch);
+  CheckEq(rust::ResolveRustcFingerprint(rustc, *scratch), first,
+          "an unchanged rustc reuses its fingerprint");
+
+  install(rustc, banner_b);
+  Check(util::FileSize(rustc).value_or(0) == banner_a.size(),
+        "the rewritten rustc keeps the same size");
+  Age(rustc, -2);
+  const std::string rebuilt = rust::ResolveRustcFingerprint(rustc, *scratch);
+  Check(rebuilt != first, "a same-size rustc with a new mtime gets a new fingerprint");
+
+  install(copy, banner_a);
+  Age(copy, 100);
+  CheckEq(rust::ResolveRustcFingerprint(copy, *scratch), first,
+          "two rustc files with one banner share a fingerprint");
+}
+
 void TestJobserver() {
   Section("daemon::jobserver");
 
@@ -2816,6 +2862,7 @@ int main() {
   TestRustManifest();
   TestRunRusage();
   TestCost();
+  TestRustcFingerprint();
   TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);

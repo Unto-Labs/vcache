@@ -183,6 +183,30 @@ warns and uses the online-CPU default. If the fifo cannot be created the
 daemon still runs, and `--jobserver-env` exits 1. It also exits 1 when the
 status still names a pool but the path is no longer a fifo.
 
+### Elastic jobserver pool
+
+Every 500 ms the daemon uses the admission queue to adjust the shared fifo.
+For total jobs `N`, free shared bytes `F`, daemon-held tokens `W`, and waiting
+reservations `Q`, pressure withdraws `min(F, Q, N-W-min_jobs)` tokens.
+`daemon.jobserver_min_jobs` defaults to 2 and is clamped to `N` with a warning
+when larger. Tokens held by running jobs are never taken. Reads are nonblocking,
+so a client taking the last byte first makes the daemon retry on a later tick.
+
+When `Q` is zero and available memory exceeds both default memory estimates,
+the daemon returns one token per tick. Shutdown returns all its held tokens
+before closing and removing the fifo. `VCACHE_LOG` and the daemon log include
+`jobserver: withdrew ...` and `jobserver: restored ...`. Status adds the live
+`jobserver tokens withdrawn` count and lifetime `jobserver tokens restored total`.
+The existing free row still counts fifo bytes plus one implicit slot.
+
+Each top-level make, ninja or cargo build owns an implicit slot. With `k`
+concurrent builds, the shared pool permits approximately `N-1-W+k` jobs;
+withdrawals cannot take those implicit slots. Memory admission bounds admitted
+memory, while the pool controls CPU concurrency approximately. A pool with no
+admission requests remains fixed, including clients with admission off.
+Tokens withdrawn by the daemon do not count as active clients for its idle
+timeout; tokens held by builds retain the existing doubled timeout.
+
 ## Files
 
 Everything lives under `<cache dir>/daemon/`, which the disk layer never walks:

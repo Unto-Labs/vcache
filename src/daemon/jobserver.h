@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
 // SPDX-License-Identifier: Apache-2.0
-// A fixed GNU-make fifo of job slots.
+// A GNU-make fifo of shared job slots.
 //
 // make, ninja and cargo block in read(2) on this fifo for a '+' byte before
 // they start a job, and write the byte back when the job ends. The daemon
@@ -23,6 +23,9 @@ namespace vcache::daemon {
 // The line `vcache --jobserver-env` prints. The bare `-j` is what tells make
 // it is a jobserver client rather than the owner of a new pool.
 std::string JobserverMakeFlagsLine(const std::string& fifo_path);
+
+int JobserverTokenChange(int total, int free, int withdrawn, uint64_t waiting,
+                         uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb);
 
 class JobserverPool {
  public:
@@ -51,8 +54,10 @@ class JobserverPool {
   // '+' bytes sitting in the fifo, without the implicit slot.
   int fifo_bytes() const;
 
-  // Always 0 until the pool can withdraw tokens under memory pressure.
-  int withdrawn() const { return 0; }
+  int withdrawn() const { return withdrawn_; }
+  uint64_t restored_total() const { return restored_total_; }
+  int Withdraw(int count);
+  int Restore(int count);
 
  private:
   JobserverPool(std::string path, int fd, int total, uint64_t fifo_dev, uint64_t fifo_ino);
@@ -64,6 +69,8 @@ class JobserverPool {
   std::string path_;
   int fd_ = -1;
   int total_ = 0;  // job slots, one more than the bytes written at start
+  int withdrawn_ = 0;
+  uint64_t restored_total_ = 0;
   uint64_t fifo_dev_ = 0;
   uint64_t fifo_ino_ = 0;
 };

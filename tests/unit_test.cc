@@ -4238,6 +4238,138 @@ void TestJobserver() {
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }
 
+void TestElasticJobserver() {
+  Section("daemon::elastic jobserver");
+  struct PolicyCase {
+    int free, withdrawn;
+    uint64_t waiting, available_kb;
+    int floor, expected;
+    const char* name;
+  };
+  for (const auto& row : std::vector<PolicyCase>{
+      {3, 0, 1, 0, 2, -1, "one waiter withdraws one shared token"},
+      {2, 1, 9, 0, 2, -1, "withdrawal stops at the configured floor"},
+      {1, 2, 9, 0, 2, 0, "the floor prevents another withdrawal"},
+      {1, 0, 9, 0, 2, -1, "withdrawal cannot take a token held by a client"},
+      {0, 0, 1, 0, 2, 0, "no free shared token means no withdrawal"},
+      {-1, 0, 1, 0, 2, 0, "an unknown free count means no withdrawal"},
+      {1, 2, 0, 8192, 2, 1, "recovery restores only one token per tick"},
+      {1, 2, 0, 4096, 2, 0, "memory equal to the default does not restore"},
+      {1, 2, 0, 4095, 2, 0, "low memory retains withdrawn tokens"},
+      {3, 0, 0, 8192, 2, 0, "admission with no waiting requests leaves the pool fixed"},
+      {3, 0, 9, 0, 9, 0, "a floor above total is clamped to the total"}}) {
+    Check(daemon::JobserverTokenChange(4, row.free, row.withdrawn, row.waiting,
+                                     row.available_kb, row.floor, 4096) == row.expected, row.name);
+  }
+  TempCacheDir dir;
+  std::string error;
+  auto pool = daemon::JobserverPool::Open(dir.path() + "/elastic.fifo", 4, &error);
+  Check(pool && pool->Withdraw(2) == 2 && pool->withdrawn() == 2 && pool->fifo_bytes() == 1,
+        "the production pool accounts for tokens actually withdrawn");
+  if (!pool) return;
+  Check(pool->Restore(1) == 1 && pool->withdrawn() == 1 && pool->restored_total() == 1 &&
+            pool->fifo_bytes() == 2, "restoring one token updates live and lifetime counters");
+  daemon::JobserverPool moved(std::move(*pool));
+  Check(moved.withdrawn() == 1 && moved.restored_total() == 1 && pool->withdrawn() == 0,
+        "moving a pool preserves withdrawn ownership and counters");
+  const int client = ::open(moved.path().c_str(), O_RDWR | O_NONBLOCK);
+  char tokens[3]{};
+  const int requested = -daemon::JobserverTokenChange(moved.total(), moved.fifo_bytes(),
+      moved.withdrawn(), 1, 0, 2, 4096);
+  const bool two_taken = client >= 0 && ::read(client, tokens, 2) == 2;
+  int result[2];
+  const bool piped = ::pipe(result) == 0;
+  const pid_t reader = piped ? ::fork() : -1;
+  if (reader == 0) {
+    ::close(result[0]);
+    const int taken = moved.Withdraw(requested);
+    ::write(result[1], &taken, sizeof(taken));
+    ::_exit(0);
+  }
+  if (piped) ::close(result[1]);
+  int taken = -1;
+  pollfd ready{piped ? result[0] : -1, POLLIN, 0};
+  Check(requested == 1 && two_taken && reader > 0 && ::poll(&ready, 1, 1000) > 0 &&
+            ::read(result[0], &taken, sizeof(taken)) == sizeof(taken) && taken == 0,
+        "a client taking the last free token makes withdrawal return EAGAIN within one second");
+  if (reader > 0) {
+    ::kill(reader, SIGKILL);
+    ::waitpid(reader, nullptr, 0);
+  }
+  if (piped) ::close(result[0]);
+  if (client >= 0) {
+    ::write(client, "++", 2);
+    ::close(client);
+  }
+  auto destination = daemon::JobserverPool::Open(dir.path() + "/assignment.fifo", 4, &error);
+  if (destination) {
+    destination->Withdraw(1);
+    const int previous_fifo = ::open(destination->path().c_str(), O_RDWR | O_NONBLOCK);
+    *destination = std::move(moved);
+    Check(destination->withdrawn() == 1 && destination->restored_total() == 1 &&
+              moved.withdrawn() == 0,
+          "move assignment preserves the source's token ownership");
+    Check(previous_fifo >= 0 && ::read(previous_fifo, tokens, 3) == 3,
+          "move assignment returns the destination's tokens before closing its fifo");
+    if (previous_fifo >= 0) ::close(previous_fifo);
+    destination->Restore(1);
+  } else {
+    Check(false, "move assignment fixture pool opens");
+  }
+  auto ending = daemon::JobserverPool::Open(dir.path() + "/ending.fifo", 4, &error);
+  if (!ending) { Check(false, "shutdown fixture pool opens"); return; }
+  ending->Withdraw(2);
+  const int blocked_fd = ::open(ending->path().c_str(), O_RDONLY);
+  int completed[2];
+  if (::pipe(completed) != 0) { if (blocked_fd >= 0) ::close(blocked_fd); return; }
+  const pid_t blocked = ::fork();
+  if (blocked == 0) {
+    ::close(completed[0]);
+    char token = 0;
+    if (::read(blocked_fd, &token, 1) != 1) ::_exit(1);
+    ::write(completed[1], "R", 1);
+    const bool returned = ::read(blocked_fd, &token, 1) == 1 &&
+                          ::read(blocked_fd, &token, 1) == 1;
+    ::write(completed[1], returned ? "Y" : "N", 1);
+    ::_exit(0);
+  }
+  ::close(completed[1]);
+  pollfd first{completed[0], POLLIN, 0};
+  char outcome = 0;
+  Check(blocked > 0 && ::poll(&first, 1, 1000) > 0 &&
+            ::read(completed[0], &outcome, 1) == 1 && outcome == 'R',
+        "shutdown fixture consumes the last free token before blocking");
+  ending.reset();
+  Check(::poll(&first, 1, 2000) > 0 && ::read(completed[0], &outcome, 1) == 1 && outcome == 'Y',
+        "pool destruction returns withdrawn tokens to a blocked reader within two seconds");
+  if (blocked > 0) {
+    ::kill(blocked, SIGKILL);
+    ::waitpid(blocked, nullptr, 0);
+  }
+  if (blocked_fd >= 0) ::close(blocked_fd);
+  ::close(completed[0]);
+  std::map<std::string, std::optional<std::string>> saved;
+  for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_JOBSERVER_MIN_JOBS"}) {
+    const char* value = ::getenv(name.c_str());
+    saved[name] = value ? std::optional<std::string>(value) : std::nullopt;
+    ::unsetenv(name.c_str());
+  }
+  const std::string config_path = dir.path() + "/min.toml";
+  util::WriteFileAtomic(config_path, "[daemon]\njobserver_min_jobs = 3\n");
+  ::setenv("VCACHE_CONFIG", config_path.c_str(), 1);
+  Check(core::LoadConfig().daemon.jobserver_min_jobs == 3, "the jobserver floor loads from TOML");
+  ::setenv("VCACHE_DAEMON_JOBSERVER_MIN_JOBS", "7", 1);
+  Check(core::LoadConfig().daemon.jobserver_min_jobs == 7, "the jobserver floor environment overrides TOML");
+  core::Config described = core::LoadConfig();
+  described.daemon.mode = core::DaemonMode::kOn;
+  described.daemon.jobserver = true;
+  Check(core::DescribeConfig(described).find("  jobserver min:  7\n") != std::string::npos,
+        "show-config displays the requested jobserver floor");
+  for (const auto& [name, value] : saved) {
+    if (value) ::setenv(name.c_str(), value->c_str(), 1); else ::unsetenv(name.c_str());
+  }
+}
+
 void TestMemoryEstimates() {
   Section("daemon::admission estimates");
   TempCacheDir cache;
@@ -4392,6 +4524,7 @@ int main(int argc, char** argv) {
   TestRustOutputNames();
   TestHeldHitLayer();
   TestJobserver();
+  TestElasticJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

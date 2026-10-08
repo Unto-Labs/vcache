@@ -158,6 +158,9 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlInt(*d, "default_link_kb")) {
       if (*v > 0) config->daemon.default_link_kb = static_cast<uint64_t>(*v);
     }
+    if (auto v = TomlInt(*d, "jobserver_min_jobs")) {
+      if (*v > 0) config->daemon.jobserver_min_jobs = static_cast<uint64_t>(*v);
+    }
     if (auto v = TomlString(*d, "mode")) {
       if (!ParseDaemonMode(*v, &config->daemon.mode)) {
         config->warnings.push_back("daemon.mode: unknown mode '" + *v +
@@ -356,7 +359,8 @@ void ApplyEnvironment(Config* config) {
   config->daemon.admission = EnvBool("VCACHE_DAEMON_ADMISSION", config->daemon.admission);
   for (const auto& [name, destination] : {
       std::pair{"VCACHE_DAEMON_DEFAULT_COMPILE_KB", &config->daemon.default_compile_kb},
-      std::pair{"VCACHE_DAEMON_DEFAULT_LINK_KB", &config->daemon.default_link_kb}}) {
+      std::pair{"VCACHE_DAEMON_DEFAULT_LINK_KB", &config->daemon.default_link_kb},
+      std::pair{"VCACHE_DAEMON_JOBSERVER_MIN_JOBS", &config->daemon.jobserver_min_jobs}}) {
     if (auto value = Env(name)) {
       char* end = nullptr;
       errno = 0;
@@ -556,6 +560,7 @@ std::string DescribeConfig(const Config& config) {
           << (config.daemon.jobserver_jobs > 0 ? std::to_string(config.daemon.jobserver_jobs)
                                                : "online CPUs")
           << "\n";
+      out << "  jobserver min:  " << config.daemon.jobserver_min_jobs << "\n";
     }
   }
   out << "roots:            "

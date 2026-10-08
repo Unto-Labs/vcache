@@ -122,6 +122,7 @@ struct DaemonConfig {
   bool admission = false;
   uint64_t default_compile_kb = 2097152;
   uint64_t default_link_kb = 4194304;
+  uint64_t jobserver_min_jobs = 2;
 
   // The daemon exits, after draining its upload queue, once it has had no
   // client for this long. Zero keeps it running until told to stop. The

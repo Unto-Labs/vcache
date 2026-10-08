@@ -83,10 +83,11 @@ void UploadQueue::SupersedeInFlight(const std::string& key) {
 }
 
 bool UploadQueue::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-                          bool journal, bool* merged) {
+                          bool journal, bool* merged, bool* in_flight_state) {
   if (merged != nullptr) *merged = false;
   const bool flying = in_flight_.count(key) != 0;
   const bool waiting = waiting_.find(key) != waiting_.end();
+  if (in_flight_state != nullptr) *in_flight_state = flying;
   std::shared_ptr<const std::string> previous;
   const auto held = held_.find(key);
   if (held != held_.end()) previous = held->second;
@@ -109,7 +110,11 @@ bool UploadQueue::Enqueue(const std::string& key, std::shared_ptr<const std::str
     }
   }
 
-  if (merged != nullptr) *merged = flying || waiting;
+  // A refusal may have marked this key superseded. This store is the one to
+  // upload, so finishing the older in-flight attempt must not drop it.
+  superseded_.erase(key);
+  if (merged != nullptr) *merged = waiting;
+  if (flying && (merged == nullptr || !*merged)) recount_on_requeue_.insert(key);
   uint64_t& gen = generation_[key];
   ++gen;
   if (blob != nullptr) {
@@ -157,10 +162,12 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
   return item;
 }
 
-bool UploadQueue::Finish(const UploadItem& item) {
+bool UploadQueue::Finish(const UploadItem& item, bool* count_requeue) {
+  if (count_requeue != nullptr) *count_requeue = false;
   in_flight_.erase(item.key);
   ReleaseFlightPin(item.key);
   if (superseded_.erase(item.key) > 0) {
+    recount_on_requeue_.erase(item.key);
     DropHeld(item.key);
     generation_.erase(item.key);
     RemoveJournal(item.key);
@@ -175,11 +182,17 @@ bool UploadQueue::Finish(const UploadItem& item) {
     if (held != held_.end()) again.blob = held->second;
     waiting_[again.key] = again;
     order_.push_back(again.key);
+    if (count_requeue != nullptr) {
+      *count_requeue = recount_on_requeue_.erase(item.key) > 0;
+    } else {
+      recount_on_requeue_.erase(item.key);
+    }
     return true;
   }
   generation_.erase(item.key);
   DropHeld(item.key);
   RemoveJournal(item.key);
+  recount_on_requeue_.erase(item.key);
   return false;
 }
 

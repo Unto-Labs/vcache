@@ -37,11 +37,12 @@ class UploadQueue {
   // A key already queued is dropped, because the caller uploads the newer
   // value itself. A key in flight is marked superseded and its generation
   // moves, so finishing that upload does not send the old value again.
-  // `merged` is set when this store joins one the queue already has, so the
-  // caller does not count it as another queued upload. `journal` creates the
-  // pending-upload marker.
+  // An accepted store clears that mark: the newer value is the one to send.
+  // `merged` is set only when the key is waiting, not when it is in flight.
+  // `in_flight_state` reports that, including when the store is refused.
+  // `journal` creates the pending-upload marker.
   bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
-               bool* merged = nullptr);
+               bool* merged = nullptr, bool* in_flight_state = nullptr);
 
   // The next item whose retry time has passed, or nullopt. Sets `soonest`
   // to the earliest retry when nothing is ready yet.
@@ -49,9 +50,11 @@ class UploadQueue {
                                       std::chrono::steady_clock::time_point* soonest);
 
   // True when the key was rewritten while this upload ran, and that newer
-  // value is now at the back of the queue. The journal stays until the
+  // value is now at the back of the queue. `count_requeue` is set when that
+  // re-queue is another queued upload (an in-flight rewrite, not a store that
+  // was already counted while it waited). The journal stays until the
   // generation that finished is the current one.
-  bool Finish(const UploadItem& item);
+  bool Finish(const UploadItem& item, bool* count_requeue = nullptr);
 
   // A failed attempt that will be retried. Picks up a newer generation so
   // the retry carries the latest value.
@@ -63,6 +66,9 @@ class UploadQueue {
   uint64_t generation(const std::string& key) const;
   std::shared_ptr<const std::string> Held(const std::string& key) const;
   bool JournalExists(const std::string& key) const;
+  bool in_flight(const std::string& key) const { return in_flight_.count(key) != 0; }
+  size_t in_flight_count() const { return in_flight_.size(); }
+  size_t superseded_count() const { return superseded_.size(); }
 
  private:
   void CreateJournal(const std::string& key) const;
@@ -87,6 +93,7 @@ class UploadQueue {
   std::map<std::string, uint64_t> generation_;
   std::set<std::string> in_flight_;
   std::set<std::string> superseded_;
+  std::set<std::string> recount_on_requeue_;
   std::map<std::string, FlightPin> flight_pin_;
   std::map<std::string, std::shared_ptr<const std::string>> held_;
   uint64_t held_bytes_ = 0;

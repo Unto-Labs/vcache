@@ -60,7 +60,9 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(HANDSHAKE_S)
 
     def end_headers(self):
-        if LATENCY_S:
+        # A put that applies after its latency has already slept, and must not
+        # sleep again here or the completion order would not match the write.
+        if LATENCY_S and not getattr(self, "_latency_applied", False):
             time.sleep(LATENCY_S)
         super().end_headers()
 
@@ -219,6 +221,20 @@ class Handler(BaseHTTPRequestHandler):
         if path is None:
             self.send_error(400, "bad key")
             return
+        # The object appears when the request finishes, not when it arrives, so
+        # a slow upload that started first can still be the value left behind.
+        if os.environ.get("MOCK_S3_APPLY_AFTER_LATENCY") == "1":
+            delay = LATENCY_S
+            slow_under = int(os.environ.get("MOCK_S3_SLOW_UNDER_BYTES", "0") or "0")
+            slow_extra = int(os.environ.get("MOCK_S3_SLOW_UNDER_EXTRA_MS", "0") or "0")
+            if slow_under and len(body) < slow_under:
+                delay += slow_extra / 1000.0
+            started = path + ".started"
+            with open(started, "w", encoding="ascii"):
+                pass
+            if delay:
+                time.sleep(delay)
+            self._latency_applied = True
         with open(path, "wb") as f:
             f.write(body)
         self.send_response(200)

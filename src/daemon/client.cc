@@ -20,11 +20,6 @@
 namespace vcache::daemon {
 namespace {
 
-// A daemon that has stopped answering must not hang the build. This is longer
-// than any single S3 request the daemon can be making on a lookup's behalf,
-// including its retries, so it only fires on a daemon that is truly stuck.
-constexpr int kReplyTimeoutSeconds = 300;
-
 // After a failed auto-start, compiles in the next minute do not try again. A
 // cache directory the daemon cannot use would otherwise cost every compile in
 // a parallel build a fork, an exec and a failure.

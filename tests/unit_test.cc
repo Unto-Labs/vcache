@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -3207,6 +3209,108 @@ void TestUploadGeneration() {
   const uint64_t pending = accounted.size();
   CheckEq(std::to_string(queued_n), std::to_string(pending),
           "a merged re-put is not counted as queued");
+
+  auto accounted_for = [](uint64_t done, const daemon::UploadQueue& q) {
+    const uint64_t pending = q.size() + q.in_flight_count() - q.superseded_count();
+    return std::to_string(done + pending + q.superseded_count());
+  };
+
+  daemon::UploadQueue waiting_id("");
+  bool merged_id = false;
+  bool flying_id = false;
+  uint64_t queued_id = 0;
+  uint64_t done_id = 0;
+  Check(waiting_id.Enqueue("a", first_blob, false, &merged_id, &flying_id),
+        "the identity's first store is queued");
+  if (!merged_id && !flying_id) ++queued_id;
+  merged_id = false;
+  flying_id = false;
+  Check(waiting_id.Enqueue("a", second_blob, false, &merged_id, &flying_id),
+        "the identity's waiting rewrite is accepted");
+  if (!merged_id && !flying_id) ++queued_id;
+  CheckEq(std::to_string(queued_id), accounted_for(done_id, waiting_id),
+          "a merged waiting re-put keeps queued equal to done, pending and superseded");
+
+  auto waiting_item = waiting_id.TakeReady(now, &soonest);
+  Check(waiting_item.has_value(), "the identity store can be taken");
+  merged_id = false;
+  flying_id = false;
+  bool counted_as_merged = false;
+  if (waiting_item) {
+    Check(waiting_id.Enqueue("a", first_blob, false, &merged_id, &flying_id),
+          "an in-flight rewrite is accepted");
+    counted_as_merged = merged_id;
+    Check(!merged_id && flying_id, "an in-flight rewrite is not a merged waiting store");
+    if (!merged_id && !flying_id) ++queued_id;
+    bool count_requeue = false;
+    const bool requeued = waiting_id.Finish(*waiting_item, &count_requeue);
+    if (requeued && count_requeue && !counted_as_merged) ++queued_id;
+    ++done_id;
+    CheckEq(std::to_string(queued_id), accounted_for(done_id, waiting_id),
+            "an in-flight rewrite keeps queued equal to done, pending and superseded");
+  }
+
+  daemon::UploadQueue refused_id("", 10);
+  uint64_t refused_queued = 0;
+  bool refused_merged = false;
+  bool refused_flying = false;
+  Check(refused_id.Enqueue("z", small, false, &refused_merged, &refused_flying),
+        "the refused identity store is queued");
+  if (!refused_merged && !refused_flying) ++refused_queued;
+  auto refused_item = refused_id.TakeReady(now, &soonest);
+  Check(refused_item.has_value(), "the refused identity store is in flight");
+  refused_flying = false;
+  Check(!refused_id.Enqueue("z", big, false, nullptr, &refused_flying) && refused_flying,
+        "the refused identity re-put is in flight");
+  CheckEq(std::to_string(refused_queued), accounted_for(0, refused_id),
+          "a refused in-flight re-put keeps queued equal to done, pending and superseded");
+
+  daemon::UploadQueue after(journal, 10);
+  const auto v1 = std::make_shared<const std::string>("v1");
+  const auto v4 = std::make_shared<const std::string>("v4");
+  Check(after.Enqueue("k", v1, true), "v1 is queued");
+  auto v1_item = after.TakeReady(now, &soonest);
+  Check(v1_item.has_value() && after.in_flight("k"), "v1 is in flight");
+  Check(!after.Enqueue("k", big, true), "v3 over the cap is refused");
+  Check(after.Enqueue("k", v4, true), "v4 under the cap is accepted");
+  if (v1_item) {
+    Check(after.Finish(*v1_item), "finishing v1 re-queues the store accepted after the refusal");
+    auto v4_item = after.TakeReady(now, &soonest);
+    const std::string got = v4_item && v4_item->blob ? *v4_item->blob : std::string();
+    CheckEq(got, "v4", "the re-queued store is v4");
+    Check(after.JournalExists("k"), "the journal stays for the store accepted after the refusal");
+  }
+
+  daemon::UploadQueue wake(journal, 10);
+  Check(wake.Enqueue("w", v1, false), "the waited store is queued");
+  auto wake_item = wake.TakeReady(now, &soonest);
+  Check(wake_item.has_value(), "the waited store is in flight");
+  Check(!wake.Enqueue("w", big, false), "the waited re-put is refused");
+  if (wake_item) {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool parked = false;
+    bool released = false;
+    std::thread waiter([&] {
+      std::unique_lock<std::mutex> lock(mu);
+      parked = true;
+      cv.notify_all();
+      cv.wait(lock, [&] { return !wake.in_flight("w"); });
+      released = true;
+    });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return parked; });
+    }
+    Check(!released, "the waiter stays parked while the refused upload is in flight");
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      wake.Finish(*wake_item);
+    }
+    cv.notify_all();
+    waiter.join();
+    Check(released, "the waiter is released when the in-flight upload finishes");
+  }
 }
 
 void TestHeldHitLayer() {

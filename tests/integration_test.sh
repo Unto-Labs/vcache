@@ -1837,40 +1837,89 @@ except Exception: sys.exit(1)
   kill "$S3PID" 2>/dev/null || true
   wait "$S3PID" 2>/dev/null || true
 
-  # No disk, and a cap the second value does not fit. The synchronous upload
-  # of that value has to be the one left in the bucket.
-  reset_cache
-  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-  S3DIR="$WORK/refuse-s3"
-  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
-  S3PID=$!
-  for _ in $(seq 1 50); do
-    python3 -c "
+  # One upload thread, so a slow put stays in flight or queued on purpose.
+  # A small body sleeps longer and is written when that sleep ends, so the
+  # last completion is the value left in the bucket.
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  export VCACHE_DISK=0
+  export VCACHE_TEST_MAX_HELD_BYTES=10
+  export VCACHE_DAEMON_UPLOAD_THREADS=1
+  export MOCK_S3_LATENCY_MS=200
+  export MOCK_S3_APPLY_AFTER_LATENCY=1
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  export MOCK_S3_SLOW_UNDER_EXTRA_MS=1500
+
+  start_order_s3() {  # $1 storage dir
+    S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+    S3DIR="$1"
+    python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+    S3PID=$!
+    for _ in $(seq 1 50); do
+      python3 -c "
 import socket,sys
 s=socket.socket()
 try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
 except Exception: sys.exit(1)
 " 2>/dev/null && break
-    sleep 0.1
-  done
-  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
-  export VCACHE_DISK=0
-  export VCACHE_TEST_MAX_HELD_BYTES=10
-  "$VCACHE" --start-daemon >/dev/null
+      sleep 0.05
+    done
+    export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+    reset_cache
+    "$VCACHE" --start-daemon >/dev/null
+  }
+  wait_started() {  # $1 path
+    local saw=0
+    for _ in $(seq 1 100); do
+      if [[ -f "$1" ]]; then saw=1; break; fi
+      sleep 0.05
+    done
+    echo "$saw"
+  }
+
+  # The worker is busy with the blocker, so the first victim value is queued.
+  start_order_s3 "$WORK/refuse-queued-s3"
   blocker_key=11111111111111111111111111111111
-  victim_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  queued_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   printf 'bbbb' | "$VCACHE" --test-put "$blocker_key"
-  printf 'v1v1' | "$VCACHE" --test-put "$victim_key"
-  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$victim_key"
+  blocker_obj="$S3DIR/${blocker_key:0:2}__${blocker_key:2}.started"
+  check "the blocker upload is in flight" "$(wait_started "$blocker_obj")" "1"
+  printf 'v1v1' | "$VCACHE" --test-put "$queued_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$queued_key"
   "$VCACHE" --stop-daemon >/dev/null
-  victim_obj="$S3DIR/${victim_key:0:2}__${victim_key:2}"
-  check "a refused re-put leaves the newer value in s3" \
-    "$(cat "$victim_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  queued_obj="$S3DIR/${queued_key:0:2}__${queued_key:2}"
+  check "a refused re-put of a queued value leaves the newer value in s3" \
+    "$(cat "$queued_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+
+  # Nothing else is queued, so the victim's own upload is the one in flight.
+  start_order_s3 "$WORK/refuse-flight-s3"
+  flight_key=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  printf 'v1v1' | "$VCACHE" --test-put "$flight_key"
+  flight_obj="$S3DIR/${flight_key:0:2}__${flight_key:2}"
+  check "the victim upload is in flight" "$(wait_started "$flight_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$flight_key" &
+  flight_put=$!
+  flight_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then flight_marked=1; break; fi
+    if ! kill -0 "$flight_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "a refused in-flight re-put is marked superseded" "$flight_marked" "1"
+  wait "$flight_put"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a refused re-put of an in-flight value leaves the newer value in s3" \
+    "$(cat "$flight_obj" 2>/dev/null)" "V2VALUE-0123456789"
   kill "$S3PID" 2>/dev/null || true
   wait "$S3PID" 2>/dev/null || true
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
-        VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES
+        VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES \
+        VCACHE_DAEMON_UPLOAD_THREADS MOCK_S3_LATENCY_MS \
+        MOCK_S3_APPLY_AFTER_LATENCY MOCK_S3_SLOW_UNDER_BYTES \
+        MOCK_S3_SLOW_UNDER_EXTRA_MS
 fi
 
 # --------------------------------------------------------------------------

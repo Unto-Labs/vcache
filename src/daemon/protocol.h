@@ -78,6 +78,10 @@ class Reader {
 // compilation produces.
 constexpr uint64_t kMaxFrame = 16ull << 30;
 
+// How long a client waits for one reply, and how long a refused re-put waits
+// for the upload it replaces. Longer than one S3 request including its retries.
+constexpr int kReplyTimeoutSeconds = 300;
+
 // Blocking whole-frame I/O on a stream socket. EINTR is retried.
 bool SendFrame(int fd, const std::string& body);
 bool RecvFrame(int fd, std::string* body);

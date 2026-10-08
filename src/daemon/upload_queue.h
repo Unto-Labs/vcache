@@ -63,6 +63,11 @@ class UploadQueue {
   // Returns 0 when the key is already in flight.
   uint64_t BeginSync(const std::string& key);
 
+  // A wait for the flight that is already in progress. Does not supersede
+  // that flight and does not pin a blob. Returns 0 when the key is not in
+  // flight.
+  uint64_t WatchFlight(const std::string& key);
+
   // The next item whose retry time has passed, or nullopt. Sets `soonest`
   // to the earliest retry when nothing is ready yet.
   std::optional<UploadItem> TakeReady(std::chrono::steady_clock::time_point now,

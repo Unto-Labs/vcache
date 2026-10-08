@@ -129,6 +129,14 @@ uint64_t UploadQueue::BeginSync(const std::string& key) {
   return gen;
 }
 
+uint64_t UploadQueue::WatchFlight(const std::string& key) {
+  const auto flight = in_flight_id_.find(key);
+  if (flight == in_flight_id_.end()) return 0;
+  const uint64_t id = next_refusal_id_++;
+  refusals_.emplace(id, FlightRefusal{key, flight->second, false});
+  return id;
+}
+
 bool UploadQueue::TakeRefusal(uint64_t refusal_id) {
   const auto it = refusals_.find(refusal_id);
   if (it == refusals_.end()) return false;

@@ -25,6 +25,7 @@ original single-threaded HTTP/1.0 server the tests were written against.
 
 import hashlib
 import os
+import signal
 import socket
 import sys
 import time
@@ -199,6 +200,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         if not self._check_headers(body):
             return
+        # 403 is a miss with no error string. A refused synchronous put must
+        # still count as a failed upload.
+        deny_min = int(os.environ.get("MOCK_S3_DENY_PUT_MIN_BYTES", "0") or "0")
+        if deny_min and len(body) >= deny_min:
+            self.send_error(403, "AccessDenied")
+            return
         path = self._object_path()
         if path is None:
             self.send_error(400, "bad key")
@@ -246,6 +253,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # A parent that ignores SIGTERM hands that disposition to this process.
+    # kill then does nothing, and the suite's wait sits on the pid.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
     global STORAGE
     port = int(sys.argv[1])
     STORAGE = sys.argv[2]

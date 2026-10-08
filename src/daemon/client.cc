@@ -33,7 +33,7 @@ constexpr std::time_t kStartRetrySeconds = 60;
 
 }  // namespace
 
-CompileSession::~CompileSession() {
+CompileSessionHandle::~CompileSessionHandle() {
   pollfd state{fd_, POLLIN, 0};
   if (::poll(&state, 1, 0) > 0) {
     std::string why = "daemon connection closed";
@@ -54,7 +54,7 @@ CompileSession::~CompileSession() {
   VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms");
 }
 
-std::unique_ptr<CompileSession> DaemonClient::OpenCompileSession(const core::Config& config) {
+std::unique_ptr<CompileSessionHandle> DaemonClient::OpenCompileSession(const core::Config& config) {
   if (config.daemon.mode == core::DaemonMode::kOff || config.read_only ||
       (!config.daemon.single_flight && !config.daemon.admission)) return nullptr;
   std::string why;
@@ -67,7 +67,8 @@ std::unique_ptr<CompileSession> DaemonClient::OpenCompileSession(const core::Con
       Reader in(reply);
       uint8_t status = 0;
       if (in.U8(&status) && status == static_cast<uint8_t>(Status::kOk) && in.done()) {
-        auto session = std::unique_ptr<CompileSession>(new CompileSession(client->fd_));
+        auto session =
+            std::unique_ptr<CompileSessionHandle>(new CompileSessionHandle(client->fd_));
         client->fd_ = -1;
         VCACHE_LOG("session: opened");
         return session;

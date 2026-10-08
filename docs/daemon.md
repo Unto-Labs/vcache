@@ -216,6 +216,11 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | status | — | ok + text |
 | shutdown | — | ok + failed-upload count + summary, once uploads have drained |
 | session open | —, immediately after hello | ok, holding this connection until compile completion |
+| any session op, or idle session | — | terminal error + "daemon shutting down" |
+
+Any session frame may be a terminal `error + "daemon shutting down"`. Shutdown
+sends this frame to idle sessions too, then closes their sockets. A terminal
+frame replaces a pending scheduling reply; clients continue locally.
 
 Get and Put use one connection per request. Protocol version 2 also supports
 **compile sessions**: one separate connection per cache miss when

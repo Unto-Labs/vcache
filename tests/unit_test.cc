@@ -4,6 +4,7 @@
 // build to plain make, as the plan asks.
 
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -1274,6 +1275,131 @@ void TestCompileSessions() {
     Check(::poll(&closed, 1, 1000) > 0, "Shutdown immediately closes the held session");
     ::close(fd);
   }
+}
+
+void TestCompileSessionShutdownRace() {
+  Section("daemon::session shutdown interleaving");
+  SessionDaemon server;
+  std::string reply;
+  const int held_fd = server.Open(&reply);
+  Check(held_fd >= 0 && reply == std::string(1, '\0'),
+        "shutdown-race holder opens a session");
+  int ready_pipe[2];
+  int open_pipe[2];
+  int result_pipe[2];
+  if (::pipe(ready_pipe) != 0 || ::pipe(open_pipe) != 0 || ::pipe(result_pipe) != 0) {
+    Check(false, "shutdown-race barriers can be created");
+    if (held_fd >= 0) ::close(held_fd);
+    return;
+  }
+  const pid_t opener_pid = ::fork();
+  if (opener_pid == 0) {
+    ::close(ready_pipe[0]);
+    ::close(open_pipe[1]);
+    ::close(result_pipe[0]);
+    if (held_fd >= 0) ::close(held_fd);
+    std::string child_reply;
+    const int child_fd = server.Hello(daemon::kProtocolVersion, &child_reply);
+    const char ready = child_fd >= 0 ? 'R' : 'E';
+    ::write(ready_pipe[1], &ready, 1);
+    pollfd open_gate{open_pipe[0], POLLIN, 0};
+    char open = 0;
+    bool refused = false;
+    if (child_fd >= 0 && ::poll(&open_gate, 1, 2000) > 0 &&
+        ::read(open_pipe[0], &open, 1) == 1) {
+      daemon::Writer request;
+      request.U8(static_cast<uint8_t>(daemon::Op::kSessionOpen));
+      if (daemon::SendFrame(child_fd, request.data()) &&
+          daemon::RecvFrame(child_fd, &child_reply)) {
+        daemon::Reader in(child_reply);
+        uint8_t status = 0;
+        std::string reason;
+        refused = in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kError) &&
+                  in.Str(&reason) && reason == "daemon shutting down" && in.done();
+      }
+      ::close(child_fd);
+    }
+    const char outcome = refused ? 'R' : 'E';
+    ::write(result_pipe[1], &outcome, 1);
+    ::_exit(refused ? 0 : 1);
+  }
+  ::close(ready_pipe[1]);
+  ::close(open_pipe[0]);
+  ::close(result_pipe[1]);
+  pollfd ready{ready_pipe[0], POLLIN, 0};
+  char code = 0;
+  const bool opener_ready = opener_pid > 0 && ::poll(&ready, 1, 2000) > 0 &&
+                            ::read(ready_pipe[0], &code, 1) == 1 && code == 'R';
+  Check(opener_ready, "shutdown-race opener completes hello before SIGTERM");
+  if (server.pid > 0) ::kill(server.pid, SIGTERM);
+  bool terminal_received = false;
+  if (held_fd >= 0 && daemon::RecvFrame(held_fd, &reply)) {
+    daemon::Reader in(reply);
+    uint8_t status = 0;
+    std::string reason;
+    terminal_received = in.U8(&status) &&
+                        status == static_cast<uint8_t>(daemon::Status::kError) &&
+                        in.Str(&reason) && reason == "daemon shutting down" && in.done();
+  }
+  Check(terminal_received, "SIGTERM broadcasts a terminal session frame before the late open");
+  const char open = 'O';
+  if (opener_ready) ::write(open_pipe[1], &open, 1);
+  pollfd result{result_pipe[0], POLLIN, 0};
+  const bool refused = ::poll(&result, 1, 1000) > 0 &&
+                       ::read(result_pipe[0], &code, 1) == 1 && code == 'R';
+  Check(refused, "session open after SIGTERM broadcast replies daemon shutting down within 1 s");
+  if (held_fd >= 0) ::close(held_fd);
+  for (int fd : {ready_pipe[0], open_pipe[1], result_pipe[0]}) ::close(fd);
+  if (opener_pid > 0) {
+    const bool exited = PollUntil(
+        [&] { return ::waitpid(opener_pid, nullptr, WNOHANG) == opener_pid; }, 1000);
+    if (!exited) {
+      ::kill(opener_pid, SIGKILL);
+      ::waitpid(opener_pid, nullptr, 0);
+    }
+  }
+}
+
+void TestCompileSessionStalledSend() {
+  Section("daemon::session send isolation");
+  SessionDaemon server;
+  std::string reply;
+  const int held_fd = server.Open(&reply);
+  if (held_fd < 0 || reply != std::string(1, '\0')) {
+    Check(false, "send-isolation holder opens a session");
+    if (held_fd >= 0) ::close(held_fd);
+    return;
+  }
+  std::string flood;
+  daemon::Writer request;
+  request.U8(static_cast<uint8_t>(daemon::Op::kSessionOpen));
+  daemon::Writer header;
+  header.U64(request.data().size());
+  for (int i = 0; i < 4096; ++i) flood.append(header.data() + request.data());
+  size_t flood_offset = 0;
+  bool queued_requests = false;
+  const bool stalled = PollUntil([&] {
+    int send_flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t sent = ::send(held_fd, flood.data() + flood_offset,
+                                flood.size() - flood_offset, send_flags);
+    if (sent > 0) flood_offset = (flood_offset + static_cast<size_t>(sent)) % flood.size();
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) queued_requests = true;
+    int unread_bytes = 0;
+    ::ioctl(held_fd, FIONREAD, &unread_bytes);
+    return queued_requests && unread_bytes >= 2048;
+  }, 500);
+  Check(stalled, "session peer stops reading until its replies fill the socket");
+  const auto started = std::chrono::steady_clock::now();
+  const bool responsive = server.Sessions(1);
+  Check(responsive && std::chrono::steady_clock::now() - started <
+                          std::chrono::milliseconds(250),
+        "a stalled session send leaves separate status requests responsive within 250 ms");
+  ::close(held_fd);
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "stalled-send session closes with compile sessions 0");
 }
 
 void TestHasher() {
@@ -2649,6 +2775,8 @@ int main() {
   TestCacheChainRemote();
   TestDaemonProtocol();
   TestCompileSessions();
+  TestCompileSessionShutdownRace();
+  TestCompileSessionStalledSend();
   TestHasher();
   TestSha256();
   TestLinkArgs();

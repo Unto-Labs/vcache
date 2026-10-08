@@ -135,9 +135,50 @@ struct Upload {
 };
 
 struct CompileSession {
-  int fd;
-  pid_t client_pid;
-  Clock::time_point opened_at;
+  CompileSession(int client_fd, pid_t peer_pid)
+      : fd(client_fd), client_pid(peer_pid), opened_at(Clock::now()) {}
+  ~CompileSession() { ::close(fd); }
+
+  bool Reply(const std::string& reply) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    if (terminal_frame_sent_) return false;
+    if (closing.load()) {
+      SendTerminalFrame();
+      return false;
+    }
+    const bool sent = SendFrame(fd, reply);
+    if (!sent) {
+      closing.store(true);
+      ::shutdown(fd, SHUT_RDWR);
+    }
+    return sent;
+  }
+
+  void Shutdown() {
+    closing.store(true);
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    SendTerminalFrame();
+  }
+
+  const int fd;
+  const pid_t client_pid;
+  const Clock::time_point opened_at;
+  std::atomic<bool> closing{false};
+
+ private:
+  void SendTerminalFrame() {
+    if (terminal_frame_sent_) return;
+    terminal_frame_sent_ = true;
+    Writer out;
+    out.U8(static_cast<uint8_t>(Status::kError));
+    out.Str("daemon shutting down");
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    SendFrame(fd, out.data());
+    ::shutdown(fd, SHUT_RDWR);
+  }
+
+  std::mutex send_mutex_;
+  bool terminal_frame_sent_ = false;
 };
 
 class Server {
@@ -202,7 +243,7 @@ class Server {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::set<int> connections_;
-  std::map<int, CompileSession> sessions_;
+  std::map<int, std::shared_ptr<CompileSession>> sessions_;
   int shutdown_waiters_ = 0;
   Clock::time_point last_activity_ = Clock::now();
   std::atomic<bool> stop_requested_{false};
@@ -679,7 +720,7 @@ void Server::Serve(int fd) {
   bool ok = RecvFrame(fd, &request) && HandleHello(request, &reply);
   SendFrame(fd, reply);
   bool first_request = true;
-  bool compile_session = false;
+  std::shared_ptr<CompileSession> compile_session;
 
   while (ok && RecvFrame(fd, &request)) {
     {
@@ -693,8 +734,7 @@ void Server::Serve(int fd) {
     if (compile_session && op != static_cast<uint8_t>(Op::kSessionOpen)) {
       out.U8(static_cast<uint8_t>(Status::kError));
       out.Str("unknown compile session request");
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!stop_requested_.load()) SendFrame(fd, out.data());
+      compile_session->Reply(out.data());
       break;
     }
     switch (static_cast<Op>(op)) {
@@ -709,7 +749,7 @@ void Server::Serve(int fd) {
 #endif
         bool pid_already_open = false;
         for (const auto& [session_fd, session] : sessions_) {
-          if (client_pid > 0 && session.client_pid == client_pid) pid_already_open = true;
+          if (client_pid > 0 && session->client_pid == client_pid) pid_already_open = true;
         }
         if (!first_request || !in.done() || stop_requested_.load() || pid_already_open) {
           out.U8(static_cast<uint8_t>(Status::kError));
@@ -717,10 +757,10 @@ void Server::Serve(int fd) {
                   pid_already_open ? "pid already holds a compile session" :
                                      "session open requires a fresh connection");
         } else {
-          sessions_.emplace(fd, CompileSession{fd, client_pid, Clock::now()});
+          compile_session = std::make_shared<CompileSession>(fd, client_pid);
+          sessions_.emplace(fd, compile_session);
           timeval send_timeout{1, 0};
           ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
-          compile_session = true;
           out.U8(static_cast<uint8_t>(Status::kOk));
           VCACHE_LOG("session: opened for pid " + std::to_string(client_pid));
         }
@@ -742,8 +782,7 @@ void Server::Serve(int fd) {
     request.shrink_to_fit();
     first_request = false;
     if (compile_session) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (stop_requested_.load() || !SendFrame(fd, out.data())) break;
+      if (!compile_session->Reply(out.data())) break;
     } else if (!SendFrame(fd, out.data())) {
       break;
     }
@@ -753,13 +792,13 @@ void Server::Serve(int fd) {
   const auto session = sessions_.find(fd);
   if (session != sessions_.end()) {
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - session->second.opened_at).count();
+        Clock::now() - session->second->opened_at).count();
     VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms for pid " +
-               std::to_string(session->second.client_pid));
+               std::to_string(session->second->client_pid));
     sessions_.erase(session);
   }
   connections_.erase(fd);
-  ::close(fd);
+  if (!compile_session) ::close(fd);
   last_activity_ = Clock::now();
   cv_.notify_all();
 }
@@ -767,8 +806,7 @@ void Server::Serve(int fd) {
 bool Server::Idle() const {
   if (config_.daemon.idle_timeout_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!sessions_.empty() || connections_.size() > sessions_.size() ||
-      !queue_.empty() || in_flight_ != 0) return false;
+  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
   return Clock::now() - last_activity_ >
          std::chrono::seconds(config_.daemon.idle_timeout_seconds);
 }
@@ -790,6 +828,15 @@ bool PeerIsSelf(int fd) {
 }
 
 void Server::Shutdown() {
+  std::vector<std::shared_ptr<CompileSession>> closing_sessions;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stop_requested_.store(true);
+    for (const auto& [session_fd, session] : sessions_) {
+      session->closing.store(true);
+      closing_sessions.push_back(session);
+    }
+  }
   ::close(listen_fd_);
   listen_fd_ = -1;
   struct stat st;
@@ -797,15 +844,9 @@ void Server::Shutdown() {
     ::unlink(socket_path_.c_str());
   }
 
+  for (const auto& session : closing_sessions) session->Shutdown();
+  closing_sessions.clear();
   std::unique_lock<std::mutex> lock(mutex_);
-  for (const auto& [session_fd, session] : sessions_) {
-    Writer out;
-    out.U8(static_cast<uint8_t>(Status::kError));
-    out.Str("daemon shutting down");
-    ::fcntl(session_fd, F_SETFL, ::fcntl(session_fd, F_GETFL) | O_NONBLOCK);
-    SendFrame(session_fd, out.data());
-    ::shutdown(session_fd, SHUT_RDWR);
-  }
   // Let compiles that are mid-request finish; a stuck one is cut off rather
   // than allowed to hold the daemon open. The shutdown requesters are
   // connections too, and they are waiting on us.

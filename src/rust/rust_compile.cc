@@ -13,6 +13,7 @@
 #include "core/cost.h"
 #include "core/depfile.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "rust/rust_manifest.h"
 #include "storage/storage.h"
@@ -582,7 +583,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
     StoreManifest(cache, manifest_key, fresh, states, cache_dir, &media_failed);
   };
 
-  if (!config.recache && cache != nullptr) {
+  const auto try_entry_hit = [&]() {
+    if (cache == nullptr) return false;
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
@@ -590,14 +592,26 @@ int RunRustCompile(const std::vector<std::string>& argv,
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
-        return 0;
+        return true;
       }
       VCACHE_LOG("rust: unusable cache entry; recompiling");
     }
-  }
-  core::RecordCounter(cache_dir, Counter::kMiss);
+    return false;
+  };
+  if (!config.recache && try_entry_hit()) return 0;
 
   // ---- miss: compile into a staging directory -----------------------------
+
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
+  if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
+    if (outcome != daemon::LeaseOutcome::kCompile && try_entry_hit()) {
+      session->ReleaseLease(true);
+      return 0;
+    }
+  }
+  core::RecordCounter(cache_dir, Counter::kMiss);
 
   const std::string stage_dir = *temp_dir + "/out";
   if (!util::MakeDirs(stage_dir)) {
@@ -617,7 +631,16 @@ int RunRustCompile(const std::vector<std::string>& argv,
   cmd.push_back(parsed.source);
 
   VCACHE_LOG("rust compile: " + util::Join(cmd, " "));
-  util::ProcResult compiled = util::Run(cmd, {.capture_stderr = true});
+  util::ProcOptions compile_options{.capture_stderr = true};
+  if (session && config.daemon.admission) {
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
+    compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+  } else if (config.daemon.admission && !config.read_only &&
+             config.daemon.mode != core::DaemonMode::kOff) {
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
+  util::ProcResult compiled = util::Run(cmd, compile_options);
   core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
                           compiled);
 
@@ -671,6 +694,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  if (session) session->ReleaseLease(put.stored);
   media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     core::RecordCounter(cache_dir, Counter::kStored);

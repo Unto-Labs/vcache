@@ -3,14 +3,45 @@
 // The compile's side of the daemon connection.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "core/config.h"
+#include "daemon/protocol.h"
 #include "storage/chain.h"
 
 namespace vcache::daemon {
+
+uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms);
+uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms);
+uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key);
+uint64_t MemoryEstimateKb(const core::Config& config, const std::string& cost_key, bool link);
+
+class CompileSessionHandle {
+ public:
+  ~CompileSessionHandle();
+  CompileSessionHandle(const CompileSessionHandle&) = delete;
+  CompileSessionHandle& operator=(const CompileSessionHandle&) = delete;
+  LeaseOutcome AcquireLease(const std::string& key, uint64_t bound_ms);
+  void ReleaseLease(bool stored);
+  bool ReserveMemory(const std::string& cost_key, uint64_t estimate_kb,
+                     uint64_t bound_ms = kMemoryWaitBoundMs);
+  void CompilerSpawned(int pid);
+
+ private:
+  friend class DaemonClient;
+  explicit CompileSessionHandle(int fd) : fd_(fd) {}
+  bool Request(const std::string& request, std::string* reply, std::string* refusal = nullptr);
+  void Unavailable(const std::string& why);
+
+  int fd_;
+  std::string leased_key_;
+  bool memory_reserved_ = false;
+  const std::chrono::steady_clock::time_point opened_at_ = std::chrono::steady_clock::now();
+};
 
 class DaemonClient : public storage::RemoteCache {
  public:
@@ -20,6 +51,7 @@ class DaemonClient : public storage::RemoteCache {
   // when there is one that refuses this client, with the reason in `why`.
   static std::unique_ptr<DaemonClient> Connect(const core::Config& config,
                                                std::string* why);
+  static std::unique_ptr<CompileSessionHandle> OpenCompileSession(const core::Config& config);
 
   std::string Name() const override { return "daemon"; }
   bool Get(const std::string& key, storage::GetResult* result) override;
@@ -37,10 +69,8 @@ class DaemonClient : public storage::RemoteCache {
  private:
   DaemonClient() = default;
 
-  // One request, one reply. Each op uses its own connection: a compile spends
-  // nearly all its life running the compiler between its lookup and its
-  // store, and a connection held open across that would keep a daemon that
-  // is trying to shut down waiting on a compile.
+  // Cache requests use separate connections so waiting on a compile session
+  // never prevents a lookup or store.
   bool RoundTrip(const std::string& request, std::string* reply,
                  int timeout_seconds);
   bool Open(std::string* why);

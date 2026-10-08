@@ -16,6 +16,7 @@
 #include "core/cost.h"
 #include "core/link_trace.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -322,7 +323,8 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   bool media_failed = false;
   std::vector<LinkManifestEntry> entries;
-  if (cache != nullptr) {
+  const auto load_entries = [&]() {
+    if (cache == nullptr) return;
     storage::GetResult got = cache->Get(pre_key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     storage::Blob manifest_blob;
@@ -332,9 +334,11 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       VCACHE_LOG("link: manifest did not parse; starting a new one");
       entries.clear();
     }
-  }
+  };
+  load_entries();
 
-  if (!config.recache && cache != nullptr) {
+  const auto try_link_hit = [&]() {
+    if (cache == nullptr) return false;
     for (const LinkManifestEntry& e : entries) {
       if (!LinkManifestStillHolds(e, roots)) continue;
       storage::GetResult result = cache->Get(e.result_key);
@@ -351,9 +355,25 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       VCACHE_LOG("link hit on " + result.layer);
       RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
                                                     : Counter::kHitDisk);
-      return media_failed && config.error_on_cache_media_failure
-                 ? kCacheMediaFailureExit
-                 : 0;
+      return true;
+    }
+    return false;
+  };
+  if (!config.recache && try_link_hit()) {
+    return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+  }
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
+  if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
+    const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(pre_key,
+        daemon::LeaseWaitBoundMs(cache_dir, cost_key));
+    if (outcome != daemon::LeaseOutcome::kCompile) {
+      entries.clear();
+      load_entries();
+      if (try_link_hit()) {
+        session->ReleaseLease(true);
+        return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+      }
     }
   }
   RecordCounter(cache_dir, Counter::kMiss);
@@ -375,6 +395,14 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
   opts.env.emplace_back("LD_PRELOAD", tracer);
+  if (session && config.daemon.admission) {
+    const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
+    session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, true));
+    opts.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+  } else if (config.daemon.admission && !config.read_only &&
+             config.daemon.mode != DaemonMode::kOff) {
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
   util::ProcResult result = util::Run(argv, opts);
   // Same rule as a compile: a link that dies is still a sample, and -flto's
   // figure is whatever wait4 reported for the largest waited-for child.
@@ -506,6 +534,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       manifest_blob.has_dep_manifest = true;
       storage::PutResult mput =
           cache->Put(pre_key, storage::SerializeBlob(manifest_blob));
+      if (session) session->ReleaseLease(mput.stored);
       media_failed |= ReportCacheMediaErrors(mput.errors, cache_dir);
       RecordCounter(cache_dir, Counter::kStored);
     } else {

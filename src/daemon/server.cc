@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -26,13 +27,17 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "daemon/protocol.h"
+#include "core/cost.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
 #include "storage/s3_storage.h"
@@ -134,7 +139,126 @@ struct Counters {
   std::atomic<uint64_t> uploads_skipped{0};
   std::atomic<uint64_t> upload_bytes{0};
   std::atomic<uint64_t> uploads_recovered{0};
+  std::atomic<uint64_t> leases_expired{0};
+  std::atomic<uint64_t> compiles_deduplicated{0};
 };
+
+struct CompileSession {
+  CompileSession(int client_fd, pid_t peer_pid)
+      : fd(client_fd), client_pid(peer_pid), opened_at(Clock::now()) {}
+  ~CompileSession() { ::close(fd); }
+
+  bool Reply(const std::string& reply) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    if (terminal_frame_sent_) return false;
+    if (closing.load()) {
+      SendTerminalFrame();
+      return false;
+    }
+    const bool sent = SendFrame(fd, reply);
+    if (!sent) {
+      closing.store(true);
+      ::shutdown(fd, SHUT_RDWR);
+    }
+    return sent;
+  }
+
+  void Shutdown() {
+    closing.store(true);
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    SendTerminalFrame();
+  }
+
+  const int fd;
+  const pid_t client_pid;
+  const Clock::time_point opened_at;
+  std::atomic<bool> closing{false};
+
+ private:
+  void SendTerminalFrame() {
+    if (terminal_frame_sent_) return;
+    terminal_frame_sent_ = true;
+    Writer out;
+    out.U8(static_cast<uint8_t>(Status::kError));
+    out.Str("daemon shutting down");
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    SendFrame(fd, out.data());
+    ::shutdown(fd, SHUT_RDWR);
+  }
+
+  std::mutex send_mutex_;
+  bool terminal_frame_sent_ = false;
+};
+
+struct LeaseWait {
+  std::weak_ptr<CompileSession> holder;
+  pid_t holder_pid = 0;
+  Clock::time_point acquired_at = Clock::now();
+  std::set<int> waiters;
+  size_t stores_in_progress = 0;
+  std::optional<LeaseOutcome> outcome;
+  LeaseCompileReason reason = LeaseCompileReason::kNone;
+  std::condition_variable changed;
+};
+
+struct CacheFetch {
+  std::atomic<bool> done{false};
+  bool hit = false;
+  std::string value;
+  std::vector<std::string> errors;
+  std::condition_variable changed;
+};
+
+struct KeyLease {
+  std::shared_ptr<LeaseWait> compile;
+  std::shared_ptr<CacheFetch> fetch;
+};
+
+struct MemoryReservation {
+  ~MemoryReservation() { if (pid_fd >= 0) ::close(pid_fd); }
+  std::weak_ptr<CompileSession> session;
+  uint64_t estimate_kb = 0;
+  uint64_t rss_kb = 0;
+  pid_t compiler_pid = 0;
+  int pid_fd = -1;
+  std::optional<Clock::time_point> fallback_started;
+};
+
+struct MemoryWait {
+  std::shared_ptr<CompileSession> session;
+  uint64_t estimate_kb = 0;
+  Clock::time_point started = Clock::now();
+  std::optional<Clock::time_point> queued_deadline;
+  std::optional<MemoryOutcome> outcome;
+  std::condition_variable changed;
+};
+
+uint64_t AddKb(uint64_t left, uint64_t right) {
+  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
+
+std::optional<uint64_t> StatusNumber(const std::string& text, const std::string& field) {
+  std::istringstream lines(text);
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream columns(line);
+    std::string name, number;
+    if (!(columns >> name >> number) || name != field + ":") continue;
+    uint64_t value = 0;
+    const auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
+    if (parsed.ec == std::errc{} && parsed.ptr == number.data() + number.size()) return value;
+  }
+  return std::nullopt;
+}
+
+bool SessionGone(const CompileSession& session) {
+  if (session.closing.load()) return true;
+  pollfd peer{session.fd, POLLIN, 0};
+  if (::poll(&peer, 1, 0) <= 0) return false;
+  char byte;
+  return ::recv(session.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0 ||
+         (peer.revents & (POLLHUP | POLLERR | POLLNVAL));
+}
 
 class Server {
  public:
@@ -157,7 +281,24 @@ class Server {
   void Serve(int fd);
   bool HandleHello(const std::string& request, std::string* reply);
   void HandleGet(Reader* in, Writer* out);
-  void HandlePut(Reader* in, Writer* out);
+  std::shared_ptr<CacheFetch> FetchKey(const std::string& key);
+  void HandlePut(Reader* in, Writer* out, pid_t peer_pid);
+  bool AwaitTestPut(const std::string& key);
+  void HandleLeaseAcquire(Reader* in, Writer* out,
+                          const std::shared_ptr<CompileSession>& session);
+  void HandleLeaseRelease(Reader* in, Writer* out,
+                          const std::shared_ptr<CompileSession>& session);
+  void CompleteLease(const std::string& key, LeaseOutcome outcome, LeaseCompileReason reason);
+  void ExpireLeases(const std::shared_ptr<CompileSession>& session);
+  void HandleMemoryReserve(Reader* in, Writer* out,
+                           const std::shared_ptr<CompileSession>& session);
+  void HandleCompilerSpawned(Reader* in, Writer* out,
+                             const std::shared_ptr<CompileSession>& session);
+  void UpdateAdmission();
+  void GrantMemoryWaiters();
+  void AdmissionWorker();
+  uint64_t UnrealisedKb() const;
+  uint64_t AvailableKb() const;
   void HandleShutdown(Writer* out);
   std::string StatusText();
 
@@ -204,6 +345,17 @@ class Server {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::set<int> connections_;
+  std::map<int, std::shared_ptr<CompileSession>> sessions_;
+  std::map<std::string, KeyLease> leases_;
+  std::map<int, std::shared_ptr<MemoryReservation>> reservations_;
+  std::deque<std::shared_ptr<MemoryWait>> memory_waiters_;
+  uint64_t mem_available_kb_ = 0;
+  Clock::time_point meminfo_read_at_{};
+  Clock::time_point rss_read_at_{};
+  uint64_t reserve_waits_ = 0;
+  uint64_t longest_reserve_wait_ms_ = 0;
+  std::thread admission_worker_;
+  bool test_put_blocked_ = false;
   int shutdown_waiters_ = 0;
   Clock::time_point last_activity_ = Clock::now();
   std::atomic<bool> stop_requested_{false};
@@ -501,6 +653,368 @@ bool Server::HandleHello(const std::string& request, std::string* reply) {
   return true;
 }
 
+void Server::CompleteLease(const std::string& key, LeaseOutcome outcome,
+                            LeaseCompileReason reason) {
+  auto found = leases_.find(key);
+  if (found == leases_.end()) return;
+  auto lease = found->second.compile;
+  if (lease && !lease->outcome) {
+    lease->outcome = outcome;
+    lease->reason = reason;
+    lease->changed.notify_all();
+    found->second.compile.reset();
+  }
+  if (!found->second.compile && !found->second.fetch) {
+    leases_.erase(found);
+  }
+}
+
+void Server::ExpireLeases(const std::shared_ptr<CompileSession>& session) {
+  std::vector<std::string> held_keys;
+  for (const auto& [key, state] : leases_) {
+    // A Put already accepted on another connection decides the result even
+    // if its holder is killed before storage finishes.
+    if (state.compile && state.compile->holder.lock() == session &&
+        state.compile->stores_in_progress == 0) {
+      held_keys.push_back(key);
+    }
+  }
+  for (const auto& key : held_keys) {
+    counters_.leases_expired++;
+    CompleteLease(key, LeaseOutcome::kCompile, LeaseCompileReason::kHolderGone);
+  }
+}
+
+void Server::HandleLeaseAcquire(Reader* in, Writer* out,
+                                const std::shared_ptr<CompileSession>& session) {
+  std::string key;
+  uint64_t bound_ms = 0;
+  if (!session || config_.read_only ||
+      !in->Str(&key) || !ValidKey(key) || !in->U64(&bound_ms) || !in->done()) {
+    out->U8(static_cast<uint8_t>(Status::kError));
+    out->Str("invalid lease acquire");
+    return;
+  }
+  bound_ms = std::min<uint64_t>(bound_ms, kReplyTimeoutSeconds * 1000);
+  const auto started = Clock::now();
+  const auto deadline = started + std::chrono::milliseconds(bound_ms);
+  std::unique_lock<std::mutex> lock(mutex_);
+  LeaseOutcome outcome = LeaseOutcome::kCompile;
+  LeaseCompileReason reason = LeaseCompileReason::kShutdown;
+  uint64_t holder_pid = 0;
+  if (!stop_requested_.load()) {
+    auto& state = leases_[key];
+    if (!state.compile) {
+      state.compile = std::make_shared<LeaseWait>();
+      state.compile->holder = session;
+      state.compile->holder_pid = session->client_pid;
+    }
+    auto lease = state.compile;
+    const auto holder = lease->holder.lock();
+    holder_pid = lease->holder_pid;
+    if (holder == session) {
+      outcome = LeaseOutcome::kGranted;
+      reason = LeaseCompileReason::kNone;
+    } else {
+      lease->waiters.insert(session->fd);
+      VCACHE_LOG("lease: waiting on holder pid " + std::to_string(holder_pid) + " up to " +
+                 std::to_string(bound_ms) + " ms");
+      bool waiter_gone = false;
+      while (!lease->outcome && !stop_requested_.load() && Clock::now() < deadline) {
+        lease->changed.wait_until(lock, std::min(deadline,
+                                      Clock::now() + std::chrono::milliseconds(250)));
+        if (lease->outcome || stop_requested_.load()) break;
+        lock.unlock();
+        pollfd peer{session->fd, POLLIN, 0};
+        if (::poll(&peer, 1, 0) > 0) {
+          char byte;
+          if (::recv(session->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0 ||
+              (peer.revents & (POLLHUP | POLLERR | POLLNVAL))) waiter_gone = true;
+        }
+        lock.lock();
+        if (waiter_gone) break;
+      }
+      lease->waiters.erase(session->fd);
+      if (lease->outcome) {
+        outcome = *lease->outcome;
+        reason = lease->reason;
+        if (outcome == LeaseOutcome::kStored) counters_.compiles_deduplicated++;
+      } else {
+        reason = stop_requested_.load() ? LeaseCompileReason::kShutdown : LeaseCompileReason::kBound;
+      }
+      const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          Clock::now() - started).count();
+      VCACHE_LOG("lease: wait ended after " + std::to_string(waited_ms) + " ms");
+      if (waiter_gone) VCACHE_LOG("lease: waiter gone after " + std::to_string(waited_ms) + " ms");
+    }
+  }
+  out->U8(static_cast<uint8_t>(Status::kOk));
+  out->U8(static_cast<uint8_t>(outcome));
+  out->U8(static_cast<uint8_t>(reason));
+  out->U64(holder_pid);
+  out->U64(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
+}
+
+void Server::HandleLeaseRelease(Reader* in, Writer* out,
+                                const std::shared_ptr<CompileSession>& session) {
+  std::string key;
+  uint8_t outcome = 0;
+  if (!session || !in->Str(&key) || !ValidKey(key) ||
+      !in->U8(&outcome) || outcome > 1 || !in->done()) {
+    out->U8(static_cast<uint8_t>(Status::kError));
+    out->Str("invalid lease release");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = leases_.find(key);
+  if (found != leases_.end() && found->second.compile &&
+      found->second.compile->holder.lock() != session) {
+    out->U8(static_cast<uint8_t>(Status::kError));
+    out->Str("lease held by another session");
+    return;
+  }
+  CompleteLease(key, outcome == 0 ? LeaseOutcome::kStored : LeaseOutcome::kCompile,
+                 outcome == 0 ? LeaseCompileReason::kNone : LeaseCompileReason::kHolderFailed);
+  out->U8(static_cast<uint8_t>(Status::kOk));
+}
+
+uint64_t Server::UnrealisedKb() const {
+  uint64_t unrealised_kb = 0;
+  for (const auto& [fd, reservation] : reservations_) {
+    unrealised_kb = AddKb(unrealised_kb, reservation->estimate_kb -
+        std::min(reservation->estimate_kb, reservation->rss_kb));
+  }
+  return unrealised_kb;
+}
+
+uint64_t Server::AvailableKb() const {
+  return mem_available_kb_ - std::min(mem_available_kb_, UnrealisedKb());
+}
+
+void Server::UpdateAdmission() {
+  const auto now = Clock::now();
+  if (now - meminfo_read_at_ >= std::chrono::seconds(1)) {
+    const char* test_path = std::getenv("VCACHE_DAEMON_MEMINFO");
+    const std::string path = test_path && *test_path ? test_path : "/proc/meminfo";
+    mem_available_kb_ = StatusNumber(util::ReadFile(path).value_or(""),
+                                    "MemAvailable").value_or(0);
+    meminfo_read_at_ = now;
+  }
+  const bool sample_rss = now - rss_read_at_ >= std::chrono::milliseconds(500);
+  for (auto found = reservations_.begin(); found != reservations_.end();) {
+    auto& reservation = *found->second;
+    const auto session = reservation.session.lock();
+    pollfd exited{reservation.pid_fd, POLLIN, 0};
+    const bool compiler_exited = reservation.pid_fd >= 0 && ::poll(&exited, 1, 0) > 0;
+    if (!session || SessionGone(*session) || compiler_exited) {
+      found = reservations_.erase(found);
+      continue;
+    }
+    if (sample_rss && reservation.compiler_pid > 0) {
+      if (reservation.fallback_started) {
+        if (now - *reservation.fallback_started >= std::chrono::seconds(10)) {
+          reservation.rss_kb = reservation.estimate_kb;
+        }
+      } else {
+        const auto status = util::ReadFile("/proc/" + std::to_string(reservation.compiler_pid) +
+                                          "/status");
+        if (status) {
+          if (auto rss = StatusNumber(*status, "VmRSS")) reservation.rss_kb = *rss;
+        }
+      }
+      VCACHE_LOG("reserve: " + std::to_string(reservation.compiler_pid) + " rss " +
+                 std::to_string(reservation.rss_kb) + " of " +
+                 std::to_string(reservation.estimate_kb));
+      if (reservation.rss_kb > reservation.estimate_kb) {
+        VCACHE_LOG("reserve: rss overshoot " + std::to_string(reservation.compiler_pid) + " by " +
+                   std::to_string(reservation.rss_kb - reservation.estimate_kb) + " kB");
+      }
+    }
+    ++found;
+  }
+  if (sample_rss) rss_read_at_ = now;
+  GrantMemoryWaiters();
+}
+
+void Server::GrantMemoryWaiters() {
+  while (!memory_waiters_.empty() && !stop_requested_.load()) {
+    auto waiter = memory_waiters_.front();
+    const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - waiter->started).count();
+    const bool gone = SessionGone(*waiter->session);
+    const bool expired = waiter->queued_deadline && Clock::now() >= *waiter->queued_deadline;
+    if (gone || expired) {
+      memory_waiters_.pop_front();
+      waiter->outcome = MemoryOutcome::kBound;
+      VCACHE_LOG(std::string("reserve: ") + (gone ? "waiter gone after " :
+                 "wait bound reached after ") + std::to_string(waited_ms) + " ms");
+      waiter->changed.notify_all();
+      continue;
+    }
+    const uint64_t available_kb = AvailableKb();
+    if (!reservations_.empty() && available_kb < waiter->estimate_kb) break;
+    auto reservation = std::make_shared<MemoryReservation>();
+    reservation->session = waiter->session;
+    reservation->estimate_kb = waiter->estimate_kb;
+    VCACHE_LOG("reserve: granted " + std::to_string(waiter->estimate_kb) + " kB after " +
+               std::to_string(waited_ms) + " ms (available " + std::to_string(available_kb) +
+               ", unrealised " + std::to_string(UnrealisedKb()) + ")");
+    reservations_.emplace(waiter->session->fd, std::move(reservation));
+    memory_waiters_.pop_front();
+    waiter->outcome = MemoryOutcome::kGranted;
+    waiter->changed.notify_all();
+  }
+}
+
+void Server::HandleMemoryReserve(Reader* in, Writer* out,
+                                 const std::shared_ptr<CompileSession>& session) {
+  std::string cost_key;
+  uint64_t estimate_kb = 0, bound_ms = 0;
+  if (!session || config_.read_only ||
+      !in->Str(&cost_key) || !ValidKey(cost_key) || !in->U64(&estimate_kb) ||
+      !in->U64(&bound_ms) || !in->done()) {
+    out->U8(static_cast<uint8_t>(Status::kError));
+    out->Str("invalid memory reserve");
+    return;
+  }
+  if (estimate_kb == 0) {
+    const auto cost = core::LoadCompileCost(config_.disk.dir, cost_key);
+    estimate_kb = cost.operation == "link" ? config_.daemon.default_link_kb :
+                                           config_.daemon.default_compile_kb;
+  }
+  auto waiter = std::make_shared<MemoryWait>();
+  waiter->session = session;
+  waiter->estimate_kb = estimate_kb;
+  const auto max_bound_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      Clock::time_point::max() - waiter->started).count();
+  const auto deadline = waiter->started + std::chrono::milliseconds(
+      std::min<uint64_t>(bound_ms, max_bound_ms));
+  std::unique_lock<std::mutex> lock(mutex_);
+  UpdateAdmission();
+  if (!admission_worker_.joinable()) {
+    admission_worker_ = std::thread([this] { AdmissionWorker(); });
+  }
+  if (reservations_.contains(session->fd)) {
+    waiter->outcome = MemoryOutcome::kGranted;
+  } else {
+    const size_t behind = memory_waiters_.size();
+    memory_waiters_.push_back(waiter);
+    GrantMemoryWaiters();
+    if (!waiter->outcome) {
+      waiter->queued_deadline = deadline;
+      ++reserve_waits_;
+      VCACHE_LOG("reserve: waiting (" + std::to_string(AvailableKb()) + " < " +
+                 std::to_string(estimate_kb) + ") behind " + std::to_string(behind));
+    }
+  }
+  waiter->changed.wait_until(lock, deadline,
+      [&] { return waiter->outcome || stop_requested_.load(); });
+  const uint64_t waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      Clock::now() - waiter->started).count();
+  longest_reserve_wait_ms_ = std::max(longest_reserve_wait_ms_, waited_ms);
+  if (!waiter->outcome) {
+    waiter->outcome = MemoryOutcome::kBound;
+    std::erase(memory_waiters_, waiter);
+    VCACHE_LOG(std::string("reserve: ") + (stop_requested_.load() ? "shutdown after " :
+               "wait bound reached after ") + std::to_string(waited_ms) + " ms");
+    GrantMemoryWaiters();
+  }
+  out->U8(static_cast<uint8_t>(Status::kOk));
+  out->U8(static_cast<uint8_t>(*waiter->outcome));
+  out->U64(waited_ms);
+}
+
+void Server::HandleCompilerSpawned(Reader* in, Writer* out,
+                                   const std::shared_ptr<CompileSession>& session) {
+  uint64_t compiler_pid = 0;
+  if (!session || !in->U64(&compiler_pid) || !in->done() ||
+      compiler_pid == 0 || compiler_pid > static_cast<uint64_t>(std::numeric_limits<pid_t>::max())) {
+    out->U8(static_cast<uint8_t>(Status::kError));
+    out->Str("invalid compiler pid");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = reservations_.find(session->fd);
+  if (found != reservations_.end()) {
+    auto& reservation = *found->second;
+    if (reservation.pid_fd >= 0) ::close(reservation.pid_fd);
+    reservation.pid_fd = -1;
+    reservation.fallback_started.reset();
+    reservation.rss_kb = 0;
+    reservation.compiler_pid = static_cast<pid_t>(compiler_pid);
+    const auto status = util::ReadFile("/proc/" + std::to_string(compiler_pid) + "/status");
+    const bool visible_child = status && StatusNumber(*status, "PPid") ==
+                                        static_cast<uint64_t>(session->client_pid);
+    if (visible_child) {
+#if defined(__linux__) && defined(SYS_pidfd_open)
+      reservation.pid_fd = static_cast<int>(::syscall(SYS_pidfd_open, compiler_pid, 0));
+#endif
+    } else {
+      reservation.fallback_started = Clock::now();
+      VCACHE_LOG("reserve: " + std::to_string(compiler_pid) +
+                 " pid not visible as peer child, whole estimate unrealised for 10000 ms");
+    }
+    rss_read_at_ = {};
+    UpdateAdmission();
+  }
+  out->U8(static_cast<uint8_t>(Status::kOk));
+}
+
+void Server::AdmissionWorker() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (!stop_requested_.load()) {
+    UpdateAdmission();
+    cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return stop_requested_.load(); });
+  }
+}
+
+std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
+  std::shared_ptr<CacheFetch> fetch;
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto& state = leases_[key];
+    fetch = state.fetch;
+    if (fetch) {
+      const auto started = Clock::now();
+      VCACHE_LOG("lease: fetch waiting " + key.substr(0, 16) + " up to " +
+                 std::to_string(kReplyTimeoutSeconds * 1000) + " ms");
+      fetch->changed.wait_for(lock, std::chrono::seconds(kReplyTimeoutSeconds),
+                              [&] { return fetch->done || stop_requested_.load(); });
+      VCACHE_LOG("lease: fetch waited " + key.substr(0, 16) + " for " +
+                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     Clock::now() - started).count()) + " ms");
+      if (fetch->done || stop_requested_.load()) return fetch;
+      // An expired fetch wait follows the original independent lookup path.
+      fetch.reset();
+    } else {
+      fetch = std::make_shared<CacheFetch>();
+      state.fetch = fetch;
+    }
+  }
+  if (!fetch) fetch = std::make_shared<CacheFetch>();
+  auto s3 = AcquireS3();
+  fetch->hit = s3->Get(key, &fetch->value);
+  if (!fetch->hit && s3->failed()) fetch->errors.push_back("s3: " + s3->last_error());
+  if (fetch->hit) {
+    auto disk = MakeDisk();
+    if (disk && disk->writable() && !disk->Put(key, fetch->value) && disk->failed()) {
+      fetch->errors.push_back("disk: " + disk->last_error());
+    }
+  }
+  ReleaseS3(std::move(s3));
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fetch->done = true;
+    fetch->changed.notify_all();
+    const auto found = leases_.find(key);
+    if (found != leases_.end() && found->second.fetch == fetch) {
+      found->second.fetch.reset();
+      if (!found->second.compile) leases_.erase(found);
+    }
+  }
+  return fetch;
+}
+
 void Server::HandleGet(Reader* in, Writer* out) {
   std::string key;
   if (!in->Str(&key) || !ValidKey(key)) {
@@ -533,19 +1047,18 @@ void Server::HandleGet(Reader* in, Writer* out) {
     }
   }
   if (layer.empty() && s3_enabled_) {
-    auto s3 = AcquireS3();
-    if (s3->Get(key, &value)) {
+    const auto fetch = FetchKey(key);
+    if (!fetch->done) {
+      out->U8(static_cast<uint8_t>(Status::kError));
+      out->Str("daemon shutting down");
+      return;
+    }
+    errors.insert(errors.end(), fetch->errors.begin(), fetch->errors.end());
+    if (fetch->hit) {
+      value = fetch->value;
       layer = "s3";
       counters_.hits_s3++;
-      if (disk != nullptr && disk->writable()) {
-        if (!disk->Put(key, value) && disk->failed()) {
-          errors.push_back("disk: " + disk->last_error());
-        }
-      }
-    } else if (s3->failed()) {
-      errors.push_back("s3: " + s3->last_error());
     }
-    ReleaseS3(std::move(s3));
   }
 
   if (layer.empty()) {
@@ -560,7 +1073,32 @@ void Server::HandleGet(Reader* in, Writer* out) {
   out->Str(value);
 }
 
-void Server::HandlePut(Reader* in, Writer* out) {
+bool Server::AwaitTestPut(const std::string& key) {
+  const char* fifo_path = std::getenv("VCACHE_DAEMON_TEST_BLOCK_PUT");
+  if (!fifo_path || !*fifo_path) return true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (test_put_blocked_) return true;
+    test_put_blocked_ = true;
+  }
+  const int gate_fd = ::open(fifo_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  if (gate_fd < 0) return false;
+  const auto started = Clock::now();
+  const auto deadline = started + std::chrono::seconds(5);
+  VCACHE_LOG("lease: test Put blocked " + key.substr(0, 16) + " up to 5000 ms");
+  char outcome = 0;
+  while (!stop_requested_.load() && Clock::now() < deadline) {
+    pollfd gate{gate_fd, POLLIN, 0};
+    if (::poll(&gate, 1, 20) > 0 && ::read(gate_fd, &outcome, 1) == 1) break;
+  }
+  ::close(gate_fd);
+  VCACHE_LOG("lease: test Put waited " + key.substr(0, 16) + " for " +
+             std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                 Clock::now() - started).count()) + " ms");
+  return outcome == 's';
+}
+
+void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
   std::string key;
   auto value = std::make_shared<std::string>();
   if (!in->Str(&key) || !ValidKey(key) || !in->Str(value.get())) {
@@ -569,10 +1107,24 @@ void Server::HandlePut(Reader* in, Writer* out) {
     return;
   }
   counters_.stores++;
+  std::shared_ptr<LeaseWait> storing_lease;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = leases_.find(key);
+    if (found != leases_.end() && found->second.compile) {
+      const pid_t holder_pid = found->second.compile->holder_pid;
+      if (peer_pid == 0 || holder_pid == 0 || holder_pid == peer_pid) {
+        storing_lease = found->second.compile;
+        ++storing_lease->stores_in_progress;
+      }
+    }
+  }
   std::vector<std::string> errors;
   bool stored = false;
 
-  auto disk = MakeDisk();
+  const bool test_put_allowed = AwaitTestPut(key);
+  auto disk = test_put_allowed ? MakeDisk() :
+      std::make_unique<storage::DiskStorage>(config_.disk.dir, config_.disk.max_size, true);
   bool on_disk = false;
   if (disk != nullptr && disk->writable()) {
     on_disk = disk->Put(key, *value);
@@ -580,7 +1132,7 @@ void Server::HandlePut(Reader* in, Writer* out) {
   }
   stored = on_disk;
 
-  if (s3_writable_) {
+  if (s3_writable_ && test_put_allowed) {
     if (on_disk) {
       stored = Enqueue(key, nullptr, /*journal=*/true) || stored;
     } else {
@@ -618,6 +1170,16 @@ void Server::HandlePut(Reader* in, Writer* out) {
   }
 
   if (!stored) counters_.stores_failed++;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = leases_.find(key);
+    if (storing_lease) --storing_lease->stores_in_progress;
+    if (found != leases_.end() && storing_lease && found->second.compile == storing_lease) {
+      CompleteLease(key, stored ? LeaseOutcome::kStored : LeaseOutcome::kCompile,
+                     stored ? LeaseCompileReason::kNone : LeaseCompileReason::kHolderFailed);
+    }
+    cv_.notify_all();
+  }
   out->U8(static_cast<uint8_t>(Status::kOk));
   out->U8(stored ? 1 : 0);
   out->StrList(errors);
@@ -632,12 +1194,31 @@ std::string Server::StatusText() {
   };
   auto n = [](const std::atomic<uint64_t>& v) { return std::to_string(v.load()); };
   size_t active = 0;
+  size_t compile_sessions = 0;
+  size_t leases_held = 0;
+  size_t leases_waiting = 0;
   size_t pending = 0;
   size_t superseded = 0;
   uint64_t held = 0;
+  uint64_t reserved_kb = 0, realised_kb = 0, memory_waiting = 0, reserve_waits = 0;
+  uint64_t longest_reserve_wait_ms = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     active = connections_.size();
+    compile_sessions = sessions_.size();
+    for (const auto& [fd, reservation] : reservations_) {
+      reserved_kb = AddKb(reserved_kb, reservation->estimate_kb);
+      realised_kb = AddKb(realised_kb, reservation->rss_kb);
+    }
+    memory_waiting = memory_waiters_.size();
+    reserve_waits = reserve_waits_;
+    longest_reserve_wait_ms = longest_reserve_wait_ms_;
+    for (const auto& [key, state] : leases_) {
+      if (state.compile) {
+        ++leases_held;
+        leases_waiting += state.compile->waiters.size();
+      }
+    }
     superseded = uploads_.superseded_count();
     pending = uploads_.size() + uploads_.in_flight_count() - superseded;
     held = uploads_.held_bytes();
@@ -654,6 +1235,16 @@ std::string Server::StatusText() {
   s += row("s3 layer", !s3_enabled_ ? "off" : (s3_writable_ ? "read-write" : "read-only"));
   s += row("connections", n(counters_.connections) + " (" + std::to_string(active) +
                               " open, " + n(counters_.refused) + " refused)");
+  s += row("compile sessions", std::to_string(compile_sessions));
+  s += row("leases held", std::to_string(leases_held));
+  s += row("leases waiting", std::to_string(leases_waiting));
+  s += row("leases expired", n(counters_.leases_expired));
+  s += row("compiles deduplicated", n(counters_.compiles_deduplicated));
+  s += row("memory reserved", std::to_string(reserved_kb));
+  s += row("memory realised", std::to_string(realised_kb));
+  s += row("memory waiting", std::to_string(memory_waiting));
+  s += row("reserve waits", std::to_string(reserve_waits));
+  s += row("longest wait ms", std::to_string(longest_reserve_wait_ms));
   s += row("lookups", n(counters_.lookups));
   s += row("  hit (disk)", n(counters_.hits_disk));
   s += row("  hit (memory)", n(counters_.hits_memory));
@@ -698,6 +1289,16 @@ void Server::Serve(int fd) {
   std::string reply;
   bool ok = RecvFrame(fd, &request) && HandleHello(request, &reply);
   SendFrame(fd, reply);
+  bool first_request = true;
+  pid_t peer_pid = 0;
+#if defined(__linux__)
+  struct ucred peer_credentials;
+  socklen_t peer_size = sizeof(peer_credentials);
+  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer_credentials, &peer_size) == 0) {
+    peer_pid = peer_credentials.pid;
+  }
+#endif
+  std::shared_ptr<CompileSession> compile_session;
 
   while (ok && RecvFrame(fd, &request)) {
     {
@@ -708,9 +1309,51 @@ void Server::Serve(int fd) {
     Writer out;
     uint8_t op = 0;
     in.U8(&op);
+    if (compile_session && op != static_cast<uint8_t>(Op::kSessionOpen) &&
+        op != static_cast<uint8_t>(Op::kLeaseAcquire) &&
+        op != static_cast<uint8_t>(Op::kLeaseRelease) &&
+        op != static_cast<uint8_t>(Op::kMemoryReserve) &&
+        op != static_cast<uint8_t>(Op::kCompilerSpawned)) {
+      out.U8(static_cast<uint8_t>(Status::kError));
+      out.Str("unknown compile session request");
+      compile_session->Reply(out.data());
+      break;
+    }
     switch (static_cast<Op>(op)) {
+      case Op::kSessionOpen: {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pid_t client_pid = 0;
+#if defined(__linux__)
+        struct ucred credentials;
+        socklen_t credentials_size = sizeof(credentials);
+        if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials,
+                         &credentials_size) == 0) client_pid = credentials.pid;
+#endif
+        bool pid_already_open = false;
+        for (const auto& [session_fd, session] : sessions_) {
+          if (client_pid > 0 && session->client_pid == client_pid) pid_already_open = true;
+        }
+        if (!first_request || !in.done() || stop_requested_.load() || pid_already_open) {
+          out.U8(static_cast<uint8_t>(Status::kError));
+          out.Str(stop_requested_.load() ? "daemon shutting down" :
+                  pid_already_open ? "pid already holds a compile session" :
+                                     "session open requires a fresh connection");
+        } else {
+          compile_session = std::make_shared<CompileSession>(fd, client_pid);
+          sessions_.emplace(fd, compile_session);
+          timeval send_timeout{1, 0};
+          ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+          out.U8(static_cast<uint8_t>(Status::kOk));
+          VCACHE_LOG("session: opened for pid " + std::to_string(client_pid));
+        }
+        break;
+      }
       case Op::kGet: HandleGet(&in, &out); break;
-      case Op::kPut: HandlePut(&in, &out); break;
+      case Op::kPut: HandlePut(&in, &out, peer_pid); break;
+      case Op::kLeaseAcquire: HandleLeaseAcquire(&in, &out, compile_session); break;
+      case Op::kLeaseRelease: HandleLeaseRelease(&in, &out, compile_session); break;
+      case Op::kMemoryReserve: HandleMemoryReserve(&in, &out, compile_session); break;
+      case Op::kCompilerSpawned: HandleCompilerSpawned(&in, &out, compile_session); break;
       case Op::kStatus:
         out.U8(static_cast<uint8_t>(Status::kOk));
         out.Str(StatusText());
@@ -723,12 +1366,31 @@ void Server::Serve(int fd) {
     }
     request.clear();
     request.shrink_to_fit();
-    if (!SendFrame(fd, out.data())) break;
+    first_request = false;
+    if (compile_session) {
+      if (!compile_session->Reply(out.data())) break;
+    } else if (!SendFrame(fd, out.data())) {
+      break;
+    }
   }
 
-  ::close(fd);
   std::lock_guard<std::mutex> lock(mutex_);
+  const auto session = sessions_.find(fd);
+  if (session != sessions_.end()) {
+    ExpireLeases(session->second);
+    reservations_.erase(fd);
+    std::erase_if(memory_waiters_, [fd](const auto& waiter) {
+      return waiter->session->fd == fd;
+    });
+    GrantMemoryWaiters();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - session->second->opened_at).count();
+    VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms for pid " +
+               std::to_string(session->second->client_pid));
+    sessions_.erase(session);
+  }
   connections_.erase(fd);
+  if (!compile_session) ::close(fd);
   last_activity_ = Clock::now();
   cv_.notify_all();
 }
@@ -769,6 +1431,28 @@ bool PeerIsSelf(int fd) {
 }
 
 void Server::Shutdown() {
+  std::vector<std::shared_ptr<CompileSession>> closing_sessions;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stop_requested_.store(true);
+    for (const auto& waiter : memory_waiters_) waiter->changed.notify_all();
+    reservations_.clear();
+    memory_waiters_.clear();
+    cv_.notify_all();
+    for (auto& [key, state] : leases_) {
+      if (state.compile) {
+        state.compile->outcome = LeaseOutcome::kCompile;
+        state.compile->reason = LeaseCompileReason::kShutdown;
+        state.compile->changed.notify_all();
+      }
+      if (state.fetch) state.fetch->changed.notify_all();
+    }
+    leases_.clear();
+    for (const auto& [session_fd, session] : sessions_) {
+      session->closing.store(true);
+      closing_sessions.push_back(session);
+    }
+  }
   ::close(listen_fd_);
   listen_fd_ = -1;
   struct stat st;
@@ -781,12 +1465,15 @@ void Server::Shutdown() {
     log_.Line("jobserver: removed " + path);
   }
 
+  for (const auto& session : closing_sessions) session->Shutdown();
+  closing_sessions.clear();
+  if (admission_worker_.joinable()) admission_worker_.join();
   std::unique_lock<std::mutex> lock(mutex_);
   // Let compiles that are mid-request finish; a stuck one is cut off rather
   // than allowed to hold the daemon open. The shutdown requesters are
   // connections too, and they are waiting on us.
   auto others = [this] {
-    return connections_.size() - static_cast<size_t>(shutdown_waiters_);
+    return connections_.size() - sessions_.size() - static_cast<size_t>(shutdown_waiters_);
   };
   if (!cv_.wait_for(lock, std::chrono::seconds(60), [&] { return others() == 0; })) {
     log_.Line("closing " + std::to_string(others()) + " connections still open");

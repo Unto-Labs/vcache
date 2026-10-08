@@ -5,6 +5,11 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <cerrno>
 #include <csignal>
@@ -16,12 +21,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -42,6 +51,8 @@
 #include "daemon/jobserver.h"
 #include "daemon/upload_queue.h"
 #include "daemon/protocol.h"
+#include "daemon/client.h"
+#include "daemon/server.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "rust/rust_compile.h"
@@ -1289,6 +1300,1186 @@ void TestDaemonProtocol() {
           "daemon mode '1' means on");
     Check(!core::ParseDaemonMode("sometimes", &mode), "an unknown mode is rejected");
   }
+}
+
+bool PollUntil(const std::function<bool()>& condition, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  do {
+    if (condition()) return true;
+    ::poll(nullptr, 0, 10);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+struct SessionDaemon {
+  core::Config config;
+  std::string directory;
+  pid_t pid = -1;
+
+  explicit SessionDaemon(int idle_seconds = 0, bool single_flight = false,
+                         bool block_put = false, uint64_t mem_available_kb = 0) {
+    directory = util::MakeTempDir("vcache-session-test-").value_or("");
+    if (directory.empty()) return;
+    config.disk.dir = directory + "/cache";
+    config.daemon.idle_timeout_seconds = idle_seconds;
+    config.daemon.single_flight = single_flight;
+    if (mem_available_kb > 0) {
+      const std::string meminfo = "MemAvailable: " + std::to_string(mem_available_kb) + " kB\n";
+      const int mem_fd = ::open((directory + "/meminfo").c_str(), O_WRONLY | O_CREAT, 0600);
+      if (mem_fd < 0) return;
+      ::write(mem_fd, meminfo.data(), meminfo.size());
+      ::close(mem_fd);
+    }
+    if (block_put && ::mkfifo((directory + "/put-gate").c_str(), 0600) != 0) return;
+    int ready_pipe[2];
+    if (::pipe(ready_pipe) != 0) return;
+    pid = ::fork();
+    if (pid == 0) {
+      ::close(ready_pipe[0]);
+      if (block_put) {
+        ::setenv("VCACHE_DAEMON_TEST_BLOCK_PUT", (directory + "/put-gate").c_str(), 1);
+        ::setenv("VCACHE_LOG", (directory + "/put-log").c_str(), 1);
+        util::InitLogging();
+      }
+      if (mem_available_kb > 0) {
+        ::setenv("VCACHE_DAEMON_MEMINFO", (directory + "/meminfo").c_str(), 1);
+        ::setenv("VCACHE_LOG", (directory + "/memory-log").c_str(), 1);
+        util::InitLogging();
+      }
+      ::_exit(daemon::RunServer(config, ready_pipe[1]));
+    }
+    ::close(ready_pipe[1]);
+    pollfd ready{ready_pipe[0], POLLIN, 0};
+    char code = 0;
+    Check(::poll(&ready, 1, 2000) > 0 && ::read(ready_pipe[0], &code, 1) == 1 &&
+              code == 'R', "session daemon becomes ready within two seconds");
+    ::close(ready_pipe[0]);
+  }
+
+  ~SessionDaemon() {
+    if (pid > 0) {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, nullptr, 0);
+    }
+    if (!directory.empty()) util::RemoveRecursive(directory);
+  }
+
+  std::string Status() const {
+    std::string reply;
+    const int fd = Hello(daemon::kProtocolVersion, &reply);
+    if (fd < 0) return "";
+    daemon::Writer request;
+    request.U8(static_cast<uint8_t>(daemon::Op::kStatus));
+    std::string text;
+    if (daemon::SendFrame(fd, request.data()) && daemon::RecvFrame(fd, &reply)) {
+      daemon::Reader in(reply);
+      uint8_t status = 0;
+      if (!in.U8(&status) || status != static_cast<uint8_t>(daemon::Status::kOk) ||
+          !in.Str(&text) || !in.done()) text.clear();
+    }
+    ::close(fd);
+    return text;
+  }
+
+  bool Sessions(size_t expected) const {
+    const std::string status = Status();
+    const size_t row = status.find("compile sessions");
+    if (row == std::string::npos) return false;
+    return std::strtoull(status.c_str() + row + 16, nullptr, 10) == expected;
+  }
+
+  int Hello(uint64_t version, std::string* reply) const {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    timeval timeout{0, 500000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string path = daemon::SocketPath(config);
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    daemon::Writer hello;
+    hello.U8(static_cast<uint8_t>(daemon::Op::kHello));
+    hello.U64(version);
+    hello.Str(daemon::ConfigFingerprint(config));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        !daemon::SendFrame(fd, hello.data()) || !daemon::RecvFrame(fd, reply)) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+
+  int Open(std::string* reply) const {
+    const int fd = Hello(daemon::kProtocolVersion, reply);
+    if (fd < 0) return -1;
+    daemon::Writer request;
+    request.U8(6);
+    if (!daemon::SendFrame(fd, request.data()) || !daemon::RecvFrame(fd, reply)) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+};
+
+void TestCompileSessions() {
+  Section("daemon::session");
+  SessionDaemon server(1);
+  std::string reply;
+  int fd = server.Hello(1, &reply);
+  daemon::Reader refused(reply);
+  uint8_t status = 0;
+  std::string reason;
+  Check(fd >= 0 && refused.U8(&status) &&
+            status == static_cast<uint8_t>(daemon::Status::kRefused) &&
+            refused.Str(&reason) && reason.find("version 1") != std::string::npos &&
+            reason.find("speaks 2") != std::string::npos,
+        "v1 hello is refused and names client version 1 and daemon version 2");
+  if (fd >= 0) ::close(fd);
+
+  fd = server.Open(&reply);
+  Check(fd >= 0 && reply == std::string(1, '\0'), "session open replies ok");
+  Check(server.Sessions(1), "compile sessions 1 survives a separate status request");
+  const auto idle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1600);
+  bool stayed_alive = true;
+  PollUntil([&] {
+    stayed_alive &= ::kill(server.pid, 0) == 0 && util::FileExists(daemon::SocketPath(server.config));
+    return !stayed_alive || std::chrono::steady_clock::now() >= idle_deadline;
+  }, 2000);
+  Check(stayed_alive && server.Sessions(1), "an open session prevents the one-second idle exit");
+
+#if defined(__linux__)
+  std::string duplicate_reply;
+  const int duplicate_fd = server.Open(&duplicate_reply);
+  Check(duplicate_fd >= 0 && !duplicate_reply.empty() &&
+            duplicate_reply[0] == static_cast<char>(daemon::Status::kError) &&
+            server.Sessions(1), "a pid cannot hold two compile sessions");
+  if (duplicate_fd >= 0) ::close(duplicate_fd);
+#endif
+  if (fd >= 0) ::close(fd);
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "closing the session fd reports compile sessions 0 within one second");
+
+  const pid_t client_pid = ::fork();
+  if (client_pid == 0) {
+    std::string child_reply;
+    const int child_fd = server.Open(&child_reply);
+    if (child_fd < 0 || child_reply != std::string(1, '\0')) ::_exit(1);
+    ::poll(nullptr, 0, 5000);
+    ::_exit(2);
+  }
+  Check(client_pid > 0 && PollUntil([&] { return server.Sessions(1); }, 1000),
+        "a separate client process opens a session");
+  if (client_pid > 0) {
+    ::kill(client_pid, SIGKILL);
+    ::waitpid(client_pid, nullptr, 0);
+  }
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "killing the client releases its session within one second");
+
+  fd = server.Open(&reply);
+  daemon::Writer shutdown;
+  shutdown.U8(static_cast<uint8_t>(daemon::Op::kShutdown));
+  int shutdown_fd = server.Hello(daemon::kProtocolVersion, &reply);
+  const auto started = std::chrono::steady_clock::now();
+  bool stopped = false;
+  if (shutdown_fd >= 0 && daemon::SendFrame(shutdown_fd, shutdown.data())) {
+    pollfd response{shutdown_fd, POLLIN, 0};
+    stopped = ::poll(&response, 1, 2000) > 0 && daemon::RecvFrame(shutdown_fd, &reply) &&
+              !reply.empty() && reply[0] == static_cast<char>(daemon::Status::kOk);
+  }
+  Check(stopped && std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+        "Shutdown returns promptly with an open session (under two seconds)");
+  if (shutdown_fd >= 0) ::close(shutdown_fd);
+  if (fd >= 0) {
+    pollfd closed{fd, POLLIN, 0};
+    Check(::poll(&closed, 1, 1000) > 0, "Shutdown immediately closes the held session");
+    ::close(fd);
+  }
+}
+
+void TestCompileSessionShutdownRace() {
+  Section("daemon::session shutdown interleaving");
+  SessionDaemon server;
+  std::string reply;
+  const int held_fd = server.Open(&reply);
+  Check(held_fd >= 0 && reply == std::string(1, '\0'),
+        "shutdown-race holder opens a session");
+  int ready_pipe[2];
+  int open_pipe[2];
+  int result_pipe[2];
+  if (::pipe(ready_pipe) != 0 || ::pipe(open_pipe) != 0 || ::pipe(result_pipe) != 0) {
+    Check(false, "shutdown-race barriers can be created");
+    if (held_fd >= 0) ::close(held_fd);
+    return;
+  }
+  const pid_t opener_pid = ::fork();
+  if (opener_pid == 0) {
+    ::close(ready_pipe[0]);
+    ::close(open_pipe[1]);
+    ::close(result_pipe[0]);
+    if (held_fd >= 0) ::close(held_fd);
+    std::string child_reply;
+    const int child_fd = server.Hello(daemon::kProtocolVersion, &child_reply);
+    const char ready = child_fd >= 0 ? 'R' : 'E';
+    ::write(ready_pipe[1], &ready, 1);
+    pollfd open_gate{open_pipe[0], POLLIN, 0};
+    char open = 0;
+    bool refused = false;
+    if (child_fd >= 0 && ::poll(&open_gate, 1, 2000) > 0 &&
+        ::read(open_pipe[0], &open, 1) == 1) {
+      daemon::Writer request;
+      request.U8(static_cast<uint8_t>(daemon::Op::kSessionOpen));
+      if (daemon::SendFrame(child_fd, request.data()) &&
+          daemon::RecvFrame(child_fd, &child_reply)) {
+        daemon::Reader in(child_reply);
+        uint8_t status = 0;
+        std::string reason;
+        refused = in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kError) &&
+                  in.Str(&reason) && reason == "daemon shutting down" && in.done();
+      }
+      ::close(child_fd);
+    }
+    const char outcome = refused ? 'R' : 'E';
+    ::write(result_pipe[1], &outcome, 1);
+    ::_exit(refused ? 0 : 1);
+  }
+  ::close(ready_pipe[1]);
+  ::close(open_pipe[0]);
+  ::close(result_pipe[1]);
+  pollfd ready{ready_pipe[0], POLLIN, 0};
+  char code = 0;
+  const bool opener_ready = opener_pid > 0 && ::poll(&ready, 1, 2000) > 0 &&
+                            ::read(ready_pipe[0], &code, 1) == 1 && code == 'R';
+  Check(opener_ready, "shutdown-race opener completes hello before SIGTERM");
+  if (server.pid > 0) ::kill(server.pid, SIGTERM);
+  bool terminal_received = false;
+  if (held_fd >= 0 && daemon::RecvFrame(held_fd, &reply)) {
+    daemon::Reader in(reply);
+    uint8_t status = 0;
+    std::string reason;
+    terminal_received = in.U8(&status) &&
+                        status == static_cast<uint8_t>(daemon::Status::kError) &&
+                        in.Str(&reason) && reason == "daemon shutting down" && in.done();
+  }
+  Check(terminal_received, "SIGTERM broadcasts a terminal session frame before the late open");
+  const char open = 'O';
+  if (opener_ready) ::write(open_pipe[1], &open, 1);
+  pollfd result{result_pipe[0], POLLIN, 0};
+  const bool refused = ::poll(&result, 1, 1000) > 0 &&
+                       ::read(result_pipe[0], &code, 1) == 1 && code == 'R';
+  Check(refused, "session open after SIGTERM broadcast replies daemon shutting down within 1 s");
+  if (held_fd >= 0) ::close(held_fd);
+  for (int fd : {ready_pipe[0], open_pipe[1], result_pipe[0]}) ::close(fd);
+  if (opener_pid > 0) {
+    const bool exited = PollUntil(
+        [&] { return ::waitpid(opener_pid, nullptr, WNOHANG) == opener_pid; }, 1000);
+    if (!exited) {
+      ::kill(opener_pid, SIGKILL);
+      ::waitpid(opener_pid, nullptr, 0);
+    }
+  }
+}
+
+void TestCompileSessionStalledSend() {
+  Section("daemon::session send isolation");
+  SessionDaemon server;
+  std::string reply;
+  const int held_fd = server.Open(&reply);
+  if (held_fd < 0 || reply != std::string(1, '\0')) {
+    Check(false, "send-isolation holder opens a session");
+    if (held_fd >= 0) ::close(held_fd);
+    return;
+  }
+  std::string flood;
+  daemon::Writer request;
+  request.U8(static_cast<uint8_t>(daemon::Op::kSessionOpen));
+  daemon::Writer header;
+  header.U64(request.data().size());
+  for (int i = 0; i < 4096; ++i) flood.append(header.data() + request.data());
+  size_t flood_offset = 0;
+  bool queued_requests = false;
+  const bool stalled = PollUntil([&] {
+    int send_flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t sent = ::send(held_fd, flood.data() + flood_offset,
+                                flood.size() - flood_offset, send_flags);
+    if (sent > 0) flood_offset = (flood_offset + static_cast<size_t>(sent)) % flood.size();
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) queued_requests = true;
+    int unread_bytes = 0;
+    ::ioctl(held_fd, FIONREAD, &unread_bytes);
+    return queued_requests && unread_bytes >= 2048;
+  }, 500);
+  Check(stalled, "session peer stops reading until its replies fill the socket");
+  const auto started = std::chrono::steady_clock::now();
+  const bool responsive = server.Sessions(1);
+  Check(responsive && std::chrono::steady_clock::now() - started <
+                          std::chrono::milliseconds(250),
+        "a stalled session send leaves separate status requests responsive within 250 ms");
+  ::close(held_fd);
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "stalled-send session closes with compile sessions 0");
+}
+
+struct LeasePeer {
+  int control_fd = -1;
+  pid_t pid = -1;
+  uint8_t last_reason = 255;
+  uint8_t last_outcome = 255;
+  uint64_t last_holder_pid = 0;
+  uint64_t last_waited_ms = 0;
+  bool request_pending = false;
+  pid_t compiler_pid = -1;
+
+  explicit LeasePeer(const SessionDaemon& server) {
+    int control[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, control) != 0) return;
+    pid = ::fork();
+    if (pid == 0) {
+      ::close(control[0]);
+      std::string reply;
+      const int session_fd = server.Open(&reply);
+      if (!daemon::SendFrame(control[1], reply) || session_fd < 0) ::_exit(1);
+      timeval session_timeout{5, 0};
+      ::setsockopt(session_fd, SOL_SOCKET, SO_RCVTIMEO, &session_timeout,
+                   sizeof(session_timeout));
+      pid_t worker_pid = -1;
+      int worker_stop_fd = -1;
+      while (daemon::RecvFrame(control[1], &reply)) {
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 251) {
+          std::string hello_reply;
+          const int put_fd = server.Hello(daemon::kProtocolVersion, &hello_reply);
+          char code = put_fd >= 0 ? 'R' : 'E';
+          iovec payload{&code, 1};
+          alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(int))]{};
+          msghdr message{};
+          message.msg_iov = &payload;
+          message.msg_iovlen = 1;
+          if (put_fd >= 0) {
+            message.msg_control = ancillary;
+            message.msg_controllen = sizeof(ancillary);
+            cmsghdr* descriptor = CMSG_FIRSTHDR(&message);
+            descriptor->cmsg_level = SOL_SOCKET;
+            descriptor->cmsg_type = SCM_RIGHTS;
+            descriptor->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(descriptor), &put_fd, sizeof(put_fd));
+          }
+          const bool sent = ::sendmsg(control[1], &message, 0) == 1;
+          if (put_fd >= 0) ::close(put_fd);
+          if (!sent) break;
+          continue;
+        }
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 253) {
+          daemon::Reader worker_request(reply);
+          uint8_t code = 0;
+          uint64_t rss_kb = 0;
+          if (!worker_request.U8(&code) || !worker_request.U64(&rss_kb) ||
+              rss_kb > 65536) ::_exit(2);
+          int worker_ready[2], worker_stop[2];
+          if (::pipe(worker_ready) != 0 || ::pipe(worker_stop) != 0) ::_exit(2);
+          worker_pid = ::fork();
+          if (worker_pid == 0) {
+            ::close(control[1]);
+            ::close(session_fd);
+            ::close(worker_ready[0]);
+            ::close(worker_stop[1]);
+            std::vector<char> memory(rss_kb * 1024, 'm');
+            for (size_t page = 0; page < memory.size(); page += 4096) memory[page] = 'r';
+            ::write(worker_ready[1], "R", 1);
+            pollfd stop{worker_stop[0], POLLIN, 0};
+            ::poll(&stop, 1, 10000);
+            ::_exit(0);
+          }
+          ::close(worker_ready[1]);
+          ::close(worker_stop[0]);
+          worker_stop_fd = worker_stop[1];
+          pollfd ready{worker_ready[0], POLLIN, 0};
+          char code_ready = 0;
+          const bool started = ::poll(&ready, 1, 1000) > 0 &&
+                               ::read(worker_ready[0], &code_ready, 1) == 1;
+          ::close(worker_ready[0]);
+          daemon::Writer worker_reply;
+          worker_reply.U64(started ? worker_pid : 0);
+          if (!daemon::SendFrame(control[1], worker_reply.data())) break;
+          continue;
+        }
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 252) {
+          if (worker_pid > 0) {
+            ::kill(worker_pid, SIGKILL);
+            ::waitpid(worker_pid, nullptr, 0);
+            worker_pid = -1;
+          }
+          if (worker_stop_fd >= 0) ::close(worker_stop_fd);
+          worker_stop_fd = -1;
+          if (!daemon::SendFrame(control[1], std::string(1, '\0'))) break;
+          continue;
+        }
+        if (!reply.empty() && reply[0] == '\0') {
+          daemon::Reader probe(reply);
+          uint8_t code = 0;
+          uint64_t timeout_ms = 0;
+          if (!probe.U8(&code) || !probe.U64(&timeout_ms) || !probe.done()) ::_exit(2);
+          pollfd readable{session_fd, POLLIN, 0};
+          const bool quiet = ::poll(&readable, 1, static_cast<int>(timeout_ms)) == 0;
+          if (!daemon::SendFrame(control[1], std::string(1, quiet ? '\0' : '\1'))) break;
+          continue;
+        }
+        if (!daemon::SendFrame(session_fd, reply) ||
+            !daemon::RecvFrame(session_fd, &reply) ||
+            !daemon::SendFrame(control[1], reply)) break;
+      }
+      ::close(session_fd);
+      ::_exit(0);
+    }
+    ::close(control[1]);
+    control_fd = control[0];
+    timeval timeout{0, 500000};
+    ::setsockopt(control_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(control_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    std::string reply;
+    Check(pid > 0 && daemon::RecvFrame(control_fd, &reply) && reply == std::string(1, '\0'),
+          "lease peer opens its held session");
+  }
+
+  ~LeasePeer() { Close(); }
+
+  void Close() {
+    if (compiler_pid > 0) StopCompiler();
+    if (control_fd >= 0) ::close(control_fd);
+    control_fd = -1;
+    if (pid > 0) {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, nullptr, 0);
+    }
+    pid = -1;
+  }
+
+  bool Acquire(const std::string& key, uint64_t bound_ms) {
+    daemon::Writer request;
+    request.U8(7);
+    request.Str(key);
+    request.U64(bound_ms);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending;
+  }
+
+  bool Reserve(uint64_t estimate_kb, uint64_t bound_ms = 3000) {
+    daemon::Writer request;
+    request.U8(9);
+    request.Str(std::string(64, 'a'));
+    request.U64(estimate_kb);
+    request.U64(bound_ms);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending;
+  }
+
+  int PutSocket() const {
+    daemon::Writer request;
+    request.U8(251);
+    if (!daemon::SendFrame(control_fd, request.data())) return -1;
+    char code = 0;
+    iovec payload{&code, 1};
+    alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(int))]{};
+    msghdr message{};
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    message.msg_control = ancillary;
+    message.msg_controllen = sizeof(ancillary);
+    if (::recvmsg(control_fd, &message, 0) != 1 || code != 'R') return -1;
+    const cmsghdr* descriptor = CMSG_FIRSTHDR(&message);
+    if (!descriptor || descriptor->cmsg_level != SOL_SOCKET ||
+        descriptor->cmsg_type != SCM_RIGHTS) return -1;
+    int put_fd = -1;
+    std::memcpy(&put_fd, CMSG_DATA(descriptor), sizeof(put_fd));
+    return put_fd;
+  }
+
+  bool MemoryOutcome(uint8_t expected, int timeout_ms = 1000) {
+    pollfd ready{control_fd, POLLIN, 0};
+    std::string reply;
+    if (::poll(&ready, 1, timeout_ms) <= 0 || !daemon::RecvFrame(control_fd, &reply)) return false;
+    request_pending = false;
+    daemon::Reader in(reply);
+    uint8_t status = 0;
+    return in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
+           in.U8(&last_outcome) && last_outcome == expected &&
+           in.U64(&last_waited_ms) && in.done();
+  }
+
+  bool Spawned(pid_t reported_pid) {
+    daemon::Writer request;
+    request.U8(10);
+    request.U64(reported_pid);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending && Released();
+  }
+
+  pid_t StartCompiler(uint64_t rss_kb) {
+    daemon::Writer request;
+    request.U8(253);
+    request.U64(rss_kb);
+    std::string reply;
+    uint64_t worker_pid = 0;
+    if (!daemon::SendFrame(control_fd, request.data()) ||
+        !daemon::RecvFrame(control_fd, &reply)) return -1;
+    daemon::Reader in(reply);
+    if (!in.U64(&worker_pid) || !in.done()) return -1;
+    compiler_pid = static_cast<pid_t>(worker_pid);
+    return compiler_pid;
+  }
+
+  void StopCompiler() {
+    if (compiler_pid <= 0) return;
+    daemon::Writer request;
+    request.U8(252);
+    std::string reply;
+    if (!daemon::SendFrame(control_fd, request.data()) || !daemon::RecvFrame(control_fd, &reply)) {
+      ::kill(compiler_pid, SIGKILL);
+    }
+    compiler_pid = -1;
+  }
+
+  bool Release(const std::string& key, bool stored) {
+    daemon::Writer request;
+    request.U8(8);
+    request.Str(key);
+    request.U8(stored ? 0 : 1);
+    request_pending = daemon::SendFrame(control_fd, request.data());
+    return request_pending;
+  }
+
+  bool Outcome(uint8_t expected, int timeout_ms = 1000) {
+    pollfd ready{control_fd, POLLIN, 0};
+    std::string reply;
+    if (::poll(&ready, 1, timeout_ms) <= 0 || !daemon::RecvFrame(control_fd, &reply)) return false;
+    request_pending = false;
+    daemon::Reader in(reply);
+    uint8_t status = 0;
+    return in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
+           in.U8(&last_outcome) && last_outcome <= 2 &&
+           (expected == 255 || last_outcome == expected) &&
+           in.U8(&last_reason) && in.U64(&last_holder_pid) && in.U64(&last_waited_ms) && in.done();
+  }
+
+  bool Released() {
+    std::string reply;
+    if (!daemon::RecvFrame(control_fd, &reply)) return false;
+    request_pending = false;
+    return reply == std::string(1, '\0');
+  }
+
+  bool NoReply(int timeout_ms = 50) const {
+    if (!request_pending) {
+      daemon::Writer probe;
+      probe.U8(0);
+      probe.U64(timeout_ms);
+      std::string reply;
+      return daemon::SendFrame(control_fd, probe.data()) &&
+             daemon::RecvFrame(control_fd, &reply) && reply == std::string(1, '\0');
+    }
+    pollfd ready{control_fd, POLLIN, 0};
+    return ::poll(&ready, 1, timeout_ms) == 0;
+  }
+
+  bool Error() {
+    std::string reply, reason;
+    uint8_t status = 0;
+    if (!daemon::RecvFrame(control_fd, &reply)) return false;
+    request_pending = false;
+    daemon::Reader in(reply);
+    return in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kError) &&
+           in.Str(&reason) && !reason.empty() && in.done();
+  }
+};
+
+bool LeaseStat(const SessionDaemon& server, const std::string& name, uint64_t expected) {
+  const std::string status = server.Status();
+  const size_t row = status.find(name);
+  return row != std::string::npos &&
+         std::strtoull(status.c_str() + row + name.size(), nullptr, 10) == expected;
+}
+
+bool PutLeaseBlob(const SessionDaemon& server, const std::string& key, int timeout_ms = 500,
+                  const LeasePeer* owner = nullptr) {
+  storage::Blob blob;
+  blob.object = "lease test object";
+  std::string reply;
+  const int fd = owner ? owner->PutSocket() : server.Hello(daemon::kProtocolVersion, &reply);
+  if (fd < 0) return false;
+  timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  daemon::Writer request;
+  request.U8(static_cast<uint8_t>(daemon::Op::kPut));
+  request.Str(key);
+  request.Str(storage::SerializeBlob(blob));
+  const bool answered = daemon::SendFrame(fd, request.data()) && daemon::RecvFrame(fd, &reply);
+  ::close(fd);
+  daemon::Reader in(reply);
+  uint8_t status = 0;
+  uint8_t stored = 0;
+  return answered && in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
+         in.U8(&stored) && stored == 1;
+}
+
+void TestKeyLeases() {
+  Section("daemon::lease");
+  Check(daemon::LeaseWaitBoundMs(std::nullopt) == 30000,
+        "no recorded duration bounds a lease wait at 30000 ms");
+  Check(daemon::LeaseWaitBoundMs(5000) == 30000,
+        "a 5000 ms record keeps the 30000 ms minimum");
+  Check(daemon::LeaseWaitBoundMs(20000) == 40000,
+        "a 20000 ms record doubles to 40000 ms");
+  Check(daemon::LeaseWaitBoundMs(UINT64_MAX) == daemon::kReplyTimeoutSeconds * 1000,
+        "a huge recorded duration saturates at the reply timeout without overflow");
+  SessionDaemon server(0, true);
+  const std::string key(64, 'a');
+  LeasePeer holder(server);
+  LeasePeer waiter(server);
+  Check(holder.Acquire(key, 3000) && holder.Outcome(0), "a free key grants one lease");
+  Check(holder.Acquire(key, 3000) && holder.Outcome(0), "holder acquire is idempotent");
+  Check(LeaseStat(server, "leases held", 1), "idempotent acquire leaves leases held 1");
+  Check(waiter.Acquire(key, 3000) &&
+            PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000) &&
+            waiter.NoReply(), "a second session waits instead of becoming a holder");
+  Check(PutLeaseBlob(server, key, 500, &holder), "holder key Put stores a production blob");
+  Check(waiter.Outcome(1), "holder Put wakes the waiter with stored");
+  Check(waiter.last_reason == 0 && waiter.last_holder_pid == static_cast<uint64_t>(holder.pid),
+        "stored reply carries the holder pid and no compile reason");
+  Check(waiter.NoReply(), "holder Put sends exactly one waiter reply");
+  Check(LeaseStat(server, "leases held", 0) && LeaseStat(server, "leases waiting", 0),
+        "Put clears the held and waiting lease status rows");
+  Check(LeaseStat(server, "compiles deduplicated", 1), "stored wake counts one deduplicated compile");
+
+  const std::string failed_key(64, 'b');
+  Check(holder.Acquire(failed_key, 3000) && holder.Outcome(0), "failed-outcome holder is granted");
+  waiter.Acquire(failed_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "failed-outcome waiter is queued");
+  Check(holder.Release(failed_key, false) && holder.Released(), "holder releases failed");
+  Check(waiter.Outcome(2), "failed release wakes the waiter with compile");
+  Check(waiter.last_reason == 1, "failed release reply distinguishes holder failure");
+
+  const std::string gone_key(64, 'c');
+  Check(holder.Acquire(gone_key, 3000) && holder.Outcome(0), "holder-gone lease is granted");
+  waiter.Acquire(gone_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "holder-gone waiter is queued");
+  const auto gone_started = std::chrono::steady_clock::now();
+  holder.Close();
+  Check(waiter.Outcome(2) && std::chrono::steady_clock::now() - gone_started <
+                               std::chrono::milliseconds(1500),
+        "holder close wakes compile within 1.5 s instead of the 3 s bound");
+  Check(LeaseStat(server, "leases expired", 1), "holder close reports leases expired 1");
+  Check(waiter.last_reason == 2, "session close reply distinguishes holder loss");
+
+  LeasePeer next_holder(server);
+  const std::string bound_key(64, 'd');
+  Check(next_holder.Acquire(bound_key, 3000) && next_holder.Outcome(0),
+        "wait-bound holder is granted");
+  const auto wait_started = std::chrono::steady_clock::now();
+  waiter.Acquire(bound_key, 75);
+  Check(waiter.Outcome(2, 750) && std::chrono::steady_clock::now() - wait_started <
+                                   std::chrono::milliseconds(750),
+        "wait bound returns compile within 750 ms");
+  Check(LeaseStat(server, "leases held", 1), "wait bound keeps the original holder");
+  Check(waiter.last_reason == 3 && waiter.last_waited_ms >= 75,
+        "wait-bound reply records the bound reason and elapsed milliseconds");
+  std::mutex put_mutex;
+  std::condition_variable put_ready;
+  bool put_allowed = false;
+  bool put_stored = false;
+  const auto bound_started = std::chrono::steady_clock::now();
+  waiter.Acquire(bound_key, 75);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "bound-versus-Put waiter is queued before the race");
+  std::thread concurrent_put([&] {
+    std::unique_lock<std::mutex> lock(put_mutex);
+    if (!put_ready.wait_for(lock, std::chrono::seconds(1), [&] { return put_allowed; })) return;
+    lock.unlock();
+    put_stored = PutLeaseBlob(server, bound_key, 500, &next_holder);
+  });
+  PollUntil([&] { return std::chrono::steady_clock::now() - bound_started >=
+                        std::chrono::milliseconds(75); }, 200);
+  {
+    std::lock_guard<std::mutex> lock(put_mutex);
+    put_allowed = true;
+  }
+  put_ready.notify_one();
+  const bool one_outcome = waiter.Outcome(255);
+  concurrent_put.join();
+  Check(one_outcome && (waiter.last_outcome == 1 || waiter.last_outcome == 2) &&
+            (waiter.last_reason == 0 || waiter.last_reason == 3) && put_stored &&
+            waiter.NoReply(), "bound-versus-Put sends exactly one stored or bound reply");
+  next_holder.Acquire(bound_key, 3000);
+  next_holder.Outcome(0);
+  waiter.Acquire(bound_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "disconnecting waiter is queued");
+  waiter.Close();
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 0); }, 1000),
+        "a disconnected waiter is removed within one second");
+  Check(next_holder.Release(bound_key, false) && next_holder.Released(),
+        "holder remains usable after waiter disconnect");
+
+  LeasePeer stored_waiter(server);
+  const std::string released_key(64, 'e');
+  next_holder.Acquire(released_key, 3000);
+  Check(next_holder.Outcome(0), "stored-release holder is granted");
+  stored_waiter.Acquire(released_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "stored-release waiter is queued");
+  Check(next_holder.Release(released_key, true) && next_holder.Released() &&
+            stored_waiter.Outcome(1), "release stored wakes stored before the subsequent Put");
+  std::string before_put_why;
+  auto before_put_client = daemon::DaemonClient::Connect(server.config, &before_put_why);
+  storage::GetResult before_put;
+  Check(before_put_client && before_put_client->Get(released_key, &before_put) && !before_put.hit,
+        "Get before the release-stored Put can safely miss");
+  Check(PutLeaseBlob(server, released_key), "Put following release stored lands the entry");
+  std::string why;
+  auto client = daemon::DaemonClient::Connect(server.config, &why);
+  storage::GetResult stored;
+  Check(client && client->Get(released_key, &stored) && stored.hit,
+        "ordinary Get after release stored then Put hits the stored entry");
+  Check(stored_waiter.NoReply(), "release stored followed by Put sends no second reply");
+
+  const std::string independent_key(64, 'f');
+  const std::string other_key(64, '1');
+  Check(next_holder.Acquire(independent_key, 3000) && next_holder.Outcome(0) &&
+            stored_waiter.Acquire(other_key, 3000) && stored_waiter.Outcome(0) &&
+            LeaseStat(server, "leases held", 2), "different keys grant independent holders");
+  Check(stored_waiter.Release(independent_key, false) && stored_waiter.Error() &&
+            LeaseStat(server, "leases held", 2), "another session cannot release a holder's key");
+  next_holder.Release(independent_key, false);
+  next_holder.Released();
+  stored_waiter.Release(other_key, false);
+  stored_waiter.Released();
+
+  const std::string store_failed_key(64, '2');
+  const int blocker_fd = ::open((server.config.disk.dir + "/22").c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL, 0600);
+  const bool blocked = blocker_fd >= 0 && ::write(blocker_fd, "blocked shard", 13) == 13;
+  if (blocker_fd >= 0) ::close(blocker_fd);
+  Check(blocked,
+        "store-failure fixture blocks a production disk shard");
+  next_holder.Acquire(store_failed_key, 3000);
+  next_holder.Outcome(0);
+  stored_waiter.Acquire(store_failed_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "store-failure waiter is queued");
+  Check(!PutLeaseBlob(server, store_failed_key, 500, &next_holder) && stored_waiter.Outcome(2) &&
+            stored_waiter.last_reason == 1, "a failed production store wakes compile with failure");
+
+  const std::string shutdown_key(64, '3');
+  next_holder.Acquire(shutdown_key, 3000);
+  next_holder.Outcome(0);
+  stored_waiter.Acquire(shutdown_key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "shutdown waiter is queued");
+  const auto shutdown_started = std::chrono::steady_clock::now();
+  ::kill(server.pid, SIGTERM);
+  Check(stored_waiter.Error() && std::chrono::steady_clock::now() - shutdown_started <
+                                   std::chrono::milliseconds(1000),
+        "shutdown replaces a pending lease reply with a terminal error within one second");
+}
+
+void TestKeyLeaseValidation() {
+  Section("daemon::lease validation");
+  SessionDaemon server(0, true);
+  std::string reply;
+  const int fd = server.Hello(daemon::kProtocolVersion, &reply);
+  daemon::Writer acquire;
+  acquire.U8(7);
+  acquire.Str(std::string(64, 'a'));
+  acquire.U64(100);
+  Check(fd >= 0 && daemon::SendFrame(fd, acquire.data()) && daemon::RecvFrame(fd, &reply) &&
+            reply[0] == static_cast<char>(daemon::Status::kError),
+        "lease acquire requires a held compile session");
+  if (fd >= 0) ::close(fd);
+  LeasePeer peer(server);
+  Check(peer.Acquire("../outside", 100) && peer.Error() && LeaseStat(server, "leases held", 0),
+        "invalid lease keys are refused without holding a lease");
+  SessionDaemon disabled;
+  LeasePeer disabled_peer(disabled);
+  Check(disabled_peer.Acquire(std::string(64, 'a'), 100) && disabled_peer.Outcome(0) &&
+            LeaseStat(disabled, "leases held", 1),
+        "a daemon started without switches grants an enabled client's lease");
+}
+
+void TestKeyLeasePutClose() {
+  Section("daemon::lease Put and holder close");
+  for (bool store_succeeds : {true, false}) {
+    SessionDaemon server(0, true, true);
+    LeasePeer holder(server);
+    LeasePeer waiter(server);
+    const std::string key(64, store_succeeds ? '4' : '5');
+    const int gate_fd = ::open((server.directory + "/put-gate").c_str(), O_RDWR | O_NONBLOCK);
+    Check(gate_fd >= 0 && holder.Acquire(key, 3000) && holder.Outcome(0),
+          "Put-close holder acquires before the store barrier");
+    waiter.Acquire(key, 3000);
+    Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+          "Put-close waiter queues before the store barrier");
+    bool stored = false;
+    std::thread put([&] { stored = PutLeaseBlob(server, key, 3000, &holder); });
+    const bool blocked = PollUntil([&] {
+      return util::ReadFile(server.directory + "/put-log").value_or("").find(
+                 "lease: test Put blocked " + key.substr(0, 16)) != std::string::npos;
+    }, 1000);
+    Check(blocked, "Put is marked in flight before the close barrier");
+    holder.Close();
+    Check(PollUntil([&] { return server.Sessions(1); }, 1000),
+          "holder close removes its compile session while Put remains in flight");
+    const auto closed_at = std::chrono::steady_clock::now();
+    PollUntil([&] { return std::chrono::steady_clock::now() - closed_at >=
+                          std::chrono::milliseconds(600); }, 800);
+    Check(LeaseStat(server, "leases held", 1) && waiter.NoReply(),
+          "a Put in flight keeps the lease held after close without a timer grace");
+    const char outcome = store_succeeds ? 's' : 'f';
+    if (gate_fd >= 0) ::write(gate_fd, &outcome, 1);
+    put.join();
+    Check(stored == store_succeeds, "blocked Put records its actual store result");
+    const bool replied = waiter.Outcome(store_succeeds ? 1 : 2);
+    Check(replied && waiter.last_reason == (store_succeeds ? 0 : 1),
+          store_succeeds ? "Put completing after holder close wakes stored" :
+                           "failed Put completing after holder close wakes compile");
+    Check(waiter.NoReply(), "Put-close sends exactly one reply on the real session socket");
+    Check(LeaseStat(server, "leases held", 0) && LeaseStat(server, "leases waiting", 0) &&
+              LeaseStat(server, "compiles deduplicated", store_succeeds ? 1 : 0),
+          "Put-close clears held and waiting rows and counts only a stored wake");
+    Check(util::ReadFile(server.directory + "/put-log").value_or("").find(
+              "lease: test Put waited " + key.substr(0, 16) + " for ") != std::string::npos,
+          "Put barrier logs its bounded wait length");
+    if (gate_fd >= 0) ::close(gate_fd);
+  }
+}
+
+void TestMemoryAdmission() {
+  Section("daemon::admission");
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server), head(server), small(server);
+    Check(holder.Reserve(6144) && holder.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 6144), "a fitting estimate is reserved");
+    head.Reserve(4096);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              head.NoReply(), "an estimate exceeding remaining memory queues");
+    small.Reserve(1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 2); }, 1000) &&
+              small.NoReply(), "a smaller reservation never jumps the FIFO head");
+    holder.Close();
+    Check(head.MemoryOutcome(0) && small.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 5120),
+          "session close releases memory and grants queued requests in order");
+    const std::string log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    Check(log.find("reserve: granted 4096 kB") < log.find("reserve: granted 1024 kB") &&
+              log.find("reserve: waiting (") != std::string::npos,
+          "FIFO grant order and wait arithmetic appear in VCACHE_LOG");
+    Check(LeaseStat(server, "reserve waits", 2), "each queued request counts one reserve wait");
+    LeasePeer bounded(server);
+    bounded.Reserve(6144, 75);
+    Check(bounded.MemoryOutcome(1, 750) && bounded.last_waited_ms >= 75 &&
+              LeaseStat(server, "memory reserved", 5120) &&
+              LeaseStat(server, "memory waiting", 0),
+          "a memory bound runs unreserved without changing held reservations");
+    head.Close();
+    small.Close();
+    LeasePeer next(server);
+    Check(next.Reserve(8192) && next.MemoryOutcome(0),
+          "release is applied before a new reserve in the same turn");
+  }
+  {
+    SessionDaemon server(0, false, false, 5 * 1024 * 1024);
+    LeasePeer first(server), second(server), third(server);
+    Check(first.Reserve(2 * 1024 * 1024) && first.MemoryOutcome(0) &&
+              second.Reserve(2 * 1024 * 1024) && second.MemoryOutcome(0),
+          "stale 5 GB meminfo grants the first two 2 GB estimates");
+    third.Reserve(2 * 1024 * 1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              third.NoReply() && LeaseStat(server, "memory reserved", 4 * 1024 * 1024),
+          "unrealised reservations queue the third grant despite stale meminfo");
+    Check(first.Spawned(2000000000), "an invisible compiler pid selects conservative fallback");
+    Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(
+              "whole estimate unrealised for 10000 ms") != std::string::npos,
+          "an invisible compiler logs its ten-second conservative fallback");
+    Check(PollUntil([&] { return server.Sessions(3); }, 1000) &&
+              LeaseStat(server, "memory reserved", 4 * 1024 * 1024) && third.NoReply(650),
+          "a failed proc read never releases a live session's reservation");
+    first.Close();
+    Check(third.MemoryOutcome(0), "closing the fallback session releases its reservation");
+  }
+  {
+    SessionDaemon server(0, false, false, 1024 * 1024);
+    LeasePeer alone(server);
+    Check(alone.Reserve(2 * 1024 * 1024) && alone.MemoryOutcome(0),
+          "always-one grants a 2 GB estimate on a 1 GB machine when alone");
+    alone.Close();
+    LeasePeer defaults(server);
+    Check(defaults.Reserve(0) && defaults.MemoryOutcome(0) &&
+              LeaseStat(server, "memory reserved", 2097152),
+          "a zero estimate uses the default compile cost");
+  }
+  {
+    SessionDaemon server(0, false, false, 50000);
+    LeasePeer first(server), second(server);
+    first.Reserve(32768);
+    Check(first.MemoryOutcome(0), "RSS fixture obtains the first reservation");
+    const pid_t compiler_pid = first.StartCompiler(16384);
+    Check(compiler_pid > 0 && first.Spawned(compiler_pid),
+          "CompilerSpawned reports a visible child of the session peer");
+    auto pid_descriptors = [&] {
+      size_t count = 0;
+      std::error_code error;
+      for (const auto& entry : std::filesystem::directory_iterator(
+               "/proc/" + std::to_string(server.pid) + "/fd", error)) {
+        if (std::filesystem::read_symlink(entry.path(), error) == "anon_inode:[pidfd]") ++count;
+      }
+      return count;
+    };
+    const size_t original_pid_descriptors = pid_descriptors();
+    Check(first.Spawned(compiler_pid) && pid_descriptors() == original_pid_descriptors,
+          "repeated compiler notifications retain exactly one pid descriptor");
+    Check(first.Spawned(2000000000) && LeaseStat(server, "memory realised", 0),
+          "a replacement invisible pid starts with the whole estimate unrealised");
+    Check(first.Spawned(compiler_pid), "a visible compiler can replace the fallback pid");
+    second.Reserve(32768);
+    Check(second.MemoryOutcome(0, 1500),
+          "realised RSS reduces unrealised memory without double counting MemAvailable");
+    Check(PollUntil([&] {
+      const std::string status = server.Status();
+      const size_t row = status.find("memory realised");
+      return row != std::string::npos &&
+             std::strtoull(status.c_str() + row + 15, nullptr, 10) >= 16384;
+    }, 1000), "memory realised status reports sampled RSS");
+    first.StopCompiler();
+    Check(PollUntil([&] { return LeaseStat(server, "memory reserved", 32768); }, 1500) &&
+              server.Sessions(2), "confirmed compiler exit releases memory before session close");
+    second.Close();
+    Check(first.Reserve(1024) && first.MemoryOutcome(0), "an overshoot fixture reserves 1024 kB");
+    const pid_t overshoot_pid = first.StartCompiler(4096);
+    first.Spawned(overshoot_pid);
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                 "rss overshoot") != std::string::npos;
+    }, 1500), "RSS above the estimate is clamped and logged as an overshoot");
+    LeasePeer after_overshoot(server);
+    Check(after_overshoot.Reserve(50000) && after_overshoot.MemoryOutcome(0, 1000),
+          "RSS above the estimate contributes zero unrealised memory to the next grant");
+    first.StopCompiler();
+  }
+  {
+    SessionDaemon server(0, false, false, 1024);
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(1024);
+    holder.MemoryOutcome(0);
+    queued.Reserve(1024);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "memory-rise fixture queues a reservation");
+    const int mem_fd = ::open((server.directory + "/meminfo").c_str(), O_WRONLY | O_TRUNC);
+    if (mem_fd >= 0) {
+      const std::string meminfo = "MemAvailable: 2048 kB\n";
+      ::write(mem_fd, meminfo.data(), meminfo.size());
+      ::close(mem_fd);
+    }
+    Check(queued.MemoryOutcome(0, 1500) && LeaseStat(server, "memory reserved", 2048),
+          "rising MemAvailable grants the FIFO head within one sample interval");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server);
+    holder.Reserve(8192);
+    holder.MemoryOutcome(0);
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    bool reserved = false;
+    std::atomic<bool> finished{false};
+    std::thread reserve([&] {
+      if (session) reserved = session->ReserveMemory(std::string(64, 'a'), 1024);
+      finished = true;
+    });
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "an enabled client reserves through a daemon started with admission off");
+    bool timeout_has_margin = false;
+    for (int fd = 0; fd < 256; ++fd) {
+      timeval timeout{};
+      socklen_t size = sizeof(timeout);
+      if (::getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, &size) == 0 &&
+          timeout.tv_sec == 615) timeout_has_margin = true;
+    }
+    Check(timeout_has_margin, "reserve receive timeout has the required 15 second margin");
+    holder.Close();
+    const bool received = PollUntil([&] { return finished.load(); }, 1000);
+    if (!received && server.pid > 0) ::kill(server.pid, SIGTERM);
+    reserve.join();
+    Check(received && reserved, "the client receives granted after the earlier reservation ends");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server), head(server), later(server);
+    holder.Reserve(6144);
+    holder.MemoryOutcome(0);
+    head.Reserve(4096, 100);
+    PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000);
+    later.Reserve(1024);
+    Check(head.MemoryOutcome(1, 1000) && later.MemoryOutcome(0, 1000) &&
+              LeaseStat(server, "memory reserved", 7168),
+          "an expired FIFO head is removed before the next fitting request is granted");
+  }
+  {
+    SessionDaemon server(0, false, false, 2048);
+    LeasePeer holder(server);
+    holder.Reserve(2048);
+    holder.MemoryOutcome(0);
+    holder.Spawned(2000000000);
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    bool reserved = false;
+    std::atomic<bool> answered{false};
+    const auto started = std::chrono::steady_clock::now();
+    std::thread reserve([&] {
+      if (session) reserved = session->ReserveMemory(std::string(64, 'a'), 2048, 12000);
+      answered = true;
+    });
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              LeaseStat(server, "memory realised", 0),
+          "an invisible pid keeps the whole estimate unrealised initially");
+    Check(PollUntil([&] { return answered.load(); }, 11000) && reserved &&
+              std::chrono::steady_clock::now() - started >= std::chrono::seconds(9) &&
+              LeaseStat(server, "memory realised", 2048) &&
+              LeaseStat(server, "memory reserved", 4096),
+          "the ten-second pid fallback realises its estimate and grants the queued head");
+    reserve.join();
+  }
+  {
+    SessionDaemon disabled;
+    LeasePeer peer(disabled);
+    Check(peer.Reserve(1024) && peer.MemoryOutcome(0),
+          "a switch-free daemon always serves an enabled client's reserve");
+  }
+}
+
+void TestRunSpawnCallback() {
+  Section("util::Run spawn callback");
+  int calls = 0;
+  pid_t spawned_pid = 0;
+  util::ProcOptions options{.capture_stdout = true, .capture_stderr = true};
+  options.on_spawn = [&](int pid) {
+    ++calls;
+    spawned_pid = pid;
+    Check(pid > 0 && ::kill(pid, 0) == 0,
+          "spawn callback receives the live child pid in the parent");
+  };
+  const auto result = util::Run({"sh", "-c", "printf out; printf err >&2; exit 7"}, options);
+  Check(calls == 1 && spawned_pid > 0 && result.exit_code == 7 &&
+            result.stdout_data == "out" && result.stderr_data == "err",
+        "spawn notification preserves exit status and concurrent pipe capture");
+  calls = 0;
+  const auto absent = util::Run({}, options);
+  Check(calls == 0 && absent.exit_code == -1 && absent.wall_ms == 0 && absent.max_rss_kb == 0,
+        "a process that was never spawned has no notification or cost");
+}
+
+void TestLeaseReviewFixes() {
+  Section("daemon::lease review fixes");
+  SessionDaemon server;
+  LeasePeer holder(server), waiter(server);
+  const std::string key(64, '6');
+  holder.Acquire(key, 3000);
+  Check(holder.Outcome(0), "a switch-free daemon grants the holder's lease");
+  waiter.Acquire(key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "foreign-store fixture queues a waiter");
+  const std::string blocker = server.config.disk.dir + "/66";
+  const int blocker_fd = ::open(blocker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (blocker_fd >= 0) ::close(blocker_fd);
+  Check(blocker_fd >= 0 && !PutLeaseBlob(server, key) && waiter.NoReply() &&
+            LeaseStat(server, "leases held", 1),
+        "a failing foreign Put leaves the holder and waiter unchanged");
+  Check(::rename(blocker.c_str(), (server.directory + "/blocked-shard").c_str()) == 0 &&
+            PutLeaseBlob(server, key, 500, &holder) && waiter.Outcome(1) && waiter.NoReply(),
+        "the holder's Put alone wakes the waiter with exactly one stored reply");
+
+  core::Config enabled = server.config;
+  enabled.daemon.mode = core::DaemonMode::kOn;
+  enabled.daemon.single_flight = true;
+  const std::string log_path = server.directory + "/client-log";
+  ::setenv("VCACHE_LOG", log_path.c_str(), 1);
+  util::InitLogging();
+  auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+  Check(session && session->AcquireLease("invalid/key", 100) == daemon::LeaseOutcome::kCompile &&
+            session->AcquireLease(std::string(64, '7'), 100) == daemon::LeaseOutcome::kGranted,
+        "a refused lease keeps the session usable for the next scheduler operation");
+  Check(util::ReadFile(log_path).value_or("").find(
+            "lease: daemon refused (invalid lease acquire), compiling") != std::string::npos,
+        "lease refusal is logged distinctly from holder loss");
+  if (session) session->ReleaseLease(false);
+  const std::string bounded_key(64, '8');
+  holder.Acquire(bounded_key, 3000);
+  holder.Outcome(0);
+  daemon::LeaseOutcome outcome = daemon::LeaseOutcome::kGranted;
+  std::thread acquire([&] {
+    if (session) outcome = session->AcquireLease(bounded_key, 300000);
+  });
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "capped lease request reaches its server wait");
+  bool timeout_has_margin = false;
+  for (int fd = 0; fd < 256; ++fd) {
+    timeval timeout{};
+    socklen_t size = sizeof(timeout);
+    if (::getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, &size) == 0 &&
+        timeout.tv_sec == 315) timeout_has_margin = true;
+  }
+  Check(timeout_has_margin, "capped lease receive timeout has the required 15 second margin");
+  holder.Release(bounded_key, false);
+  holder.Released();
+  acquire.join();
+  Check(outcome == daemon::LeaseOutcome::kCompile,
+        "a capped wait still receives its holder failure reply normally");
+  session.reset();
+  ::unsetenv("VCACHE_LOG");
+  util::InitLogging();
+}
+
+void TestLeaseOrphanPut() {
+  Section("daemon::lease holder identity after close");
+  SessionDaemon server(0, false, true);
+  LeasePeer holder(server);
+  const std::string key(64, '9');
+  holder.Acquire(key, 3000);
+  Check(holder.Outcome(0), "orphan-Put holder acquires without waiters");
+  const int gate_fd = ::open((server.directory + "/put-gate").c_str(), O_RDWR | O_NONBLOCK);
+  bool stored = false;
+  std::thread put([&] { stored = PutLeaseBlob(server, key, 3000, &holder); });
+  Check(PollUntil([&] {
+    return util::ReadFile(server.directory + "/put-log").value_or("").find(
+               "lease: test Put blocked ") != std::string::npos;
+  }, 1000), "orphan-Put store reaches the accepted-store barrier");
+  const uint64_t holder_pid = holder.pid;
+  holder.Close();
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "holder session ends before a later waiter exists");
+  LeasePeer waiter(server);
+  waiter.Acquire(key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "a later waiter joins the orphaned in-flight Put");
+  const std::string blocker = server.config.disk.dir + "/99";
+  const int blocker_fd = ::open(blocker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (blocker_fd >= 0) ::close(blocker_fd);
+  Check(blocker_fd >= 0 && !PutLeaseBlob(server, key) && waiter.NoReply(),
+        "cached holder identity rejects a foreign failed Put after session destruction");
+  if (blocker_fd >= 0) ::rename(blocker.c_str(), (server.directory + "/blocked-shard").c_str());
+  if (gate_fd >= 0) ::write(gate_fd, "s", 1);
+  put.join();
+  Check(stored && waiter.Outcome(1) && waiter.last_holder_pid == holder_pid && waiter.NoReply(),
+        "the accepted holder Put wakes once with its retained holder pid");
+  if (gate_fd >= 0) ::close(gate_fd);
 }
 
 void TestHasher() {
@@ -3437,9 +4628,106 @@ void TestJobserver() {
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }
 
+void TestMemoryEstimates() {
+  Section("daemon::admission estimates");
+  TempCacheDir cache;
+  core::Config config;
+  config.disk.dir = cache.path();
+  const std::string missing_key(64, 'f');
+  Check(daemon::MemoryEstimateKb(config, missing_key, false) == 2097152 &&
+            daemon::MemoryEstimateKb(config, missing_key, true) == 4194304,
+        "missing cost records use separate compile and link defaults");
+  config.daemon.mode = core::DaemonMode::kOn;
+  config.daemon.admission = true;
+  const std::string description = core::DescribeConfig(config);
+  Check(description.find("  admission:      on\n") != std::string::npos &&
+            description.find("  compile kB:     2097152\n") != std::string::npos &&
+            description.find("  link kB:        4194304\n") != std::string::npos,
+        "show-config reports client admission and its separate kilobyte defaults");
+  const auto roots = MakeRoots({cache.path() + "=project"});
+  const std::string source = cache.path() + "/source.cc";
+  const std::string key = core::ComputeCostKey("compile", source, "c++", {"-O2"}, roots);
+  for (uint64_t rss_kb : {20000, 5000}) {
+    util::ProcResult proc;
+    proc.max_rss_kb = rss_kb;
+    proc.wall_ms = 1000;
+    core::RecordCompileCost(cache.path(), "compile", source, "c++", {"-O2"}, roots, proc);
+  }
+  Check(daemon::MemoryEstimateKb(config, key, false) == 20000,
+        "the largest production-written RSS observation supplies the estimate");
+  const std::string link_source = cache.path() + "/program";
+  util::ProcResult zero;
+  zero.wall_ms = 1;
+  core::RecordCompileCost(cache.path(), "link", link_source, "", {}, roots, zero);
+  const std::string zero_key = core::ComputeCostKey("link", link_source, "", {}, roots);
+  Check(daemon::MemoryEstimateKb(config, zero_key, true) == 4194304,
+        "a zero-RSS cost record uses the link default");
+
+  std::map<std::string, std::optional<std::string>> saved;
+  for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_DEFAULT_COMPILE_KB",
+                                  "VCACHE_DAEMON_DEFAULT_LINK_KB"}) {
+    const char* value = std::getenv(name.c_str());
+    saved[name] = value ? std::optional<std::string>(value) : std::nullopt;
+    ::unsetenv(name.c_str());
+  }
+  const std::string path = cache.path() + "/config.toml";
+  util::WriteFileAtomic(path, "[daemon]\ndefault_compile_kb = 77\ndefault_link_kb = 88\n");
+  ::setenv("VCACHE_CONFIG", path.c_str(), 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 77 &&
+            core::LoadConfig().daemon.default_link_kb == 88,
+        "the admission default configuration keys load as kilobytes");
+  ::setenv("VCACHE_DAEMON_DEFAULT_COMPILE_KB", "99", 1);
+  ::setenv("VCACHE_DAEMON_DEFAULT_LINK_KB", "111", 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 99 &&
+            core::LoadConfig().daemon.default_link_kb == 111,
+        "admission default environment variables override configuration");
+  ::setenv("VCACHE_DAEMON_DEFAULT_COMPILE_KB", "0", 1);
+  ::setenv("VCACHE_DAEMON_DEFAULT_LINK_KB", "18446744073709551616", 1);
+  Check(core::LoadConfig().daemon.default_compile_kb == 77 &&
+            core::LoadConfig().daemon.default_link_kb == 88,
+        "zero and overflowing defaults leave the configured positive estimates");
+  for (const auto& [name, value] : saved) {
+    if (value) ::setenv(name.c_str(), value->c_str(), 1);
+    else ::unsetenv(name.c_str());
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc >= 7 && (std::string(argv[1]) == "--write-lease-cost-fixture" ||
+                    std::string(argv[1]) == "--write-admission-cost-fixture")) {
+    const bool admission = std::string(argv[1]) == "--write-admission-cost-fixture";
+    const std::string cache_dir = argv[2];
+    const auto roots = MakeRoots({argv[3]});
+    const std::string operation = argv[4];
+    util::ProcResult proc;
+    proc.wall_ms = admission ? 1000 : std::strtoull(argv[5], nullptr, 10);
+    proc.max_rss_kb = admission ? std::strtoull(argv[5], nullptr, 10) : 4096;
+    const std::vector<std::string> command(argv + 6, argv + argc);
+    std::string source, language;
+    std::vector<std::string> key_args;
+    if (operation == "compile") {
+      const auto parsed = args::Parse(command);
+      source = parsed.source;
+      language = args::LanguageName(parsed.language);
+      key_args = parsed.key_args;
+    } else if (operation == "rustc") {
+      const auto parsed = args::ParseRustc(command);
+      source = parsed.source;
+      language = "rust";
+      key_args = parsed.key_args;
+    } else if (operation == "link") {
+      const auto parsed = args::ParseLink(command);
+      source = parsed.output;
+      key_args = parsed.key_args;
+    } else {
+      return 2;
+    }
+    core::RecordCompileCost(cache_dir, operation, source, language, key_args, roots, proc);
+    return core::LoadCompileCost(cache_dir, core::ComputeCostKey(
+        operation, source, language, key_args, roots)).observations.empty() ? 1 : 0;
+  }
   TestStringUtils();
   TestRootMap();
   TestDepFile();
@@ -3449,6 +4737,16 @@ int main() {
   TestCacheChain();
   TestCacheChainRemote();
   TestDaemonProtocol();
+  TestCompileSessions();
+  TestCompileSessionShutdownRace();
+  TestCompileSessionStalledSend();
+  TestKeyLeases();
+  TestKeyLeaseValidation();
+  TestKeyLeasePutClose();
+  TestMemoryAdmission();
+  TestRunSpawnCallback();
+  TestLeaseReviewFixes();
+  TestLeaseOrphanPut();
   TestHasher();
   TestSha256();
   TestLinkArgs();
@@ -3481,6 +4779,7 @@ int main() {
   // and a forked child is charged that high-water mark until exec replaces it.
   TestReadFile();
   TestCost();
+  TestMemoryEstimates();
   TestRustcFingerprint();
   TestRustOutputNames();
   TestUploadGeneration();

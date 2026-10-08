@@ -118,6 +118,10 @@ const char* DaemonModeName(DaemonMode mode);
 
 struct DaemonConfig {
   DaemonMode mode = DaemonMode::kOff;
+  bool single_flight = false;
+  bool admission = false;
+  uint64_t default_compile_kb = 2097152;
+  uint64_t default_link_kb = 4194304;
 
   // The daemon exits, after draining its upload queue, once it has had no
   // client for this long. Zero keeps it running until told to stop. The

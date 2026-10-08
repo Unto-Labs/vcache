@@ -125,6 +125,7 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
   }
 
   // Parent.
+  if (opts.on_spawn) opts.on_spawn(pid);
   if (out_pipe[1] >= 0) ::close(out_pipe[1]);
   if (err_pipe[1] >= 0) ::close(err_pipe[1]);
   PumpPipes(out_pipe[0], err_pipe[0], &result.stdout_data, &result.stderr_data);

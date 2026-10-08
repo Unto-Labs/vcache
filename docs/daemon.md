@@ -38,6 +38,8 @@ upload_threads = 4      # background S3 uploaders
 | `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | `900` |
 | `daemon.upload_threads` | `VCACHE_DAEMON_UPLOAD_THREADS` | `4` |
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | `<cache dir>/daemon/sock` |
+| `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | `false` |
+| `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | `false` |
 | `daemon.jobserver` | `VCACHE_DAEMON_JOBSERVER` | off |
 | `daemon.jobserver_jobs` | `VCACHE_DAEMON_JOBSERVER_JOBS` | online CPUs |
 
@@ -162,8 +164,20 @@ others.
 Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
 fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
 does not print) and ignores the fifo when its own command line passes `-j`.
-cargo and rustc speak the same protocol through the `jobserver` crate; that
-is checked separately before a sibling repo relies on it.
+cargo and rustc speak the same protocol through the `jobserver` crate. With
+cargo and rustc 1.97.1, `strace -f` of one `cargo build` of a five-crate
+workspace under this `MAKEFLAGS`, with and without `RUSTC_WRAPPER=vcache`,
+shows cargo and every rustc it spawns opening the fifo `O_RDWR`, then
+reading and writing back `+` bytes. The fifo form needs no inherited
+descriptors, so the wrapper does not have to forward any. The pool held the same bytes after
+the build as before it:
+
+```text
+openat(AT_FDCWD, "<cache dir>/daemon/jobserver.fifo", O_RDWR|O_CLOEXEC) = 3
+openat(AT_FDCWD, "<cache dir>/daemon/jobserver.fifo", O_RDWR|O_CLOEXEC) = 4
+read(3, "+", 1) = 1
+write(4, "+", 1) = 1
+```
 
 A build that still has the `MAKEFLAGS` line after the daemon has gone falls
 back to the tool's own default. ninja warns and uses its usual `-j`. A client
@@ -248,6 +262,97 @@ separately, and a client that reuses its connection waits on the delayed-ACK
 timer. Real endpoints do not do this. Measured without it, the daemon looked
 *slower* on S3 hits (1.48 s against 1.37 s).
 
+## Single-flight
+
+Set `daemon.single_flight = true` (`VCACHE_DAEMON_SINGLE_FLIGHT=1`) to share
+one compile of a missed key across concurrent worktrees. It defaults to false.
+The switches control each client's requests. The daemon always serves scheduler
+operations, so a tree can enable them after another tree has started the daemon.
+A compile session holds a memory-only `KeyLease`; another compile of the same
+key waits for its holder to store or release it. Different keys remain independent.
+C and Rust lease the entry key. Links lease the pre-key that locates their
+result manifest. Rust's dep-info and manifest keys never receive compile leases.
+Read-only clients hold no compile lease. Recache requests
+compile independently so they still replace existing entries.
+
+After a stored reply the waiter uses an ordinary Get and restores the outputs.
+A failed holder, a lost session, daemon shutdown, or the wait bound makes it
+compile locally. A missing or unusable entry after a stored reply also compiles:
+release-stored can precede Put, so that ordering remains safe without guaranteeing
+a hit. A granted holder rechecks the cache too, covering a store between its
+initial miss and acquire. A restored result counts as a normal cache hit; only
+a wrapper that actually compiles records a miss.
+
+If a holder closes while a Put of its key is already in flight, the lease stays
+held until that Put finishes: success wakes stored, failure wakes compile. A
+close with no Put in flight wakes compile immediately. The waiter's own bound
+still limits its wait if storage stalls; there is no timer grace on holder close.
+Put completes a lease only when its peer pid matches the holder's pid. If either
+pid is unavailable, the daemon accepts the Put as it did before pid checks.
+The test-only `VCACHE_DAEMON_TEST_BLOCK_PUT=<fifo>` seam pauses the first Put
+after marking it in flight, for at most five seconds. A byte `s` permits storage;
+any other byte or timeout makes that Put's disk read-only and skips remote stores.
+The seam is inactive when the variable is absent.
+
+The wait bound is the larger of twice the waiter's own recorded wall time and
+30 seconds, capped at the 300-second reply timeout. Without a usable cost record
+the bound is 30 seconds. It uses the highest wall time in the matching cost
+record, rather than only its latest observation. A waiter still occupies its
+build tool's job slot while it waits.
+Decision logs include holder pid, bound and elapsed wait; the client receives
+this metadata with its scheduling reply. Session loss never fails the build.
+The socket receive timeout exceeds a scheduling bound by 15 seconds, allowing
+the bound reply to arrive. Disconnect checks run outside the shared server lock
+at most every 250 ms; holder completion wakes the lease condition immediately.
+
+`--daemon-status` shows `leases held`, `leases waiting`, lifetime `leases expired`
+and `compiles deduplicated`. A stored wake increments the deduplication counter;
+the subsequent Get can still miss after eviction. Restart drops all leases and
+waiters continue locally. Concurrent S3 Gets also share one fetch through the
+key table, without holding a compile lease or affecting compile deduplication
+counters. Fetch waits are bounded by the same 300-second reply timeout and log
+their elapsed duration.
+
+Measured cross-worktree deduplication: pending the scheduler benchmark.
+
+## Memory admission
+
+`daemon.admission` defaults to false and enables admission for that client.
+The daemon serves scheduling requests regardless of the starter's switches.
+After a cache miss, and after acquiring a lease when single-flight is enabled,
+the wrapper reserves memory before its actual compile or link. Preprocessing
+and Rust dep-info runs do not reserve memory. A lease waiter holds no reservation.
+
+The estimate is the highest RSS in the matching cost record. Missing or zero
+records use `daemon.default_compile_kb` (2097152 kB, 2 GiB) or
+`daemon.default_link_kb` (4194304 kB, 4 GiB). The daemon reads `MemAvailable`
+at most once a second and samples the compiler's `VmRSS` every 500 ms:
+
+```
+unrealised_kb = sum(max(0, estimate_kb - rss_kb))
+available_kb = max(0, MemAvailable - unrealised_kb)
+```
+
+Resident memory is already reflected in `MemAvailable`, so it is subtracted
+from each reservation's unrealised amount. Grants follow strict FIFO order;
+a small request cannot pass a larger head request. An estimate above available
+RAM can start when no reservation is held, allowing at least one job to proceed.
+Session close or confirmed compiler exit releases the reservation immediately.
+A failed proc read alone retains it. RSS above the estimate contributes zero
+unrealised memory and logs the overshoot.
+
+The reported compiler pid is sampled only when visible with the session peer
+as its parent. Otherwise the daemon logs the pid mismatch and treats the whole
+estimate as unrealised for ten seconds, then as realised. This fallback allows
+clients in another pid namespace to proceed without sampling an unrelated pid.
+
+Waiting is bounded to ten minutes by default. A bound reply, refusal, disconnect
+or daemon shutdown runs the compiler unreserved. Decision logs contain the
+estimate, elapsed wait and admission arithmetic. `--daemon-status` adds
+`memory reserved`, `memory realised`, `memory waiting`, `reserve waits` and
+`longest wait ms`. The first two values are in kB. Reservations and waiters are
+memory-only and disappear on restart.
+
 ## Protocol
 
 Every message is one frame: an 8-byte little-endian length, then the body. A
@@ -262,20 +367,51 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | put | key, blob | ok + stored flag + errors |
 | status | — | ok + text |
 | shutdown | — | ok + failed-upload count + summary, once uploads have drained |
+| session open | —, immediately after hello | ok, holding this connection until compile completion |
+| lease acquire | key, bound ms | ok + outcome + compile reason + holder pid + waited ms |
+| lease release | key, stored or failed | ok |
+| memory reserve | cost key, estimate kB, bound ms | ok + granted or bound + waited ms |
+| compiler spawned | compiler pid | ok |
+| any session op, or idle session | — | terminal error + "daemon shutting down" |
 
-Compiles use one connection per request. A compile spends nearly all its life
-running the compiler between its lookup and its store, and holding a connection
-across that would keep a daemon that is shutting down waiting on it.
+Any session frame may be a terminal `error + "daemon shutting down"`. Shutdown
+sends this frame to idle sessions too, then closes their sockets. A terminal
+frame replaces a pending scheduling reply; clients continue locally.
+
+Lease outcomes are one-byte `granted`, `stored`, or `compile`. Compile reasons
+are one-byte `none`, `holder_failed`, `holder_gone`, `bound`, or `shutdown`.
+Holder pid (zero if unknown) and waited milliseconds are unsigned 64-bit integers.
+Memory outcomes are one-byte `granted` (0) or `bound` (1), followed by unsigned
+64-bit waited milliseconds. Compiler pid, estimate and bound use unsigned
+64-bit integers too.
+
+Get and Put use one connection per request. Protocol version 2 also supports
+**compile sessions**: one separate connection per cache miss when
+`daemon.single_flight` or `daemon.admission` is enabled. These switches default
+to false; this session scaffolding carries the scheduling operations added by
+those features. Read-only clients and daemon-off invocations hold no session.
+
+A session opens after key computation and lookup, before the real compile or
+link, and closes after output restoration and stores, or on failure. It has no
+idle timeout: a compiler can legitimately run for an hour. An open session keeps
+the daemon alive, and `--daemon-status` reports `compile sessions N`.
+Shutdown sends a terminal error and closes sessions immediately, while ordinary
+requests and uploads retain their existing drain behavior. A missing, refused,
+or interrupted session logs `session: daemon unavailable (...)`, and the compile
+continues. Successful sessions log their opening and closing duration.
+
+The daemon allows one session per peer pid on Linux. Sessions and ordinary
+connections share the 1024-connection limit; a `-j128` build can hold up to 128
+sessions alongside its cache requests. A client that never sends another message
+keeps one server thread until its socket closes. Sessions are memory-only and
+are dropped on restart.
 
 A new op, distributed compilation for example, is a version bump. Clients and
 daemons that disagree on the version refuse each other at hello and fall back
-cleanly.
+cleanly. Version 1 and version 2 refuse each other with both versions in the reason.
 
 ## Not done yet
 
-- **Deduplicating concurrent S3 lookups.** Two compiles that miss the same key
-  at the same moment both fetch it. This is rare in practice, because keys are
-  per translation unit.
 - **Refreshing credentials.** See above.
 - **Deciding eviction centrally.** The disk layer still evicts the way it did
   without a daemon (see `design.md`). It works unchanged with or without one,

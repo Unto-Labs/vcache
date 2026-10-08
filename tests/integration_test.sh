@@ -3475,6 +3475,48 @@ check "followed by one reason line per reason" \
 "$VCACHE" --zero-stats >/dev/null
 check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"
 
+section "10a. Compile sessions"
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$TOP/tests/daemon_session_test.py" "$VCACHE" "$WORK/compile-sessions" \
+    > "$WORK/compile-sessions.report" 2> "$WORK/compile-sessions.errors"
+  session_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/compile-sessions.report"
+  check "compile session integration driver completes" "$session_test_exit" "0"
+  if [[ "$session_test_exit" != 0 ]]; then cat "$WORK/compile-sessions.errors"; fi
+else
+  bad "compile session integration requires python3"
+fi
+
+section "10b. Single-flight"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+    > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
+  lease_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/single-flight.report"
+  check "single-flight integration driver completes" "$lease_test_exit" "0"
+  if [[ "$lease_test_exit" != 0 ]]; then cat "$WORK/single-flight.errors"; fi
+else
+  bad "single-flight integration requires python3"
+fi
+
+section "10c. Memory admission"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+    "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
+  admission_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/admission.report"
+  check "memory admission integration driver completes" "$admission_test_exit" "0"
+  if [[ "$admission_test_exit" != 0 ]]; then cat "$WORK/admission.errors"; fi
+else
+  bad "memory admission integration requires python3"
+fi
+
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

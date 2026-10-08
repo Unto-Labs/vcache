@@ -50,6 +50,7 @@
 #include "daemon/server.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
+#include "rust/rust_compile.h"
 #include "rust/rust_manifest.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
@@ -2898,6 +2899,51 @@ void TestCost() {
         "a cost file from today survives trim");
 }
 
+void TestRustcFingerprint() {
+  Section("rust::fingerprint");
+
+  auto scratch = util::MakeTempDir("vcache-rustc-memo-");
+  Check(scratch.has_value(), "rustc memo scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string banner_a =
+      "#!/bin/sh\n"
+      "if [ \"$1\" = \"-vV\" ]; then printf 'release: 9.9.1\\n'; exit 0; fi\n"
+      "exit 0\n";
+  const std::string banner_b =
+      "#!/bin/sh\n"
+      "if [ \"$1\" = \"-vV\" ]; then printf 'release: 9.9.2\\n'; exit 0; fi\n"
+      "exit 0\n";
+  Check(banner_a.size() == banner_b.size(), "the two fake rustc scripts have the same size");
+
+  const std::string rustc = *scratch + "/rustc";
+  const std::string copy = *scratch + "/rustc-copy";
+  auto install = [](const std::string& path, const std::string& text) {
+    util::WriteFileAtomic(path, text);
+    ::chmod(path.c_str(), 0755);
+  };
+  install(rustc, banner_a);
+  const std::string first = rust::ResolveRustcFingerprint(rustc, *scratch);
+  CheckEq(rust::ResolveRustcFingerprint(rustc, *scratch), first,
+          "an unchanged rustc reuses its fingerprint");
+
+  install(rustc, banner_b);
+  Check(util::FileSize(rustc).value_or(0) == banner_a.size(),
+        "the rewritten rustc keeps the same size");
+  Age(rustc, -2);
+  const std::string rebuilt = rust::ResolveRustcFingerprint(rustc, *scratch);
+  Check(rebuilt != first, "a same-size rustc with a new mtime gets a new fingerprint");
+
+  install(copy, banner_a);
+  Age(copy, 100);
+  CheckEq(rust::ResolveRustcFingerprint(copy, *scratch), first,
+          "two rustc files with one banner share a fingerprint");
+}
+
 void TestJobserver() {
   Section("daemon::jobserver");
 
@@ -2944,6 +2990,22 @@ void TestJobserver() {
   pool.reset();
   Check(::lstat(path.c_str(), &st) != 0, "destroying the pool removes the fifo");
 
+  auto replaced_pool = daemon::JobserverPool::Open(path, 2, &error);
+  Check(replaced_pool.has_value(), "opened a pool whose fifo will be replaced (" + error + ")");
+  if (replaced_pool) {
+    Check(::unlink(path.c_str()) == 0, "the pool fifo can be removed by path");
+    Check(::mkfifo(path.c_str(), 0600) == 0, "a new fifo can take the same path");
+    struct stat replaced {};
+    const bool replaced_ok = ::lstat(path.c_str(), &replaced) == 0 && S_ISFIFO(replaced.st_mode);
+    const ino_t replaced_ino = replaced.st_ino;
+    replaced_pool.reset();
+    struct stat after {};
+    Check(replaced_ok && ::lstat(path.c_str(), &after) == 0 && S_ISFIFO(after.st_mode) &&
+              after.st_ino == replaced_ino,
+          "destroying the pool leaves a replaced fifo in place");
+    ::unlink(path.c_str());
+  }
+
   ::setenv("VCACHE_DAEMON_JOBSERVER", "1", 1);
   ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "-2", 1);
   const core::Config negative = core::LoadConfig();
@@ -2961,6 +3023,29 @@ void TestJobserver() {
   }
   Check(zero.daemon.jobserver_jobs == 0 && warned,
         "jobserver_jobs of 0 warns and uses the online-CPU default");
+
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "2147483648", 1);
+  const core::Config huge_env = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : huge_env.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(huge_env.daemon.jobserver_jobs == 0 && warned,
+        "a jobserver_jobs above INT_MAX from the environment warns and uses the online-CPU default");
+
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
+  TempCacheDir toml_dir;
+  const std::string toml_path = toml_dir.path() + "/vcache.toml";
+  util::WriteFileAtomic(toml_path, "[daemon]\njobserver_jobs = 3000000000\n");
+  ::setenv("VCACHE_CONFIG", toml_path.c_str(), 1);
+  const core::Config huge_toml = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : huge_toml.warnings) {
+    if (warning.find("daemon.jobserver_jobs") != std::string::npos) warned = true;
+  }
+  Check(huge_toml.daemon.jobserver_jobs == 0 && warned,
+        "a jobserver_jobs above INT_MAX from toml warns and uses the online-CPU default");
+  ::unsetenv("VCACHE_CONFIG");
   ::unsetenv("VCACHE_DAEMON_JOBSERVER");
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }
@@ -3004,6 +3089,7 @@ int main() {
   TestRustManifest();
   TestRunRusage();
   TestCost();
+  TestRustcFingerprint();
   TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);

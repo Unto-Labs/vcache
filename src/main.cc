@@ -6,6 +6,7 @@
 //   vcache g++ -c foo.cc -o foo.o     explicit prefix
 //   ln -s vcache g++; g++ -c foo.cc   masquerade via a symlink on $PATH
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -227,8 +228,13 @@ int JobserverEnv(const vcache::core::Config& config) {
               client == nullptr ? why.c_str() : "the daemon has no pool");
     return 1;
   }
-  const std::string line = vcache::daemon::JobserverMakeFlagsLine(
-      vcache::daemon::StateDir(config) + "/jobserver.fifo");
+  const std::string path = vcache::daemon::StateDir(config) + "/jobserver.fifo";
+  struct stat st {};
+  if (::lstat(path.c_str(), &st) != 0 || !S_ISFIFO(st.st_mode)) {
+    ::fprintf(stderr, "vcache: no jobserver (the fifo is gone)\n");
+    return 1;
+  }
+  const std::string line = vcache::daemon::JobserverMakeFlagsLine(path);
   std::fputs(line.c_str(), stdout);
   return 0;
 }

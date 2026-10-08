@@ -590,6 +590,100 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9e. Rust: a rustc rebuilt in place is a new toolchain"
+
+# `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo
+# keyed only by path and size answers the new binary from the old banner.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  real_rustc=$(command -v rustc)
+  banner=$("$real_rustc" -vV)
+  mkdir -p "$WORK/rustc-swap/bin"
+  write_fake_rustc() {  # $1 = dest, $2 = release value
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf '%s\n' 'if [ "$1" = "-vV" ]; then'
+      printf '%s\n' "cat <<'END'"
+      printf '%s\n' "$banner" | sed "s/^release: .*/release: $2/"
+      printf '%s\n' 'END'
+      printf '%s\n' 'exit 0'
+      printf '%s\n' 'fi'
+      printf 'exec %q "$@"\n' "$real_rustc"
+    } > "$1"
+    chmod +x "$1"
+  }
+  write_fake_rustc "$WORK/rustc-swap/rustc-a" "9.9.1"
+  write_fake_rustc "$WORK/rustc-swap/rustc-b" "9.9.2"
+  size_a=$(wc -c < "$WORK/rustc-swap/rustc-a" | tr -d ' ')
+  size_b=$(wc -c < "$WORK/rustc-swap/rustc-b" | tr -d ' ')
+  check "the two fake rustc scripts are the same size" "$size_a" "$size_b"
+  if cmp -s "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/rustc-b"; then
+    bad "the two fake rustc scripts differ"
+  else
+    ok "the two fake rustc scripts differ"
+  fi
+  cp "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+
+  swap_log="$WORK/rustc-swap.log"
+  : > "$swap_log"
+  swap_compile() {
+    ( cd "$WORK/rust-a" && VCACHE_ROOTS="$WORK/rust-a=crate" VCACHE_LOG="$swap_log" \
+        "$VCACHE" "$WORK/rustc-swap/bin/rustc" --crate-name demo --crate-type lib \
+        -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rust-a/out" src/lib.rs ) \
+        >/dev/null
+  }
+  swap_compile
+  check "the first swapped rustc compile misses" "$(misses)" "1"
+  key_before=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | head -1)
+  swap_compile
+  check "the same rustc hits" "$(hits)" "1"
+
+  cp "$WORK/rustc-swap/rustc-b" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+  touch -d '+2 seconds' "$WORK/rustc-swap/bin/rustc"
+  swap_compile
+  check "a rebuilt rustc misses" "$(misses)" "2"
+  key_after=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | tail -1)
+  if [[ -n "$key_before" && "$key_before" != "$key_after" ]]; then
+    ok "a rebuilt rustc logs a different rust key"
+  else
+    bad "a rebuilt rustc logs a different rust key (before ${key_before:-missing}, after ${key_after:-missing})"
+  fi
+
+  # Same banner at two paths with different mtimes. The cache key is the
+  # banner, so the second checkout hits. mtime stays in the local memo.
+  reset_cache
+  for tree in rustc-share-a rustc-share-b; do
+    mkdir -p "$WORK/$tree/src"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+mod helper;
+pub fn location() -> &'static str { file!() }
+pub fn value() -> u32 { helper::value() }
+EOF
+    cat > "$WORK/$tree/src/helper.rs" <<'EOF'
+pub fn value() -> u32 { 42 }
+EOF
+    cp "$WORK/rustc-swap/rustc-a" "$WORK/$tree/rustc"
+    chmod +x "$WORK/$tree/rustc"
+  done
+  touch -d '2020-01-01 00:00:00' "$WORK/rustc-share-a/rustc"
+  touch -d '2024-06-01 00:00:00' "$WORK/rustc-share-b/rustc"
+  ( cd "$WORK/rustc-share-a" && VCACHE_ROOTS="$WORK/rustc-share-a=crate" \
+      "$VCACHE" "$WORK/rustc-share-a/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-a/out" src/lib.rs ) \
+      >/dev/null
+  check "the first copy of one rustc banner misses" "$(misses)" "1"
+  ( cd "$WORK/rustc-share-b" && VCACHE_ROOTS="$WORK/rustc-share-b=crate" \
+      "$VCACHE" "$WORK/rustc-share-b/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-b/out" src/lib.rs ) \
+      >/dev/null
+  check "two rustc copies with one banner share an entry" "$(hits)" "1"
+fi
+
+# --------------------------------------------------------------------------
 section "9b. Rust crates that read the environment"
 
 # rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
@@ -1657,6 +1751,14 @@ check "the daemon stays up while a token is out past one idle timeout" \
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 kill "$JS_HOLDER" 2>/dev/null || true
 wait "$JS_HOLDER" 2>/dev/null || true
+
+reset_cache
+"$VCACHE" --start-daemon >/dev/null
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+rm -f "$JS_FIFO"
+check "--jobserver-env exits 1 when the fifo is missing" \
+  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
 
 # --------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 // bytes would let it run N+1 jobs.
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -54,11 +55,17 @@ class JobserverPool {
   int withdrawn() const { return 0; }
 
  private:
-  JobserverPool(std::string path, int fd, int total);
+  JobserverPool(std::string path, int fd, int total, uint64_t fifo_dev, uint64_t fifo_ino);
+  // Unlinks path_ only when it is still the fifo this pool opened. A daemon
+  // that exits because its socket was replaced must not delete the new
+  // daemon's fifo at the same path.
+  void RemoveOwnedFifo();
 
   std::string path_;
   int fd_ = -1;
   int total_ = 0;  // job slots, one more than the bytes written at start
+  uint64_t fifo_dev_ = 0;
+  uint64_t fifo_ino_ = 0;
 };
 
 }  // namespace vcache::daemon

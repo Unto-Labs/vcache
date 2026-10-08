@@ -181,6 +181,10 @@ class Server {
 
   void Shutdown();
   bool Idle() const;
+  // Seconds of quiet this process waits before exiting. Twice the configured
+  // timeout while a jobserver client holds a token, because that client is
+  // not a socket connection.
+  int IdleLimitSeconds() const;
   void StartJobserver();
 
   const core::Config config_;
@@ -775,18 +779,23 @@ void Server::Serve(int fd) {
   cv_.notify_all();
 }
 
-bool Server::Idle() const {
-  if (config_.daemon.idle_timeout_seconds <= 0) return false;
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+int Server::IdleLimitSeconds() const {
+  if (config_.daemon.idle_timeout_seconds <= 0) return 0;
   // A build blocked in read() on the fifo is not a socket client, so the
   // ordinary idle clock would exit under it and take the tokens with it.
   // One extra timeout is enough to tell "the build went quiet" from "the
   // build is still holding slots".
-  int periods = 1;
-  if (jobserver_ && jobserver_->free_tokens() < jobserver_->total()) periods = 2;
-  return Clock::now() - last_activity_ >
-         std::chrono::seconds(config_.daemon.idle_timeout_seconds) * periods;
+  const int periods =
+      (jobserver_ && jobserver_->free_tokens() < jobserver_->total()) ? 2 : 1;
+  return config_.daemon.idle_timeout_seconds * periods;
+}
+
+bool Server::Idle() const {
+  const int limit_seconds = IdleLimitSeconds();
+  if (limit_seconds <= 0) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+  return Clock::now() - last_activity_ > std::chrono::seconds(limit_seconds);
 }
 
 // Only the user the daemon runs as may talk to it. The directory permissions
@@ -895,7 +904,7 @@ void Server::StartJobserver() {
     return;
   }
   log_.Line("jobserver: pool " + pool->path() + " with " + std::to_string(pool->total()) +
-            " tokens");
+            " slots (" + std::to_string(pool->total() - 1) + " tokens)");
   jobserver_ = std::make_unique<JobserverPool>(std::move(*pool));
 }
 
@@ -984,8 +993,7 @@ int Server::Run(int ready_fd) {
       break;
     }
     if (Idle()) {
-      log_.Line("idle for " + std::to_string(config_.daemon.idle_timeout_seconds) +
-                " s; exiting");
+      log_.Line("idle for " + std::to_string(IdleLimitSeconds()) + " s; exiting");
       break;
     }
   }

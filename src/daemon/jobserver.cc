@@ -39,33 +39,57 @@ std::string JobserverMakeFlagsLine(const std::string& fifo_path) {
   return "MAKEFLAGS=-j --jobserver-auth=fifo:" + fifo_path + "\n";
 }
 
-JobserverPool::JobserverPool(std::string path, int fd, int total)
-    : path_(std::move(path)), fd_(fd), total_(total) {}
+JobserverPool::JobserverPool(std::string path, int fd, int total, uint64_t fifo_dev,
+                             uint64_t fifo_ino)
+    : path_(std::move(path)), fd_(fd), total_(total), fifo_dev_(fifo_dev), fifo_ino_(fifo_ino) {}
 
 JobserverPool::JobserverPool(JobserverPool&& other) noexcept
-    : path_(std::move(other.path_)), fd_(other.fd_), total_(other.total_) {
+    : path_(std::move(other.path_)),
+      fd_(other.fd_),
+      total_(other.total_),
+      fifo_dev_(other.fifo_dev_),
+      fifo_ino_(other.fifo_ino_) {
   other.fd_ = -1;
   other.path_.clear();
   other.total_ = 0;
+  other.fifo_dev_ = 0;
+  other.fifo_ino_ = 0;
 }
 
 JobserverPool& JobserverPool::operator=(JobserverPool&& other) noexcept {
   if (this != &other) {
     if (fd_ >= 0) ::close(fd_);
-    if (!path_.empty()) ::unlink(path_.c_str());
+    fd_ = -1;
+    RemoveOwnedFifo();
     path_ = std::move(other.path_);
     fd_ = other.fd_;
     total_ = other.total_;
+    fifo_dev_ = other.fifo_dev_;
+    fifo_ino_ = other.fifo_ino_;
     other.fd_ = -1;
     other.path_.clear();
     other.total_ = 0;
+    other.fifo_dev_ = 0;
+    other.fifo_ino_ = 0;
   }
   return *this;
 }
 
+void JobserverPool::RemoveOwnedFifo() {
+  if (path_.empty()) return;
+  struct stat st {};
+  if (::lstat(path_.c_str(), &st) == 0 &&
+      static_cast<uint64_t>(st.st_dev) == fifo_dev_ &&
+      static_cast<uint64_t>(st.st_ino) == fifo_ino_) {
+    ::unlink(path_.c_str());
+  }
+  path_.clear();
+}
+
 JobserverPool::~JobserverPool() {
   if (fd_ >= 0) ::close(fd_);
-  if (!path_.empty()) ::unlink(path_.c_str());
+  fd_ = -1;
+  RemoveOwnedFifo();
 }
 
 std::optional<JobserverPool> JobserverPool::Open(const std::string& path, int slots,
@@ -114,7 +138,15 @@ std::optional<JobserverPool> JobserverPool::Open(const std::string& path, int sl
       return fail("write tokens to " + path + ": " + std::strerror(saved));
     }
   }
-  return JobserverPool(path, fd, slots);
+  struct stat owned {};
+  if (::fstat(fd, &owned) != 0) {
+    const int saved = errno;
+    ::close(fd);
+    ::unlink(path.c_str());
+    return fail("fstat " + path + ": " + std::strerror(saved));
+  }
+  return JobserverPool(path, fd, slots, static_cast<uint64_t>(owned.st_dev),
+                       static_cast<uint64_t>(owned.st_ino));
 }
 
 int JobserverPool::fifo_bytes() const {

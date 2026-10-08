@@ -25,6 +25,35 @@
 namespace fs = std::filesystem;
 
 namespace vcache::rust {
+
+// A relink after a source change often keeps the same byte count. The memo
+// key therefore includes mtime, or the new binary is answered from the
+// previous banner and every later crate hits the old toolchain. mtime stays
+// out of the banner hash: that hash is what other machines share.
+std::string ResolveRustcFingerprint(const std::string& rustc,
+                                    const std::string& cache_dir) {
+  const std::string real = util::RealPath(rustc).value_or(rustc);
+  const uint64_t size = util::FileSize(real).value_or(0);
+  const int64_t mtime = util::FileMtime(real).value_or(0);
+
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("rustc-version-memo-v2");
+  memo_key.UpdateDelimited(real);
+  memo_key.UpdateU64(size);
+  memo_key.UpdateU64(static_cast<uint64_t>(mtime));
+  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
+
+  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
+
+  util::ProcResult probe =
+      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
+  const std::string banner = probe.stdout_data + probe.stderr_data;
+  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
+
+  util::WriteFileAtomic(memo_path, banner);
+  return hash::HashString(banner);
+}
+
 namespace {
 
 using core::Counter;
@@ -43,30 +72,6 @@ int RunPassthrough(const std::vector<std::string>& argv) {
     return 127;
   }
   return result.exit_code;
-}
-
-// Identity of the rustc toolchain. `rustc -vV` reports version, commit hash and
-// host triple, all machine-independent, so entries stay shareable through S3.
-std::string ResolveRustcFingerprint(const std::string& rustc,
-                                    const std::string& cache_dir) {
-  const std::string real = util::RealPath(rustc).value_or(rustc);
-  uint64_t size = util::FileSize(real).value_or(0);
-
-  hash::Hasher memo_key;
-  memo_key.UpdateDelimited("rustc-version-memo-v1");
-  memo_key.UpdateDelimited(real);
-  memo_key.UpdateU64(size);
-  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
-
-  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
-
-  util::ProcResult probe =
-      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
-  const std::string banner = probe.stdout_data + probe.stderr_data;
-  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
-
-  util::WriteFileAtomic(memo_path, banner);
-  return hash::HashString(banner);
 }
 
 // What rustc's dep-info says the crate reads.

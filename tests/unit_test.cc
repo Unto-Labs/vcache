@@ -5021,6 +5021,23 @@ void TestUploadGeneration() {
   auto sync_again = sync_upload.TakeReady(now, &soonest);
   const std::string sync_blob = sync_again && sync_again->blob ? *sync_again->blob : std::string();
   CheckEq(sync_blob, "later", "the re-queued store is the later value");
+
+  daemon::UploadQueue watched(journal, 100);
+  const uint64_t watched_generation = watched.BeginSync("q");
+  const uint64_t watch_id = watched.WatchFlight("q");
+  Check(watch_id != 0 && watched.RefusalStillInFlight(watch_id),
+        "a watch follows the flight already in progress");
+  Check(watched.BeginSync("q") == 0, "a second synchronous upload waits for that flight");
+  Check(watched.Enqueue("q", sync_later, false),
+        "a newer store during the watch is accepted");
+  Check(watched.RefusalOvertaken(watch_id), "the watch is overtaken by the newer store");
+  daemon::UploadItem watched_done;
+  watched_done.key = "q";
+  watched_done.generation = watched_generation;
+  bool watched_requeue = false;
+  Check(watched.Finish(watched_done, &watched_requeue) && watched_requeue,
+        "finishing the watched flight re-queues the newer store");
+  Check(!watched.RefusalStillInFlight(watch_id), "the watch ends when that flight finishes");
 }
 
 void TestHeldHitLayer() {

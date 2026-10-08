@@ -236,6 +236,11 @@ separate processes do.
   running daemon, so a test can put two values of one key while an upload is
   still in flight. `VCACHE_TEST_MAX_HELD_BYTES` shrinks the daemon's held-blob
   cap for that same test. Unset, the cap stays 1 GiB.
+  `VCACHE_TEST_REFUSAL_WAIT_MS` shrinks how long a refused re-put waits for
+  the in-flight upload, when set to a positive number of milliseconds no
+  larger than half the client reply timeout. Unset, that wait stays 150
+  seconds. `MOCK_S3_DENY_PUT_MIN_BYTES` makes the test bucket answer 403 for
+  a PUT whose body is at least that many bytes.
 
 ## Parsing choices
 

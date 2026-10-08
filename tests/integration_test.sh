@@ -20,7 +20,49 @@ VCACHE="$TOP/bin/vcache"
 TMPBASE="${TMPDIR:-/tmp}"
 while [[ "$TMPBASE" == */ && "$TMPBASE" != "/" ]]; do TMPBASE="${TMPBASE%/}"; done
 WORK="$(mktemp -d "$TMPBASE/vcache-it-XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# A slow PUT dies on SIGTERM when the disposition is the default. The flight
+# mock is not stopped by its own case: the next start is what signals it, and
+# only if that pid is still the one the shell holds. A parent that ignores
+# SIGTERM hands the mock that disposition, so the signal does nothing and
+# wait sits on the pid until the suite is abandoned. The exit path used to
+# remove the work directory and leave the process.
+work_mocks() {
+  pgrep -af "[m]ock_s3.py" 2>/dev/null | grep -F -- "$WORK/" || true
+}
+stop_s3() {
+  if [[ -z "${S3PID:-}" ]]; then
+    return
+  fi
+  if kill -0 "$S3PID" 2>/dev/null; then
+    kill -TERM "$S3PID" 2>/dev/null || true
+    local n=0
+    while kill -0 "$S3PID" 2>/dev/null; do
+      if (( n >= 20 )); then
+        kill -KILL "$S3PID" 2>/dev/null || true
+        break
+      fi
+      sleep 0.05
+      n=$((n + 1))
+    done
+  fi
+  wait "$S3PID" 2>/dev/null || true
+  S3PID=
+}
+reap_work_mocks() {
+  local line pid
+  while IFS= read -r line; do
+    pid=${line%% *}
+    [[ -n "$pid" ]] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done < <(work_mocks)
+}
+check_mocks_gone() {
+  local left
+  left=$(work_mocks | wc -l | tr -d ' ')
+  check "no mock from this run is still up" "$left" "0"
+}
+trap 'reap_work_mocks; rm -rf "$WORK"' EXIT
 
 PASS=0
 FAIL=0
@@ -1346,7 +1388,7 @@ BACKDATE
   done
   check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "3"
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   MOCK_S3_PAGE_SIZE=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1378,7 +1420,7 @@ except Exception: sys.exit(1)
   fi
 
   # An unreachable remote must degrade to a miss, never break the build.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   rm -rf "$VCACHE_DIR"
   ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
       "$VCACHE" g++ -O0 -c -I include src/lib.cc -o "$WORK/s4.o" ) 2>/dev/null
@@ -1430,6 +1472,7 @@ except Exception: sys.exit(1)
   #
   # Restart the mock as a bucket that denies both the listing and any missing
   # object, which is how real S3 behaves without s3:ListBucket.
+  stop_s3
   MOCK_S3_NO_LISTBUCKET=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1479,7 +1522,7 @@ TOML
   # With ListBucket available, a 403 on the object means something really is
   # wrong, and must be reported rather than filed as a miss. Deleting the
   # object directory makes every GET a miss; the listing still succeeds.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1500,7 +1543,7 @@ except Exception: sys.exit(1)
     ok "a bucket that does grant ListBucket produces no warning"
   fi
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
 
   # A bucket shedding load answers 503 SlowDown. That is not a failed store,
   # it is a store to try again: without a retry the entry is lost, the compile
@@ -1532,7 +1575,7 @@ except Exception: sys.exit(1)
   check "and the retried store is readable from s3 afterwards" \
         "$("$VCACHE" --show-stats | awk '/^cache hit \(s3\)[[:space:]]/ { print $NF }')" "1"
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
 
   # A compile that genuinely fails must keep reporting the compiler's status,
   # not vcache's, even with the flag on and s3 down.
@@ -1543,6 +1586,7 @@ except Exception: sys.exit(1)
   check "a compiler error still wins over the cache status" "$([[ $? -ne 0 && $? -ne 90 ]] && echo yes)" "yes"
   check "object still produced with s3 down" "$([[ -s "$WORK/s4.o" ]] && echo yes)" "yes"
 
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION
 else
@@ -1672,6 +1716,7 @@ export VCACHE_DAEMON=on
 if command -v python3 >/dev/null 2>&1; then
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/daemon-s3"
+  stop_s3
   python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1728,7 +1773,7 @@ except Exception: sys.exit(1)
   # Uploads are asynchronous, so a failed one cannot fail the compile that
   # stored it. --stop-daemon is where it surfaces, and where the strict flag
   # turns it into an exit status.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   reset_cache
   "$VCACHE" --start-daemon >/dev/null
   compile_a "$WORK/ds3.o"
@@ -1738,6 +1783,7 @@ except Exception: sys.exit(1)
   check "--stop-daemon reports the failed upload" "$?" "90"
   check "and says so" "$(grep -c 'failed 1' "$WORK/stop.out")" "1"
 
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION
 else
@@ -1758,6 +1804,7 @@ else
   reset_cache
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/held-s3"
+  stop_s3
   MOCK_S3_LATENCY_MS=3000 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1789,8 +1836,8 @@ except Exception: sys.exit(1)
   check "a held hit counts as a disk hit" "$(hits)" "1"
   check "the daemon counts a memory hit" "$(daemon_stat 'hit (memory)')" "1"
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
         VCACHE_DISK VCACHE_DAEMON
@@ -1808,6 +1855,7 @@ else
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/rewrite-s3"
+  stop_s3
   MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1835,14 +1883,12 @@ except Exception: sys.exit(1)
   "$VCACHE" --stop-daemon >/dev/null
   rewrite_obj="$S3DIR/${rewrite_key:0:2}__${rewrite_key:2}"
   check "the bucket object is the second store" "$(cat "$rewrite_obj" 2>/dev/null)" "manifest-v2"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
 
   # One upload thread, so a slow put stays in flight or queued on purpose.
   # A small body sleeps longer and is written when that sleep ends, so the
   # last completion is the value left in the bucket.
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
   export VCACHE_DISK=0
   export VCACHE_TEST_MAX_HELD_BYTES=10
   export VCACHE_DAEMON_UPLOAD_THREADS=1
@@ -1867,13 +1913,7 @@ except Exception: sys.exit(1)
       }'
   }
   start_order_s3() {  # $1 storage dir
-    # The shell still tracks the previous mock. Leaving it running leaks a
-    # server whose storage dir this section has already finished.
-    if [[ -n "${S3PID:-}" ]]; then
-      kill "$S3PID" 2>/dev/null || true
-      wait "$S3PID" 2>/dev/null || true
-      S3PID=
-    fi
+    stop_s3
     S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
     S3DIR="$1"
     python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
@@ -1914,8 +1954,7 @@ except Exception: sys.exit(1)
   queued_obj="$S3DIR/${queued_key:0:2}__${queued_key:2}"
   check "a refused re-put of a queued value leaves the newer value in s3" \
     "$(cat "$queued_obj" 2>/dev/null)" "V2VALUE-0123456789"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
 
   # Nothing else is queued, so the victim's own upload is the one in flight.
   start_order_s3 "$WORK/refuse-flight-s3"
@@ -1967,8 +2006,7 @@ except Exception: sys.exit(1)
   "$VCACHE" --stop-daemon >/dev/null
   check "a newer accepted store is what s3 keeps" \
     "$(cat "$overtake_obj" 2>/dev/null)" "v3v3"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
 
   # V1's put fails three times while V2 is refused against that flight. The
   # drop is a skip, and V2's put is the one that lands.
@@ -1983,8 +2021,7 @@ except Exception: sys.exit(1)
   "$VCACHE" --stop-daemon >/dev/null
   check "a superseded retry leaves the newer value in s3" \
     "$(cat "$retry_obj" 2>/dev/null)" "V2VALUE-0123456789"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
   unset MOCK_S3_TRANSIENT_PUT_FAILURES
 
   # Both stores miss the held cap, so each would upload on its own. The first
@@ -2002,10 +2039,53 @@ except Exception: sys.exit(1)
   "$VCACHE" --stop-daemon >/dev/null
   check "a later refused upload is what s3 keeps" \
     "$(cat "$sync_obj" 2>/dev/null)" "V3VALUE-0123456789-later"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
-  check "the flight mock is gone" \
-    "$(pgrep -f "$WORK/[r]efuse-flight-s3" >/dev/null && echo yes || echo no)" "no"
+  stop_s3
+
+  # The refused put is the large body, so the mock answers 403 and records
+  # no error. The identity has to count that as failed.
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  export MOCK_S3_DENY_PUT_MIN_BYTES=10
+  start_order_s3 "$WORK/refuse-deny-s3"
+  deny_blocker=11111111111111111111111111111111
+  deny_key=ffffffffffffffffffffffffffffffff
+  printf 'bbbb' | "$VCACHE" --test-put "$deny_blocker"
+  deny_started="$S3DIR/${deny_blocker:0:2}__${deny_blocker:2}.started"
+  check "the deny-case blocker upload is in flight" "$(wait_started "$deny_started")" "1"
+  printf 'v1v1' | "$VCACHE" --test-put "$deny_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$deny_key"
+  check "a denied synchronous put keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  stop_s3
+  unset MOCK_S3_DENY_PUT_MIN_BYTES
+
+  # The wait is shorter than the slow put, so the refused store finds that
+  # flight still running. It has to wait for it, then upload.
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    "$VCACHE" --daemon-status >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  export VCACHE_TEST_REFUSAL_WAIT_MS=200
+  export VCACHE_LOG="$WORK/refusal-wait.log"
+  rm -f "$WORK/refusal-wait.log"
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  start_order_s3 "$WORK/refuse-wait-s3"
+  wait_key=abababababababababababababababab
+  printf 'v1v1' | "$VCACHE" --test-put "$wait_key"
+  wait_obj="$S3DIR/${wait_key:0:2}__${wait_key:2}"
+  check "the short-wait upload is in flight" "$(wait_started "$wait_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$wait_key"
+  retries=$(grep -c 'still in flight' "$WORK/refusal-wait.log" || true)
+  check "the short wait retried while the flight was up" \
+    "$([[ "$retries" -ge 1 ]] && echo yes)" "yes"
+  # pending ignores a superseded flight, so stop is what waits for that put
+  # to finish writing. Reading before then sees the fast body.
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a refused put waits out the flight it found" \
+    "$(cat "$wait_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  stop_s3
+  unset VCACHE_TEST_REFUSAL_WAIT_MS VCACHE_LOG
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
         VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES \
@@ -2025,6 +2105,7 @@ else
   reset_cache
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/evict-s3"
+  stop_s3
   MOCK_S3_LATENCY_MS=300 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -2059,8 +2140,8 @@ except Exception: sys.exit(1)
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
   check "the bucket received all five compiles" \
     "$(find "$S3DIR" -type f | wc -l | tr -d ' ')" "5"
-  kill "$S3PID" 2>/dev/null || true
-  wait "$S3PID" 2>/dev/null || true
+  stop_s3
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
         VCACHE_CACHE_SIZE VCACHE_DAEMON

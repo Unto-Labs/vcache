@@ -139,6 +139,20 @@ uint64_t TestMaxHeldBytes() {
   return static_cast<uint64_t>(n);
 }
 
+// Half the client reply timeout, so a synchronous upload can still answer.
+// Tests shrink it. A value above the cap is ignored.
+std::chrono::milliseconds RefusalWaitBound() {
+  const int cap_ms = kReplyTimeoutSeconds * 1000 / 2;
+  const char* text = std::getenv("VCACHE_TEST_REFUSAL_WAIT_MS");
+  if (text == nullptr || *text == '\0') return std::chrono::milliseconds(cap_ms);
+  char* end = nullptr;
+  const long n = std::strtol(text, &end, 10);
+  if (end == text || *end != '\0' || n <= 0 || n > cap_ms) {
+    return std::chrono::milliseconds(cap_ms);
+  }
+  return std::chrono::milliseconds(n);
+}
+
 struct Counters {
   std::atomic<uint64_t> connections{0};
   std::atomic<uint64_t> refused{0};
@@ -634,12 +648,12 @@ bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> 
 
 void Server::WaitForRefusal(uint64_t refusal_id, const std::string& key) {
   std::unique_lock<std::mutex> lock(mutex_);
-  // Half the client reply timeout: when this fires, the client is still
-  // waiting, so the synchronous upload can still be its answer.
-  const auto deadline = Clock::now() + std::chrono::seconds(kReplyTimeoutSeconds / 2);
+  // The caller retries this wait. Uploading beside the flight that is still
+  // running is how an older value wins.
+  const auto deadline = Clock::now() + RefusalWaitBound();
   while (uploads_.RefusalStillInFlight(refusal_id)) {
     if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
-      log_.Line("refused re-put of " + key + " uploaded without waiting");
+      log_.Line("refused re-put of " + key + " still in flight");
       return;
     }
   }
@@ -675,28 +689,35 @@ void Server::UploadWorker() {
     }
 
     bool done = true;
-    if (!have) {
-      // Evicted between the store and its turn in the queue. Nothing to send;
-      // the entry is gone from this machine too, so it was not worth keeping.
-      counters_.uploads_skipped++;
-    } else if (s3->Put(item.key, *blob)) {
-      counters_.uploads_done++;
-      counters_.upload_bytes += blob->size();
-    } else if (++item.attempts < kMaxUploadAttempts) {
+    bool put_ok = false;
+    std::string failed_detail;
+    if (have && s3->Put(item.key, *blob)) {
+      put_ok = true;
+    } else if (have && ++item.attempts < kMaxUploadAttempts) {
       // S3Storage already retries throttling inside one attempt; this covers
       // the connection-level failures it does not, with a longer gap.
       done = false;
       item.not_before = Clock::now() + std::chrono::seconds(1 << item.attempts);
       VCACHE_LOG("daemon: upload " + item.key + " failed (" + s3->last_error() +
                  "); will retry");
-    } else {
-      counters_.uploads_failed++;
-      log_.Line("upload " + item.key + " failed after " +
-                std::to_string(item.attempts) + " attempts: " +
-                (s3->failed() ? s3->last_error() : std::string("rejected")));
+    } else if (have) {
+      failed_detail = s3->failed() ? s3->last_error() : std::string("rejected");
     }
 
+    // The terminal count and Finish/Requeue share this lock with StatusText,
+    // so one upload cannot be both completed and still pending.
     lock.lock();
+    if (!have) {
+      // Evicted between the store and its turn. Nothing to send.
+      counters_.uploads_skipped++;
+    } else if (put_ok) {
+      counters_.uploads_done++;
+      counters_.upload_bytes += blob->size();
+    } else if (done) {
+      counters_.uploads_failed++;
+      log_.Line("upload " + item.key + " failed after " +
+                std::to_string(item.attempts) + " attempts: " + failed_detail);
+    }
     if (done) {
       bool count_requeue = false;
       if (uploads_.Finish(item, &count_requeue)) {
@@ -1364,43 +1385,58 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
         stored = true;
       } else {
         // The memory queue is full: upload here and make this one store wait,
-        // rather than grow without bound. Wait only for the upload that was
-        // already in flight. A newer store overtakes this one.
+        // rather than grow without bound. The overtaken check and the flight
+        // registration share one lock, so a newer store cannot be dequeued
+        // between them. Finding the key already in flight waits and retries;
+        // uploading beside that flight is how an older value wins.
         bool overtaken = false;
-        if (refused_in_flight) {
-          WaitForRefusal(refusal_id, key);
+        uint64_t sync_generation = 0;
+        bool have_refusal = refused_in_flight;
+        while (!overtaken && sync_generation == 0) {
+          if (have_refusal) WaitForRefusal(refusal_id, key);
           std::lock_guard<std::mutex> lock(mutex_);
-          overtaken = uploads_.TakeRefusal(refusal_id);
+          if (have_refusal) {
+            overtaken = uploads_.TakeRefusal(refusal_id);
+            have_refusal = false;
+          }
+          if (overtaken) break;
+          sync_generation = uploads_.BeginSync(key);
+          if (sync_generation != 0) {
+            counters_.uploads_queued++;
+            break;
+          }
+          refusal_id = uploads_.WatchFlight(key);
+          if (refusal_id == 0) {
+            sync_generation = uploads_.BeginSync(key);
+            if (sync_generation != 0) counters_.uploads_queued++;
+            break;
+          }
+          have_refusal = true;
         }
         if (overtaken) {
           stored = true;
-        } else {
-          uint64_t sync_generation = 0;
-          {
-            std::lock_guard<std::mutex> lock(mutex_);
-            sync_generation = uploads_.BeginSync(key);
-          }
-          counters_.uploads_queued++;
+        } else if (sync_generation != 0) {
           auto s3 = AcquireS3();
-          if (s3->Put(key, *value)) {
-            stored = true;
+          const bool uploaded = s3->Put(key, *value);
+          std::string s3_error;
+          if (!uploaded && s3->failed()) s3_error = s3->last_error();
+          ReleaseS3(std::move(s3));
+          if (uploaded) stored = true;
+          else if (!s3_error.empty()) errors.push_back("s3: " + s3_error);
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (uploaded) {
             counters_.uploads_done++;
             counters_.upload_bytes += value->size();
           } else {
             counters_.uploads_failed++;
-            if (s3->failed()) errors.push_back("s3: " + s3->last_error());
           }
-          ReleaseS3(std::move(s3));
-          if (sync_generation != 0) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            bool count_requeue = false;
-            UploadItem finished;
-            finished.key = key;
-            finished.generation = sync_generation;
-            if (uploads_.Finish(finished, &count_requeue)) {
-              if (count_requeue) counters_.uploads_queued++;
-              log_.Line("re-queued " + key + " (rewritten during upload)");
-            }
+          bool count_requeue = false;
+          UploadItem finished;
+          finished.key = key;
+          finished.generation = sync_generation;
+          if (uploads_.Finish(finished, &count_requeue)) {
+            if (count_requeue) counters_.uploads_queued++;
+            log_.Line("re-queued " + key + " (rewritten during upload)");
           }
         }
       }
@@ -1430,7 +1466,6 @@ std::string Server::StatusText() {
     else line.push_back(' ');
     return line + value + "\n";
   };
-  auto n = [](const std::atomic<uint64_t>& v) { return std::to_string(v.load()); };
   size_t active = 0;
   size_t compile_sessions = 0;
   size_t leases_held = 0;
@@ -1440,9 +1475,31 @@ std::string Server::StatusText() {
   uint64_t held = 0;
   uint64_t reserved_kb = 0, realised_kb = 0, memory_waiting = 0, reserve_waits = 0;
   uint64_t longest_reserve_wait_ms = 0;
+  uint64_t uploads_queued = 0, uploads_done = 0, uploads_failed = 0, uploads_skipped = 0;
+  uint64_t upload_bytes = 0, uploads_recovered = 0;
+  uint64_t connections = 0, refused = 0, lookups = 0, hits_disk = 0, hits_memory = 0;
+  uint64_t hits_s3 = 0, misses = 0, stores = 0, stores_failed = 0;
+  uint64_t leases_expired = 0, compiles_deduplicated = 0;
   std::string jobserver_status;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    connections = counters_.connections.load();
+    refused = counters_.refused.load();
+    lookups = counters_.lookups.load();
+    hits_disk = counters_.hits_disk.load();
+    hits_memory = counters_.hits_memory.load();
+    hits_s3 = counters_.hits_s3.load();
+    misses = counters_.misses.load();
+    stores = counters_.stores.load();
+    stores_failed = counters_.stores_failed.load();
+    uploads_queued = counters_.uploads_queued.load();
+    uploads_done = counters_.uploads_done.load();
+    uploads_failed = counters_.uploads_failed.load();
+    uploads_skipped = counters_.uploads_skipped.load();
+    upload_bytes = counters_.upload_bytes.load();
+    uploads_recovered = counters_.uploads_recovered.load();
+    leases_expired = counters_.leases_expired.load();
+    compiles_deduplicated = counters_.compiles_deduplicated.load();
     active = connections_.size();
     compile_sessions = sessions_.size();
     for (const auto& [fd, reservation] : reservations_) {
@@ -1481,31 +1538,31 @@ std::string Server::StatusText() {
                                ? std::to_string(config_.daemon.idle_timeout_seconds) + " s"
                                : std::string("none"));
   s += row("s3 layer", !s3_enabled_ ? "off" : (s3_writable_ ? "read-write" : "read-only"));
-  s += row("connections", n(counters_.connections) + " (" + std::to_string(active) +
-                              " open, " + n(counters_.refused) + " refused)");
+  s += row("connections", std::to_string(connections) + " (" + std::to_string(active) +
+                              " open, " + std::to_string(refused) + " refused)");
   s += row("compile sessions", std::to_string(compile_sessions));
   s += row("leases held", std::to_string(leases_held));
   s += row("leases waiting", std::to_string(leases_waiting));
-  s += row("leases expired", n(counters_.leases_expired));
-  s += row("compiles deduplicated", n(counters_.compiles_deduplicated));
+  s += row("leases expired", std::to_string(leases_expired));
+  s += row("compiles deduplicated", std::to_string(compiles_deduplicated));
   s += row("memory reserved", std::to_string(reserved_kb));
   s += row("memory realised", std::to_string(realised_kb));
   s += row("memory waiting", std::to_string(memory_waiting));
   s += row("reserve waits", std::to_string(reserve_waits));
   s += row("longest wait ms", std::to_string(longest_reserve_wait_ms));
-  s += row("lookups", n(counters_.lookups));
-  s += row("  hit (disk)", n(counters_.hits_disk));
-  s += row("  hit (memory)", n(counters_.hits_memory));
-  s += row("  hit (s3)", n(counters_.hits_s3));
-  s += row("  miss", n(counters_.misses));
-  s += row("stores", n(counters_.stores));
-  s += row("  failed", n(counters_.stores_failed));
-  s += row("uploads queued", n(counters_.uploads_queued));
-  s += row("  recovered", n(counters_.uploads_recovered));
-  s += row("  completed", n(counters_.uploads_done));
-  s += row("  bytes", n(counters_.upload_bytes));
-  s += row("  failed", n(counters_.uploads_failed));
-  s += row("  skipped", n(counters_.uploads_skipped));
+  s += row("lookups", std::to_string(lookups));
+  s += row("  hit (disk)", std::to_string(hits_disk));
+  s += row("  hit (memory)", std::to_string(hits_memory));
+  s += row("  hit (s3)", std::to_string(hits_s3));
+  s += row("  miss", std::to_string(misses));
+  s += row("stores", std::to_string(stores));
+  s += row("  failed", std::to_string(stores_failed));
+  s += row("uploads queued", std::to_string(uploads_queued));
+  s += row("  recovered", std::to_string(uploads_recovered));
+  s += row("  completed", std::to_string(uploads_done));
+  s += row("  bytes", std::to_string(upload_bytes));
+  s += row("  failed", std::to_string(uploads_failed));
+  s += row("  skipped", std::to_string(uploads_skipped));
   s += row("  pending", std::to_string(pending));
   s += row("  held in memory", std::to_string(held) + " bytes");
   s += row("uploads superseded", std::to_string(superseded));

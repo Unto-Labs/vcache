@@ -1187,12 +1187,15 @@ struct SessionDaemon {
 
   explicit SessionDaemon(int idle_seconds = 0, bool single_flight = false,
                          bool block_put = false, uint64_t mem_available_kb = 0,
-                         const std::map<std::string, std::string>& test_settings = {}) {
+                         const std::map<std::string, std::string>& test_settings = {},
+                         bool jobserver = false) {
     directory = util::MakeTempDir("vcache-session-test-").value_or("");
     if (directory.empty()) return;
     config.disk.dir = directory + "/cache";
     config.daemon.idle_timeout_seconds = idle_seconds;
     config.daemon.single_flight = single_flight;
+    config.daemon.jobserver = jobserver;
+    config.daemon.jobserver_jobs = 4;
     if (mem_available_kb > 0) {
       const std::string meminfo = "MemAvailable: " + std::to_string(mem_available_kb) + " kB\n";
       const int mem_fd = ::open((directory + "/meminfo").c_str(), O_WRONLY | O_CREAT, 0600);
@@ -2260,7 +2263,7 @@ void TestMemoryAdmission() {
 
 void TestAdmissionProcessTree() {
   Section("daemon::admission process tree");
-  SessionDaemon server(0, false, false, 90000);
+  SessionDaemon server(0, false, false, 90000, {}, true);
   LeasePeer holder(server), queued(server);
   Check(holder.Reserve(65536) && holder.MemoryOutcome(0),
         "process-tree fixture reserves its driver estimate");
@@ -2276,6 +2279,13 @@ void TestAdmissionProcessTree() {
     return row != std::string::npos &&
            std::strtoull(status.c_str() + row + 15, nullptr, 10) >= 49152;
   }, 1000), "process-tree realised memory includes the live grandchild");
+  const auto granted = std::chrono::steady_clock::now();
+  PollUntil([&] { return std::chrono::steady_clock::now() - granted >=
+                        std::chrono::milliseconds(1100); }, 1500);
+  Check(LeaseStat(server, "memory waiting", 0) &&
+            LeaseStat(server, "jobserver tokens withdrawn", 0) &&
+            LeaseStat(server, "jobserver tokens free", 4),
+        "realised grandchild memory keeps the jobserver fully available across two ticks");
 }
 
 void TestAdmissionReview() {
@@ -4510,9 +4520,11 @@ void TestElasticJobserver() {
       {1, 2, 0, 4096, 2, 0, "memory equal to the default does not restore"},
       {1, 2, 0, 4095, 2, 0, "low memory retains withdrawn tokens"},
       {3, 0, 0, 8192, 2, 0, "admission with no waiting requests leaves the pool fixed"},
+      {3, 1, 9, 0, 0, -2, "a zero policy floor is raised to one implicit slot"},
       {3, 0, 9, 0, 9, 0, "a floor above total is clamped to the total"}}) {
-    Check(daemon::JobserverTokenChange(4, row.free, row.withdrawn, row.waiting,
-                                     row.available_kb, row.floor, 4096) == row.expected, row.name);
+    Check(daemon::JobserverSignedTokenChange(4, row.free, row.withdrawn, row.waiting,
+                                           row.available_kb, row.floor, 4096) == row.expected,
+          row.name);
   }
   TempCacheDir dir;
   std::string error;
@@ -4527,30 +4539,46 @@ void TestElasticJobserver() {
         "moving a pool preserves withdrawn ownership and counters");
   const int client = ::open(moved.path().c_str(), O_RDWR | O_NONBLOCK);
   char tokens[3]{};
-  const int requested = -daemon::JobserverTokenChange(moved.total(), moved.fifo_bytes(),
+  const int requested = -daemon::JobserverSignedTokenChange(moved.total(), moved.fifo_bytes(),
       moved.withdrawn(), 1, 0, 2, 4096);
   const bool two_taken = client >= 0 && ::read(client, tokens, 2) == 2;
+  Check(moved.withdrawn() == 1, "the client race begins with one daemon-owned token");
+  struct WithdrawalResult {
+    int taken = -1, before = -1, after = -1;
+    int fifo_before = -1, restored = -1, fifo_after = -1;
+  } observation;
   int result[2];
   const bool piped = ::pipe(result) == 0;
   const pid_t reader = piped ? ::fork() : -1;
   if (reader == 0) {
     ::close(result[0]);
-    const int taken = moved.Withdraw(requested);
-    ::write(result[1], &taken, sizeof(taken));
+    observation.before = moved.withdrawn();
+    observation.taken = moved.Withdraw(requested);
+    observation.after = moved.withdrawn();
+    observation.fifo_before = moved.fifo_bytes();
+    observation.restored = moved.Restore(moved.withdrawn());
+    observation.fifo_after = moved.fifo_bytes();
+    ::write(result[1], &observation, sizeof(observation));
     ::_exit(0);
   }
   if (piped) ::close(result[1]);
-  int taken = -1;
   pollfd ready{piped ? result[0] : -1, POLLIN, 0};
   Check(requested == 1 && two_taken && reader > 0 && ::poll(&ready, 1, 1000) > 0 &&
-            ::read(result[0], &taken, sizeof(taken)) == sizeof(taken) && taken == 0,
+            ::read(result[0], &observation, sizeof(observation)) == sizeof(observation) &&
+            observation.taken == 0,
         "a client taking the last free token makes withdrawal return EAGAIN within one second");
+  Check(observation.before == 1 && observation.after == 1 && moved.withdrawn() == 1,
+        "a lost withdrawal race retains exactly the previously owned token");
+  Check(observation.fifo_before == 0 && observation.restored == 1 &&
+            observation.fifo_after == 1 && moved.fifo_bytes() == 1,
+        "restoring after a lost race returns only the previously withdrawn fifo byte");
   if (reader > 0) {
     ::kill(reader, SIGKILL);
     ::waitpid(reader, nullptr, 0);
   }
   if (piped) ::close(result[0]);
   if (client >= 0) {
+    ::read(client, tokens, sizeof(tokens));
     ::write(client, "++", 2);
     ::close(client);
   }
@@ -4618,6 +4646,24 @@ void TestElasticJobserver() {
   described.daemon.jobserver = true;
   Check(core::DescribeConfig(described).find("  jobserver min:  7\n") != std::string::npos,
         "show-config displays the requested jobserver floor");
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER_MIN_JOBS");
+  for (const std::string value : {"0", "-1", "\"bad\"", "1.5", "true"}) {
+    util::WriteFileAtomic(config_path, "[daemon]\njobserver_min_jobs = " + value + "\n");
+    const auto invalid = core::LoadConfig();
+    Check(invalid.daemon.jobserver_min_jobs == 2 && std::any_of(
+              invalid.warnings.begin(), invalid.warnings.end(), [](const auto& warning) {
+                return warning.find("daemon.jobserver_min_jobs:") != std::string::npos;
+              }), "an invalid TOML jobserver floor warns and retains its default: " + value);
+  }
+  util::WriteFileAtomic(config_path, "[daemon]\njobserver_min_jobs = 3\n");
+  for (const std::string value : {"0", "-1", "bad", "18446744073709551616"}) {
+    ::setenv("VCACHE_DAEMON_JOBSERVER_MIN_JOBS", value.c_str(), 1);
+    const auto invalid = core::LoadConfig();
+    Check(invalid.daemon.jobserver_min_jobs == 3 && std::any_of(
+              invalid.warnings.begin(), invalid.warnings.end(), [](const auto& warning) {
+                return warning.find("VCACHE_DAEMON_JOBSERVER_MIN_JOBS:") != std::string::npos;
+              }), "an invalid environment jobserver floor warns and retains TOML: " + value);
+  }
   for (const auto& [name, value] : saved) {
     if (value) ::setenv(name.c_str(), value->c_str(), 1); else ::unsetenv(name.c_str());
   }

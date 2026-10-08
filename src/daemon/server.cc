@@ -406,8 +406,6 @@ class Server {
   int lock_fd_ = -1;
   int listen_fd_ = -1;
   ino_t socket_inode_ = 0;
-  std::unique_ptr<JobserverPool> jobserver_;
-  int jobserver_min_jobs_ = 2;
 
   bool s3_enabled_ = false;
   bool s3_writable_ = false;
@@ -416,6 +414,8 @@ class Server {
 
   // Connection bookkeeping. `mutex_` guards everything below it.
   mutable std::mutex mutex_;
+  std::unique_ptr<JobserverPool> jobserver_;
+  int jobserver_min_jobs_ = 2;
   std::condition_variable cv_;
   std::set<int> connections_;
   std::map<int, std::shared_ptr<CompileSession>> sessions_;
@@ -1140,7 +1140,7 @@ void Server::TickJobserver() {
   if (!jobserver_) return;
   const uint64_t waiting = memory_waiters_.size();
   const uint64_t available_kb = AvailableKb();
-  const int change = JobserverTokenChange(jobserver_->total(), jobserver_->fifo_bytes(),
+  const int change = JobserverSignedTokenChange(jobserver_->total(), jobserver_->fifo_bytes(),
       jobserver_->withdrawn(), waiting, available_kb, jobserver_min_jobs_,
       std::max(config_.daemon.default_compile_kb, config_.daemon.default_link_kb));
   std::string message;
@@ -1154,7 +1154,6 @@ void Server::TickJobserver() {
     if (returned > 0) message = "jobserver: restored " + std::to_string(returned) + " tokens";
   }
   if (!message.empty()) {
-    VCACHE_LOG(message);
     log_.Line(message);
   }
 }
@@ -1639,7 +1638,6 @@ void Server::Shutdown() {
       const int returned = jobserver_->Restore(jobserver_->withdrawn());
       if (returned > 0) {
         const std::string message = "jobserver: restored " + std::to_string(returned) + " tokens";
-        VCACHE_LOG(message);
         log_.Line(message);
       }
       const std::string path = jobserver_->path();
@@ -1750,7 +1748,6 @@ void Server::StartJobserver() {
   if (config_.daemon.jobserver_min_jobs > static_cast<uint64_t>(jobserver_->total())) {
     const std::string message = "jobserver: jobserver_min_jobs exceeds pool, clamped to " +
                                 std::to_string(jobserver_min_jobs_);
-    VCACHE_LOG(message);
     log_.Line(message);
   }
   admission_worker_ = std::thread([this] { AdmissionWorker(); });

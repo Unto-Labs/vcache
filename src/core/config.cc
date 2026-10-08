@@ -159,7 +159,17 @@ void ApplyTomlFile(const std::string& path, Config* config) {
       if (*v > 0) config->daemon.default_link_kb = static_cast<uint64_t>(*v);
     }
     if (auto v = TomlInt(*d, "jobserver_min_jobs")) {
-      if (*v > 0) config->daemon.jobserver_min_jobs = static_cast<uint64_t>(*v);
+      if (*v > 0) {
+        config->daemon.jobserver_min_jobs = static_cast<uint64_t>(*v);
+      } else {
+        config->warnings.push_back("daemon.jobserver_min_jobs: " + std::to_string(*v) +
+            " is not a positive job count; keeping " +
+            std::to_string(config->daemon.jobserver_min_jobs));
+      }
+    } else if (d->contains("jobserver_min_jobs")) {
+      config->warnings.push_back(
+          "daemon.jobserver_min_jobs: expected a positive job count; keeping " +
+          std::to_string(config->daemon.jobserver_min_jobs));
     }
     if (auto v = TomlString(*d, "mode")) {
       if (!ParseDaemonMode(*v, &config->daemon.mode)) {
@@ -364,9 +374,14 @@ void ApplyEnvironment(Config* config) {
     if (auto value = Env(name)) {
       char* end = nullptr;
       errno = 0;
-      const unsigned long long kb = std::strtoull(value->c_str(), &end, 10);
+      const unsigned long long parsed = std::strtoull(value->c_str(), &end, 10);
       if (!value->empty() && value->front() != '-' && end != value->c_str() &&
-          *end == '\0' && kb > 0 && errno != ERANGE) *destination = kb;
+          *end == '\0' && parsed > 0 && errno != ERANGE) {
+        *destination = parsed;
+      } else if (destination == &config->daemon.jobserver_min_jobs) {
+        config->warnings.push_back(std::string(name) + ": expected a positive job count, got '" +
+            *value + "'; keeping " + std::to_string(*destination));
+      }
     }
   }
   config->daemon.jobserver = EnvBool("VCACHE_DAEMON_JOBSERVER", config->daemon.jobserver);

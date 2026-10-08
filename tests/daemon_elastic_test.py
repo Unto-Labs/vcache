@@ -8,6 +8,7 @@ import select
 import shlex
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True
 from daemon_session_test import check, poll_until
@@ -205,10 +206,24 @@ sys.exit(result)
                     check(row(env, "jobserver tokens withdrawn", 0) and
                           "clamped to 4" in contents(log),
                           label + ": a floor above total is clamped and warns")
+                    check(contents(log).count("jobserver: jobserver_min_jobs exceeds pool") == 1,
+                          label + ": the clamp warning appears once in VCACHE_LOG")
                 else:
                     check(poll_until(lambda: row(env, "jobserver tokens withdrawn", 2)) and
                           row(env, "jobserver tokens free", 2),
                           label + ": pressure withdraws only two shared tokens to the floor")
+                    if label == "elastic":
+                        floor_started = time.monotonic()
+                        held_floor = True
+                        def observe_floor():
+                            nonlocal held_floor
+                            held_floor &= row(env, "jobserver tokens withdrawn", 2) and \
+                                          row(env, "jobserver tokens free", 2)
+                            return time.monotonic() - floor_started >= 1.1
+                        check(poll_until(observe_floor, 1.5) and held_floor and
+                              row(env, "jobserver tokens withdrawn", 2) and
+                              row(env, "jobserver tokens free", 2),
+                              label + ": the two-job floor holds across at least two ticks")
                 if stopping:
                     fifo = case / "cache/daemon/jobserver.fifo"
                     reader_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -243,8 +258,11 @@ sys.exit(result)
                         check(poll_until(lambda: row(env, "jobserver tokens withdrawn", 0)) and
                               row(env, "jobserver tokens restored total", 2),
                               label + ": drained pressure restores the full pool")
-                        restores = re.findall(r"\] jobserver: restored ([0-9]+) tokens", contents(log))
+                        restores = re.findall(r"\] daemon: jobserver: restored ([0-9]+) tokens",
+                                              contents(log))
                         check(restores == ["1", "1"], label + ": recovery logs one restore per tick")
+                        check(contents(log).count("jobserver: restored") == 2,
+                              label + ": each restored token appears exactly once in VCACHE_LOG")
                         check("jobserver: withdrew 1 tokens (waiting 1, available " in contents(log),
                               label + ": withdrawal logs the queue length and available memory")
                         make_phase(env, case, "recovered-make", 4, processes, descriptors)

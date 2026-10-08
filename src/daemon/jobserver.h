@@ -24,8 +24,9 @@ namespace vcache::daemon {
 // it is a jobserver client rather than the owner of a new pool.
 std::string JobserverMakeFlagsLine(const std::string& fifo_path);
 
-int JobserverTokenChange(int total, int free, int withdrawn, uint64_t waiting,
-                         uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb);
+// Negative values withdraw tokens; positive values restore them.
+int JobserverSignedTokenChange(int total, int free_fifo_bytes, int withdrawn, uint64_t waiting,
+                               uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb);
 
 class JobserverPool {
  public:

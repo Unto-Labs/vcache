@@ -229,7 +229,9 @@ separate processes do.
   one Put. `VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT` names a fifo; a test write
   to it releases the process that is waiting to re-read. A path that is not a
   fifo is ignored, and a fifo with no writer is given up after 60 seconds.
-  Unset, it does nothing.
+  `VCACHE_TEST_PAUSE_BOUND_MS` shrinks that wait when a test sets it to a
+  positive number of milliseconds no larger than 60000. Unset, the pause
+  does nothing.
   `vcache --test-put KEY` reads one blob from stdin and stores it through a
   running daemon, so a test can put two values of one key while an upload is
   still in flight. `VCACHE_TEST_MAX_HELD_BYTES` shrinks the daemon's held-blob

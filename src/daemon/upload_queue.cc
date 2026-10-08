@@ -77,52 +77,64 @@ void UploadQueue::ForgetQueued(const std::string& key) {
 }
 
 void UploadQueue::OvertakeRefusals(const std::string& key) {
-  const auto it = refusals_.find(key);
-  if (it == refusals_.end()) return;
-  for (FlightRefusal& refusal : it->second) refusal.overtaken = true;
+  for (auto& entry : refusals_) {
+    if (entry.second.key == key) entry.second.overtaken = true;
+  }
 }
 
 uint64_t UploadQueue::SupersedeInFlight(const std::string& key) {
   // A newer refusal replaces one that is still waiting on this upload.
   OvertakeRefusals(key);
-  const auto generation = in_flight_generation_.find(key);
-  const uint64_t waited = generation == in_flight_generation_.end() ? 0 : generation->second;
+  const auto flight = in_flight_id_.find(key);
+  const uint64_t flight_id = flight == in_flight_id_.end() ? 0 : flight->second;
   ++generation_[key];
   superseded_.insert(key);
   DropHeld(key);
-  FlightRefusal refusal;
-  refusal.id = next_refusal_id_++;
-  refusal.waited_generation = waited;
-  refusals_[key].push_back(refusal);
-  return refusal.id;
+  const uint64_t id = next_refusal_id_++;
+  refusals_.emplace(id, FlightRefusal{key, flight_id, false});
+  return id;
 }
 
 const UploadQueue::FlightRefusal* UploadQueue::FindRefusal(uint64_t refusal_id) const {
-  for (const auto& [key, list] : refusals_) {
-    (void)key;
-    for (const FlightRefusal& refusal : list) {
-      if (refusal.id == refusal_id) return &refusal;
-    }
-  }
-  return nullptr;
+  const auto it = refusals_.find(refusal_id);
+  if (it == refusals_.end()) return nullptr;
+  return &it->second;
 }
 
 bool UploadQueue::RefusalStillInFlight(uint64_t refusal_id) const {
-  for (const auto& [key, list] : refusals_) {
-    for (const FlightRefusal& refusal : list) {
-      if (refusal.id != refusal_id) continue;
-      if (in_flight_.count(key) == 0) return false;
-      const auto generation = in_flight_generation_.find(key);
-      if (generation == in_flight_generation_.end()) return false;
-      return generation->second <= refusal.waited_generation;
-    }
-  }
-  return false;
+  const FlightRefusal* refusal = FindRefusal(refusal_id);
+  if (refusal == nullptr) return false;
+  const auto flight = in_flight_id_.find(refusal->key);
+  if (flight == in_flight_id_.end()) return false;
+  return flight->second == refusal->flight_id;
 }
 
 bool UploadQueue::RefusalOvertaken(uint64_t refusal_id) const {
   const FlightRefusal* refusal = FindRefusal(refusal_id);
   return refusal != nullptr && refusal->overtaken;
+}
+
+void UploadQueue::MarkInFlight(const std::string& key) {
+  in_flight_.insert(key);
+  // generation_ restarts after a superseded finish. The flight id does not,
+  // so a refusal recorded against this attempt cannot latch onto the next one.
+  in_flight_id_[key] = next_flight_id_++;
+}
+
+uint64_t UploadQueue::BeginSync(const std::string& key) {
+  if (in_flight_.count(key) != 0) return 0;
+  uint64_t& gen = generation_[key];
+  ++gen;
+  MarkInFlight(key);
+  return gen;
+}
+
+bool UploadQueue::TakeRefusal(uint64_t refusal_id) {
+  const auto it = refusals_.find(refusal_id);
+  if (it == refusals_.end()) return false;
+  const bool overtaken = it->second.overtaken;
+  refusals_.erase(it);
+  return overtaken;
 }
 
 bool UploadQueue::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
@@ -209,8 +221,7 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
   order_.erase(ready);
   UploadItem item = std::move(waiting_.find(key)->second);
   waiting_.erase(key);
-  in_flight_.insert(item.key);
-  in_flight_generation_[item.key] = item.generation;
+  MarkInFlight(item.key);
   if (item.blob) flight_pin_[item.key] = FlightPin{item.blob, false};
   return item;
 }
@@ -218,7 +229,7 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
 bool UploadQueue::Finish(const UploadItem& item, bool* count_requeue) {
   if (count_requeue != nullptr) *count_requeue = false;
   in_flight_.erase(item.key);
-  in_flight_generation_.erase(item.key);
+  in_flight_id_.erase(item.key);
   ReleaseFlightPin(item.key);
   if (superseded_.erase(item.key) > 0) {
     recount_on_requeue_.erase(item.key);
@@ -252,7 +263,7 @@ bool UploadQueue::Finish(const UploadItem& item, bool* count_requeue) {
 
 bool UploadQueue::Requeue(UploadItem item) {
   in_flight_.erase(item.key);
-  in_flight_generation_.erase(item.key);
+  in_flight_id_.erase(item.key);
   ReleaseFlightPin(item.key);
   if (superseded_.erase(item.key) > 0) {
     recount_on_requeue_.erase(item.key);

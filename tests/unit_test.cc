@@ -4955,7 +4955,47 @@ void TestUploadGeneration() {
     waiter.join();
     Check(released, "the waiter is released by finish of v1 even when v3 is in flight");
     Check(wake.in_flight("w"), "v3 stays in flight after v1 finishes");
+    Check(wake.TakeRefusal(refusal_id), "taking the refusal reports it was overtaken");
+    CheckEq(std::to_string(wake.refusal_count()), "0",
+            "a finished refusal leaves no record");
   }
+
+  // Finish of a superseded flight clears generation_, so the next store starts
+  // again at 1. That store is a new flight and must not keep the old refusal
+  // waiting.
+  daemon::UploadQueue reset_flight(journal, 10);
+  Check(reset_flight.Enqueue("s", v1, false), "the reset store is queued");
+  auto reset_item = reset_flight.TakeReady(now, &soonest);
+  uint64_t reset_refusal = 0;
+  Check(!reset_flight.Enqueue("s", big, false, nullptr, nullptr, &reset_refusal),
+        "the reset re-put is refused");
+  if (reset_item) {
+    Check(!reset_flight.Finish(*reset_item), "finishing the superseded flight drops it");
+  }
+  const auto v_next = std::make_shared<const std::string>("vn");
+  Check(reset_flight.Enqueue("s", v_next, false), "a store after the drop is accepted");
+  auto next_item = reset_flight.TakeReady(now, &soonest);
+  Check(next_item.has_value() && reset_flight.in_flight("s"),
+        "the later store is in flight");
+  Check(!reset_flight.RefusalStillInFlight(reset_refusal),
+        "a new flight does not keep the old refusal waiting");
+
+  daemon::UploadQueue sync_upload(journal, 100);
+  const uint64_t sync_generation = sync_upload.BeginSync("y");
+  Check(sync_generation != 0 && sync_upload.in_flight("y") && sync_upload.held_bytes() == 0,
+        "a synchronous upload is in flight and pins nothing");
+  const auto sync_later = std::make_shared<const std::string>("later");
+  Check(sync_upload.Enqueue("y", sync_later, false),
+        "a store during the synchronous upload is accepted");
+  daemon::UploadItem sync_done;
+  sync_done.key = "y";
+  sync_done.generation = sync_generation;
+  bool sync_requeue = false;
+  Check(sync_upload.Finish(sync_done, &sync_requeue) && sync_requeue,
+        "finishing the synchronous upload re-queues the later store");
+  auto sync_again = sync_upload.TakeReady(now, &soonest);
+  const std::string sync_blob = sync_again && sync_again->blob ? *sync_again->blob : std::string();
+  CheckEq(sync_blob, "later", "the re-queued store is the later value");
 }
 
 void TestHeldHitLayer() {

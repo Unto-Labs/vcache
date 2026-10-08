@@ -3173,6 +3173,20 @@ else
   bad "single-flight integration requires python3"
 fi
 
+section "10d. Elastic jobserver"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
+    "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
+  elastic_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/elastic.report"
+  check "elastic jobserver integration driver completes" "$elastic_test_exit" "0"
+  if [[ "$elastic_test_exit" != 0 ]]; then cat "$WORK/elastic.errors"; fi
+else
+  bad "elastic jobserver integration requires python3"
+fi
+
 section "10c. Memory admission"
 if command -v python3 >/dev/null 2>&1; then
   timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \

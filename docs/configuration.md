@@ -117,6 +117,7 @@ timeout        = 30                # seconds
 | `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | — | `false` |
 | `daemon.default_compile_kb` | `VCACHE_DAEMON_DEFAULT_COMPILE_KB` | — | `2097152` |
 | `daemon.default_link_kb` | `VCACHE_DAEMON_DEFAULT_LINK_KB` | — | `4194304` |
+| `daemon.jobserver_min_jobs` | `VCACHE_DAEMON_JOBSERVER_MIN_JOBS` | — | `2` |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -672,6 +673,13 @@ because each client already owns one. Unset means the machine's online CPUs.
 does the same. `vcache --jobserver-env` prints the `MAKEFLAGS` line, or
 exits 1 when no pool is running or the path is not a fifo. See
 [daemon.md](daemon.md) for the protocol and the tool versions.
+
+When admission requests wait, the pool withdraws unused shared tokens every
+500 ms, down to `daemon.jobserver_min_jobs`. A floor larger than the pool is
+clamped to its size with a warning. After the queue drains and available memory
+exceeds both default estimates, it restores one token per tick. With no
+admission requests the pool stays fixed. Each top-level build has an implicit
+slot, so concurrent builds can run `N-1 + builds` jobs before withdrawals.
 
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.

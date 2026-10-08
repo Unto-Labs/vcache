@@ -8,6 +8,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
+#include <array>
 #include <climits>
 #include <cstring>
 #include <utility>
@@ -39,6 +41,17 @@ std::string JobserverMakeFlagsLine(const std::string& fifo_path) {
   return "MAKEFLAGS=-j --jobserver-auth=fifo:" + fifo_path + "\n";
 }
 
+int JobserverTokenChange(int total, int free, int withdrawn, uint64_t waiting,
+                         uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb) {
+  const int floor = std::clamp(min_jobs, 1, std::max(1, total));
+  if (waiting > 0 && free > 0) {
+    return -static_cast<int>(std::min<uint64_t>(waiting,
+        std::max(0, std::min(free, total - withdrawn - floor))));
+  }
+  if (waiting == 0 && withdrawn > 0 && available_kb > default_estimate_kb) return 1;
+  return 0;
+}
+
 JobserverPool::JobserverPool(std::string path, int fd, int total, uint64_t fifo_dev,
                              uint64_t fifo_ino)
     : path_(std::move(path)), fd_(fd), total_(total), fifo_dev_(fifo_dev), fifo_ino_(fifo_ino) {}
@@ -47,28 +60,37 @@ JobserverPool::JobserverPool(JobserverPool&& other) noexcept
     : path_(std::move(other.path_)),
       fd_(other.fd_),
       total_(other.total_),
+      withdrawn_(other.withdrawn_),
+      restored_total_(other.restored_total_),
       fifo_dev_(other.fifo_dev_),
       fifo_ino_(other.fifo_ino_) {
   other.fd_ = -1;
   other.path_.clear();
   other.total_ = 0;
+  other.withdrawn_ = 0;
+  other.restored_total_ = 0;
   other.fifo_dev_ = 0;
   other.fifo_ino_ = 0;
 }
 
 JobserverPool& JobserverPool::operator=(JobserverPool&& other) noexcept {
   if (this != &other) {
+    Restore(withdrawn_);
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
     RemoveOwnedFifo();
     path_ = std::move(other.path_);
     fd_ = other.fd_;
     total_ = other.total_;
+    withdrawn_ = other.withdrawn_;
+    restored_total_ = other.restored_total_;
     fifo_dev_ = other.fifo_dev_;
     fifo_ino_ = other.fifo_ino_;
     other.fd_ = -1;
     other.path_.clear();
     other.total_ = 0;
+    other.withdrawn_ = 0;
+    other.restored_total_ = 0;
     other.fifo_dev_ = 0;
     other.fifo_ino_ = 0;
   }
@@ -87,6 +109,7 @@ void JobserverPool::RemoveOwnedFifo() {
 }
 
 JobserverPool::~JobserverPool() {
+  Restore(withdrawn_);
   if (fd_ >= 0) ::close(fd_);
   fd_ = -1;
   RemoveOwnedFifo();
@@ -160,6 +183,35 @@ int JobserverPool::free_tokens() const {
   const int bytes = fifo_bytes();
   if (bytes < 0) return -1;
   return bytes + 1;
+}
+
+int JobserverPool::Withdraw(int count) {
+  int taken = 0;
+  std::array<char, 256> tokens{};
+  count = std::clamp(count, 0, std::max(0, total_ - 1 - withdrawn_));
+  while (fd_ >= 0 && taken < count) {
+    const ssize_t size = ::read(fd_, tokens.data(),
+        std::min<size_t>(tokens.size(), count - taken));
+    if (size < 0 && errno == EINTR) continue;
+    if (size <= 0) break;
+    taken += static_cast<int>(size);
+    withdrawn_ += static_cast<int>(size);
+  }
+  return taken;
+}
+
+int JobserverPool::Restore(int count) {
+  int returned = 0;
+  const std::string tokens(static_cast<size_t>(std::clamp(count, 0, withdrawn_)), '+');
+  while (fd_ >= 0 && returned < static_cast<int>(tokens.size())) {
+    const ssize_t size = ::write(fd_, tokens.data() + returned, tokens.size() - returned);
+    if (size < 0 && errno == EINTR) continue;
+    if (size <= 0) break;
+    returned += static_cast<int>(size);
+    withdrawn_ -= static_cast<int>(size);
+    restored_total_ += static_cast<uint64_t>(size);
+  }
+  return returned;
 }
 
 }  // namespace vcache::daemon

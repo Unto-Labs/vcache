@@ -321,6 +321,7 @@ class Server {
   // not a socket connection.
   int IdleLimitSeconds() const;
   void StartJobserver();
+  void TickJobserver();
 
   const core::Config config_;
   const std::string state_dir_;
@@ -334,6 +335,7 @@ class Server {
   int listen_fd_ = -1;
   ino_t socket_inode_ = 0;
   std::unique_ptr<JobserverPool> jobserver_;
+  int jobserver_min_jobs_ = 2;
 
   bool s3_enabled_ = false;
   bool s3_writable_ = false;
@@ -966,7 +968,31 @@ void Server::AdmissionWorker() {
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stop_requested_.load()) {
     UpdateAdmission();
+    TickJobserver();
     cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return stop_requested_.load(); });
+  }
+}
+
+void Server::TickJobserver() {
+  if (!jobserver_) return;
+  const uint64_t waiting = memory_waiters_.size();
+  const uint64_t available_kb = AvailableKb();
+  const int change = JobserverTokenChange(jobserver_->total(), jobserver_->fifo_bytes(),
+      jobserver_->withdrawn(), waiting, available_kb, jobserver_min_jobs_,
+      std::max(config_.daemon.default_compile_kb, config_.daemon.default_link_kb));
+  std::string message;
+  if (change < 0) {
+    const int taken = jobserver_->Withdraw(-change);
+    if (taken > 0) message = "jobserver: withdrew " + std::to_string(taken) +
+        " tokens (waiting " + std::to_string(waiting) + ", available " +
+        std::to_string(available_kb) + " kB)";
+  } else if (change > 0) {
+    const int returned = jobserver_->Restore(change);
+    if (returned > 0) message = "jobserver: restored " + std::to_string(returned) + " tokens";
+  }
+  if (!message.empty()) {
+    VCACHE_LOG(message);
+    log_.Line(message);
   }
 }
 
@@ -1188,6 +1214,7 @@ std::string Server::StatusText() {
   uint64_t held = 0;
   uint64_t reserved_kb = 0, realised_kb = 0, memory_waiting = 0, reserve_waits = 0;
   uint64_t longest_reserve_wait_ms = 0;
+  std::string jobserver_status;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     active = connections_.size();
@@ -1199,6 +1226,15 @@ std::string Server::StatusText() {
     memory_waiting = memory_waiters_.size();
     reserve_waits = reserve_waits_;
     longest_reserve_wait_ms = longest_reserve_wait_ms_;
+    if (jobserver_) {
+      const int free = jobserver_->free_tokens();
+      jobserver_status += row("jobserver tokens total", std::to_string(jobserver_->total()));
+      jobserver_status += row("jobserver tokens free",
+                             free < 0 ? std::string("unknown") : std::to_string(free));
+      jobserver_status += row("jobserver tokens withdrawn", std::to_string(jobserver_->withdrawn()));
+      jobserver_status += row("jobserver tokens restored total",
+                             std::to_string(jobserver_->restored_total()));
+    }
     for (const auto& [key, state] : leases_) {
       if (state.compile) {
         ++leases_held;
@@ -1246,13 +1282,7 @@ std::string Server::StatusText() {
   s += row("  skipped", n(counters_.uploads_skipped));
   s += row("  pending", std::to_string(pending + static_cast<size_t>(in_flight)));
   s += row("  held in memory", std::to_string(held) + " bytes");
-  if (jobserver_) {
-    const int free = jobserver_->free_tokens();
-    s += row("jobserver tokens total", std::to_string(jobserver_->total()));
-    s += row("jobserver tokens free",
-             free < 0 ? std::string("unknown") : std::to_string(free));
-    s += row("jobserver tokens withdrawn", std::to_string(jobserver_->withdrawn()));
-  }
+  s += jobserver_status;
   return s;
 }
 
@@ -1381,13 +1411,15 @@ void Server::Serve(int fd) {
 }
 
 int Server::IdleLimitSeconds() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (config_.daemon.idle_timeout_seconds <= 0) return 0;
   // A build blocked in read() on the fifo is not a socket client, so the
   // ordinary idle clock would exit under it and take the tokens with it.
   // One extra timeout is enough to tell "the build went quiet" from "the
   // build is still holding slots".
   const int periods =
-      (jobserver_ && jobserver_->free_tokens() < jobserver_->total()) ? 2 : 1;
+      (jobserver_ && jobserver_->free_tokens() + jobserver_->withdrawn() <
+                         jobserver_->total()) ? 2 : 1;
   return config_.daemon.idle_timeout_seconds * periods;
 }
 
@@ -1424,6 +1456,17 @@ void Server::Shutdown() {
     reservations_.clear();
     memory_waiters_.clear();
     cv_.notify_all();
+    if (jobserver_) {
+      const int returned = jobserver_->Restore(jobserver_->withdrawn());
+      if (returned > 0) {
+        const std::string message = "jobserver: restored " + std::to_string(returned) + " tokens";
+        VCACHE_LOG(message);
+        log_.Line(message);
+      }
+      const std::string path = jobserver_->path();
+      jobserver_.reset();
+      log_.Line("jobserver: removed " + path);
+    }
     for (auto& [key, state] : leases_) {
       if (state.compile) {
         state.compile->outcome = LeaseOutcome::kCompile;
@@ -1443,11 +1486,6 @@ void Server::Shutdown() {
   struct stat st;
   if (::lstat(socket_path_.c_str(), &st) == 0 && st.st_ino == socket_inode_) {
     ::unlink(socket_path_.c_str());
-  }
-  if (jobserver_) {
-    const std::string path = jobserver_->path();
-    jobserver_.reset();
-    log_.Line("jobserver: removed " + path);
   }
 
   for (const auto& session : closing_sessions) session->Shutdown();
@@ -1524,6 +1562,15 @@ void Server::StartJobserver() {
   log_.Line("jobserver: pool " + pool->path() + " with " + std::to_string(pool->total()) +
             " slots (" + std::to_string(pool->total() - 1) + " tokens)");
   jobserver_ = std::make_unique<JobserverPool>(std::move(*pool));
+  jobserver_min_jobs_ = static_cast<int>(std::min<uint64_t>(config_.daemon.jobserver_min_jobs,
+                                                         jobserver_->total()));
+  if (config_.daemon.jobserver_min_jobs > static_cast<uint64_t>(jobserver_->total())) {
+    const std::string message = "jobserver: jobserver_min_jobs exceeds pool, clamped to " +
+                                std::to_string(jobserver_min_jobs_);
+    VCACHE_LOG(message);
+    log_.Line(message);
+  }
+  admission_worker_ = std::thread([this] { AdmissionWorker(); });
 }
 
 int Server::Run(int ready_fd) {

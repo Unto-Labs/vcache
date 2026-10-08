@@ -234,7 +234,10 @@ VCACHE_SRCS := \
   $(SRC)/storage/disk_storage.cc \
   $(SRC)/storage/s3_storage.cc \
   $(SRC)/storage/chain.cc \
-  $(SRC)/storage/curl_api.cc
+  $(SRC)/storage/curl_api.cc \
+  $(SRC)/daemon/protocol.cc \
+  $(SRC)/daemon/client.cc \
+  $(SRC)/daemon/server.cc
 
 MAIN_SRC := $(SRC)/main.cc
 

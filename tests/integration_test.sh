@@ -958,6 +958,199 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "11b. cache daemon"
+
+# Every daemon here is stopped explicitly; the short idle timeout is a backstop
+# so a failed assertion cannot leave one running long after the suite.
+export VCACHE_DAEMON_IDLE_TIMEOUT=60
+
+daemon_stat() { "$VCACHE" --daemon-status 2>/dev/null | grep -F "$1" | head -1 | awk '{print $NF}'; }
+daemon_pid() { "$VCACHE" --daemon-status 2>/dev/null | awk '/^daemon pid/ {print $NF}'; }
+compile_a() {
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$1" ) 2>/dev/null
+}
+compile_b() {
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$1" ) 2>/dev/null
+}
+
+# Runs a command with a deadline, reporting "timeout" instead of hanging the
+# suite. macOS has no timeout(1).
+with_deadline() {
+  local secs=$1; shift
+  "$@" & local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= secs * 10 )); then kill -9 "$pid" 2>/dev/null; echo timeout; return; fi
+    sleep 0.1; waited=$((waited+1))
+  done
+  wait "$pid"; echo "exit=$?"
+}
+
+reset_cache
+check "--start-daemon starts one" \
+  "$("$VCACHE" --start-daemon | grep -c 'daemon started')" "1"
+check "a second --start-daemon finds it running" \
+  "$("$VCACHE" --start-daemon | grep -c 'already running')" "1"
+DPID=$(daemon_pid)
+check "the daemon reports its pid" "$([[ -n "$DPID" ]] && kill -0 "$DPID" && echo yes)" "yes"
+check "its state directory is private" \
+  "$(ls -ld "$VCACHE_DIR/daemon" | cut -c1-10)" "drwx------"
+
+export VCACHE_DAEMON=on
+compile_a "$WORK/d1.o"
+compile_b "$WORK/d2.o"
+check "a compile through the daemon misses, then" "$(misses)" "1"
+check "the other checkout hits through the daemon" "$(hits)" "1"
+check "the daemon served both lookups" "$(daemon_stat 'lookups')" "2"
+check "and took the store" "$(daemon_stat 'stores')" "1"
+if cmp -s "$WORK/d1.o" "$WORK/d2.o"; then
+  ok "objects through the daemon are byte-identical"
+else
+  bad "objects through the daemon are byte-identical"
+fi
+check "the entry is in the ordinary disk layer" "$(disk_entries)" "1"
+check "--show-stats mentions the running daemon" \
+  "$("$VCACHE" --show-stats | grep -c '^daemon .*running')" "1"
+
+# A client whose cache differs is refused and runs in-process, so it still
+# builds and still caches -- just not through the daemon.
+VCACHE_CACHE_SIZE=5G compile_a "$WORK/d3.o"
+check "a client with a different cache config still compiles" \
+  "$([[ -s "$WORK/d3.o" ]] && echo yes)" "yes"
+check "and the daemon recorded the refusal" \
+  "$("$VCACHE" --daemon-status | grep -c '1 refused')" "1"
+check "the refused client hit the disk layer in-process" "$(hits)" "2"
+
+# A daemon killed outright: compiles fall back, and a new one can take over
+# the lock and the leftover socket.
+kill -9 "$DPID" 2>/dev/null; sleep 0.2
+compile_b "$WORK/d4.o"
+check "a compile after the daemon is killed still hits, in-process" "$(hits)" "3"
+check "--start-daemon replaces a killed daemon" \
+  "$("$VCACHE" --start-daemon | grep -c 'daemon started')" "1"
+check "--stop-daemon stops it" "$("$VCACHE" --stop-daemon | grep -c 'stopped')" "1"
+check "and nothing answers afterwards" \
+  "$("$VCACHE" --daemon-status >/dev/null 2>&1; echo $?)" "1"
+
+# auto: the first compile starts the daemon. It must not keep the build's
+# output pipe open, or `$(...)` -- and make, and a CI step -- never finishes.
+export VCACHE_DAEMON=auto
+reset_cache
+result=$(with_deadline 20 bash -c "out=\$(cd '$WORK/checkout-a' && VCACHE_ROOTS='$WORK/checkout-a=proj' '$VCACHE' g++ -O2 -c -I include src/lib.cc -o '$WORK/d5.o' 2>&1); echo \"\$out\"")
+check "auto mode does not hold the caller's output open" \
+  "$([[ "$result" != *timeout* ]] && echo yes)" "yes"
+check "auto mode started a daemon" "$([[ -n "$(daemon_pid)" ]] && echo yes)" "yes"
+check "and the compile went through it" "$(daemon_stat 'stores')" "1"
+"$VCACHE" --stop-daemon >/dev/null
+
+# A relative VCACHE_DIR names the same cache for the daemon, which runs from
+# "/", as for the compile that started it. Otherwise the daemon would refuse
+# its own client.
+mkdir -p "$WORK/rel"
+( cd "$WORK/rel" && VCACHE_DIR=relcache VCACHE_ROOTS="$WORK/checkout-a=proj" \
+    "$VCACHE" g++ -O2 -c -I "$WORK/checkout-a/include" "$WORK/checkout-a/src/lib.cc" \
+    -o "$WORK/rel/r.o" ) 2>/dev/null
+check "auto mode with a relative VCACHE_DIR serves its own client" \
+  "$(cd "$WORK/rel" && VCACHE_DIR=relcache "$VCACHE" --daemon-status | awk '/^stores/ {print $NF}')" "1"
+( cd "$WORK/rel" && VCACHE_DIR=relcache "$VCACHE" --stop-daemon >/dev/null )
+
+# A daemon whose cache directory is deleted from under it exits rather than
+# lingering unreachable until its idle timeout.
+reset_cache
+"$VCACHE" --start-daemon >/dev/null
+DPID=$(daemon_pid)
+reset_cache
+for _ in $(seq 1 30); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
+check "a daemon whose cache directory is deleted exits" \
+  "$(kill -0 "$DPID" 2>/dev/null && echo running || echo exited)" "exited"
+
+# Idle exit.
+VCACHE_DAEMON_IDLE_TIMEOUT=1 "$VCACHE" --start-daemon >/dev/null
+sleep 2.5
+check "an idle daemon exits on its own" \
+  "$("$VCACHE" --daemon-status >/dev/null 2>&1; echo $?)" "1"
+export VCACHE_DAEMON=on
+
+if command -v python3 >/dev/null 2>&1; then
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/daemon-s3"
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  s3_objects() { find "$S3DIR" -type f 2>/dev/null | wc -l | tr -d " "; }
+
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+
+  reset_cache
+  "$VCACHE" --start-daemon >/dev/null
+  compile_a "$WORK/ds1.o"
+  check "a store through the daemon reaches disk" "$(disk_entries)" "1"
+  stop_out=$("$VCACHE" --stop-daemon)
+  check "--stop-daemon drains the upload" "$(grep -c 'uploaded 1, failed 0' <<<"$stop_out")" "1"
+  check "the entry reached s3" "$(s3_objects)" "1"
+
+  # A fresh local cache: the daemon fetches from s3 and backfills disk.
+  reset_cache
+  "$VCACHE" --start-daemon >/dev/null
+  compile_b "$WORK/ds2.o"
+  check "the daemon serves an s3 hit" "$(stat_of 'cache hit (s3)')" "1"
+  check "and backfills the disk layer" "$(disk_entries)" "1"
+  if cmp -s "$WORK/ds1.o" "$WORK/ds2.o"; then
+    ok "the object from s3 via the daemon is byte-identical"
+  else
+    bad "the object from s3 via the daemon is byte-identical"
+  fi
+  "$VCACHE" --stop-daemon >/dev/null
+
+  # A journalled upload left by a daemon that died is sent by the next one.
+  rm -rf "$S3DIR"; mkdir -p "$S3DIR"
+  entry=$(find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" | head -1)
+  key="$(basename "$(dirname "$entry")")$(basename "$entry")"
+  mkdir -p "$VCACHE_DIR/daemon/pending"
+  : > "$VCACHE_DIR/daemon/pending/$key"
+  "$VCACHE" --start-daemon >/dev/null
+  stop_out=$("$VCACHE" --stop-daemon)
+  check "a journalled upload is recovered and sent" "$(s3_objects)" "1"
+  check "and its journal entry is cleared" \
+    "$(find "$VCACHE_DIR/daemon/pending" -type f | wc -l | tr -d ' ')" "0"
+
+  # Uploads are asynchronous, so a failed one cannot fail the compile that
+  # stored it. --stop-daemon is where it surfaces, and where the strict flag
+  # turns it into an exit status.
+  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  reset_cache
+  "$VCACHE" --start-daemon >/dev/null
+  compile_a "$WORK/ds3.o"
+  check "a compile with s3 down still produces its object" \
+    "$([[ -s "$WORK/ds3.o" ]] && echo yes)" "yes"
+  VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE=1 "$VCACHE" --stop-daemon > "$WORK/stop.out"
+  check "--stop-daemon reports the failed upload" "$?" "90"
+  check "and says so" "$(grep -c 'failed 1' "$WORK/stop.out")" "1"
+
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION
+else
+  skipped "daemon s3 tests: python3 not installed"
+fi
+"$VCACHE" --stop-daemon >/dev/null 2>&1
+unset VCACHE_DAEMON VCACHE_DAEMON_IDLE_TIMEOUT
+
+# --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"
 
 # vcache runs once per compilation, so every DT_NEEDED entry is mapped and

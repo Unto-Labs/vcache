@@ -89,9 +89,42 @@ enum class DepScanPolicy {
 bool ParseDepScanPolicy(std::string_view name, DepScanPolicy* out);
 const char* DepScanPolicyName(DepScanPolicy policy);
 
+// Whether a compile talks to the cache daemon (see daemon/server.h).
+enum class DaemonMode {
+  // Every compile opens its own cache layers. The behaviour before the daemon
+  // existed, and the default while it earns trust.
+  kOff,
+  // Use a daemon that is already running; fall back to in-process layers when
+  // none is. Something else -- a CI step, systemd, launchd -- starts it.
+  kOn,
+  // As kOn, but start one when none is running.
+  kAuto,
+};
+
+bool ParseDaemonMode(std::string_view name, DaemonMode* out);
+const char* DaemonModeName(DaemonMode mode);
+
+struct DaemonConfig {
+  DaemonMode mode = DaemonMode::kOff;
+
+  // The daemon exits, after draining its upload queue, once it has had no
+  // client for this long. Zero keeps it running until told to stop. The
+  // default outlives the gap between two builds without leaving a process
+  // around all day holding credentials it was started with.
+  int idle_timeout_seconds = 900;
+
+  // Background S3 uploaders. Each holds its own persistent connection.
+  int upload_threads = 4;
+
+  // Unix socket path. Empty derives one from the cache directory, so two
+  // caches never share a daemon by accident.
+  std::string socket;
+};
+
 struct Config {
   DiskCacheConfig disk;
   S3CacheConfig s3;
+  DaemonConfig daemon;
 
   // Root specs in "PATH" or "PATH=TARGET" form, before RootMap resolution.
   std::vector<std::string> root_specs;

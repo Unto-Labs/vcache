@@ -9,6 +9,7 @@
 // writable layer.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,11 +34,35 @@ struct PutResult {
   std::vector<std::string> errors;
 };
 
+// A cache that answers whole-chain lookups and stores on the chain's behalf --
+// in practice the daemon, which owns the layers itself. Unlike a Storage it
+// reports which layer served a hit, because statistics are kept per layer.
+//
+// Each call returns false only when the remote could not be asked at all (the
+// connection broke, the reply was malformed). A miss or a failed layer is a
+// successful call with that outcome in the result.
+class RemoteCache {
+ public:
+  virtual ~RemoteCache() = default;
+  virtual std::string Name() const = 0;
+  virtual bool Get(const std::string& key, GetResult* result) = 0;
+  virtual bool Put(const std::string& key, const std::string& value,
+                   PutResult* result) = 0;
+};
+
 class CacheChain {
  public:
   void AddLayer(std::unique_ptr<Storage> layer);
 
-  bool empty() const { return layers_.empty(); }
+  // Sends every lookup and store to `remote` instead of the local layers. If
+  // the remote stops answering part-way through, `build_local` is called once
+  // to populate the local layers and the chain carries on with those, so a
+  // daemon that dies mid-build costs the daemon's benefits and nothing else.
+  void SetRemote(std::unique_ptr<RemoteCache> remote,
+                 std::function<void(CacheChain*)> build_local);
+  bool remote() const { return remote_ != nullptr; }
+
+  bool empty() const { return remote_ == nullptr && layers_.empty(); }
   size_t size() const { return layers_.size(); }
 
   GetResult Get(const std::string& key);
@@ -53,7 +78,12 @@ class CacheChain {
   void Trim();
 
  private:
+  // Drops the remote and builds the local layers in its place.
+  void FallBackToLocal();
+
   std::vector<std::unique_ptr<Storage>> layers_;
+  std::unique_ptr<RemoteCache> remote_;
+  std::function<void(CacheChain*)> build_local_;
 };
 
 }  // namespace vcache::storage

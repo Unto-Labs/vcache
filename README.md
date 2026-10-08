@@ -47,6 +47,7 @@ is a hit at all when a ccache hit would not have been.
 | [docs/configuration.md](docs/configuration.md) | Every option, precedence, worked examples |
 | [docs/preprocessor-problem.md](docs/preprocessor-problem.md) | Why this is needed, with measurements |
 | [docs/design.md](docs/design.md) | How it is put together |
+| [docs/daemon.md](docs/daemon.md) | The optional cache daemon: async S3 uploads, kept connections |
 | [docs/linux-kernel.md](docs/linux-kernel.md) | Recipe: caching Linux kernel builds |
 
 ## Quick start
@@ -174,6 +175,10 @@ promoted into the local layer so the rest of the build serves it locally. Writes
 go to every writable layer. If S3 is unreachable, lookups degrade to misses and
 the build proceeds — a shared cache outage never breaks a build.
 
+Optionally, a daemon (`VCACHE_DAEMON=auto`) owns the layers for every compile
+on the machine. Compiles then stop waiting for S3 uploads and stop paying for a
+new S3 connection each; see [docs/daemon.md](docs/daemon.md).
+
 ## Commands
 
 | Command | Effect |
@@ -184,6 +189,9 @@ the build proceeds — a shared cache outage never breaks a build.
 | `vcache --trim` | evict until under the size limit |
 | `vcache --show-config` | effective configuration |
 | `vcache --show-roots` | resolved root mapping for this directory |
+| `vcache --start-daemon` | start the cache daemon in the background |
+| `vcache --stop-daemon` | drain pending uploads, then stop the daemon |
+| `vcache --daemon-status` | what the daemon is doing |
 
 ## Debugging cached builds
 

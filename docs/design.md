@@ -26,6 +26,10 @@ src/
     disk_storage.*     sharded local cache with LRU eviction
     s3_storage.*       SigV4 over libcurl
     chain.*            multi-level chain with read-through backfill
+  daemon/
+    protocol.*         wire format, socket path, config fingerprint
+    server.*           the optional cache daemon (see daemon.md)
+    client.*           a compile's side of the connection
   hash/hasher.*        BLAKE3
   util/                strings, filesystem, subprocess, logging
 ```
@@ -163,7 +167,11 @@ visible but the reason was not.
 
 ## Concurrency
 
-A parallel build runs many independent vcache processes. There is no daemon.
+A parallel build runs many independent vcache processes. By default there is
+no daemon. With one ([daemon.md](daemon.md)), the compiles still run in
+parallel and only the cache layers move into the shared process, so everything
+below holds in both cases: the daemon's threads write the disk layer exactly as
+separate processes do.
 
 - Cache writes go through a temp file plus `rename(2)`, so a reader never sees a
   partial entry.

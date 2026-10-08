@@ -323,6 +323,9 @@ The wait bound is the larger of twice the waiter's own recorded wall time and
 the bound is 30 seconds. It uses the highest wall time in the matching cost
 record, rather than only its latest observation. A waiter still occupies its
 build tool's job slot while it waits.
+Time the holder spends queued for memory pauses this lease bound, for up to
+600 additional seconds. The client receive timeout includes that headroom
+and the existing 15-second reply margin.
 Decision logs include holder pid, bound and elapsed wait; the client receives
 this metadata with its scheduling reply. Session loss never fails the build.
 The socket receive timeout exceeds a scheduling bound by 15 seconds, allowing
@@ -349,11 +352,13 @@ and Rust dep-info runs do not reserve memory. A lease waiter holds no reservatio
 
 The estimate is the highest RSS in the matching cost record. Missing or zero
 records use `daemon.default_compile_kb` (2097152 kB, 2 GiB) or
-`daemon.default_link_kb` (4194304 kB, 4 GiB). The daemon reads `MemAvailable`
-at most once a second and samples the compiler's `VmRSS` every 500 ms:
+`daemon.default_link_kb` (4194304 kB, 4 GiB). Every 500 ms the daemon reads
+`MemAvailable`, then sums `VmRSS` over each compiler's live process tree,
+including children and grandchildren. A spawn samples only the new tree
+with a fresh memory reading. Process reads run outside the shared server lock.
 
 ```
-unrealised_kb = sum(max(0, estimate_kb - rss_kb))
+unrealised_kb = sum(max(0, estimate_kb - realised_kb))
 available_kb = max(0, MemAvailable - unrealised_kb)
 ```
 
@@ -363,7 +368,11 @@ a small request cannot pass a larger head request. An estimate above available
 RAM can start when no reservation is held, allowing at least one job to proceed.
 Session close or confirmed compiler exit releases the reservation immediately.
 A failed proc read alone retains it. RSS above the estimate contributes zero
-unrealised memory and logs the overshoot.
+unrealised memory and logs the overshoot. Release logs the tree's peak RSS;
+steady samples do not write per-tick lines. If `MemAvailable` is unreadable,
+the daemon logs once and retains its last good value, deferring new sampled RSS
+realisation until a fresh memory reading succeeds. With no good reading yet,
+admission is unavailable and requests proceed without waiting for memory.
 
 The reported compiler pid is sampled only when visible with the session peer
 as its parent. Otherwise the daemon logs the pid mismatch and treats the whole

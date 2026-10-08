@@ -92,7 +92,10 @@ bool CompileSessionHandle::ReserveMemory(const std::string& cost_key, uint64_t e
     return false;
   }
   memory_reserved_ = outcome == static_cast<uint8_t>(MemoryOutcome::kGranted);
-  if (!memory_reserved_) {
+  if (memory_reserved_) {
+    VCACHE_LOG("reserve: granted " + std::to_string(estimate_kb) + " kB after " +
+               std::to_string(waited_ms) + " ms");
+  } else {
     VCACHE_LOG("reserve: wait bound reached after " + std::to_string(waited_ms) +
                " ms, running unreserved");
   }
@@ -158,7 +161,9 @@ LeaseOutcome CompileSessionHandle::AcquireLease(const std::string& key, uint64_t
   request.U8(static_cast<uint8_t>(Op::kLeaseAcquire));
   request.Str(key);
   request.U64(bound_ms);
-  timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(bound_ms)), 0};
+  const uint64_t reply_bound_ms = std::min<uint64_t>(bound_ms, kReplyTimeoutSeconds * 1000) +
+                                  kMemoryWaitBoundMs;
+  timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(reply_bound_ms)), 0};
   ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   std::string reply, refusal;
   const bool answered = Request(request.data(), &reply, &refusal);

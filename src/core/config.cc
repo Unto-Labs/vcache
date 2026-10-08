@@ -148,6 +148,8 @@ void ApplyTomlFile(const std::string& path, Config* config) {
   }
 
   if (auto d = root["daemon"].as_table()) {
+    if (auto v = TomlBool(*d, "single_flight")) config->daemon.single_flight = *v;
+    if (auto v = TomlBool(*d, "admission")) config->daemon.admission = *v;
     if (auto v = TomlString(*d, "mode")) {
       if (!ParseDaemonMode(*v, &config->daemon.mode)) {
         config->warnings.push_back("daemon.mode: unknown mode '" + *v +
@@ -330,6 +332,9 @@ void ApplyEnvironment(Config* config) {
   if (auto v = Env("VCACHE_DAEMON_SOCKET")) {
     config->daemon.socket = util::ExpandTilde(*v);
   }
+  config->daemon.single_flight =
+      EnvBool("VCACHE_DAEMON_SINGLE_FLIGHT", config->daemon.single_flight);
+  config->daemon.admission = EnvBool("VCACHE_DAEMON_ADMISSION", config->daemon.admission);
 
   if (auto v = Env("VCACHE_DEP_SCAN")) {
     if (!ParseDepScanPolicy(*v, &config->dep_scan_policy)) {

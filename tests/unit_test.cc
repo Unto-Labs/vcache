@@ -4,6 +4,10 @@
 // build to plain make, as the plan asks.
 
 #include <sys/stat.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <cerrno>
 #include <sys/types.h>
@@ -11,6 +15,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -32,6 +39,8 @@
 #include "core/roots.h"
 #include "core/stats.h"
 #include "daemon/protocol.h"
+#include "daemon/client.h"
+#include "daemon/server.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "rust/rust_manifest.h"
@@ -1086,6 +1095,184 @@ void TestDaemonProtocol() {
     Check(core::ParseDaemonMode("1", &mode) && mode == core::DaemonMode::kOn,
           "daemon mode '1' means on");
     Check(!core::ParseDaemonMode("sometimes", &mode), "an unknown mode is rejected");
+  }
+}
+
+bool PollUntil(const std::function<bool()>& condition, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  do {
+    if (condition()) return true;
+    ::poll(nullptr, 0, 10);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+struct SessionDaemon {
+  core::Config config;
+  std::string directory;
+  pid_t pid = -1;
+
+  explicit SessionDaemon(int idle_seconds = 0) {
+    directory = util::MakeTempDir("vcache-session-test-").value_or("");
+    if (directory.empty()) return;
+    config.disk.dir = directory + "/cache";
+    config.daemon.idle_timeout_seconds = idle_seconds;
+    int ready_pipe[2];
+    if (::pipe(ready_pipe) != 0) return;
+    pid = ::fork();
+    if (pid == 0) {
+      ::close(ready_pipe[0]);
+      ::_exit(daemon::RunServer(config, ready_pipe[1]));
+    }
+    ::close(ready_pipe[1]);
+    pollfd ready{ready_pipe[0], POLLIN, 0};
+    char code = 0;
+    Check(::poll(&ready, 1, 2000) > 0 && ::read(ready_pipe[0], &code, 1) == 1 &&
+              code == 'R', "session daemon becomes ready within two seconds");
+    ::close(ready_pipe[0]);
+  }
+
+  ~SessionDaemon() {
+    if (pid > 0) {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, nullptr, 0);
+    }
+    if (!directory.empty()) util::RemoveRecursive(directory);
+  }
+
+  std::string Status() const {
+    std::string reply;
+    const int fd = Hello(daemon::kProtocolVersion, &reply);
+    if (fd < 0) return "";
+    daemon::Writer request;
+    request.U8(static_cast<uint8_t>(daemon::Op::kStatus));
+    std::string text;
+    if (daemon::SendFrame(fd, request.data()) && daemon::RecvFrame(fd, &reply)) {
+      daemon::Reader in(reply);
+      uint8_t status = 0;
+      if (!in.U8(&status) || status != static_cast<uint8_t>(daemon::Status::kOk) ||
+          !in.Str(&text) || !in.done()) text.clear();
+    }
+    ::close(fd);
+    return text;
+  }
+
+  bool Sessions(size_t expected) const {
+    const std::string status = Status();
+    const size_t row = status.find("compile sessions");
+    if (row == std::string::npos) return false;
+    return std::strtoull(status.c_str() + row + 16, nullptr, 10) == expected;
+  }
+
+  int Hello(uint64_t version, std::string* reply) const {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    timeval timeout{0, 500000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string path = daemon::SocketPath(config);
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    daemon::Writer hello;
+    hello.U8(static_cast<uint8_t>(daemon::Op::kHello));
+    hello.U64(version);
+    hello.Str(daemon::ConfigFingerprint(config));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        !daemon::SendFrame(fd, hello.data()) || !daemon::RecvFrame(fd, reply)) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+
+  int Open(std::string* reply) const {
+    const int fd = Hello(daemon::kProtocolVersion, reply);
+    if (fd < 0) return -1;
+    daemon::Writer request;
+    request.U8(6);
+    if (!daemon::SendFrame(fd, request.data()) || !daemon::RecvFrame(fd, reply)) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+};
+
+void TestCompileSessions() {
+  Section("daemon::session");
+  SessionDaemon server(1);
+  std::string reply;
+  int fd = server.Hello(1, &reply);
+  daemon::Reader refused(reply);
+  uint8_t status = 0;
+  std::string reason;
+  Check(fd >= 0 && refused.U8(&status) &&
+            status == static_cast<uint8_t>(daemon::Status::kRefused) &&
+            refused.Str(&reason) && reason.find("version 1") != std::string::npos &&
+            reason.find("speaks 2") != std::string::npos,
+        "v1 hello is refused and names client version 1 and daemon version 2");
+  if (fd >= 0) ::close(fd);
+
+  fd = server.Open(&reply);
+  Check(fd >= 0 && reply == std::string(1, '\0'), "session open replies ok");
+  Check(server.Sessions(1), "compile sessions 1 survives a separate status request");
+  const auto idle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1600);
+  bool stayed_alive = true;
+  PollUntil([&] {
+    stayed_alive &= ::kill(server.pid, 0) == 0 && util::FileExists(daemon::SocketPath(server.config));
+    return !stayed_alive || std::chrono::steady_clock::now() >= idle_deadline;
+  }, 2000);
+  Check(stayed_alive && server.Sessions(1), "an open session prevents the one-second idle exit");
+
+#if defined(__linux__)
+  std::string duplicate_reply;
+  const int duplicate_fd = server.Open(&duplicate_reply);
+  Check(duplicate_fd >= 0 && !duplicate_reply.empty() &&
+            duplicate_reply[0] == static_cast<char>(daemon::Status::kError) &&
+            server.Sessions(1), "a pid cannot hold two compile sessions");
+  if (duplicate_fd >= 0) ::close(duplicate_fd);
+#endif
+  if (fd >= 0) ::close(fd);
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "closing the session fd reports compile sessions 0 within one second");
+
+  const pid_t client_pid = ::fork();
+  if (client_pid == 0) {
+    std::string child_reply;
+    const int child_fd = server.Open(&child_reply);
+    if (child_fd < 0 || child_reply != std::string(1, '\0')) ::_exit(1);
+    ::poll(nullptr, 0, 5000);
+    ::_exit(2);
+  }
+  Check(client_pid > 0 && PollUntil([&] { return server.Sessions(1); }, 1000),
+        "a separate client process opens a session");
+  if (client_pid > 0) {
+    ::kill(client_pid, SIGKILL);
+    ::waitpid(client_pid, nullptr, 0);
+  }
+  Check(PollUntil([&] { return server.Sessions(0); }, 1000),
+        "killing the client releases its session within one second");
+
+  fd = server.Open(&reply);
+  daemon::Writer shutdown;
+  shutdown.U8(static_cast<uint8_t>(daemon::Op::kShutdown));
+  int shutdown_fd = server.Hello(daemon::kProtocolVersion, &reply);
+  const auto started = std::chrono::steady_clock::now();
+  bool stopped = false;
+  if (shutdown_fd >= 0 && daemon::SendFrame(shutdown_fd, shutdown.data())) {
+    pollfd response{shutdown_fd, POLLIN, 0};
+    stopped = ::poll(&response, 1, 2000) > 0 && daemon::RecvFrame(shutdown_fd, &reply) &&
+              !reply.empty() && reply[0] == static_cast<char>(daemon::Status::kOk);
+  }
+  Check(stopped && std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+        "Shutdown returns promptly with an open session (under two seconds)");
+  if (shutdown_fd >= 0) ::close(shutdown_fd);
+  if (fd >= 0) {
+    pollfd closed{fd, POLLIN, 0};
+    Check(::poll(&closed, 1, 1000) > 0, "Shutdown immediately closes the held session");
+    ::close(fd);
   }
 }
 
@@ -2461,6 +2648,7 @@ int main() {
   TestCacheChain();
   TestCacheChainRemote();
   TestDaemonProtocol();
+  TestCompileSessions();
   TestHasher();
   TestSha256();
   TestLinkArgs();

@@ -3,6 +3,7 @@
 // The compile's side of the daemon connection.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -12,6 +13,20 @@
 
 namespace vcache::daemon {
 
+class CompileSession {
+ public:
+  ~CompileSession();
+  CompileSession(const CompileSession&) = delete;
+  CompileSession& operator=(const CompileSession&) = delete;
+
+ private:
+  friend class DaemonClient;
+  explicit CompileSession(int fd) : fd_(fd) {}
+
+  int fd_;
+  const std::chrono::steady_clock::time_point opened_at_ = std::chrono::steady_clock::now();
+};
+
 class DaemonClient : public storage::RemoteCache {
  public:
   ~DaemonClient() override;
@@ -20,6 +35,7 @@ class DaemonClient : public storage::RemoteCache {
   // when there is one that refuses this client, with the reason in `why`.
   static std::unique_ptr<DaemonClient> Connect(const core::Config& config,
                                                std::string* why);
+  static std::unique_ptr<CompileSession> OpenCompileSession(const core::Config& config);
 
   std::string Name() const override { return "daemon"; }
   bool Get(const std::string& key, storage::GetResult* result) override;
@@ -37,10 +53,8 @@ class DaemonClient : public storage::RemoteCache {
  private:
   DaemonClient() = default;
 
-  // One request, one reply. Each op uses its own connection: a compile spends
-  // nearly all its life running the compiler between its lookup and its
-  // store, and a connection held open across that would keep a daemon that
-  // is trying to shut down waiting on a compile.
+  // Cache requests use separate connections so waiting on a compile session
+  // never prevents a lookup or store.
   bool RoundTrip(const std::string& request, std::string* reply,
                  int timeout_seconds);
   bool Open(std::string* why);

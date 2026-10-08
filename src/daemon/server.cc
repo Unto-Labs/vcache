@@ -134,6 +134,12 @@ struct Upload {
   Clock::time_point not_before{};
 };
 
+struct CompileSession {
+  int fd;
+  pid_t client_pid;
+  Clock::time_point opened_at;
+};
+
 class Server {
  public:
   explicit Server(const core::Config& config)
@@ -196,6 +202,7 @@ class Server {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::set<int> connections_;
+  std::map<int, CompileSession> sessions_;
   int shutdown_waiters_ = 0;
   Clock::time_point last_activity_ = Clock::now();
   std::atomic<bool> stop_requested_{false};
@@ -610,12 +617,14 @@ std::string Server::StatusText() {
   };
   auto n = [](const std::atomic<uint64_t>& v) { return std::to_string(v.load()); };
   size_t active = 0;
+  size_t compile_sessions = 0;
   size_t pending = 0;
   int in_flight = 0;
   uint64_t held = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     active = connections_.size();
+    compile_sessions = sessions_.size();
     pending = queue_.size();
     in_flight = in_flight_;
     held = held_bytes_;
@@ -632,6 +641,7 @@ std::string Server::StatusText() {
   s += row("s3 layer", !s3_enabled_ ? "off" : (s3_writable_ ? "read-write" : "read-only"));
   s += row("connections", n(counters_.connections) + " (" + std::to_string(active) +
                               " open, " + n(counters_.refused) + " refused)");
+  s += row("compile sessions", std::to_string(compile_sessions));
   s += row("lookups", n(counters_.lookups));
   s += row("  hit (disk)", n(counters_.hits_disk));
   s += row("  hit (memory)", n(counters_.hits_memory));
@@ -668,6 +678,8 @@ void Server::Serve(int fd) {
   std::string reply;
   bool ok = RecvFrame(fd, &request) && HandleHello(request, &reply);
   SendFrame(fd, reply);
+  bool first_request = true;
+  bool compile_session = false;
 
   while (ok && RecvFrame(fd, &request)) {
     {
@@ -678,7 +690,42 @@ void Server::Serve(int fd) {
     Writer out;
     uint8_t op = 0;
     in.U8(&op);
+    if (compile_session && op != static_cast<uint8_t>(Op::kSessionOpen)) {
+      out.U8(static_cast<uint8_t>(Status::kError));
+      out.Str("unknown compile session request");
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!stop_requested_.load()) SendFrame(fd, out.data());
+      break;
+    }
     switch (static_cast<Op>(op)) {
+      case Op::kSessionOpen: {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pid_t client_pid = 0;
+#if defined(__linux__)
+        struct ucred credentials;
+        socklen_t credentials_size = sizeof(credentials);
+        if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials,
+                         &credentials_size) == 0) client_pid = credentials.pid;
+#endif
+        bool pid_already_open = false;
+        for (const auto& [session_fd, session] : sessions_) {
+          if (client_pid > 0 && session.client_pid == client_pid) pid_already_open = true;
+        }
+        if (!first_request || !in.done() || stop_requested_.load() || pid_already_open) {
+          out.U8(static_cast<uint8_t>(Status::kError));
+          out.Str(stop_requested_.load() ? "daemon shutting down" :
+                  pid_already_open ? "pid already holds a compile session" :
+                                     "session open requires a fresh connection");
+        } else {
+          sessions_.emplace(fd, CompileSession{fd, client_pid, Clock::now()});
+          timeval send_timeout{1, 0};
+          ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+          compile_session = true;
+          out.U8(static_cast<uint8_t>(Status::kOk));
+          VCACHE_LOG("session: opened for pid " + std::to_string(client_pid));
+        }
+        break;
+      }
       case Op::kGet: HandleGet(&in, &out); break;
       case Op::kPut: HandlePut(&in, &out); break;
       case Op::kStatus:
@@ -693,12 +740,26 @@ void Server::Serve(int fd) {
     }
     request.clear();
     request.shrink_to_fit();
-    if (!SendFrame(fd, out.data())) break;
+    first_request = false;
+    if (compile_session) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_requested_.load() || !SendFrame(fd, out.data())) break;
+    } else if (!SendFrame(fd, out.data())) {
+      break;
+    }
   }
 
-  ::close(fd);
   std::lock_guard<std::mutex> lock(mutex_);
+  const auto session = sessions_.find(fd);
+  if (session != sessions_.end()) {
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - session->second.opened_at).count();
+    VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms for pid " +
+               std::to_string(session->second.client_pid));
+    sessions_.erase(session);
+  }
   connections_.erase(fd);
+  ::close(fd);
   last_activity_ = Clock::now();
   cv_.notify_all();
 }
@@ -706,7 +767,8 @@ void Server::Serve(int fd) {
 bool Server::Idle() const {
   if (config_.daemon.idle_timeout_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+  if (!sessions_.empty() || connections_.size() > sessions_.size() ||
+      !queue_.empty() || in_flight_ != 0) return false;
   return Clock::now() - last_activity_ >
          std::chrono::seconds(config_.daemon.idle_timeout_seconds);
 }
@@ -736,11 +798,19 @@ void Server::Shutdown() {
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
+  for (const auto& [session_fd, session] : sessions_) {
+    Writer out;
+    out.U8(static_cast<uint8_t>(Status::kError));
+    out.Str("daemon shutting down");
+    ::fcntl(session_fd, F_SETFL, ::fcntl(session_fd, F_GETFL) | O_NONBLOCK);
+    SendFrame(session_fd, out.data());
+    ::shutdown(session_fd, SHUT_RDWR);
+  }
   // Let compiles that are mid-request finish; a stuck one is cut off rather
   // than allowed to hold the daemon open. The shutdown requesters are
   // connections too, and they are waiting on us.
   auto others = [this] {
-    return connections_.size() - static_cast<size_t>(shutdown_waiters_);
+    return connections_.size() - sessions_.size() - static_cast<size_t>(shutdown_waiters_);
   };
   if (!cv_.wait_for(lock, std::chrono::seconds(60), [&] { return others() == 0; })) {
     log_.Line("closing " + std::to_string(others()) + " connections still open");

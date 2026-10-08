@@ -15,6 +15,7 @@
 #include "core/manifest.h"
 #include "core/preprocessed.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -901,6 +902,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   RecordCounter(cache_dir, Counter::kMiss);
 
   // ---- miss: compile for real ---------------------------------------------
+
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
 
   // Compile to a temporary and move into place only on success, so a failed
   // build never leaves a half-written object where make expects a good one.

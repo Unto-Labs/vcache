@@ -113,6 +113,8 @@ timeout        = 30                # seconds
 | `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | — | `900` |
 | `daemon.upload_threads` | `VCACHE_DAEMON_UPLOAD_THREADS` | — | `4` |
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | — | `<cache dir>/daemon/sock` |
+| `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | — | `false` |
+| `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | — | `false` |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -646,6 +648,11 @@ directory, the size, read-only, and the bucket, prefix, endpoint and identity.
 A client that differs is refused and runs in-process. Because uploads are
 asynchronous, `--error-on-cache-media-failure` reports a failed upload when
 `vcache --stop-daemon` runs, not during the compile.
+
+`daemon.single_flight` and `daemon.admission` default to false. Enabling either
+opens one compile session on each cache miss; read-only clients and daemon-off
+invocations skip it. Scheduling operations build on this protocol version 2
+session; lookups and stores keep their own connections.
 
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.

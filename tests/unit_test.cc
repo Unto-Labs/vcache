@@ -684,6 +684,11 @@ void TestManifestMerge() {
   CheckEq(show(core::MergeManifestStates(State{"F"}, reread, {}, &State::key)), "F A",
           "an empty loaded list keeps the re-read behind fresh");
 
+  const std::vector<State> both_reread{State{"A"}, State{"C"}};
+  const std::vector<State> both_loaded{State{"A"}, State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, both_reread, both_loaded, &State::key)),
+          "F A C B", "a state in both lists is kept once, from the re-read");
+
   std::vector<State> full;
   for (int i = 1; i <= 8; ++i) full.push_back(State{"R" + std::to_string(i)});
   const std::vector<State> tail{State{"L1"}};
@@ -700,6 +705,84 @@ void TestManifestMerge() {
   Check(dep_merged.size() == 2 && dep_merged[0].result_key == "F" &&
             dep_merged[1].result_key == "L",
         "a dep-scan merge keeps a loaded-only state");
+}
+
+void TestManifestMediaCount() {
+  Section("core::manifest media");
+  auto scratch = util::MakeTempDir("vcache-manifest-media-");
+  Check(scratch.has_value(), "manifest media scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const bool reread_failed =
+      core::ReportCacheMediaErrors({"disk: read failed"}, *scratch, true);
+  core::ReportCacheMediaErrors({"disk: write failed"}, *scratch, !reread_failed);
+  const core::Stats stats = core::ReadStats(*scratch);
+  Check(reread_failed, "the re-read failure is reported");
+  CheckEq(std::to_string(stats.Get(core::Counter::kCacheMediaError)), "1",
+          "a put that fails after a failed re-read is not counted again");
+}
+
+void TestManifestPause() {
+  Section("core::manifest pause");
+  auto scratch = util::MakeTempDir("vcache-manifest-pause-");
+  Check(scratch.has_value(), "manifest pause scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string log_path = *scratch + "/pause.log";
+  ::setenv("VCACHE_LOG", log_path.c_str(), 1);
+  util::InitLogging();
+  auto log_text = [&]() {
+    const auto text = util::ReadFile(log_path);
+    return text ? *text : std::string();
+  };
+  auto clear_log = [&]() {
+    FILE* f = ::fopen(log_path.c_str(), "w");
+    if (f != nullptr) ::fclose(f);
+  };
+
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", (*scratch + "/missing").c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a missing pause path does not wait");
+
+  const std::string regular = *scratch + "/regular";
+  util::WriteFileAtomic(regular, "x");
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", regular.c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a regular pause path does not wait");
+
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", scratch->c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a directory pause path does not wait");
+
+  const std::string fifo = *scratch + "/pause.fifo";
+  Check(::mkfifo(fifo.c_str(), 0600) == 0, "the pause fifo exists");
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", fifo.c_str(), 1);
+  const auto started = std::chrono::steady_clock::now();
+  core::PauseBeforeManifestPut();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  ::unsetenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT");
+  Check(log_text().find("manifest: test pause timed out") != std::string::npos,
+        "a fifo with no writer times out");
+  Check(elapsed >= 55 && elapsed < 70,
+        "a fifo with no writer returns within 60 seconds (took " + std::to_string(elapsed) +
+            "s)");
 }
 
 void TestReadFile() {
@@ -1934,7 +2017,8 @@ void TestRustManifest() {
   for (int i = 0; i < 10; ++i) {
     rust::RustManifestState fresh;
     fresh.key = StateKey(i);
-    states = rust::RecordRustState(std::move(fresh), std::move(states));
+    states = core::PrependManifestState(std::move(fresh), std::move(states),
+                                       &rust::RustManifestState::key);
   }
   auto order = [&]() {
     std::string out;
@@ -1942,11 +2026,12 @@ void TestRustManifest() {
     return out;
   };
   CheckEq(order(), "98765432", "eight states, newest first, oldest dropped");
-  states = rust::RecordRustState(states[4], states);
+  states = core::PrependManifestState(states[4], states, &rust::RustManifestState::key);
   CheckEq(order(), "59876432", "re-recording a state moves it to the front once");
   rust::RustManifestState newest;
   newest.key = StateKey(10);
-  states = rust::RecordRustState(std::move(newest), std::move(states));
+  states = core::PrependManifestState(std::move(newest), std::move(states),
+                                     &rust::RustManifestState::key);
   CheckEq(order(), "a5987643", "the least recently used state is the one evicted");
 }
 
@@ -3274,6 +3359,7 @@ int main() {
   // Writes files too.
   TestRustManifest();
   TestManifestMerge();
+  TestManifestMediaCount();
   TestRunRusage();
   // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
   // and a forked child is charged that high-water mark until exec replaces it.
@@ -3284,6 +3370,8 @@ int main() {
   TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();
+  // Last: a fifo with no writer waits out the 60s pause bound.
+  TestManifestPause();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

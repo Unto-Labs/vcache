@@ -482,6 +482,22 @@ bool ParseManifest(const std::string& text, std::vector<DepManifestEntry>* entri
   return true;
 }
 
+// The list a manifest blob holds, or empty when there is none or it does not
+// parse. Lookup and the re-read before a store share this so a corrupt
+// manifest is dropped the same way in both places.
+std::vector<DepManifestEntry> DepManifestEntries(const storage::GetResult& got) {
+  std::vector<DepManifestEntry> entries;
+  storage::Blob blob;
+  if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
+    return entries;
+  }
+  if (!ParseManifest(blob.dep_manifest, &entries)) {
+    VCACHE_LOG("dep scan: manifest did not parse; starting a new one");
+    entries.clear();
+  }
+  return entries;
+}
+
 // Writes the dependency text where the caller asked for it: the named file, or
 // stdout when neither -o nor -MF was given.
 bool EmitDepOutput(const std::string& path, const std::string& text) {
@@ -566,14 +582,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   if (cache != nullptr) {
     storage::GetResult got = cache->Get(key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
-    storage::Blob manifest_blob;
-    if (got.hit && storage::DeserializeBlob(got.value, &manifest_blob) &&
-        manifest_blob.has_dep_manifest) {
-      if (!ParseManifest(manifest_blob.dep_manifest, &entries)) {
-        VCACHE_LOG("dep scan: manifest did not parse; starting a new one");
-        entries.clear();
-      }
-    }
+    entries = DepManifestEntries(got);
   }
 
   if (!config.recache && cache != nullptr) {
@@ -721,17 +730,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   fresh.result_key = result_key;
   fresh.files = std::move(files);
   PauseBeforeManifestPut();
-  std::vector<DepManifestEntry> reread;
-  {
-    storage::GetResult again = cache->Get(key);
-    media_failed |= ReportCacheMediaErrors(again.errors, cache_dir);
-    storage::Blob again_blob;
-    if (again.hit && storage::DeserializeBlob(again.value, &again_blob) &&
-        again_blob.has_dep_manifest &&
-        !ParseManifest(again_blob.dep_manifest, &reread)) {
-      reread.clear();
-    }
-  }
+  storage::GetResult again = cache->Get(key);
+  const bool reread_failed = ReportCacheMediaErrors(again.errors, cache_dir);
+  media_failed |= reread_failed;
+  const std::vector<DepManifestEntry> reread = DepManifestEntries(again);
   const std::vector<DepManifestEntry> updated = MergeManifestStates(
       std::move(fresh), std::move(reread), entries, &DepManifestEntry::result_key);
 
@@ -743,7 +745,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   const storage::PutResult manifest_put =
       cache->Put(key, storage::SerializeBlob(manifest_blob));
-  media_failed |= ReportCacheMediaErrors(manifest_put.errors, cache_dir);
+  media_failed |= ReportCacheMediaErrors(manifest_put.errors, cache_dir, !reread_failed);
   if (manifest_put.stored) {
     RecordCounter(cache_dir, Counter::kStored);
   } else {
@@ -753,10 +755,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 }
 
 bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
-                            const std::string& cache_dir) {
+                            const std::string& cache_dir, bool count) {
   for (const std::string& e : errors) {
     ::fprintf(stderr, "vcache: warning: cache layer failed: %s\n", e.c_str());
-    RecordCounter(cache_dir, Counter::kCacheMediaError);
+    if (count) RecordCounter(cache_dir, Counter::kCacheMediaError);
   }
   return !errors.empty();
 }

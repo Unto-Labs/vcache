@@ -80,8 +80,10 @@ std::vector<State> MergeManifestStates(State fresh, std::vector<State> reread,
 }
 
 // Blocks on the fifo in VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT when that
-// variable names one. Inert otherwise. The read is the re-read's predecessor,
-// so a test can store another state before this process merges.
+// variable names one, for at most 60 seconds. A missing path, a regular file
+// or a directory is ignored, so a stale setting cannot stop the build. The
+// read is the re-read's predecessor, so a test can store another state before
+// this process merges.
 void PauseBeforeManifestPut();
 
 }  // namespace vcache::core

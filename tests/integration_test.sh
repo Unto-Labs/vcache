@@ -45,6 +45,31 @@ sed_inplace() {
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# Releases a manifest-pause fifo. The write happens only when the compile is
+# actually waiting; otherwise that process is stopped. The write is bounded
+# because opening a fifo with no reader blocks.
+release_pause_fifo() {  # $1 fifo, $2 pid, $3 waiting (1 or 0)
+  local fifo=$1 pid=$2 waiting=$3
+  if [[ "$waiting" != 1 ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return
+  fi
+  printf x > "$fifo" &
+  local wpid=$!
+  local n=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    if (( n >= 50 )); then
+      kill "$wpid" 2>/dev/null || true
+      wait "$wpid" 2>/dev/null || true
+      return
+    fi
+    sleep 0.05
+    n=$((n + 1))
+  done
+  wait "$wpid" 2>/dev/null || true
+}
+
 export VCACHE_DIR="$WORK/cache"
 
 # Dumps the paths an object records in its debug info. readelf is GNU's; macOS
@@ -735,8 +760,10 @@ EOF
     sleep 0.05
   done
   check "the second manifest store waits" "$waiting" "1"
-  man_compile "$WORK/man-c" ""
-  printf x > "$fifo"
+  if [[ "$waiting" == 1 ]]; then
+    man_compile "$WORK/man-c" ""
+  fi
+  release_pause_fifo "$fifo" "$bpid" "$waiting"
   for _ in $(seq 1 200); do
     if ! kill -0 "$bpid" 2>/dev/null; then break; fi
     sleep 0.05
@@ -965,6 +992,7 @@ EOF
 
   rust_man rust-man-a
   check "first manifest-mode compile is a miss" "$(misses)" "1"
+  check "a first compile logs none stored once" "$(logged 'rust manifest: none stored')" "1"
   check "a miss asks rustc for dep-info" "$(dep_info_runs)" "1"
   check "the miss records one state" "$(logged 'rust manifest: stored 1 states')" "1"
   cp "$WORK/rust-man-a/out/libman.rlib" "$WORK/rust-man-a.rlib"
@@ -2367,8 +2395,10 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 check "the second dep-scan store waits" "$dwaiting" "1"
-ds_scan "$WORK/ds-c" ""
-printf x > "$fifo"
+if [[ "$dwaiting" == 1 ]]; then
+  ds_scan "$WORK/ds-c" ""
+fi
+release_pause_fifo "$fifo" "$dbpid" "$dwaiting"
 for _ in $(seq 1 200); do
   if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
   sleep 0.05

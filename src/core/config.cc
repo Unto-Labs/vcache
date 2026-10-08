@@ -3,6 +3,7 @@
 #include "core/config.h"
 
 #include <climits>
+#include <cerrno>
 #include <cstdlib>
 #include <sstream>
 
@@ -151,6 +152,12 @@ void ApplyTomlFile(const std::string& path, Config* config) {
   if (auto d = root["daemon"].as_table()) {
     if (auto v = TomlBool(*d, "single_flight")) config->daemon.single_flight = *v;
     if (auto v = TomlBool(*d, "admission")) config->daemon.admission = *v;
+    if (auto v = TomlInt(*d, "default_compile_kb")) {
+      if (*v > 0) config->daemon.default_compile_kb = static_cast<uint64_t>(*v);
+    }
+    if (auto v = TomlInt(*d, "default_link_kb")) {
+      if (*v > 0) config->daemon.default_link_kb = static_cast<uint64_t>(*v);
+    }
     if (auto v = TomlString(*d, "mode")) {
       if (!ParseDaemonMode(*v, &config->daemon.mode)) {
         config->warnings.push_back("daemon.mode: unknown mode '" + *v +
@@ -347,6 +354,17 @@ void ApplyEnvironment(Config* config) {
   config->daemon.single_flight =
       EnvBool("VCACHE_DAEMON_SINGLE_FLIGHT", config->daemon.single_flight);
   config->daemon.admission = EnvBool("VCACHE_DAEMON_ADMISSION", config->daemon.admission);
+  for (const auto& [name, destination] : {
+      std::pair{"VCACHE_DAEMON_DEFAULT_COMPILE_KB", &config->daemon.default_compile_kb},
+      std::pair{"VCACHE_DAEMON_DEFAULT_LINK_KB", &config->daemon.default_link_kb}}) {
+    if (auto value = Env(name)) {
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long long kb = std::strtoull(value->c_str(), &end, 10);
+      if (!value->empty() && value->front() != '-' && end != value->c_str() &&
+          *end == '\0' && kb > 0 && errno != ERANGE) *destination = kb;
+    }
+  }
   config->daemon.jobserver = EnvBool("VCACHE_DAEMON_JOBSERVER", config->daemon.jobserver);
   if (auto v = Env("VCACHE_DAEMON_JOBSERVER_JOBS")) {
     char* end = nullptr;
@@ -518,6 +536,10 @@ std::string DescribeConfig(const Config& config) {
   }
   out << "daemon:           " << DaemonModeName(config.daemon.mode) << "\n";
   if (config.daemon.mode != DaemonMode::kOff) {
+    out << "  single flight:  " << (config.daemon.single_flight ? "on" : "off") << "\n";
+    out << "  admission:      " << (config.daemon.admission ? "on" : "off") << "\n";
+    out << "  compile kB:     " << config.daemon.default_compile_kb << "\n";
+    out << "  link kB:        " << config.daemon.default_link_kb << "\n";
     out << "  idle timeout:   ";
     if (config.daemon.idle_timeout_seconds > 0) {
       out << config.daemon.idle_timeout_seconds << " s\n";

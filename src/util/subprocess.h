@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,6 +39,7 @@ struct ProcOptions {
   // its log path to reach the linker's whole process tree without vcache's own
   // environment being modified, which would leak into anything else it runs.
   std::vector<std::pair<std::string, std::string>> env;
+  std::function<void(int)> on_spawn;
 };
 
 // Runs argv[0] with `argv`. Returns exit_code == -1 if the process could not be

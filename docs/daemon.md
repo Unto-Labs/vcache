@@ -254,11 +254,13 @@ timer. Real endpoints do not do this. Measured without it, the daemon looked
 
 Set `daemon.single_flight = true` (`VCACHE_DAEMON_SINGLE_FLIGHT=1`) to share
 one compile of a missed key across concurrent worktrees. It defaults to false.
+The switches control each client's requests. The daemon always serves scheduler
+operations, so a tree can enable them after another tree has started the daemon.
 A compile session holds a memory-only `KeyLease`; another compile of the same
 key waits for its holder to store or release it. Different keys remain independent.
 C and Rust lease the entry key. Links lease the pre-key that locates their
 result manifest. Rust's dep-info and manifest keys never receive compile leases.
-Read-only clients and speculative lookups hold no compile lease. Recache requests
+Read-only clients hold no compile lease. Recache requests
 compile independently so they still replace existing entries.
 
 After a stored reply the waiter uses an ordinary Get and restores the outputs.
@@ -273,6 +275,8 @@ If a holder closes while a Put of its key is already in flight, the lease stays
 held until that Put finishes: success wakes stored, failure wakes compile. A
 close with no Put in flight wakes compile immediately. The waiter's own bound
 still limits its wait if storage stalls; there is no timer grace on holder close.
+Put completes a lease only when its peer pid matches the holder's pid. If either
+pid is unavailable, the daemon accepts the Put as it did before pid checks.
 The test-only `VCACHE_DAEMON_TEST_BLOCK_PUT=<fifo>` seam pauses the first Put
 after marking it in flight, for at most five seconds. A byte `s` permits storage;
 any other byte or timeout makes that Put's disk read-only and skips remote stores.
@@ -285,6 +289,9 @@ record, rather than only its latest observation. A waiter still occupies its
 build tool's job slot while it waits.
 Decision logs include holder pid, bound and elapsed wait; the client receives
 this metadata with its scheduling reply. Session loss never fails the build.
+The socket receive timeout exceeds a scheduling bound by 15 seconds, allowing
+the bound reply to arrive. Disconnect checks run outside the shared server lock
+at most every 250 ms; holder completion wakes the lease condition immediately.
 
 `--daemon-status` shows `leases held`, `leases waiting`, lifetime `leases expired`
 and `compiles deduplicated`. A stored wake increments the deduplication counter;
@@ -295,6 +302,44 @@ counters. Fetch waits are bounded by the same 300-second reply timeout and log
 their elapsed duration.
 
 Measured cross-worktree deduplication: pending the scheduler benchmark.
+
+## Memory admission
+
+`daemon.admission` defaults to false and enables admission for that client.
+The daemon serves scheduling requests regardless of the starter's switches.
+After a cache miss, and after acquiring a lease when single-flight is enabled,
+the wrapper reserves memory before its actual compile or link. Preprocessing
+and Rust dep-info runs do not reserve memory. A lease waiter holds no reservation.
+
+The estimate is the highest RSS in the matching cost record. Missing or zero
+records use `daemon.default_compile_kb` (2097152 kB, 2 GiB) or
+`daemon.default_link_kb` (4194304 kB, 4 GiB). The daemon reads `MemAvailable`
+at most once a second and samples the compiler's `VmRSS` every 500 ms:
+
+```
+unrealised_kb = sum(max(0, estimate_kb - rss_kb))
+available_kb = max(0, MemAvailable - unrealised_kb)
+```
+
+Resident memory is already reflected in `MemAvailable`, so it is subtracted
+from each reservation's unrealised amount. Grants follow strict FIFO order;
+a small request cannot pass a larger head request. An estimate above available
+RAM can start when no reservation is held, allowing at least one job to proceed.
+Session close or confirmed compiler exit releases the reservation immediately.
+A failed proc read alone retains it. RSS above the estimate contributes zero
+unrealised memory and logs the overshoot.
+
+The reported compiler pid is sampled only when visible with the session peer
+as its parent. Otherwise the daemon logs the pid mismatch and treats the whole
+estimate as unrealised for ten seconds, then as realised. This fallback allows
+clients in another pid namespace to proceed without sampling an unrelated pid.
+
+Waiting is bounded to ten minutes by default. A bound reply, refusal, disconnect
+or daemon shutdown runs the compiler unreserved. Decision logs contain the
+estimate, elapsed wait and admission arithmetic. `--daemon-status` adds
+`memory reserved`, `memory realised`, `memory waiting`, `reserve waits` and
+`longest wait ms`. The first two values are in kB. Reservations and waiters are
+memory-only and disappear on restart.
 
 ## Protocol
 
@@ -313,6 +358,8 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | session open | —, immediately after hello | ok, holding this connection until compile completion |
 | lease acquire | key, bound ms | ok + outcome + compile reason + holder pid + waited ms |
 | lease release | key, stored or failed | ok |
+| memory reserve | cost key, estimate kB, bound ms | ok + granted or bound + waited ms |
+| compiler spawned | compiler pid | ok |
 | any session op, or idle session | — | terminal error + "daemon shutting down" |
 
 Any session frame may be a terminal `error + "daemon shutting down"`. Shutdown
@@ -322,6 +369,9 @@ frame replaces a pending scheduling reply; clients continue locally.
 Lease outcomes are one-byte `granted`, `stored`, or `compile`. Compile reasons
 are one-byte `none`, `holder_failed`, `holder_gone`, `bound`, or `shutdown`.
 Holder pid (zero if unknown) and waited milliseconds are unsigned 64-bit integers.
+Memory outcomes are one-byte `granted` (0) or `bound` (1), followed by unsigned
+64-bit waited milliseconds. Compiler pid, estimate and bound use unsigned
+64-bit integers too.
 
 Get and Put use one connection per request. Protocol version 2 also supports
 **compile sessions**: one separate connection per cache miss when

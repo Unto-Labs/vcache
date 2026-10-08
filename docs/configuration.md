@@ -115,6 +115,8 @@ timeout        = 30                # seconds
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | — | `<cache dir>/daemon/sock` |
 | `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | — | `false` |
 | `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | — | `false` |
+| `daemon.default_compile_kb` | `VCACHE_DAEMON_DEFAULT_COMPILE_KB` | — | `2097152` |
+| `daemon.default_link_kb` | `VCACHE_DAEMON_DEFAULT_LINK_KB` | — | `4194304` |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -653,6 +655,14 @@ asynchronous, `--error-on-cache-media-failure` reports a failed upload when
 opens one compile session on each cache miss; read-only clients and daemon-off
 invocations skip it. Scheduling operations build on this protocol version 2
 session; lookups and stores keep their own connections.
+
+These switches belong to each client. A daemon started by a client with the
+switches off also serves scheduling requests from clients that enable them.
+Admission reserves memory before the actual compile or link. It uses the
+largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
+and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
+integer defaults are in kB. A wait lasts at most ten minutes; reaching that
+bound or losing the daemon runs the compiler unreserved and logs the decision.
 
 `daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots
 that make, ninja and cargo share. `daemon.jobserver_jobs`

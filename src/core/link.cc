@@ -395,6 +395,14 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
   opts.env.emplace_back("LD_PRELOAD", tracer);
+  if (session && config.daemon.admission) {
+    const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
+    session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, true));
+    opts.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+  } else if (config.daemon.admission && !config.read_only &&
+             config.daemon.mode != DaemonMode::kOff) {
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
   util::ProcResult result = util::Run(argv, opts);
   // Same rule as a compile: a link that dies is still a sample, and -flto's
   // figure is whatever wait4 reported for the largest waited-for child.

@@ -37,6 +37,10 @@ uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms) {
   return std::max<uint64_t>(30000, 2 * *recorded_wall_ms);
 }
 
+uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms) {
+  return bound_ms / 1000 + (bound_ms % 1000 != 0) + 15;
+}
+
 uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key) {
   std::optional<uint64_t> max_wall_ms;
   for (const auto& observation : core::LoadCompileCost(cache_dir, cost_key).observations) {
@@ -45,15 +49,74 @@ uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_
   return LeaseWaitBoundMs(max_wall_ms);
 }
 
+uint64_t MemoryEstimateKb(const core::Config& config, const std::string& cost_key, bool link) {
+  const auto recorded_kb = core::EstimateMaxRssKb(config.disk.dir, cost_key);
+  return recorded_kb && *recorded_kb > 0 ? *recorded_kb :
+      link ? config.daemon.default_link_kb : config.daemon.default_compile_kb;
+}
+
 void CompileSessionHandle::Unavailable(const std::string& why) {
   if (fd_ < 0) return;
   VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
   ::close(fd_);
   fd_ = -1;
   leased_key_.clear();
+  if (memory_reserved_) VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  memory_reserved_ = false;
 }
 
-bool CompileSessionHandle::Request(const std::string& request, std::string* reply) {
+bool CompileSessionHandle::ReserveMemory(const std::string& cost_key, uint64_t estimate_kb,
+                                        uint64_t bound_ms) {
+  const auto started = std::chrono::steady_clock::now();
+  Writer request;
+  request.U8(static_cast<uint8_t>(Op::kMemoryReserve));
+  request.Str(cost_key);
+  request.U64(estimate_kb);
+  request.U64(bound_ms);
+  timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(bound_ms)), 0};
+  ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  std::string reply;
+  const bool answered = Request(request.data(), &reply);
+  timeout.tv_sec = kReplyTimeoutSeconds;
+  if (fd_ >= 0) ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  Reader in(reply);
+  uint8_t status = 0, outcome = 0;
+  uint64_t waited_ms = 0;
+  if (!answered || !in.U8(&status) || status != static_cast<uint8_t>(Status::kOk) ||
+      !in.U8(&outcome) || outcome > 1 || !in.U64(&waited_ms) || !in.done()) {
+    if (answered) Unavailable("malformed memory reply");
+    VCACHE_LOG("reserve: request waited " + std::to_string(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count()) + " ms");
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+    return false;
+  }
+  memory_reserved_ = outcome == static_cast<uint8_t>(MemoryOutcome::kGranted);
+  if (!memory_reserved_) {
+    VCACHE_LOG("reserve: wait bound reached after " + std::to_string(waited_ms) +
+               " ms, running unreserved");
+  }
+  return memory_reserved_;
+}
+
+void CompileSessionHandle::CompilerSpawned(int pid) {
+  if (!memory_reserved_) return;
+  const auto started = std::chrono::steady_clock::now();
+  Writer request;
+  request.U8(static_cast<uint8_t>(Op::kCompilerSpawned));
+  request.U64(pid);
+  std::string reply;
+  if (!Request(request.data(), &reply) || reply != std::string(1, '\0')) {
+    Unavailable("malformed compiler pid reply");
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
+  VCACHE_LOG("reserve: compiler notification waited " + std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started).count()) + " ms");
+}
+
+bool CompileSessionHandle::Request(const std::string& request, std::string* reply,
+                                   std::string* refusal) {
   if (fd_ < 0) return false;
   pollfd pending{fd_, POLLIN, 0};
   bool terminal_pending = ::poll(&pending, 1, 0) > 0;
@@ -72,7 +135,14 @@ bool CompileSessionHandle::Request(const std::string& request, std::string* repl
   uint8_t status = 0;
   std::string why;
   if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError)) {
-    if (!in.Str(&why) || !in.done()) why = "malformed session reply";
+    if (!in.Str(&why) || !in.done()) {
+      Unavailable("malformed session reply");
+      return false;
+    }
+    if (refusal && !terminal_pending && why != "daemon shutting down") {
+      *refusal = why;
+      return false;
+    }
     Unavailable(why);
     return false;
   }
@@ -88,9 +158,15 @@ LeaseOutcome CompileSessionHandle::AcquireLease(const std::string& key, uint64_t
   request.U8(static_cast<uint8_t>(Op::kLeaseAcquire));
   request.Str(key);
   request.U64(bound_ms);
-  std::string reply;
-  if (!Request(request.data(), &reply)) {
-    VCACHE_LOG("lease: holder gone, compiling");
+  timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(bound_ms)), 0};
+  ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  std::string reply, refusal;
+  const bool answered = Request(request.data(), &reply, &refusal);
+  timeout.tv_sec = kReplyTimeoutSeconds;
+  if (fd_ >= 0) ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  if (!answered) {
+    VCACHE_LOG(refusal.empty() ? "lease: holder gone, compiling" :
+               "lease: daemon refused (" + refusal + "), compiling");
     return LeaseOutcome::kCompile;
   }
   Reader in(reply);
@@ -152,7 +228,7 @@ CompileSessionHandle::~CompileSessionHandle() {
       if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError) &&
           in.Str(&reason) && in.done()) why = reason;
     }
-    VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
+    Unavailable(why);
   }
   if (fd_ >= 0) ::close(fd_);
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

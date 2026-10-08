@@ -1909,9 +1909,45 @@ except Exception: sys.exit(1)
   done
   check "a refused in-flight re-put is marked superseded" "$flight_marked" "1"
   wait "$flight_put"
+  upload_identity=$("$VCACHE" --daemon-status 2>/dev/null | awk '
+    $1=="uploads" && $2=="queued" {q=$NF}
+    $1=="completed" {c=$NF}
+    $1=="bytes" {seen_bytes=1}
+    $1=="failed" && seen_bytes {f=$NF}
+    $1=="skipped" {s=$NF}
+    $1=="pending" {p=$NF}
+    $1=="uploads" && $2=="superseded" {u=$NF}
+    END {
+      sum = c+0 + f+0 + s+0 + p+0 + u+0
+      if (q+0 == sum) print "yes"
+      else print q "!=" sum
+    }')
+  check "a drained in-flight refusal keeps the upload identity" "$upload_identity" "yes"
   "$VCACHE" --stop-daemon >/dev/null
   check "a refused re-put of an in-flight value leaves the newer value in s3" \
     "$(cat "$flight_obj" 2>/dev/null)" "V2VALUE-0123456789"
+
+  # V2 is refused while V1 is in flight, then V3 is accepted. V2 must not
+  # upload after V3.
+  start_order_s3 "$WORK/refuse-overtake-s3"
+  overtake_key=cccccccccccccccccccccccccccccccc
+  printf 'v1v1' | "$VCACHE" --test-put "$overtake_key"
+  overtake_obj="$S3DIR/${overtake_key:0:2}__${overtake_key:2}"
+  check "the overtaken upload is in flight" "$(wait_started "$overtake_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$overtake_key" &
+  overtake_put=$!
+  overtake_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then overtake_marked=1; break; fi
+    if ! kill -0 "$overtake_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the overtaken refusal is waiting" "$overtake_marked" "1"
+  printf 'v3v3' | "$VCACHE" --test-put "$overtake_key"
+  wait "$overtake_put"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a newer accepted store is what s3 keeps" \
+    "$(cat "$overtake_obj" 2>/dev/null)" "v3v3"
   kill "$S3PID" 2>/dev/null || true
   wait "$S3PID" 2>/dev/null || true
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \

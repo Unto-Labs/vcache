@@ -168,10 +168,11 @@ class Server {
 
   // Queues an upload. Returns false only when the blob could not be held.
   // `refused_in_flight` is set when that refusal replaced an upload already
-  // being sent, so the caller can wait for it before uploading the new value.
+  // being sent. `refusal_id` identifies that upload so the caller waits for
+  // it, not for a later generation of the same key.
   bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
-               bool* refused_in_flight = nullptr);
-  bool WaitForInFlight(const std::string& key);
+               bool* refused_in_flight = nullptr, uint64_t* refusal_id = nullptr);
+  void WaitForRefusal(uint64_t refusal_id, const std::string& key);
   void UploadWorker();
   void Shutdown();
   bool Idle() const;
@@ -363,12 +364,19 @@ void Server::RecoverJournal() {
 }
 
 bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
-                     bool* refused_in_flight) {
+                     bool* refused_in_flight, uint64_t* refusal_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   bool merged = false;
   bool in_flight = false;
-  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged, &in_flight)) {
+  bool dropped_waiting = false;
+  uint64_t id = 0;
+  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged, &in_flight, &id,
+                        &dropped_waiting)) {
     if (refused_in_flight != nullptr) *refused_in_flight = in_flight;
+    if (refusal_id != nullptr) *refusal_id = id;
+    if (dropped_waiting) counters_.uploads_skipped++;
+    lock.unlock();
+    cv_.notify_all();
     return false;
   }
   // A key already waiting keeps its one queued upload. A key in flight is
@@ -379,16 +387,17 @@ bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> 
   return true;
 }
 
-bool Server::WaitForInFlight(const std::string& key) {
+void Server::WaitForRefusal(uint64_t refusal_id, const std::string& key) {
   std::unique_lock<std::mutex> lock(mutex_);
-  const auto deadline = Clock::now() + std::chrono::seconds(kReplyTimeoutSeconds);
-  while (uploads_.in_flight(key)) {
+  // Half the client reply timeout: when this fires, the client is still
+  // waiting, so the synchronous upload can still be its answer.
+  const auto deadline = Clock::now() + std::chrono::seconds(kReplyTimeoutSeconds / 2);
+  while (uploads_.RefusalStillInFlight(refusal_id)) {
     if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
       log_.Line("refused re-put of " + key + " uploaded without waiting");
-      return false;
+      return;
     }
   }
-  return true;
 }
 
 void Server::UploadWorker() {
@@ -451,8 +460,8 @@ void Server::UploadWorker() {
         if (count_requeue) counters_.uploads_queued++;
         log_.Line("re-queued " + item.key + " (rewritten during upload)");
       }
-    } else {
-      uploads_.Requeue(std::move(item));
+    } else if (uploads_.Requeue(std::move(item))) {
+      counters_.uploads_skipped++;
     }
     cv_.notify_all();
   }
@@ -576,22 +585,34 @@ void Server::HandlePut(Reader* in, Writer* out) {
       stored = Enqueue(key, nullptr, /*journal=*/true) || stored;
     } else {
       bool refused_in_flight = false;
-      if (Enqueue(key, value, /*journal=*/false, &refused_in_flight)) {
+      uint64_t refusal_id = 0;
+      if (Enqueue(key, value, /*journal=*/false, &refused_in_flight, &refusal_id)) {
         stored = true;
       } else {
         // The memory queue is full: upload here and make this one store wait,
-        // rather than grow without bound. An upload already in flight has to
-        // finish first, or its later completion overwrites this value.
-        if (refused_in_flight) WaitForInFlight(key);
-        auto s3 = AcquireS3();
-        if (s3->Put(key, *value)) {
-          stored = true;
-          counters_.uploads_done++;
-          counters_.upload_bytes += value->size();
-        } else if (s3->failed()) {
-          errors.push_back("s3: " + s3->last_error());
+        // rather than grow without bound. Wait only for the upload that was
+        // already in flight. A newer store overtakes this one.
+        bool overtaken = false;
+        if (refused_in_flight) {
+          WaitForRefusal(refusal_id, key);
+          std::lock_guard<std::mutex> lock(mutex_);
+          overtaken = uploads_.RefusalOvertaken(refusal_id);
         }
-        ReleaseS3(std::move(s3));
+        if (overtaken) {
+          stored = true;
+        } else {
+          counters_.uploads_queued++;
+          auto s3 = AcquireS3();
+          if (s3->Put(key, *value)) {
+            stored = true;
+            counters_.uploads_done++;
+            counters_.upload_bytes += value->size();
+          } else if (s3->failed()) {
+            counters_.uploads_failed++;
+            errors.push_back("s3: " + s3->last_error());
+          }
+          ReleaseS3(std::move(s3));
+        }
       }
     }
   }

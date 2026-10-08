@@ -48,8 +48,16 @@ void PauseBeforeManifestPut() {
 
   // A fifo left over with no writer must not hold the compile. 60s is long
   // enough for the test that releases it, and short enough to give the build
-  // back if the variable was set by accident.
-  constexpr int kBoundMs = 60 * 1000;
+  // back if the variable was set by accident. Tests shrink the bound.
+  int bound_ms = 60 * 1000;
+  if (const char* bound = std::getenv("VCACHE_TEST_PAUSE_BOUND_MS")) {
+    char* end = nullptr;
+    const long parsed = std::strtol(bound, &end, 10);
+    if (end != bound && *end == '\0' && parsed > 0 && parsed <= bound_ms) {
+      bound_ms = static_cast<int>(parsed);
+    }
+  }
+  const int kBoundMs = bound_ms;
   const auto started = std::chrono::steady_clock::now();
   pollfd pfd {};
   pfd.fd = fd;
@@ -67,7 +75,7 @@ void PauseBeforeManifestPut() {
     break;
   }
   if (rc <= 0) {
-    VCACHE_LOG("manifest: test pause timed out");
+    VCACHE_LOG(rc < 0 ? "manifest: test pause failed" : "manifest: test pause timed out");
     ::close(fd);
     return;
   }

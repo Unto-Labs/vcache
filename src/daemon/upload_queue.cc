@@ -76,15 +76,60 @@ void UploadQueue::ForgetQueued(const std::string& key) {
   RemoveJournal(key);
 }
 
-void UploadQueue::SupersedeInFlight(const std::string& key) {
+void UploadQueue::OvertakeRefusals(const std::string& key) {
+  const auto it = refusals_.find(key);
+  if (it == refusals_.end()) return;
+  for (FlightRefusal& refusal : it->second) refusal.overtaken = true;
+}
+
+uint64_t UploadQueue::SupersedeInFlight(const std::string& key) {
+  // A newer refusal replaces one that is still waiting on this upload.
+  OvertakeRefusals(key);
+  const auto generation = in_flight_generation_.find(key);
+  const uint64_t waited = generation == in_flight_generation_.end() ? 0 : generation->second;
   ++generation_[key];
   superseded_.insert(key);
   DropHeld(key);
+  FlightRefusal refusal;
+  refusal.id = next_refusal_id_++;
+  refusal.waited_generation = waited;
+  refusals_[key].push_back(refusal);
+  return refusal.id;
+}
+
+const UploadQueue::FlightRefusal* UploadQueue::FindRefusal(uint64_t refusal_id) const {
+  for (const auto& [key, list] : refusals_) {
+    (void)key;
+    for (const FlightRefusal& refusal : list) {
+      if (refusal.id == refusal_id) return &refusal;
+    }
+  }
+  return nullptr;
+}
+
+bool UploadQueue::RefusalStillInFlight(uint64_t refusal_id) const {
+  for (const auto& [key, list] : refusals_) {
+    for (const FlightRefusal& refusal : list) {
+      if (refusal.id != refusal_id) continue;
+      if (in_flight_.count(key) == 0) return false;
+      const auto generation = in_flight_generation_.find(key);
+      if (generation == in_flight_generation_.end()) return false;
+      return generation->second <= refusal.waited_generation;
+    }
+  }
+  return false;
+}
+
+bool UploadQueue::RefusalOvertaken(uint64_t refusal_id) const {
+  const FlightRefusal* refusal = FindRefusal(refusal_id);
+  return refusal != nullptr && refusal->overtaken;
 }
 
 bool UploadQueue::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-                          bool journal, bool* merged, bool* in_flight_state) {
+                          bool journal, bool* merged, bool* in_flight_state,
+                          uint64_t* refusal_id, bool* dropped_waiting) {
   if (merged != nullptr) *merged = false;
+  if (dropped_waiting != nullptr) *dropped_waiting = false;
   const bool flying = in_flight_.count(key) != 0;
   const bool waiting = waiting_.find(key) != waiting_.end();
   if (in_flight_state != nullptr) *in_flight_state = flying;
@@ -104,17 +149,24 @@ bool UploadQueue::Enqueue(const std::string& key, std::shared_ptr<const std::str
     }
     const uint64_t next = held_bytes_ - (old_stays ? 0 : old_bytes) + blob->size();
     if (next > max_held_bytes_) {
-      if (flying) SupersedeInFlight(key);
-      else if (waiting || previous) ForgetQueued(key);
+      if (flying) {
+        const uint64_t id = SupersedeInFlight(key);
+        if (refusal_id != nullptr) *refusal_id = id;
+      } else if (waiting || previous) {
+        ForgetQueued(key);
+        if (dropped_waiting != nullptr) *dropped_waiting = waiting;
+      }
       return false;
     }
   }
 
   // A refusal may have marked this key superseded. This store is the one to
-  // upload, so finishing the older in-flight attempt must not drop it.
+  // upload, so finishing the older in-flight attempt must not drop it. It
+  // also overtakes a refusal that was waiting to upload an older value.
+  OvertakeRefusals(key);
   superseded_.erase(key);
   if (merged != nullptr) *merged = waiting;
-  if (flying && (merged == nullptr || !*merged)) recount_on_requeue_.insert(key);
+  if (flying) recount_on_requeue_.insert(key);
   uint64_t& gen = generation_[key];
   ++gen;
   if (blob != nullptr) {
@@ -158,6 +210,7 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
   UploadItem item = std::move(waiting_.find(key)->second);
   waiting_.erase(key);
   in_flight_.insert(item.key);
+  in_flight_generation_[item.key] = item.generation;
   if (item.blob) flight_pin_[item.key] = FlightPin{item.blob, false};
   return item;
 }
@@ -165,6 +218,7 @@ std::optional<UploadItem> UploadQueue::TakeReady(std::chrono::steady_clock::time
 bool UploadQueue::Finish(const UploadItem& item, bool* count_requeue) {
   if (count_requeue != nullptr) *count_requeue = false;
   in_flight_.erase(item.key);
+  in_flight_generation_.erase(item.key);
   ReleaseFlightPin(item.key);
   if (superseded_.erase(item.key) > 0) {
     recount_on_requeue_.erase(item.key);
@@ -196,14 +250,16 @@ bool UploadQueue::Finish(const UploadItem& item, bool* count_requeue) {
   return false;
 }
 
-void UploadQueue::Requeue(UploadItem item) {
+bool UploadQueue::Requeue(UploadItem item) {
   in_flight_.erase(item.key);
+  in_flight_generation_.erase(item.key);
   ReleaseFlightPin(item.key);
   if (superseded_.erase(item.key) > 0) {
+    recount_on_requeue_.erase(item.key);
     DropHeld(item.key);
     generation_.erase(item.key);
     RemoveJournal(item.key);
-    return;
+    return true;
   }
   const auto gen = generation_.find(item.key);
   if (gen != generation_.end() && gen->second != item.generation) {
@@ -215,6 +271,7 @@ void UploadQueue::Requeue(UploadItem item) {
   }
   waiting_[item.key] = item;
   order_.push_back(item.key);
+  return false;
 }
 
 }  // namespace vcache::daemon

@@ -1186,7 +1186,8 @@ struct SessionDaemon {
   pid_t pid = -1;
 
   explicit SessionDaemon(int idle_seconds = 0, bool single_flight = false,
-                         bool block_put = false, uint64_t mem_available_kb = 0) {
+                         bool block_put = false, uint64_t mem_available_kb = 0,
+                         const std::map<std::string, std::string>& test_settings = {}) {
     directory = util::MakeTempDir("vcache-session-test-").value_or("");
     if (directory.empty()) return;
     config.disk.dir = directory + "/cache";
@@ -1200,11 +1201,20 @@ struct SessionDaemon {
       ::close(mem_fd);
     }
     if (block_put && ::mkfifo((directory + "/put-gate").c_str(), 0600) != 0) return;
+    for (const auto& [variable, value] : test_settings) {
+      if (variable.ends_with("_GATE") && ::mkfifo((directory + "/" + value).c_str(), 0600) != 0) {
+        return;
+      }
+    }
     int ready_pipe[2];
     if (::pipe(ready_pipe) != 0) return;
     pid = ::fork();
     if (pid == 0) {
       ::close(ready_pipe[0]);
+      for (const auto& [variable, value] : test_settings) {
+        const std::string setting = value == "1" ? value : directory + "/" + value;
+        ::setenv(variable.c_str(), setting.c_str(), 1);
+      }
       if (block_put) {
         ::setenv("VCACHE_DAEMON_TEST_BLOCK_PUT", (directory + "/put-gate").c_str(), 1);
         ::setenv("VCACHE_LOG", (directory + "/put-log").c_str(), 1);
@@ -1544,17 +1554,29 @@ struct LeasePeer {
         if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 253) {
           daemon::Reader worker_request(reply);
           uint8_t code = 0;
-          uint64_t rss_kb = 0;
+          uint64_t rss_kb = 0, depth = 0;
           if (!worker_request.U8(&code) || !worker_request.U64(&rss_kb) ||
-              rss_kb > 65536) ::_exit(2);
+              !worker_request.U64(&depth) || rss_kb > 65536 || depth > 2) ::_exit(2);
           int worker_ready[2], worker_stop[2];
           if (::pipe(worker_ready) != 0 || ::pipe(worker_stop) != 0) ::_exit(2);
           worker_pid = ::fork();
           if (worker_pid == 0) {
+            ::setpgid(0, 0);
             ::close(control[1]);
             ::close(session_fd);
             ::close(worker_ready[0]);
             ::close(worker_stop[1]);
+            if (depth > 0) {
+              const std::string helper = util::DirName(util::SelfPath().value_or("")) +
+                                         "/vcache_test_alloc";
+              const std::string mib = std::to_string(rss_kb / 1024);
+              const std::string levels = std::to_string(depth);
+              const std::string ready_fd = std::to_string(worker_ready[1]);
+              const std::string stop_fd = std::to_string(worker_stop[0]);
+              ::execl(helper.c_str(), helper.c_str(), mib.c_str(), levels.c_str(),
+                      ready_fd.c_str(), stop_fd.c_str(), nullptr);
+              ::_exit(2);
+            }
             std::vector<char> memory(rss_kb * 1024, 'm');
             for (size_t page = 0; page < memory.size(); page += 4096) memory[page] = 'r';
             ::write(worker_ready[1], "R", 1);
@@ -1577,6 +1599,7 @@ struct LeasePeer {
         }
         if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 252) {
           if (worker_pid > 0) {
+            ::kill(-worker_pid, SIGKILL);
             ::kill(worker_pid, SIGKILL);
             ::waitpid(worker_pid, nullptr, 0);
             worker_pid = -1;
@@ -1686,10 +1709,11 @@ struct LeasePeer {
     return request_pending && Released();
   }
 
-  pid_t StartCompiler(uint64_t rss_kb) {
+  pid_t StartCompiler(uint64_t rss_kb, uint64_t depth = 0) {
     daemon::Writer request;
     request.U8(253);
     request.U64(rss_kb);
+    request.U64(depth);
     std::string reply;
     uint64_t worker_pid = 0;
     if (!daemon::SendFrame(control_fd, request.data()) ||
@@ -1706,6 +1730,7 @@ struct LeasePeer {
     request.U8(252);
     std::string reply;
     if (!daemon::SendFrame(control_fd, request.data()) || !daemon::RecvFrame(control_fd, &reply)) {
+      ::kill(-compiler_pid, SIGKILL);
       ::kill(compiler_pid, SIGKILL);
     }
     compiler_pid = -1;
@@ -2233,6 +2258,233 @@ void TestMemoryAdmission() {
   }
 }
 
+void TestAdmissionProcessTree() {
+  Section("daemon::admission process tree");
+  SessionDaemon server(0, false, false, 90000);
+  LeasePeer holder(server), queued(server);
+  Check(holder.Reserve(65536) && holder.MemoryOutcome(0),
+        "process-tree fixture reserves its driver estimate");
+  const pid_t compiler = holder.StartCompiler(49152, 2);
+  Check(compiler > 0 && holder.Spawned(compiler),
+        "a visible compiler driver reports its grandchild allocator");
+  queued.Reserve(65536);
+  Check(queued.MemoryOutcome(0, 1500),
+        "a grandchild allocator's RSS realises the driver reservation and grants the next job");
+  Check(PollUntil([&] {
+    const std::string status = server.Status();
+    const size_t row = status.find("memory realised");
+    return row != std::string::npos &&
+           std::strtoull(status.c_str() + row + 15, nullptr, 10) >= 49152;
+  }, 1000), "process-tree realised memory includes the live grandchild");
+}
+
+void TestAdmissionReview() {
+  Section("daemon::admission synchronized samples");
+  {
+    SessionDaemon server(0, true, false, 8192);
+    LeasePeer blocker(server), holder(server), waiter(server);
+    blocker.Reserve(8192);
+    blocker.MemoryOutcome(0);
+    const std::string key(64, 'c');
+    holder.Acquire(key, 3000);
+    holder.Outcome(0);
+    holder.Reserve(8192);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "a lease holder queues behind the full memory reservation");
+    waiter.Acquire(key, 100);
+    Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000) &&
+              waiter.NoReply(250),
+          "a 100 ms lease bound stays paused while its holder waits for memory");
+    blocker.Close();
+    Check(holder.MemoryOutcome(0, 1000) && PutLeaseBlob(server, key, 500, &holder) &&
+              waiter.Outcome(1, 1000) && waiter.NoReply(),
+          "a memory-queued holder's Put wakes exactly one stored lease reply");
+  }
+  {
+    SessionDaemon server(0, false, false, 50000);
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(32768);
+    Check(holder.MemoryOutcome(0), "meminfo-drop fixture reserves its first compiler");
+    const pid_t compiler = holder.StartCompiler(16384, 1);
+    util::WriteFileAtomic(server.directory + "/meminfo", "MemAvailable: 20000 kB\n");
+    holder.Spawned(compiler);
+    queued.Reserve(30000);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              queued.NoReply(100),
+          "RSS growth refreshes the dropped MemAvailable before granting another reservation");
+  }
+  {
+    SessionDaemon server(0, false, false, 1);
+    util::WriteFileAtomic(server.directory + "/meminfo", "unreadable MemAvailable\n");
+    LeasePeer first(server), second(server);
+    first.Reserve(1024);
+    second.Reserve(1024);
+    Check(first.MemoryOutcome(0) && second.MemoryOutcome(0, 1000) &&
+              LeaseStat(server, "memory reserved", 2048),
+          "unavailable meminfo grants concurrent reserves when no good sample exists");
+    const std::string log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    Check(log.find("MemAvailable unreadable, admission unavailable") != std::string::npos,
+          "unavailable admission is logged instead of silently serializing compiles");
+    const auto warned = std::chrono::steady_clock::now();
+    PollUntil([&] { return std::chrono::steady_clock::now() - warned >=
+                          std::chrono::milliseconds(750); }, 1000);
+    const std::string repeated_log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    const size_t warning = repeated_log.find("MemAvailable unreadable");
+    Check(warning != std::string::npos &&
+              repeated_log.find("MemAvailable unreadable", warning + 1) == std::string::npos,
+          "unreadable meminfo logs one warning across repeated sampling ticks");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer first(server), second(server);
+    first.Reserve(4096);
+    first.MemoryOutcome(0);
+    util::WriteFileAtomic(server.directory + "/meminfo", "MemAvailable missing\n");
+    first.Spawned(2000000000);
+    second.Reserve(2048);
+    Check(second.MemoryOutcome(0, 1000) && LeaseStat(server, "memory reserved", 6144),
+          "an unreadable meminfo refresh retains its last good value");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192,
+                         {{"VCACHE_DAEMON_TEST_NO_PIDFD", "1"},
+                          {"VCACHE_DAEMON_TEST_FAIL_RSS", "failed-rss"}});
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(65536);
+    holder.MemoryOutcome(0);
+    const pid_t compiler = holder.StartCompiler(1024, 1);
+    Check(compiler > 0 && holder.Spawned(compiler),
+          "failed-read fixture has a visible live compiler without a pidfd");
+    util::WriteFileAtomic(server.directory + "/failed-rss", "fail next proc read\n");
+    holder.Spawned(compiler);
+    queued.Reserve(8192);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000) &&
+              LeaseStat(server, "memory reserved", 65536) && queued.NoReply(100) &&
+              ::kill(compiler, 0) == 0,
+          "a failed visible proc read without pidfd never releases a live reservation");
+  }
+  {
+    SessionDaemon server(0, false, false, 90000,
+                         {{"VCACHE_DAEMON_TEST_RSS_GATE", "rss-gate"}});
+    LeasePeer holder(server);
+    holder.Reserve(65536);
+    holder.MemoryOutcome(0);
+    const pid_t compiler = holder.StartCompiler(2048, 1);
+    const int gate = ::open((server.directory + "/rss-gate").c_str(), O_RDWR | O_NONBLOCK);
+    bool spawned = false;
+    std::thread spawn([&] { spawned = holder.Spawned(compiler); });
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                 "reserve: test RSS sample blocked") != std::string::npos;
+    }, 1000), "RSS fixture reaches its outside-lock sample barrier");
+    const auto started = std::chrono::steady_clock::now();
+    Check(server.Sessions(1) && std::chrono::steady_clock::now() - started <
+                                   std::chrono::milliseconds(250),
+          "a blocked RSS sample leaves status responsive within 250 ms");
+    if (gate >= 0) ::write(gate, "R", 1);
+    spawn.join();
+    Check(spawned, "RSS sampling resumes after its bounded barrier");
+    const auto sampled = std::chrono::steady_clock::now();
+    PollUntil([&] { return std::chrono::steady_clock::now() - sampled >=
+                          std::chrono::milliseconds(750); }, 1000);
+    const std::string prefix = "reserve: " + std::to_string(compiler) + " rss ";
+    Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) ==
+              std::string::npos, "steady RSS sampling does not write per-tick log lines");
+    holder.Close();
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) !=
+             std::string::npos;
+    }, 1000), "reservation release logs the process-tree RSS peak");
+    if (gate >= 0) ::close(gate);
+  }
+  {
+    SessionDaemon server(0, false, false, 90000,
+                         {{"VCACHE_DAEMON_TEST_TRACE_RSS", "1"}});
+    LeasePeer first(server), second(server);
+    first.Reserve(32768);
+    first.MemoryOutcome(0);
+    const pid_t first_pid = first.StartCompiler(1024, 1);
+    first.Spawned(first_pid);
+    second.Reserve(32768);
+    second.MemoryOutcome(0);
+    const pid_t second_pid = second.StartCompiler(1024, 1);
+    second.Spawned(second_pid);
+    const std::string log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    const std::string marker = "reserve: test spawn sample " + std::to_string(first_pid);
+    const size_t first_sample = log.find(marker);
+    Check(first_sample != std::string::npos &&
+              log.find(marker, first_sample + marker.size()) == std::string::npos &&
+              log.find("reserve: test spawn sample " + std::to_string(second_pid)) !=
+                  std::string::npos,
+          "a new compiler notification samples only its own pid tree");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192,
+                         {{"VCACHE_DAEMON_TEST_RESERVE_GATE", "reserve-gate"}});
+    LeasePeer peer(server);
+    const int gate = ::open((server.directory + "/reserve-gate").c_str(), O_RDWR | O_NONBLOCK);
+    peer.Reserve(1024);
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                 "reserve: test reserve blocked") != std::string::npos;
+    }, 1000), "late-reserve fixture pauses a received frame before admission");
+    std::string shutdown_reply;
+    const int shutdown_fd = server.Hello(daemon::kProtocolVersion, &shutdown_reply);
+    daemon::Writer shutdown_request;
+    shutdown_request.U8(static_cast<uint8_t>(daemon::Op::kShutdown));
+    Check(shutdown_fd >= 0 && daemon::SendFrame(shutdown_fd, shutdown_request.data()),
+          "the late-reserve fixture begins a real daemon shutdown request");
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                 "reserve: test sampler joined during shutdown") != std::string::npos;
+    }, 1000), "shutdown moves and joins the old sampler before the late reserve resumes");
+    if (gate >= 0) ::write(gate, "R", 1);
+    peer.Error();
+    peer.Close();
+    Check(shutdown_fd >= 0 && daemon::RecvFrame(shutdown_fd, &shutdown_reply) &&
+              !shutdown_reply.empty() && shutdown_reply[0] == '\0',
+          "the shutdown client receives its drain result after the late reserve");
+    if (shutdown_fd >= 0) ::close(shutdown_fd);
+    int status = 0;
+    const bool exited = PollUntil([&] { return ::waitpid(server.pid, &status, WNOHANG) ==
+                                              server.pid; }, 2000);
+    Check(exited && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "a reserve received before shutdown cannot restart a worker or abort the daemon");
+    if (exited) server.pid = -1;
+    if (gate >= 0) ::close(gate);
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server);
+    holder.Reserve(8192);
+    holder.MemoryOutcome(0);
+    const std::string client_log = server.directory + "/waiting-client-log";
+    ::setenv("VCACHE_LOG", client_log.c_str(), 1);
+    util::InitLogging();
+    core::Config enabled = server.config;
+    enabled.daemon.mode = core::DaemonMode::kOn;
+    enabled.daemon.admission = true;
+    auto session = daemon::DaemonClient::OpenCompileSession(enabled);
+    std::atomic<bool> answered{false};
+    bool reserved = false;
+    std::thread reserve([&] {
+      if (session) reserved = session->ReserveMemory(std::string(64, 'a'), 1024);
+      answered = true;
+    });
+    const bool queued = PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000);
+    holder.Close();
+    const bool received = PollUntil([&] { return answered.load(); }, 1000);
+    if (!received) ::kill(server.pid, SIGTERM);
+    reserve.join();
+    Check(queued && received && reserved && util::ReadFile(client_log).value_or("").find(
+              "reserve: granted 1024 kB after ") != std::string::npos,
+          "a granted memory wait is logged in the waiting client's own decision log");
+    session.reset();
+    ::unsetenv("VCACHE_LOG");
+    util::InitLogging();
+  }
+}
+
 void TestRunSpawnCallback() {
   Section("util::Run spawn callback");
   int calls = 0;
@@ -2302,9 +2554,10 @@ void TestLeaseReviewFixes() {
     timeval timeout{};
     socklen_t size = sizeof(timeout);
     if (::getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, &size) == 0 &&
-        timeout.tv_sec == 315) timeout_has_margin = true;
+        timeout.tv_sec == 915) timeout_has_margin = true;
   }
-  Check(timeout_has_margin, "capped lease receive timeout has the required 15 second margin");
+  Check(timeout_has_margin,
+        "capped lease receive timeout includes memory-queue headroom and the 15 second margin");
   holder.Release(bounded_key, false);
   holder.Released();
   acquire.join();
@@ -4525,6 +4778,8 @@ int main(int argc, char** argv) {
   TestHeldHitLayer();
   TestJobserver();
   TestElasticJobserver();
+  TestAdmissionProcessTree();
+  TestAdmissionReview();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

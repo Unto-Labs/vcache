@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "storage/chain.h"
 
+#include <string_view>
+
 #include "hash/hasher.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -18,7 +20,7 @@ void AppendU64(std::string* out, uint64_t value) {
   for (int i = 0; i < 8; ++i) out->push_back(static_cast<char>(value >> (8 * i)));
 }
 
-bool ReadU64(const std::string& data, size_t* pos, uint64_t* out) {
+bool ReadU64(std::string_view data, size_t* pos, uint64_t* out) {
   if (*pos + 8 > data.size()) return false;
   uint64_t value = 0;
   for (int i = 0; i < 8; ++i) {
@@ -82,14 +84,17 @@ bool DeserializeBlob(const std::string& data, Blob* blob) {
   if (data.compare(0, sizeof(kMagic), kMagic, sizeof(kMagic)) != 0) return false;
   pos += sizeof(kMagic);
 
-  const std::string digest = data.substr(pos, hash::kDigestHexLen);
+  const std::string_view all(data);
+  const std::string_view digest = all.substr(pos, hash::kDigestHexLen);
   pos += hash::kDigestHexLen;
 
   uint64_t body_len = 0;
-  if (!ReadU64(data, &pos, &body_len)) return false;
+  if (!ReadU64(all, &pos, &body_len)) return false;
   if (pos + body_len != data.size()) return false;
 
-  const std::string body = data.substr(pos, body_len);
+  // The body stays in `data`. Sections are views into it; each field is
+  // filled once from its view, so the body is not copied aside for the hash.
+  const std::string_view body = all.substr(pos, static_cast<size_t>(body_len));
   if (hash::HashString(body) != digest) {
     VCACHE_LOG("cache entry failed checksum verification");
     return false;
@@ -103,19 +108,25 @@ bool DeserializeBlob(const std::string& data, Blob* blob) {
     uint64_t len = 0;
     if (!ReadU64(body, &bpos, &len)) return false;
     if (bpos + len > body.size()) return false;
-    std::string payload = body.substr(bpos, len);
-    bpos += len;
+    const std::string_view payload = body.substr(bpos, static_cast<size_t>(len));
+    bpos += static_cast<size_t>(len);
 
     switch (kind) {
-      case SectionKind::kObject: blob->object = std::move(payload); break;
+      case SectionKind::kObject:
+        blob->object.assign(payload.data(), payload.size());
+        break;
       case SectionKind::kDepFile:
-        blob->depfile = std::move(payload);
+        blob->depfile.assign(payload.data(), payload.size());
         blob->has_depfile = true;
         break;
-      case SectionKind::kStderr: blob->stderr_text = std::move(payload); break;
-      case SectionKind::kMeta: blob->meta = std::move(payload); break;
+      case SectionKind::kStderr:
+        blob->stderr_text.assign(payload.data(), payload.size());
+        break;
+      case SectionKind::kMeta:
+        blob->meta.assign(payload.data(), payload.size());
+        break;
       case SectionKind::kDepManifest:
-        blob->dep_manifest = std::move(payload);
+        blob->dep_manifest.assign(payload.data(), payload.size());
         blob->has_dep_manifest = true;
         break;
       case SectionKind::kFile: {
@@ -124,11 +135,11 @@ bool DeserializeBlob(const std::string& data, Blob* blob) {
         if (!ReadU64(payload, &fpos, &name_len)) return false;
         if (fpos + name_len + 1 > payload.size()) return false;
         BlobFile file;
-        file.name = payload.substr(fpos, name_len);
-        const auto flags =
-            static_cast<unsigned char>(payload[fpos + name_len]);
+        file.name.assign(payload.data() + fpos, static_cast<size_t>(name_len));
+        const auto flags = static_cast<unsigned char>(payload[fpos + name_len]);
         file.executable = (flags & kFileFlagExecutable) != 0;
-        file.contents = payload.substr(fpos + name_len + 1);
+        const size_t contents_at = fpos + static_cast<size_t>(name_len) + 1;
+        file.contents.assign(payload.data() + contents_at, payload.size() - contents_at);
         blob->files.push_back(std::move(file));
         break;
       }

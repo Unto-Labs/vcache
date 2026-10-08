@@ -366,15 +366,19 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   }
   for (const storage::BlobFile& file : files) {
     const std::string target = out_dir + "/" + file.name;
-    std::string contents = file.contents;
+    // A dep-info file is rewritten into this checkout. Every other file is
+    // written from the bytes already in the blob.
+    const std::string* bytes = &file.contents;
+    std::string rewritten;
     if (util::EndsWith(file.name, ".d")) {
-      if (auto dep = core::ParseDepFile(contents)) {
+      if (auto dep = core::ParseDepFile(file.contents)) {
         core::RemapDepFile(&*dep, roots, MapDirection::kLocalize, path_env_vars);
         SubstituteDir(&*dep, std::string(kOutDirPlaceholder), out_dir);
-        contents = core::RenderDepFile(*dep);
+        rewritten = core::RenderDepFile(*dep);
+        bytes = &rewritten;
       }
     }
-    if (!util::WriteFileAtomic(target, contents)) {
+    if (!util::WriteFileAtomic(target, *bytes)) {
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }

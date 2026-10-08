@@ -656,6 +656,52 @@ void TestPreprocessedNormalization() {
         "does not fire on ordinary code");
 }
 
+void TestManifestMerge() {
+  Section("core::manifest merge");
+
+  struct State {
+    std::string key;
+  };
+  auto show = [](const std::vector<State>& states) {
+    std::string out;
+    for (const State& state : states) {
+      if (!out.empty()) out.push_back(' ');
+      out += state.key;
+    }
+    return out;
+  };
+
+  const std::vector<State> already{State{"F"}, State{"A"}};
+  const std::vector<State> extra{State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, already, extra, &State::key)), "F A B",
+          "a state already re-read stays one copy at the front");
+
+  const std::vector<State> loaded{State{"A"}, State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, {}, loaded, &State::key)), "F A B",
+          "an empty re-read still keeps the loaded states");
+
+  const std::vector<State> reread{State{"A"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, reread, {}, &State::key)), "F A",
+          "an empty loaded list keeps the re-read behind fresh");
+
+  std::vector<State> full;
+  for (int i = 1; i <= 8; ++i) full.push_back(State{"R" + std::to_string(i)});
+  const std::vector<State> tail{State{"L1"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, full, tail, &State::key)),
+          "F R1 R2 R3 R4 R5 R6 R7",
+          "a full re-read stays ahead of loaded-only states");
+
+  struct DepState {
+    std::string result_key;
+  };
+  const std::vector<DepState> dep_loaded{DepState{"L"}};
+  const std::vector<DepState> dep_merged =
+      core::MergeManifestStates(DepState{"F"}, {}, dep_loaded, &DepState::result_key);
+  Check(dep_merged.size() == 2 && dep_merged[0].result_key == "F" &&
+            dep_merged[1].result_key == "L",
+        "a dep-scan merge keeps a loaded-only state");
+}
+
 void TestReadFile() {
   Section("util::ReadFile");
 
@@ -3141,6 +3187,7 @@ int main() {
   TestStats();
   // Writes files too.
   TestRustManifest();
+  TestManifestMerge();
   TestRunRusage();
   // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
   // and a forked child is charged that high-water mark until exec replaces it.

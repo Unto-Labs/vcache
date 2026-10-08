@@ -720,8 +720,20 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   DepManifestEntry fresh;
   fresh.result_key = result_key;
   fresh.files = std::move(files);
-  const std::vector<DepManifestEntry> updated = PrependManifestState(
-      std::move(fresh), std::move(entries), &DepManifestEntry::result_key);
+  PauseBeforeManifestPut();
+  std::vector<DepManifestEntry> reread;
+  {
+    storage::GetResult again = cache->Get(key);
+    media_failed |= ReportCacheMediaErrors(again.errors, cache_dir);
+    storage::Blob again_blob;
+    if (again.hit && storage::DeserializeBlob(again.value, &again_blob) &&
+        again_blob.has_dep_manifest &&
+        !ParseManifest(again_blob.dep_manifest, &reread)) {
+      reread.clear();
+    }
+  }
+  const std::vector<DepManifestEntry> updated = MergeManifestStates(
+      std::move(fresh), std::move(reread), entries, &DepManifestEntry::result_key);
 
   storage::Blob manifest_blob;
   manifest_blob.dep_manifest = RenderManifest(updated);

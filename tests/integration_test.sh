@@ -684,6 +684,83 @@ EOF
 fi
 
 # --------------------------------------------------------------------------
+section "9f. Concurrent manifest stores keep both states"
+
+# Two worktrees load the same manifest, each adds its own state, and the
+# second store must not drop the first. The fifo holds one of them still
+# until the other has stored.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  man_tree() {  # $1 dir, $2 helper return value
+    mkdir -p "$1/src"
+    cat > "$1/src/lib.rs" << 'EOF'
+mod helper;
+pub fn v() -> u32 { helper::v() }
+EOF
+    printf 'pub fn v() -> u32 { %s }\n' "$2" > "$1/src/helper.rs"
+  }
+  man_tree "$WORK/man-a" 1
+  man_tree "$WORK/man-b" 2
+  man_tree "$WORK/man-c" 3
+  man_compile() {  # $1 dir, $2 log (may be empty)
+    # An expanded VAR=value is a command word, not an assignment, so the log
+    # path has to be a literal prefix when it is set.
+    if [[ -n "$2" ]]; then
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" VCACHE_LOG="$2" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    else
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    fi
+  }
+  man_compile "$WORK/man-a" ""
+  check "the first manifest version misses" "$(misses)" "1"
+  fifo="$WORK/manifest-pause.fifo"
+  mkfifo "$fifo"
+  blog="$WORK/man-b-pause.log"
+  rm -f "$blog"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog" \
+      VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null &
+  bpid=$!
+  waiting=0
+  for _ in $(seq 1 200); do
+    if grep -q 'manifest: waiting before put' "$blog" 2>/dev/null; then waiting=1; break; fi
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the second manifest store waits" "$waiting" "1"
+  man_compile "$WORK/man-c" ""
+  printf x > "$fifo"
+  for _ in $(seq 1 200); do
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  wait "$bpid" || true
+  blog2="$WORK/man-b-hit.log"
+  rm -f "$blog2"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog2" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null
+  check "version 2 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog2" || true)" "1"
+  check "version 2 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog2" || true)" "0"
+  blog3="$WORK/man-c-hit.log"
+  rm -f "$blog3"
+  ( cd "$WORK/man-c" && VCACHE_ROOTS="$WORK/man-c=crate" VCACHE_LOG="$blog3" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-c/out" src/lib.rs ) >/dev/null
+  check "version 3 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog3" || true)" "1"
+  check "version 3 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog3" || true)" "0"
+fi
+
+# --------------------------------------------------------------------------
 section "9b. Rust crates that read the environment"
 
 # rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
@@ -2171,6 +2248,66 @@ for mode in "-MM" "-M -MP"; do
   check_depsrc_answer "$mode: and the restored paths name this checkout" \
     "$WORK/depsrc/d" "$WORK/pc-d.d" "${mflags[@]}" "$WORK/depsrc/d/main.c"
 done
+
+# --------------------------------------------------------------------------
+section "14b. Concurrent dep-scan stores keep both states"
+
+# Same source, different headers, one canonical root. The paused store must
+# keep the state the other checkout wrote while it waited.
+reset_cache
+ds_tree() {  # $1 dir, $2 header value
+  mkdir -p "$1"
+  printf '#include "x.h"\nint v = V;\n' > "$1/main.c"
+  printf '#define V %s\n' "$2" > "$1/x.h"
+}
+ds_tree "$WORK/ds-a" 1
+ds_tree "$WORK/ds-b" 2
+ds_tree "$WORK/ds-c" 3
+ds_scan() {  # $1 dir, $2 log (may be empty)
+  if [[ -n "${2:-}" ]]; then
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  else
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  fi
+}
+ds_scan "$WORK/ds-a" ""
+check "the first dep-scan version misses" "$(misses)" "1"
+fifo="$WORK/depscan-pause.fifo"
+mkfifo "$fifo"
+dblog="$WORK/ds-b-pause.log"
+rm -f "$dblog"
+( cd "$WORK/ds-b" && VCACHE_ROOTS="$WORK/ds-b=proj" VCACHE_LOG="$dblog" \
+    VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+    "$VCACHE" gcc -M -MP main.c -o "$WORK/ds-b/out.d" ) >/dev/null &
+dbpid=$!
+dwaiting=0
+for _ in $(seq 1 200); do
+  if grep -q 'manifest: waiting before put' "$dblog" 2>/dev/null; then dwaiting=1; break; fi
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+check "the second dep-scan store waits" "$dwaiting" "1"
+ds_scan "$WORK/ds-c" ""
+printf x > "$fifo"
+for _ in $(seq 1 200); do
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+wait "$dbpid" || true
+dblog2="$WORK/ds-b-hit.log"
+rm -f "$dblog2"
+ds_scan "$WORK/ds-b" "$dblog2"
+check "header 2 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog2" || true)" "1"
+check "header 2 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog2" || true)" "0"
+dblog3="$WORK/ds-c-hit.log"
+rm -f "$dblog3"
+ds_scan "$WORK/ds-c" "$dblog3"
+check "header 3 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog3" || true)" "1"
+check "header 3 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog3" || true)" "0"
 
 # --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"

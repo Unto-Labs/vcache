@@ -261,8 +261,13 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
 }
 
 void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
-                   const std::vector<RustManifestState>& states,
+                   RustManifestState fresh, const std::vector<RustManifestState>& loaded,
                    const std::string& cache_dir, bool* media_failed) {
+  core::PauseBeforeManifestPut();
+  const std::vector<RustManifestState> reread =
+      LoadManifest(cache, manifest_key, cache_dir, media_failed);
+  const std::vector<RustManifestState> states = core::MergeManifestStates(
+      std::move(fresh), reread, loaded, &RustManifestState::key);
   storage::Blob blob;
   blob.dep_manifest = RenderRustManifest(states);
   blob.has_dep_manifest = true;
@@ -534,8 +539,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
       core::RecordCounter(cache_dir, HitCounter(got));
       if (i > 0 && !config.read_only) {
-        StoreManifest(cache, manifest_key, RecordRustState(states[i], states),
-                      cache_dir, &media_failed);
+        StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }
       return 0;
     }
@@ -569,8 +573,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // Records what this dep-info run found, once its entry is known to exist.
   const auto record_state = [&]() {
     if (manifest_key.empty() || config.read_only) return;
-    StoreManifest(cache, manifest_key, RecordRustState(fresh, states), cache_dir,
-                  &media_failed);
+    StoreManifest(cache, manifest_key, fresh, states, cache_dir, &media_failed);
   };
 
   if (!config.recache && cache != nullptr) {

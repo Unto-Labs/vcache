@@ -58,4 +58,30 @@ std::vector<State> PrependManifestState(State fresh, std::vector<State> older,
   return updated;
 }
 
+// Re-read wins over the list loaded at lookup. `fresh` is first, then the
+// re-read order, then states that existed only in the loaded list. One copy
+// of each key. The cap is the same one PrependManifestState applies.
+template <typename State>
+std::vector<State> MergeManifestStates(State fresh, std::vector<State> reread,
+                                       const std::vector<State>& loaded,
+                                       std::string State::*key) {
+  for (const State& state : loaded) {
+    if (state.*key == fresh.*key) continue;
+    bool seen = false;
+    for (const State& have : reread) {
+      if (have.*key == state.*key) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) reread.push_back(state);
+  }
+  return PrependManifestState(std::move(fresh), std::move(reread), key);
+}
+
+// Blocks on the fifo in VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT when that
+// variable names one. Inert otherwise. The read is the re-read's predecessor,
+// so a test can store another state before this process merges.
+void PauseBeforeManifestPut();
+
 }  // namespace vcache::core

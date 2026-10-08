@@ -222,6 +222,10 @@ separate processes do.
 - Two processes computing the same key simply both compile and both store the
   same bytes. Adding cross-process locking to prevent that would cost more than
   the duplicated work.
+- A manifest is re-read just before it is written and merged, so two worktrees
+  that each add a state keep both. The gap that remains is the one Get and the
+  one Put. `VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT` names a fifo; a test write
+  to it releases the process that is waiting to re-read. Unset, it does nothing.
 
 ## Parsing choices
 

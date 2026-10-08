@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon/jobserver.h"
 #include "daemon/server.h"
+#include "daemon/upload_queue.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -112,6 +113,17 @@ class DaemonLog {
   std::mutex mutex_;
 };
 
+// A test shrinks the held-blob cap without changing the fingerprint a client
+// and the daemon have to agree on. Unset, the queue keeps its 1 GiB cap.
+uint64_t TestMaxHeldBytes() {
+  const char* text = std::getenv("VCACHE_TEST_MAX_HELD_BYTES");
+  if (text == nullptr || *text == '\0') return UploadQueue::kDefaultMaxHeldBytes;
+  char* end = nullptr;
+  const unsigned long long n = std::strtoull(text, &end, 10);
+  if (end == text || *end != '\0' || n == 0) return UploadQueue::kDefaultMaxHeldBytes;
+  return static_cast<uint64_t>(n);
+}
+
 struct Counters {
   std::atomic<uint64_t> connections{0};
   std::atomic<uint64_t> refused{0};
@@ -130,17 +142,6 @@ struct Counters {
   std::atomic<uint64_t> uploads_recovered{0};
   std::atomic<uint64_t> leases_expired{0};
   std::atomic<uint64_t> compiles_deduplicated{0};
-};
-
-// One pending upload. An entry the disk layer holds is queued by key alone and
-// read back when its turn comes, which keeps a long queue cheap and lets the
-// journal be nothing but file names. Without a disk layer the blob itself has
-// to wait in memory.
-struct Upload {
-  std::string key;
-  std::shared_ptr<const std::string> blob;  // null: read it from disk
-  int attempts = 0;
-  Clock::time_point not_before{};
 };
 
 struct CompileSession {
@@ -335,7 +336,8 @@ class Server {
       : config_(config),
         state_dir_(StateDir(config)),
         socket_path_(SocketPath(config)),
-        fingerprint_(ConfigFingerprint(config)) {}
+        fingerprint_(ConfigFingerprint(config)),
+        uploads_(state_dir_ + "/pending", TestMaxHeldBytes()) {}
 
   int Run(int ready_fd);
 
@@ -378,14 +380,13 @@ class Server {
   void ReleaseS3(std::unique_ptr<storage::S3Storage> s3);
 
   // Queues an upload. Returns false only when the blob could not be held.
-  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-               bool journal);
+  // `refused_in_flight` is set when that refusal replaced an upload already
+  // being sent. `refusal_id` identifies that upload so the caller waits for
+  // it, not for a later generation of the same key.
+  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
+               bool* refused_in_flight = nullptr, uint64_t* refusal_id = nullptr);
+  void WaitForRefusal(uint64_t refusal_id, const std::string& key);
   void UploadWorker();
-  void FinishUpload(const Upload& item);
-  std::string JournalPath(const std::string& key) const {
-    return state_dir_ + "/pending/" + key;
-  }
-
   void Shutdown();
   bool Idle() const;
   // Seconds of quiet this process waits before exiting. Twice the configured
@@ -440,17 +441,11 @@ class Server {
   std::string drain_summary_;
 
   // Upload queue, also under `mutex_`.
-  std::deque<Upload> queue_;
-  std::set<std::string> queued_keys_;  // queued or in flight; dedupes repeats
-  std::map<std::string, std::shared_ptr<const std::string>> held_;  // memory blobs
-  uint64_t held_bytes_ = 0;
+  UploadQueue uploads_;
   int in_flight_ = 0;
   bool workers_stop_ = false;
   std::vector<std::thread> workers_;
 
-  // A store without a disk layer holds its blob in memory until uploaded. Past
-  // this the store uploads synchronously instead, which is slower but bounded.
-  static constexpr uint64_t kMaxHeldBytes = 1ull << 30;
   static constexpr int kMaxUploadAttempts = 3;
   static constexpr size_t kMaxConnections = 1024;
 };
@@ -598,36 +593,40 @@ void Server::RecoverJournal() {
             " uploads journalled by a previous daemon");
 }
 
-bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-                     bool journal) {
+bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
+                     bool* refused_in_flight, uint64_t* refusal_id) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (queued_keys_.count(key) != 0) return true;  // already on its way
-  if (blob != nullptr) {
-    if (held_bytes_ + blob->size() > kMaxHeldBytes) return false;
-    held_bytes_ += blob->size();
-    held_[key] = blob;
+  bool merged = false;
+  bool in_flight = false;
+  bool dropped_waiting = false;
+  uint64_t id = 0;
+  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged, &in_flight, &id,
+                        &dropped_waiting)) {
+    if (refused_in_flight != nullptr) *refused_in_flight = in_flight;
+    if (refusal_id != nullptr) *refusal_id = id;
+    if (dropped_waiting) counters_.uploads_skipped++;
+    lock.unlock();
+    cv_.notify_all();
+    return false;
   }
-  if (journal) {
-    // An empty file is the whole record; creating it is what makes the upload
-    // survive this process.
-    const int fd = ::open(JournalPath(key).c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-    if (fd >= 0) ::close(fd);
-  }
-  queued_keys_.insert(key);
-  queue_.push_back(Upload{key, std::move(blob)});
-  counters_.uploads_queued++;
+  // A key already waiting keeps its one queued upload. A key in flight is
+  // counted when that upload finishes and the newer value is queued.
+  if (!merged && !in_flight) counters_.uploads_queued++;
   lock.unlock();
   cv_.notify_all();
   return true;
 }
 
-void Server::FinishUpload(const Upload& item) {
-  ::unlink(JournalPath(item.key).c_str());
-  std::lock_guard<std::mutex> lock(mutex_);
-  queued_keys_.erase(item.key);
-  if (item.blob != nullptr) {
-    held_bytes_ -= item.blob->size();
-    held_.erase(item.key);
+void Server::WaitForRefusal(uint64_t refusal_id, const std::string& key) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  // Half the client reply timeout: when this fires, the client is still
+  // waiting, so the synchronous upload can still be its answer.
+  const auto deadline = Clock::now() + std::chrono::seconds(kReplyTimeoutSeconds / 2);
+  while (uploads_.RefusalStillInFlight(refusal_id)) {
+    if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      log_.Line("refused re-put of " + key + " uploaded without waiting");
+      return;
+    }
   }
 }
 
@@ -638,17 +637,10 @@ void Server::UploadWorker() {
   for (;;) {
     // The first item whose retry delay has passed. Retries go to the back, so
     // this is nearly always the front.
-    auto ready = queue_.end();
     Clock::time_point soonest = Clock::time_point::max();
-    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
-      if (it->not_before <= Clock::now()) {
-        ready = it;
-        break;
-      }
-      soonest = std::min(soonest, it->not_before);
-    }
-    if (ready == queue_.end()) {
-      if (workers_stop_ && queue_.empty()) return;
+    auto ready = uploads_.TakeReady(Clock::now(), &soonest);
+    if (!ready) {
+      if (workers_stop_ && uploads_.empty()) return;
       if (soonest == Clock::time_point::max()) {
         cv_.wait(lock);
       } else {
@@ -656,8 +648,7 @@ void Server::UploadWorker() {
       }
       continue;
     }
-    Upload item = std::move(*ready);
-    queue_.erase(ready);
+    UploadItem item = std::move(*ready);
     ++in_flight_;
     lock.unlock();
 
@@ -691,10 +682,17 @@ void Server::UploadWorker() {
                 (s3->failed() ? s3->last_error() : std::string("rejected")));
     }
 
-    if (done) FinishUpload(item);
     lock.lock();
     --in_flight_;
-    if (!done) queue_.push_back(std::move(item));
+    if (done) {
+      bool count_requeue = false;
+      if (uploads_.Finish(item, &count_requeue)) {
+        if (count_requeue) counters_.uploads_queued++;
+        log_.Line("re-queued " + item.key + " (rewritten during upload)");
+      }
+    } else if (uploads_.Requeue(std::move(item))) {
+      counters_.uploads_skipped++;
+    }
     cv_.notify_all();
   }
 }
@@ -1230,9 +1228,8 @@ void Server::HandleGet(Reader* in, Writer* out) {
     // Stored moments ago, still waiting for its upload, and no disk layer to
     // have put it in. Serving it is what makes the queue invisible to builds.
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = held_.find(key);
-    if (it != held_.end()) {
-      value = *it->second;
+    if (auto held = uploads_.Held(key)) {
+      value = *held;
       layer = HeldHitLayerName();
       counters_.hits_memory++;
     }
@@ -1326,20 +1323,37 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
   if (s3_writable_ && test_put_allowed) {
     if (on_disk) {
       stored = Enqueue(key, nullptr, /*journal=*/true) || stored;
-    } else if (Enqueue(key, value, /*journal=*/false)) {
-      stored = true;
     } else {
-      // The memory queue is full: upload here and make this one store wait,
-      // rather than grow without bound.
-      auto s3 = AcquireS3();
-      if (s3->Put(key, *value)) {
+      bool refused_in_flight = false;
+      uint64_t refusal_id = 0;
+      if (Enqueue(key, value, /*journal=*/false, &refused_in_flight, &refusal_id)) {
         stored = true;
-        counters_.uploads_done++;
-        counters_.upload_bytes += value->size();
-      } else if (s3->failed()) {
-        errors.push_back("s3: " + s3->last_error());
+      } else {
+        // The memory queue is full: upload here and make this one store wait,
+        // rather than grow without bound. Wait only for the upload that was
+        // already in flight. A newer store overtakes this one.
+        bool overtaken = false;
+        if (refused_in_flight) {
+          WaitForRefusal(refusal_id, key);
+          std::lock_guard<std::mutex> lock(mutex_);
+          overtaken = uploads_.RefusalOvertaken(refusal_id);
+        }
+        if (overtaken) {
+          stored = true;
+        } else {
+          counters_.uploads_queued++;
+          auto s3 = AcquireS3();
+          if (s3->Put(key, *value)) {
+            stored = true;
+            counters_.uploads_done++;
+            counters_.upload_bytes += value->size();
+          } else if (s3->failed()) {
+            counters_.uploads_failed++;
+            errors.push_back("s3: " + s3->last_error());
+          }
+          ReleaseS3(std::move(s3));
+        }
       }
-      ReleaseS3(std::move(s3));
     }
   }
 
@@ -1372,7 +1386,7 @@ std::string Server::StatusText() {
   size_t leases_held = 0;
   size_t leases_waiting = 0;
   size_t pending = 0;
-  int in_flight = 0;
+  size_t superseded = 0;
   uint64_t held = 0;
   uint64_t reserved_kb = 0, realised_kb = 0, memory_waiting = 0, reserve_waits = 0;
   uint64_t longest_reserve_wait_ms = 0;
@@ -1403,9 +1417,9 @@ std::string Server::StatusText() {
         leases_waiting += state.compile->waiters.size();
       }
     }
-    pending = queue_.size();
-    in_flight = in_flight_;
-    held = held_bytes_;
+    superseded = uploads_.superseded_count();
+    pending = uploads_.size() + uploads_.in_flight_count() - superseded;
+    held = uploads_.held_bytes();
   }
   const auto uptime =
       std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started_).count();
@@ -1442,7 +1456,8 @@ std::string Server::StatusText() {
   s += row("  bytes", n(counters_.upload_bytes));
   s += row("  failed", n(counters_.uploads_failed));
   s += row("  skipped", n(counters_.uploads_skipped));
-  s += row("  pending", std::to_string(pending + static_cast<size_t>(in_flight)));
+  s += row("  pending", std::to_string(pending));
+  s += row("uploads superseded", std::to_string(superseded));
   s += row("  held in memory", std::to_string(held) + " bytes");
   s += jobserver_status;
   return s;
@@ -1596,7 +1611,7 @@ bool Server::Idle() const {
   const int limit_seconds = IdleLimitSeconds();
   if (limit_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+  if (!connections_.empty() || !uploads_.empty() || in_flight_ != 0) return false;
   return Clock::now() - last_activity_ > std::chrono::seconds(limit_seconds);
 }
 
@@ -1685,7 +1700,7 @@ void Server::Shutdown() {
     cv_.wait_for(lock, std::chrono::seconds(5), [&] { return others() == 0; });
   }
 
-  const size_t pending = queue_.size() + static_cast<size_t>(in_flight_);
+  const size_t pending = uploads_.size() + static_cast<size_t>(in_flight_);
   if (pending > 0) log_.Line("draining " + std::to_string(pending) + " uploads");
   workers_stop_ = true;
   cv_.notify_all();

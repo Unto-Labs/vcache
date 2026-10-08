@@ -24,9 +24,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <functional>
-#include <cstdio>
 #include <map>
 #include <filesystem>
 #include <memory>
@@ -49,6 +49,7 @@
 #include "core/roots.h"
 #include "core/stats.h"
 #include "daemon/jobserver.h"
+#include "daemon/upload_queue.h"
 #include "daemon/protocol.h"
 #include "daemon/client.h"
 #include "daemon/server.h"
@@ -666,6 +667,137 @@ void TestPreprocessedNormalization() {
         "does not fire without the leading dot");
   Check(!core::ContainsIncbin("static void inc(void);"),
         "does not fire on ordinary code");
+}
+
+void TestManifestMerge() {
+  Section("core::manifest merge");
+
+  struct State {
+    std::string key;
+  };
+  auto show = [](const std::vector<State>& states) {
+    std::string out;
+    for (const State& state : states) {
+      if (!out.empty()) out.push_back(' ');
+      out += state.key;
+    }
+    return out;
+  };
+
+  const std::vector<State> already{State{"F"}, State{"A"}};
+  const std::vector<State> extra{State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, already, extra, &State::key)), "F A B",
+          "a state already re-read stays one copy at the front");
+
+  const std::vector<State> loaded{State{"A"}, State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, {}, loaded, &State::key)), "F A B",
+          "an empty re-read still keeps the loaded states");
+
+  const std::vector<State> reread{State{"A"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, reread, {}, &State::key)), "F A",
+          "an empty loaded list keeps the re-read behind fresh");
+
+  const std::vector<State> both_reread{State{"A"}, State{"C"}};
+  const std::vector<State> both_loaded{State{"A"}, State{"B"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, both_reread, both_loaded, &State::key)),
+          "F A C B", "a state in both lists is kept once, from the re-read");
+
+  std::vector<State> full;
+  for (int i = 1; i <= 8; ++i) full.push_back(State{"R" + std::to_string(i)});
+  const std::vector<State> tail{State{"L1"}};
+  CheckEq(show(core::MergeManifestStates(State{"F"}, full, tail, &State::key)),
+          "F R1 R2 R3 R4 R5 R6 R7",
+          "a full re-read stays ahead of loaded-only states");
+
+  struct DepState {
+    std::string result_key;
+  };
+  const std::vector<DepState> dep_loaded{DepState{"L"}};
+  const std::vector<DepState> dep_merged =
+      core::MergeManifestStates(DepState{"F"}, {}, dep_loaded, &DepState::result_key);
+  Check(dep_merged.size() == 2 && dep_merged[0].result_key == "F" &&
+            dep_merged[1].result_key == "L",
+        "a dep-scan merge keeps a loaded-only state");
+}
+
+void TestManifestMediaCount() {
+  Section("core::manifest media");
+  auto scratch = util::MakeTempDir("vcache-manifest-media-");
+  Check(scratch.has_value(), "manifest media scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const bool reread_failed =
+      core::ReportCacheMediaErrors({"disk: read failed"}, *scratch, true);
+  core::ReportCacheMediaErrors({"disk: write failed"}, *scratch, !reread_failed);
+  const core::Stats stats = core::ReadStats(*scratch);
+  Check(reread_failed, "the re-read failure is reported");
+  CheckEq(std::to_string(stats.Get(core::Counter::kCacheMediaError)), "1",
+          "a put that fails after a failed re-read is not counted again");
+}
+
+void TestManifestPause() {
+  Section("core::manifest pause");
+  auto scratch = util::MakeTempDir("vcache-manifest-pause-");
+  Check(scratch.has_value(), "manifest pause scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string log_path = *scratch + "/pause.log";
+  ::setenv("VCACHE_LOG", log_path.c_str(), 1);
+  util::InitLogging();
+  auto log_text = [&]() {
+    const auto text = util::ReadFile(log_path);
+    return text ? *text : std::string();
+  };
+  auto clear_log = [&]() {
+    FILE* f = ::fopen(log_path.c_str(), "w");
+    if (f != nullptr) ::fclose(f);
+  };
+
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", (*scratch + "/missing").c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a missing pause path does not wait");
+
+  const std::string regular = *scratch + "/regular";
+  util::WriteFileAtomic(regular, "x");
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", regular.c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a regular pause path does not wait");
+
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", scratch->c_str(), 1);
+  core::PauseBeforeManifestPut();
+  Check(log_text().find("waiting before put") == std::string::npos,
+        "a directory pause path does not wait");
+
+  const std::string fifo = *scratch + "/pause.fifo";
+  Check(::mkfifo(fifo.c_str(), 0600) == 0, "the pause fifo exists");
+  clear_log();
+  ::setenv("VCACHE_TEST_PAUSE_BOUND_MS", "500", 1);
+  ::setenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT", fifo.c_str(), 1);
+  const auto started = std::chrono::steady_clock::now();
+  core::PauseBeforeManifestPut();
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+  ::unsetenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT");
+  ::unsetenv("VCACHE_TEST_PAUSE_BOUND_MS");
+  Check(log_text().find("manifest: test pause timed out") != std::string::npos,
+        "a fifo with no writer times out");
+  Check(elapsed_ms >= 400 && elapsed_ms < 2000,
+        "a fifo with no writer returns at the test bound (took " + std::to_string(elapsed_ms) +
+            "ms)");
 }
 
 void TestReadFile() {
@@ -3343,7 +3475,8 @@ void TestRustManifest() {
   for (int i = 0; i < 10; ++i) {
     rust::RustManifestState fresh;
     fresh.key = StateKey(i);
-    states = rust::RecordRustState(std::move(fresh), std::move(states));
+    states = core::PrependManifestState(std::move(fresh), std::move(states),
+                                       &rust::RustManifestState::key);
   }
   auto order = [&]() {
     std::string out;
@@ -3351,11 +3484,12 @@ void TestRustManifest() {
     return out;
   };
   CheckEq(order(), "98765432", "eight states, newest first, oldest dropped");
-  states = rust::RecordRustState(states[4], states);
+  states = core::PrependManifestState(states[4], states, &rust::RustManifestState::key);
   CheckEq(order(), "59876432", "re-recording a state moves it to the front once");
   rust::RustManifestState newest;
   newest.key = StateKey(10);
-  states = rust::RecordRustState(std::move(newest), std::move(states));
+  states = core::PrependManifestState(std::move(newest), std::move(states),
+                                     &rust::RustManifestState::key);
   CheckEq(order(), "a5987643", "the least recently used state is the one evicted");
 }
 
@@ -4389,6 +4523,262 @@ void TestRustOutputNames() {
         "capturing a name that escapes the output directory fails");
 }
 
+void TestUploadGeneration() {
+  Section("daemon::upload generation");
+
+  auto scratch = util::MakeTempDir("vcache-upload-");
+  Check(scratch.has_value(), "upload scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string journal = *scratch + "/pending";
+  util::MakeDirs(journal);
+  const auto now = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point soonest;
+
+  daemon::UploadQueue queued(journal);
+  const auto first_blob = std::make_shared<const std::string>("v1");
+  const auto second_blob = std::make_shared<const std::string>("v2-value");
+  Check(queued.Enqueue("k", first_blob, true), "the first store is queued");
+  Check(queued.Enqueue("k", second_blob, true), "a rewrite while queued is accepted");
+  const auto yielded = queued.TakeReady(now, &soonest);
+  Check(yielded.has_value() && yielded->blob && *yielded->blob == "v2-value" &&
+            yielded->generation == 2,
+        "dequeue yields the rewritten blob once");
+  Check(!queued.TakeReady(now, &soonest).has_value(), "a rewrite while queued is one upload");
+  Check(queued.held_bytes() == second_blob->size(),
+        "replacing a held blob adjusts the held byte count");
+
+  const std::string disk_journal = *scratch + "/disk-pending";
+  util::MakeDirs(disk_journal);
+  daemon::UploadQueue disk(disk_journal);
+  Check(disk.Enqueue("m", nullptr, true), "a disk store is queued");
+  const auto old = disk.TakeReady(now, &soonest);
+  Check(old.has_value() && old->generation == 1, "the first disk upload is generation 1");
+  Check(disk.Enqueue("m", nullptr, true), "a rewrite during upload is accepted");
+  Check(disk.Finish(*old), "finishing the old generation re-queues");
+  Check(disk.JournalExists("m"), "the journal stays while a rewrite is re-queued");
+  const auto newer = disk.TakeReady(now, &soonest);
+  Check(newer.has_value() && newer->generation == 2,
+        "the re-queued upload is the newer generation");
+  Check(!disk.Finish(*newer) && disk.empty(),
+        "finishing the current generation empties the queue");
+
+  daemon::UploadQueue once("");
+  const auto only = std::make_shared<const std::string>("only");
+  Check(once.Enqueue("once", only, false), "a single store is queued");
+  const auto one = once.TakeReady(now, &soonest);
+  Check(one.has_value() && !once.Finish(*one) && !once.TakeReady(now, &soonest).has_value(),
+        "a single store is uploaded once");
+
+  daemon::UploadQueue tiny("", 10);
+  const auto small = std::make_shared<const std::string>(std::string(6, 'a'));
+  const auto big = std::make_shared<const std::string>(std::string(20, 'b'));
+  Check(tiny.Enqueue("z", small, false), "a blob under the cap is held");
+  Check(!tiny.Enqueue("z", big, false), "a blob over the cap is refused");
+  Check(tiny.empty() && tiny.Held("z") == nullptr, "a refused re-put drops the queued blob");
+
+  daemon::UploadQueue first_refuse("", 10);
+  Check(!first_refuse.Enqueue("n", big, false) && first_refuse.generation("n") == 0,
+        "a refused first store does not bump the generation");
+
+  daemon::UploadQueue flying_refuse("", 10);
+  Check(flying_refuse.Enqueue("f", small, false), "an in-flight cap store is queued");
+  const auto inflight = flying_refuse.TakeReady(now, &soonest);
+  Check(inflight.has_value(), "the in-flight cap store is taken");
+  Check(!flying_refuse.Enqueue("f", big, false), "a re-put during upload over the cap is refused");
+  Check(flying_refuse.Held("f") == nullptr, "a refused re-put drops the held blob");
+  if (inflight) {
+    Check(!flying_refuse.Finish(*inflight) &&
+              !flying_refuse.TakeReady(now, &soonest).has_value(),
+          "a refused re-put during upload does not re-queue the old blob");
+  }
+
+  // A later disk store must not upload the blob that was held when the disk
+  // write failed. A null blob is what tells the worker to read the disk value.
+  daemon::UploadQueue replaced(journal);
+  const auto held_v1 = std::make_shared<const std::string>("v1");
+  Check(replaced.Enqueue("h", held_v1, true), "the held value is queued");
+  Check(replaced.Enqueue("h", nullptr, true), "a disk store of the same key is accepted");
+  const auto from_disk = replaced.TakeReady(now, &soonest);
+  const std::string replaced_blob =
+      from_disk && from_disk->blob ? *from_disk->blob : std::string();
+  CheckEq(replaced_blob, "", "a disk store replaces a held blob");
+
+  daemon::UploadQueue reread(journal);
+  Check(reread.Enqueue("r", held_v1, false), "the in-flight held value is queued");
+  const auto old_held = reread.TakeReady(now, &soonest);
+  Check(old_held.has_value(), "the held value is in flight");
+  Check(reread.Enqueue("r", nullptr, false), "a disk store during that upload is accepted");
+  Check(reread.Held("r") == nullptr, "the disk store drops the held value");
+  Check(reread.held_bytes() == held_v1->size(),
+        "an in-flight blob stays in the held byte count");
+  if (old_held) {
+    Check(reread.Finish(*old_held), "finishing the held upload re-queues the disk store");
+    const auto disk_again = reread.TakeReady(now, &soonest);
+    const std::string reread_blob =
+        disk_again && disk_again->blob ? *disk_again->blob : std::string();
+    CheckEq(reread_blob, "", "a disk store during upload is re-read from disk");
+  }
+
+  daemon::UploadQueue pins("");
+  const auto pin_old = std::make_shared<const std::string>("aaaa");
+  const auto pin_new = std::make_shared<const std::string>("bbbbbbbb");
+  Check(pins.Enqueue("p", pin_old, false), "the pinned store is queued");
+  const auto pin_flight = pins.TakeReady(now, &soonest);
+  Check(pin_flight.has_value() && pins.Enqueue("p", pin_new, false),
+        "a rewrite while uploading is held too");
+  Check(pins.held_bytes() == pin_old->size() + pin_new->size(),
+        "an in-flight blob stays in the held byte count beside the new one");
+
+  daemon::UploadQueue budget("");
+  const auto budget_old = std::make_shared<const std::string>("old");
+  const auto budget_new = std::make_shared<const std::string>("new");
+  Check(budget.Enqueue("t", budget_old, false), "a budget store is queued");
+  auto budget_item = budget.TakeReady(now, &soonest);
+  Check(budget_item.has_value(), "the budget upload is in flight");
+  if (budget_item) {
+    budget_item->attempts = 2;
+    Check(budget.Enqueue("t", budget_new, false), "a rewrite during the budget upload is accepted");
+    budget.Requeue(*budget_item);
+    int tries = 0;
+    auto cur = budget.TakeReady(now, &soonest);
+    while (cur) {
+      ++tries;
+      if (++cur->attempts >= 3) break;
+      budget.Requeue(*cur);
+      cur = budget.TakeReady(now, &soonest);
+    }
+    CheckEq(std::to_string(tries), "3", "a rewritten upload gets three attempts");
+  }
+
+  daemon::UploadQueue accounted("");
+  uint64_t queued_n = 0;
+  bool merged = false;
+  Check(accounted.Enqueue("k", first_blob, false, &merged), "the counted store is queued");
+  if (!merged) ++queued_n;
+  merged = false;
+  Check(accounted.Enqueue("k", second_blob, false, &merged), "the counted rewrite is accepted");
+  if (!merged) ++queued_n;
+  const uint64_t pending = accounted.size();
+  CheckEq(std::to_string(queued_n), std::to_string(pending),
+          "a merged re-put is not counted as queued");
+
+  auto accounted_for = [](uint64_t done, const daemon::UploadQueue& q) {
+    const uint64_t pending = q.size() + q.in_flight_count() - q.superseded_count();
+    return std::to_string(done + pending + q.superseded_count());
+  };
+
+  daemon::UploadQueue waiting_id("");
+  bool merged_id = false;
+  bool flying_id = false;
+  uint64_t queued_id = 0;
+  uint64_t done_id = 0;
+  Check(waiting_id.Enqueue("a", first_blob, false, &merged_id, &flying_id),
+        "the identity's first store is queued");
+  if (!merged_id && !flying_id) ++queued_id;
+  merged_id = false;
+  flying_id = false;
+  Check(waiting_id.Enqueue("a", second_blob, false, &merged_id, &flying_id),
+        "the identity's waiting rewrite is accepted");
+  if (!merged_id && !flying_id) ++queued_id;
+  CheckEq(std::to_string(queued_id), accounted_for(done_id, waiting_id),
+          "a merged waiting re-put keeps queued equal to done, pending and superseded");
+
+  auto waiting_item = waiting_id.TakeReady(now, &soonest);
+  Check(waiting_item.has_value(), "the identity store can be taken");
+  merged_id = false;
+  flying_id = false;
+  bool counted_as_merged = false;
+  if (waiting_item) {
+    Check(waiting_id.Enqueue("a", first_blob, false, &merged_id, &flying_id),
+          "an in-flight rewrite is accepted");
+    counted_as_merged = merged_id;
+    Check(!merged_id && flying_id, "an in-flight rewrite is not a merged waiting store");
+    if (!merged_id && !flying_id) ++queued_id;
+    bool count_requeue = false;
+    const bool requeued = waiting_id.Finish(*waiting_item, &count_requeue);
+    if (requeued && count_requeue && !counted_as_merged) ++queued_id;
+    ++done_id;
+    CheckEq(std::to_string(queued_id), accounted_for(done_id, waiting_id),
+            "an in-flight rewrite keeps queued equal to done, pending and superseded");
+  }
+
+  daemon::UploadQueue refused_id("", 10);
+  uint64_t refused_queued = 0;
+  bool refused_merged = false;
+  bool refused_flying = false;
+  Check(refused_id.Enqueue("z", small, false, &refused_merged, &refused_flying),
+        "the refused identity store is queued");
+  if (!refused_merged && !refused_flying) ++refused_queued;
+  auto refused_item = refused_id.TakeReady(now, &soonest);
+  Check(refused_item.has_value(), "the refused identity store is in flight");
+  refused_flying = false;
+  Check(!refused_id.Enqueue("z", big, false, nullptr, &refused_flying) && refused_flying,
+        "the refused identity re-put is in flight");
+  CheckEq(std::to_string(refused_queued), accounted_for(0, refused_id),
+          "a refused in-flight re-put keeps queued equal to done, pending and superseded");
+
+  daemon::UploadQueue after(journal, 10);
+  const auto v1 = std::make_shared<const std::string>("v1");
+  const auto v4 = std::make_shared<const std::string>("v4");
+  Check(after.Enqueue("k", v1, true), "v1 is queued");
+  auto v1_item = after.TakeReady(now, &soonest);
+  Check(v1_item.has_value() && after.in_flight("k"), "v1 is in flight");
+  Check(!after.Enqueue("k", big, true), "v3 over the cap is refused");
+  Check(after.Enqueue("k", v4, true), "v4 under the cap is accepted");
+  if (v1_item) {
+    Check(after.Finish(*v1_item), "finishing v1 re-queues the store accepted after the refusal");
+    auto v4_item = after.TakeReady(now, &soonest);
+    const std::string got = v4_item && v4_item->blob ? *v4_item->blob : std::string();
+    CheckEq(got, "v4", "the re-queued store is v4");
+    Check(after.JournalExists("k"), "the journal stays for the store accepted after the refusal");
+  }
+
+  daemon::UploadQueue wake(journal, 10);
+  Check(wake.Enqueue("w", v1, false), "the waited store is queued");
+  auto wake_item = wake.TakeReady(now, &soonest);
+  Check(wake_item.has_value(), "the waited store is in flight");
+  uint64_t refusal_id = 0;
+  Check(!wake.Enqueue("w", big, false, nullptr, nullptr, &refusal_id),
+        "the waited re-put is refused");
+  const auto v3 = std::make_shared<const std::string>("v3");
+  Check(wake.Enqueue("w", v3, false), "a newer store overtakes the refusal");
+  Check(wake.RefusalStillInFlight(refusal_id), "the refusal still waits for v1");
+  Check(wake.RefusalOvertaken(refusal_id), "the refused value is overtaken");
+  if (wake_item) {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool parked = false;
+    bool released = false;
+    std::thread waiter([&] {
+      std::unique_lock<std::mutex> lock(mu);
+      parked = true;
+      cv.notify_all();
+      const bool woke = cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !wake.RefusalStillInFlight(refusal_id);
+      });
+      released = woke && !wake.RefusalStillInFlight(refusal_id);
+    });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return parked; });
+    }
+    Check(!released, "the waiter stays parked while the refused upload is in flight");
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      wake.Finish(*wake_item);
+      wake.TakeReady(now, &soonest);
+    }
+    cv.notify_all();
+    waiter.join();
+    Check(released, "the waiter is released by finish of v1 even when v3 is in flight");
+    Check(wake.in_flight("w"), "v3 stays in flight after v1 finishes");
+  }
+}
+
 void TestHeldHitLayer() {
   Section("daemon::held hit");
   CheckEq(std::string(daemon::HeldHitLayerName()), "memory",
@@ -4813,6 +5203,8 @@ int main(int argc, char** argv) {
   TestStats();
   // Writes files too.
   TestRustManifest();
+  TestManifestMerge();
+  TestManifestMediaCount();
   TestRunRusage();
   // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
   // and a forked child is charged that high-water mark until exec replaces it.
@@ -4821,11 +5213,13 @@ int main(int argc, char** argv) {
   TestMemoryEstimates();
   TestRustcFingerprint();
   TestRustOutputNames();
+  TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();
   TestElasticJobserver();
   TestAdmissionProcessTree();
   TestAdmissionReview();
+  TestManifestPause();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

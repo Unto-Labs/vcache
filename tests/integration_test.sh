@@ -45,6 +45,31 @@ sed_inplace() {
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# Releases a manifest-pause fifo. The write happens only when the compile is
+# actually waiting; otherwise that process is stopped. The write is bounded
+# because opening a fifo with no reader blocks.
+release_pause_fifo() {  # $1 fifo, $2 pid, $3 waiting (1 or 0)
+  local fifo=$1 pid=$2 waiting=$3
+  if [[ "$waiting" != 1 ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return
+  fi
+  printf x > "$fifo" &
+  local wpid=$!
+  local n=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    if (( n >= 50 )); then
+      kill "$wpid" 2>/dev/null || true
+      wait "$wpid" 2>/dev/null || true
+      return
+    fi
+    sleep 0.05
+    n=$((n + 1))
+  done
+  wait "$wpid" 2>/dev/null || true
+}
+
 export VCACHE_DIR="$WORK/cache"
 
 # Dumps the paths an object records in its debug info. readelf is GNU's; macOS
@@ -684,6 +709,85 @@ EOF
 fi
 
 # --------------------------------------------------------------------------
+section "9f. Concurrent manifest stores keep both states"
+
+# Two worktrees load the same manifest, each adds its own state, and the
+# second store must not drop the first. The fifo holds one of them still
+# until the other has stored.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  man_tree() {  # $1 dir, $2 helper return value
+    mkdir -p "$1/src"
+    cat > "$1/src/lib.rs" << 'EOF'
+mod helper;
+pub fn v() -> u32 { helper::v() }
+EOF
+    printf 'pub fn v() -> u32 { %s }\n' "$2" > "$1/src/helper.rs"
+  }
+  man_tree "$WORK/man-a" 1
+  man_tree "$WORK/man-b" 2
+  man_tree "$WORK/man-c" 3
+  man_compile() {  # $1 dir, $2 log (may be empty)
+    # An expanded VAR=value is a command word, not an assignment, so the log
+    # path has to be a literal prefix when it is set.
+    if [[ -n "$2" ]]; then
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" VCACHE_LOG="$2" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    else
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    fi
+  }
+  man_compile "$WORK/man-a" ""
+  check "the first manifest version misses" "$(misses)" "1"
+  fifo="$WORK/manifest-pause.fifo"
+  mkfifo "$fifo"
+  blog="$WORK/man-b-pause.log"
+  rm -f "$blog"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog" \
+      VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null &
+  bpid=$!
+  waiting=0
+  for _ in $(seq 1 200); do
+    if grep -q 'manifest: waiting before put' "$blog" 2>/dev/null; then waiting=1; break; fi
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the second manifest store waits" "$waiting" "1"
+  if [[ "$waiting" == 1 ]]; then
+    man_compile "$WORK/man-c" ""
+  fi
+  release_pause_fifo "$fifo" "$bpid" "$waiting"
+  for _ in $(seq 1 200); do
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  wait "$bpid" || true
+  blog2="$WORK/man-b-hit.log"
+  rm -f "$blog2"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog2" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null
+  check "version 2 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog2" || true)" "1"
+  check "version 2 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog2" || true)" "0"
+  blog3="$WORK/man-c-hit.log"
+  rm -f "$blog3"
+  ( cd "$WORK/man-c" && VCACHE_ROOTS="$WORK/man-c=crate" VCACHE_LOG="$blog3" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-c/out" src/lib.rs ) >/dev/null
+  check "version 3 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog3" || true)" "1"
+  check "version 3 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog3" || true)" "0"
+fi
+
+# --------------------------------------------------------------------------
 section "9b. Rust crates that read the environment"
 
 # rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
@@ -888,6 +992,7 @@ EOF
 
   rust_man rust-man-a
   check "first manifest-mode compile is a miss" "$(misses)" "1"
+  check "a first compile logs none stored once" "$(logged 'rust manifest: none stored')" "1"
   check "a miss asks rustc for dep-info" "$(dep_info_runs)" "1"
   check "the miss records one state" "$(logged 'rust manifest: stored 1 states')" "1"
   cp "$WORK/rust-man-a/out/libman.rlib" "$WORK/rust-man-a.rlib"
@@ -1691,6 +1796,169 @@ except Exception: sys.exit(1)
 fi
 
 # --------------------------------------------------------------------------
+section "11b2. A second store during an upload is the one S3 keeps"
+
+# Two stores of one key, the second while the first upload is still in the
+# mock's latency. The bucket must end on the second value.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "rewrite upload test: python3 not installed"
+else
+  reset_cache
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/rewrite-s3"
+  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  rewrite_key=22222222222222222222222222222222
+  printf 'manifest-v1' | "$VCACHE" --test-put "$rewrite_key"
+  printf 'manifest-v2' | "$VCACHE" --test-put "$rewrite_key"
+  check "a merged re-put is not a second queued upload" \
+    "$(daemon_stat 'uploads queued')" "1"
+  "$VCACHE" --stop-daemon >/dev/null
+  rewrite_obj="$S3DIR/${rewrite_key:0:2}__${rewrite_key:2}"
+  check "the bucket object is the second store" "$(cat "$rewrite_obj" 2>/dev/null)" "manifest-v2"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+
+  # One upload thread, so a slow put stays in flight or queued on purpose.
+  # A small body sleeps longer and is written when that sleep ends, so the
+  # last completion is the value left in the bucket.
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  export VCACHE_DISK=0
+  export VCACHE_TEST_MAX_HELD_BYTES=10
+  export VCACHE_DAEMON_UPLOAD_THREADS=1
+  export MOCK_S3_LATENCY_MS=200
+  export MOCK_S3_APPLY_AFTER_LATENCY=1
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  export MOCK_S3_SLOW_UNDER_EXTRA_MS=1500
+
+  start_order_s3() {  # $1 storage dir
+    S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+    S3DIR="$1"
+    python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+    S3PID=$!
+    for _ in $(seq 1 50); do
+      python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+      sleep 0.05
+    done
+    export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+    reset_cache
+    "$VCACHE" --start-daemon >/dev/null
+  }
+  wait_started() {  # $1 path
+    local saw=0
+    for _ in $(seq 1 100); do
+      if [[ -f "$1" ]]; then saw=1; break; fi
+      sleep 0.05
+    done
+    echo "$saw"
+  }
+
+  # The worker is busy with the blocker, so the first victim value is queued.
+  start_order_s3 "$WORK/refuse-queued-s3"
+  blocker_key=11111111111111111111111111111111
+  queued_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  printf 'bbbb' | "$VCACHE" --test-put "$blocker_key"
+  blocker_obj="$S3DIR/${blocker_key:0:2}__${blocker_key:2}.started"
+  check "the blocker upload is in flight" "$(wait_started "$blocker_obj")" "1"
+  printf 'v1v1' | "$VCACHE" --test-put "$queued_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$queued_key"
+  "$VCACHE" --stop-daemon >/dev/null
+  queued_obj="$S3DIR/${queued_key:0:2}__${queued_key:2}"
+  check "a refused re-put of a queued value leaves the newer value in s3" \
+    "$(cat "$queued_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+
+  # Nothing else is queued, so the victim's own upload is the one in flight.
+  start_order_s3 "$WORK/refuse-flight-s3"
+  flight_key=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  printf 'v1v1' | "$VCACHE" --test-put "$flight_key"
+  flight_obj="$S3DIR/${flight_key:0:2}__${flight_key:2}"
+  check "the victim upload is in flight" "$(wait_started "$flight_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$flight_key" &
+  flight_put=$!
+  flight_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then flight_marked=1; break; fi
+    if ! kill -0 "$flight_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "a refused in-flight re-put is marked superseded" "$flight_marked" "1"
+  wait "$flight_put"
+  upload_identity=$("$VCACHE" --daemon-status 2>/dev/null | awk '
+    $1=="uploads" && $2=="queued" {q=$NF}
+    $1=="completed" {c=$NF}
+    $1=="bytes" {seen_bytes=1}
+    $1=="failed" && seen_bytes {f=$NF}
+    $1=="skipped" {s=$NF}
+    $1=="pending" {p=$NF}
+    $1=="uploads" && $2=="superseded" {u=$NF}
+    END {
+      sum = c+0 + f+0 + s+0 + p+0 + u+0
+      if (q+0 == sum) print "yes"
+      else print q "!=" sum
+    }')
+  check "a drained in-flight refusal keeps the upload identity" "$upload_identity" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a refused re-put of an in-flight value leaves the newer value in s3" \
+    "$(cat "$flight_obj" 2>/dev/null)" "V2VALUE-0123456789"
+
+  # V2 is refused while V1 is in flight, then V3 is accepted. V2 must not
+  # upload after V3.
+  start_order_s3 "$WORK/refuse-overtake-s3"
+  overtake_key=cccccccccccccccccccccccccccccccc
+  printf 'v1v1' | "$VCACHE" --test-put "$overtake_key"
+  overtake_obj="$S3DIR/${overtake_key:0:2}__${overtake_key:2}"
+  check "the overtaken upload is in flight" "$(wait_started "$overtake_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$overtake_key" &
+  overtake_put=$!
+  overtake_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then overtake_marked=1; break; fi
+    if ! kill -0 "$overtake_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the overtaken refusal is waiting" "$overtake_marked" "1"
+  printf 'v3v3' | "$VCACHE" --test-put "$overtake_key"
+  wait "$overtake_put"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a newer accepted store is what s3 keeps" \
+    "$(cat "$overtake_obj" 2>/dev/null)" "v3v3"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES \
+        VCACHE_DAEMON_UPLOAD_THREADS MOCK_S3_LATENCY_MS \
+        MOCK_S3_APPLY_AFTER_LATENCY MOCK_S3_SLOW_UNDER_BYTES \
+        MOCK_S3_SLOW_UNDER_EXTRA_MS
+fi
+
+# --------------------------------------------------------------------------
 section "11. Daemon uploads survive eviction"
 
 # A later compile must not evict an entry whose upload is still journalled.
@@ -2171,6 +2439,68 @@ for mode in "-MM" "-M -MP"; do
   check_depsrc_answer "$mode: and the restored paths name this checkout" \
     "$WORK/depsrc/d" "$WORK/pc-d.d" "${mflags[@]}" "$WORK/depsrc/d/main.c"
 done
+
+# --------------------------------------------------------------------------
+section "14b. Concurrent dep-scan stores keep both states"
+
+# Same source, different headers, one canonical root. The paused store must
+# keep the state the other checkout wrote while it waited.
+reset_cache
+ds_tree() {  # $1 dir, $2 header value
+  mkdir -p "$1"
+  printf '#include "x.h"\nint v = V;\n' > "$1/main.c"
+  printf '#define V %s\n' "$2" > "$1/x.h"
+}
+ds_tree "$WORK/ds-a" 1
+ds_tree "$WORK/ds-b" 2
+ds_tree "$WORK/ds-c" 3
+ds_scan() {  # $1 dir, $2 log (may be empty)
+  if [[ -n "${2:-}" ]]; then
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  else
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  fi
+}
+ds_scan "$WORK/ds-a" ""
+check "the first dep-scan version misses" "$(misses)" "1"
+fifo="$WORK/depscan-pause.fifo"
+mkfifo "$fifo"
+dblog="$WORK/ds-b-pause.log"
+rm -f "$dblog"
+( cd "$WORK/ds-b" && VCACHE_ROOTS="$WORK/ds-b=proj" VCACHE_LOG="$dblog" \
+    VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+    "$VCACHE" gcc -M -MP main.c -o "$WORK/ds-b/out.d" ) >/dev/null &
+dbpid=$!
+dwaiting=0
+for _ in $(seq 1 200); do
+  if grep -q 'manifest: waiting before put' "$dblog" 2>/dev/null; then dwaiting=1; break; fi
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+check "the second dep-scan store waits" "$dwaiting" "1"
+if [[ "$dwaiting" == 1 ]]; then
+  ds_scan "$WORK/ds-c" ""
+fi
+release_pause_fifo "$fifo" "$dbpid" "$dwaiting"
+for _ in $(seq 1 200); do
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+wait "$dbpid" || true
+dblog2="$WORK/ds-b-hit.log"
+rm -f "$dblog2"
+ds_scan "$WORK/ds-b" "$dblog2"
+check "header 2 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog2" || true)" "1"
+check "header 2 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog2" || true)" "0"
+dblog3="$WORK/ds-c-hit.log"
+rm -f "$dblog3"
+ds_scan "$WORK/ds-c" "$dblog3"
+check "header 3 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog3" || true)" "1"
+check "header 3 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog3" || true)" "0"
 
 # --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"

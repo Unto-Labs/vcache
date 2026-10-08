@@ -245,13 +245,18 @@ std::string ComputeManifestKey(const args::RustcArgs& parsed, const RootMap& roo
 std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
                                             const std::string& manifest_key,
                                             const std::string& cache_dir,
-                                            bool* media_failed) {
+                                            bool* media_failed, bool log_if_absent,
+                                            bool* get_failed) {
   std::vector<RustManifestState> states;
   storage::GetResult got = cache->Get(manifest_key);
-  *media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
+  const bool failed = core::ReportCacheMediaErrors(got.errors, cache_dir);
+  *media_failed |= failed;
+  if (get_failed != nullptr) *get_failed = failed;
   storage::Blob blob;
   if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
-    VCACHE_LOG("rust manifest: none stored");
+    // The store re-reads just before its put. Logging there as well would
+    // say "none stored" twice on the first compile of a key.
+    if (log_if_absent) VCACHE_LOG("rust manifest: none stored");
     return states;
   }
   if (!ParseRustManifest(blob.dep_manifest, &states)) {
@@ -262,14 +267,20 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
 }
 
 void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
-                   const std::vector<RustManifestState>& states,
+                   RustManifestState fresh, const std::vector<RustManifestState>& loaded,
                    const std::string& cache_dir, bool* media_failed) {
+  core::PauseBeforeManifestPut();
+  bool reread_failed = false;
+  const std::vector<RustManifestState> reread =
+      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
+  const std::vector<RustManifestState> states = core::MergeManifestStates(
+      std::move(fresh), reread, loaded, &RustManifestState::key);
   storage::Blob blob;
   blob.dep_manifest = RenderRustManifest(states);
   blob.has_dep_manifest = true;
   blob.meta = "rust dep-info manifest\nstates: " + std::to_string(states.size()) + "\n";
   const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
-  *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
+  *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "rust manifest: stored " + std::to_string(states.size()) + " states"
                         : std::string("rust manifest: could not store"));
 }
@@ -511,7 +522,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, config,
                                         *source_digest, *externs);
       VCACHE_LOG("rust manifest key " + manifest_key + " for " + parsed.source);
-      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed);
+      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr);
     }
   }
 
@@ -535,8 +546,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
       core::RecordCounter(cache_dir, HitCounter(got));
       if (i > 0 && !config.read_only) {
-        StoreManifest(cache, manifest_key, RecordRustState(states[i], states),
-                      cache_dir, &media_failed);
+        StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }
       return 0;
     }
@@ -570,8 +580,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // Records what this dep-info run found, once its entry is known to exist.
   const auto record_state = [&]() {
     if (manifest_key.empty() || config.read_only) return;
-    StoreManifest(cache, manifest_key, RecordRustState(fresh, states), cache_dir,
-                  &media_failed);
+    StoreManifest(cache, manifest_key, fresh, states, cache_dir, &media_failed);
   };
 
   const auto try_entry_hit = [&]() {

@@ -239,6 +239,30 @@ int JobserverEnv(const vcache::core::Config& config) {
   return 0;
 }
 
+// Reads one blob from stdin and stores it through the running daemon. The
+// integration tests use it to put two values of one key faster than a compile.
+int TestDaemonPut(const vcache::core::Config& config, const std::string& key) {
+  std::string value;
+  char buf[8192];
+  while (true) {
+    const size_t n = std::fread(buf, 1, sizeof(buf), stdin);
+    if (n > 0) value.append(buf, n);
+    if (n < sizeof(buf)) break;
+  }
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  if (client == nullptr) {
+    ::fprintf(stderr, "vcache: %s\n", why.c_str());
+    return 1;
+  }
+  vcache::storage::PutResult result;
+  if (!client->Put(key, value, &result) || !result.stored) {
+    ::fprintf(stderr, "vcache: test put was not stored\n");
+    return 1;
+  }
+  return 0;
+}
+
 int DaemonStatus(const vcache::core::Config& config) {
   std::string why;
   auto client = vcache::daemon::DaemonClient::Connect(config, &why);
@@ -429,6 +453,13 @@ int main(int argc, char** argv) {
     if (first == "--start-daemon") return StartDaemon(config);
     if (first == "--stop-daemon") return StopDaemon(config);
     if (first == "--daemon-status") return DaemonStatus(config);
+    if (first == "--test-put") {
+      if (argc < 3) {
+        ::fprintf(stderr, "vcache: --test-put needs a key\n");
+        return 1;
+      }
+      return TestDaemonPut(config, argv[2]);
+    }
     if (first == "--daemon-foreground") return RunDaemonForeground(config);
     if (first == "--jobserver-env") return JobserverEnv(config);
     if (first == "--show-config") {

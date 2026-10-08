@@ -343,7 +343,10 @@ key table, without holding a compile lease or affecting compile deduplication
 counters. Fetch waits are bounded by the same 300-second reply timeout and log
 their elapsed duration.
 
-Measured cross-worktree deduplication: pending the scheduler benchmark.
+Measured cross-worktree deduplication: see [Results](#results) under
+Measuring. Each key is compiled once, but a waiter with no usable cost record
+gives up after 30 seconds and compiles again, which there cost more than the
+deduplication saved.
 
 ## Memory admission
 
@@ -465,6 +468,124 @@ daemon's `VCACHE_LOG` and `log`, the final `--daemon-status` and `--show-stats`,
 and `samples.csv`. `samples.csv` also records compile sessions, leases, reserved
 memory and free and withdrawn tokens each second. The store is emptied with
 `--clear` after the run unless `--keep-store` is given.
+
+### Results
+
+One `--matrix` run per tree, on a 128-core, 125 GB Linux host, 2026-10-08,
+with vcache 1.3.0 at efd4e11:
+
+- **Rust.** A 357-crate workspace, `cargo build --workspace` with an optimised,
+  incremental profile, cargo and rustc 1.97.1. Without `-j`, cargo runs 128 jobs.
+- **C++.** A ~400-TU project (429 compiles, 440 links, including its test
+  binaries), clang 22.1.8, ninja 1.13.2. It is configured with the compiler set
+  to the `--masquerade` link and ccache off. Each build used
+  `-j min(nproc - 4, (MemAvailable - 12 GiB) / 2 GiB)` as the project's own
+  build script computes it, which is 45 at the start of every run. The jobserver
+  sets drop `-j` and use the pool.
+
+The host was otherwise idle for the Rust matrix and the C++ 2-worktree rows.
+Other work (two test VMs, about 20 GB) started during the C++ 3-worktree
+`admission` cold run and stayed for the rest. The jobserver sets use
+`--jobs 128`. Each top-level cargo or ninja keeps its implicit slot, so the pool
+caps concurrent jobs at 127 shared + 1 per build: 129 with 2 worktrees and 130
+with 3. `jobserver_elastic` uses the default `jobserver_min_jobs` of 2.
+
+The wall times are those of the slowest build, in seconds. Min MemAvailable is
+the lowest 1 Hz sample over that set's four runs, in GiB. The dedup, reserve
+wait and withdrawn columns give the counts for the 2 / 3 worktree cold runs.
+Warm runs deduplicated nothing and waited for nothing.
+
+**Rust workspace**
+
+| Set | 2 wt cold | 2 wt warm | 3 wt cold | 3 wt warm | Min MemAvailable | Deduplicated | Reserve waits | Tokens withdrawn | OOM kills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `off` | 102.8 | 4.6 | 124.0 | 6.3 | 78 | - | - | - | 0 |
+| `single_flight` | 129.9 | 4.8 | 134.3 | 7.7 | 85 | 322 / 601 | - | - | 0 |
+| `admission` | 130.5 | 4.7 | 137.0 | 8.4 | 85 | 306 / 621 | 0 / 0 | - | 0 |
+| `jobserver_fixed` | 130.1 | 5.1 | 138.7 | 6.8 | 86 | 262 / 381 | 86 / 41 | 0 / 0 | 0 |
+| `jobserver_elastic` | 135.9 | 5.9 | 134.5 | 7.6 | 83 | 237 / 411 | 0 / 37 | 0 / 0 | 0 |
+
+**C++ project**
+
+| Set | 2 wt cold | 2 wt warm | 3 wt cold | 3 wt warm | Min MemAvailable | Deduplicated | Reserve waits | Tokens withdrawn | OOM kills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `off` | 61.0 | 19.4 | 72.0 | 26.1 | 80 | - | - | - | 0 |
+| `single_flight` | 67.1 | 19.7 | 72.2 | 37.6 | 90 | 401 / 795 | - | - | 0 |
+| `admission` | 40.0 | 18.2 | 70.9 | 36.0 | 84 | 401 / 794 | 4 / 41 | - | 0 |
+| `jobserver_fixed` | 38.2 | 18.8 | 74.3 | 26.1 | 82 | 397 / 733 | 232 / 338 | 0 / 0 | 0 |
+| `jobserver_elastic` | 38.1 | 18.5 | 73.5 | 29.3 | 81 | 400 / 792 | 230 / 319 | 42 / 126 | 0 |
+
+Neither the kernel nor systemd-oomd killed anything, and MemAvailable never
+fell below 78 GiB in the matrix. The largest Rust crate peaked at 8.5 GB RSS,
+and the largest C++ compile at 0.78 GB. These trees on this host never come near
+the memory pressure that admission and the elastic pool are for. In the C++
+warm rows the tree that warmed the store finishes about 12 s before the others:
+17 test TUs pass the worktree's absolute path in a `-D` define, so they miss in
+every other tree.
+
+More rows ran under the later load. Compare them
+only with each other and with the `off` baseline taken under the same load.
+Each cold run there starts from a store that holds only the cost records of an
+earlier build. That is the state of a long-lived store, because `--clear` keeps
+`costs/`.
+
+| 3 worktrees, cold, store with cost records | `off` | `single_flight` | `admission` | `jobserver_fixed` | `jobserver_elastic` |
+| --- | --- | --- | --- | --- | --- |
+| Rust | 138.5 | 159.0 | 153.4 | 153.6 | 157.3 |
+| C++ | 95.0 | 50.7 | 50.2 | 50.4 | 50.9 |
+
+Two repeats of the C++ 3-worktree warm row gave `off` 27.6 and 25.4,
+`single_flight` 29.9 and 24.7, and `admission` 24.2 and 24.2. The 37.6 and
+36.0 in the matrix are noise from that load, not a cost of the daemon.
+
+Reading each feature:
+
+- **Single-flight** did what it is for: with the daemon each key was compiled
+  once. Cold misses fell from 629 to 363 (Rust, 2 worktrees), 889 to 369
+  (Rust, 3), 836 to 436 (C++, 2) and 1230 to 455 (C++, 3). The wall time did
+  not follow, because of the 30-second lease bound for a key with no usable
+  cost record. Each waiting tree waited 30 s on the longest compile, then
+  compiled it itself. That compile was an 83 s crate in the Rust tree and a
+  29 s test TU in the C++ tree, so the waiter's critical path grew by the full
+  30 s. Every daemon cold run hit this once per waiting tree, except the C++
+  2-worktree `admission` and jobserver runs. Those runs show what
+  deduplication gives when the bound does not fire: 61.0 s down to 38-40 s,
+  35% faster. With cost records in the store the C++ bound becomes twice the
+  recorded wall time, and it never fired: three worktrees took 50 s against
+  95 s for `off` under the same load. The Rust tree still hit it, because the
+  Rust cost key leaves out `--crate-name`. Each registry crate's cwd becomes a
+  root, so every such crate's source is `/vcache/cwd/src/lib.rs`. 369 compiles
+  recorded under only 65 cost keys, one key across at least 8 crates in one
+  tree. With 8 observations kept per key, small crates push the 83 s crate's
+  record out before its next compile. Rust warm builds were 0.1-2.1 s slower
+  with the daemon (one run each, not repeated).
+- **Admission** changed no wall time beyond noise and prevented nothing, as
+  there was no memory pressure to act on. Its waits come from the 2 GiB and
+  4 GiB default estimates: a burst of compile starts reserves far more than the
+  compilers use until the 500 ms sampling catches up. C++ links run outside the
+  cache ("multiple inputs"), so they are never admitted.
+- **Fixed jobserver pool** matched `admission` within noise: Rust 130.1 against
+  130.5 and 138.7 against 137.0; C++ 38.2 against 40.0 and 74.3 against 70.9.
+  It held three builds to 130 jobs instead of 3 × 128 (Rust) or 3 × 45 (C++),
+  which here neither cost nor saved anything.
+- **Elastic jobserver pool** withdrew tokens only in the C++ cold runs (42 and
+  126), while MemAvailable stayed above 80 GiB. It reacts to waiting
+  reservations, and the default estimates create those. No wall-time effect
+  beyond noise.
+
+Recommended defaults for a build environment script:
+
+| Feature | Default | Why |
+| --- | --- | --- |
+| `daemon.single_flight` | off until both defects below are fixed, then on | It cuts cold compile work by half (2 trees) to two thirds (3 trees). Today the 30 s no-record bound and the Rust cost-key collision make cold Rust builds 10-30 s slower. C++ with cost records gains 35-47% |
+| `daemon.admission` | off | No gain or loss measured and no memory pressure reached. Measure again with heavier configurations (`-O3 -ggdb3`, release links) |
+| `daemon.jobserver` (fixed pool) | off | No gain measured |
+| elastic pool (`jobserver_min_jobs` below `jobserver_jobs`) | off | No gain measured. It withdraws in response to a queue that the default estimates inflate, not to real memory pressure |
+
+The two defects: a lease waiter with no cost record should get a longer bound,
+or keep waiting while the holder's session is open, rather than 30 s; and the
+Rust cost key should include the crate name, so that registry crates stop
+sharing records.
 
 ## Protocol
 

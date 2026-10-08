@@ -2110,6 +2110,66 @@ size_t CountFiles(const std::string& dir) {
   return util::ListFilesRecursive(dir).size();
 }
 
+void TestDiskTrimPins() {
+  Section("storage::disk trim");
+
+  const std::string payload(4096, 'a');
+  const std::string k1 = "aa1111";
+  const std::string k2 = "bb2222";
+  const std::string k3 = "cc3333";
+
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "two entries fit under the high water");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    Check(disk.Put(k3, payload), "the store that crosses the budget succeeds");
+    Check(util::FileExists(EntryPath(tmp.path(), k1)), "a pending upload is not evicted");
+    Check(!util::FileExists(EntryPath(tmp.path(), k2)), "an unpinned older entry is evicted");
+    Check(util::FileExists(EntryPath(tmp.path(), k3)), "the new entry stays");
+  }
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "the control stores two entries");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    Check(disk.Put(k3, payload), "the control store succeeds");
+    Check(!util::FileExists(EntryPath(tmp.path(), k1)),
+          "without a pending marker the oldest entry is evicted");
+  }
+  {
+    TempCacheDir tmp;
+    for (const std::string& key : {k1, k2, k3}) {
+      util::MakeDirs(tmp.path() + "/" + key.substr(0, 2));
+      util::WriteFileAtomic(EntryPath(tmp.path(), key), payload);
+      util::MakeDirs(tmp.path() + "/daemon/pending");
+      util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + key, "");
+    }
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    const pid_t pid = ::fork();
+    Check(pid >= 0, "the all-pinned trim can be watched");
+    if (pid == 0) {
+      ::alarm(2);
+      disk.Trim();
+      _exit(0);
+    }
+    if (pid > 0) {
+      int status = 0;
+      ::waitpid(pid, &status, 0);
+      Check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "an all-pinned trim finishes");
+    }
+    Check(util::FileExists(EntryPath(tmp.path(), k1)) &&
+              util::FileExists(EntryPath(tmp.path(), k2)) &&
+              util::FileExists(EntryPath(tmp.path(), k3)),
+          "an all-pinned trim removes nothing");
+  }
+}
+
 void TestDiskStorageEviction() {
   Section("disk storage: global eviction");
 
@@ -3015,6 +3075,7 @@ int main() {
   // disk cache does on every Put -- primes the cache in the parent, the child
   // inherits it, and the strict-umask assertion fails.
   TestDiskStorageEviction();
+  TestDiskTrimPins();
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();

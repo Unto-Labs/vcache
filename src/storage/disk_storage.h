@@ -41,6 +41,9 @@ class DiskStorage : public Storage {
 
   const std::string& dir() const { return dir_; }
 
+  // True when the daemon's upload journal still names the entry at this path.
+  bool IsPendingUpload(const std::string& entry_path) const;
+
  private:
   std::string PathForKey(const std::string& key) const;
   std::string ShardDir(const std::string& key) const;

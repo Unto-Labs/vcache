@@ -1691,6 +1691,58 @@ except Exception: sys.exit(1)
 fi
 
 # --------------------------------------------------------------------------
+section "11. Daemon uploads survive eviction"
+
+# A later compile must not evict an entry whose upload is still journalled.
+# The mock answers slowly so the journal is still there when the cache trims.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "upload eviction test: python3 not installed"
+else
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/evict-s3"
+  MOCK_S3_LATENCY_MS=300 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_CACHE_SIZE=16K
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  mkdir -p "$WORK/evict-src"
+  for n in 1 2 3 4 5; do
+    printf 'int evict_%d(void){return %d;}\n' "$n" "$n" > "$WORK/evict-src/f$n.c"
+    ( cd "$WORK/evict-src" && VCACHE_ROOTS="$WORK/evict-src=proj" \
+        "$VCACHE" gcc -c "f$n.c" -o "$WORK/evict$n.o" ) >/dev/null
+  done
+  for _ in $(seq 1 80); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then break; fi
+    sleep 0.1
+  done
+  check "eviction does not skip an upload" "$(daemon_stat 'skipped')" "0"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  check "the bucket received all five compiles" \
+    "$(find "$S3DIR" -type f | wc -l | tr -d ' ')" "5"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_CACHE_SIZE VCACHE_DAEMON
+fi
+
+# --------------------------------------------------------------------------
 section "10d. Jobserver"
 
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true

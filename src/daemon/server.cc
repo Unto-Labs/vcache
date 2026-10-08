@@ -107,6 +107,17 @@ class DaemonLog {
   std::mutex mutex_;
 };
 
+// A test shrinks the held-blob cap without changing the fingerprint a client
+// and the daemon have to agree on. Unset, the queue keeps its 1 GiB cap.
+uint64_t TestMaxHeldBytes() {
+  const char* text = std::getenv("VCACHE_TEST_MAX_HELD_BYTES");
+  if (text == nullptr || *text == '\0') return UploadQueue::kDefaultMaxHeldBytes;
+  char* end = nullptr;
+  const unsigned long long n = std::strtoull(text, &end, 10);
+  if (end == text || *end != '\0' || n == 0) return UploadQueue::kDefaultMaxHeldBytes;
+  return static_cast<uint64_t>(n);
+}
+
 struct Counters {
   std::atomic<uint64_t> connections{0};
   std::atomic<uint64_t> refused{0};
@@ -132,7 +143,7 @@ class Server {
         state_dir_(StateDir(config)),
         socket_path_(SocketPath(config)),
         fingerprint_(ConfigFingerprint(config)),
-        uploads_(state_dir_ + "/pending") {}
+        uploads_(state_dir_ + "/pending", TestMaxHeldBytes()) {}
 
   int Run(int ready_fd);
 
@@ -351,8 +362,9 @@ void Server::RecoverJournal() {
 bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
                      bool journal) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!uploads_.Enqueue(key, std::move(blob), journal)) return false;
-  counters_.uploads_queued++;
+  bool merged = false;
+  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged)) return false;
+  if (!merged) counters_.uploads_queued++;
   lock.unlock();
   cv_.notify_all();
   return true;
@@ -414,7 +426,7 @@ void Server::UploadWorker() {
     --in_flight_;
     if (done) {
       if (uploads_.Finish(item)) {
-        log_.Line("daemon: re-queued " + item.key + " (rewritten during upload)");
+        log_.Line("re-queued " + item.key + " (rewritten during upload)");
       }
     } else {
       uploads_.Requeue(std::move(item));

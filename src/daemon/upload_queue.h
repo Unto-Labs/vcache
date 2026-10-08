@@ -33,9 +33,15 @@ class UploadQueue {
 
   explicit UploadQueue(std::string journal_dir, uint64_t max_held_bytes = kDefaultMaxHeldBytes);
 
-  // False only when a held blob would exceed the cap. A refusal does not
-  // change the generation. `journal` creates the pending-upload marker.
-  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal);
+  // False when a held blob would exceed the cap. A new key is left untouched.
+  // A key already queued is dropped, because the caller uploads the newer
+  // value itself. A key in flight is marked superseded and its generation
+  // moves, so finishing that upload does not send the old value again.
+  // `merged` is set when this store joins one the queue already has, so the
+  // caller does not count it as another queued upload. `journal` creates the
+  // pending-upload marker.
+  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
+               bool* merged = nullptr);
 
   // The next item whose retry time has passed, or nullopt. Sets `soonest`
   // to the earliest retry when nothing is ready yet.
@@ -51,8 +57,8 @@ class UploadQueue {
   // the retry carries the latest value.
   void Requeue(UploadItem item);
 
-  bool empty() const { return queue_.empty(); }
-  size_t size() const { return queue_.size(); }
+  bool empty() const { return waiting_.empty(); }
+  size_t size() const { return waiting_.size(); }
   uint64_t held_bytes() const { return held_bytes_; }
   uint64_t generation(const std::string& key) const;
   std::shared_ptr<const std::string> Held(const std::string& key) const;
@@ -62,12 +68,26 @@ class UploadQueue {
   void CreateJournal(const std::string& key) const;
   void RemoveJournal(const std::string& key) const;
   std::string JournalPath(const std::string& key) const;
+  void DropHeld(const std::string& key);
+  void ReleaseFlightPin(const std::string& key);
+  void ForgetQueued(const std::string& key);
+  void SupersedeInFlight(const std::string& key);
+
+  // The blob an in-flight upload already copied. It stays in the byte count
+  // after a newer store drops it from held_, until that upload finishes.
+  struct FlightPin {
+    std::shared_ptr<const std::string> blob;
+    bool counted_outside_held = false;
+  };
 
   std::string journal_dir_;
   uint64_t max_held_bytes_;
-  std::deque<UploadItem> queue_;
+  std::deque<std::string> order_;
+  std::map<std::string, UploadItem> waiting_;
   std::map<std::string, uint64_t> generation_;
   std::set<std::string> in_flight_;
+  std::set<std::string> superseded_;
+  std::map<std::string, FlightPin> flight_pin_;
   std::map<std::string, std::shared_ptr<const std::string>> held_;
   uint64_t held_bytes_ = 0;
 };

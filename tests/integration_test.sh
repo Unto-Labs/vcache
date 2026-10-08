@@ -1768,6 +1768,84 @@ except Exception: sys.exit(1)
 fi
 
 # --------------------------------------------------------------------------
+section "11b2. A second store during an upload is the one S3 keeps"
+
+# Two stores of one key, the second while the first upload is still in the
+# mock's latency. The bucket must end on the second value.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "rewrite upload test: python3 not installed"
+else
+  reset_cache
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/rewrite-s3"
+  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  rewrite_key=22222222222222222222222222222222
+  printf 'manifest-v1' | "$VCACHE" --test-put "$rewrite_key"
+  printf 'manifest-v2' | "$VCACHE" --test-put "$rewrite_key"
+  check "a merged re-put is not a second queued upload" \
+    "$(daemon_stat 'uploads queued')" "1"
+  "$VCACHE" --stop-daemon >/dev/null
+  rewrite_obj="$S3DIR/${rewrite_key:0:2}__${rewrite_key:2}"
+  check "the bucket object is the second store" "$(cat "$rewrite_obj" 2>/dev/null)" "manifest-v2"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+
+  # No disk, and a cap the second value does not fit. The synchronous upload
+  # of that value has to be the one left in the bucket.
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/refuse-s3"
+  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_DISK=0
+  export VCACHE_TEST_MAX_HELD_BYTES=10
+  "$VCACHE" --start-daemon >/dev/null
+  blocker_key=11111111111111111111111111111111
+  victim_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  printf 'bbbb' | "$VCACHE" --test-put "$blocker_key"
+  printf 'v1v1' | "$VCACHE" --test-put "$victim_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$victim_key"
+  "$VCACHE" --stop-daemon >/dev/null
+  victim_obj="$S3DIR/${victim_key:0:2}__${victim_key:2}"
+  check "a refused re-put leaves the newer value in s3" \
+    "$(cat "$victim_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES
+fi
+
+# --------------------------------------------------------------------------
 section "11. Daemon uploads survive eviction"
 
 # A later compile must not evict an entry whose upload is still journalled.

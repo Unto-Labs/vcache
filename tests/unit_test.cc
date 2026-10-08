@@ -3035,7 +3035,93 @@ void TestUploadGeneration() {
   const auto big = std::make_shared<const std::string>(std::string(20, 'b'));
   Check(tiny.Enqueue("z", small, false), "a blob under the cap is held");
   Check(!tiny.Enqueue("z", big, false), "a blob over the cap is refused");
-  Check(tiny.generation("z") == 1, "a refused enqueue does not bump the generation");
+  Check(tiny.empty() && tiny.Held("z") == nullptr, "a refused re-put drops the queued blob");
+
+  daemon::UploadQueue first_refuse("", 10);
+  Check(!first_refuse.Enqueue("n", big, false) && first_refuse.generation("n") == 0,
+        "a refused first store does not bump the generation");
+
+  daemon::UploadQueue flying_refuse("", 10);
+  Check(flying_refuse.Enqueue("f", small, false), "an in-flight cap store is queued");
+  const auto inflight = flying_refuse.TakeReady(now, &soonest);
+  Check(inflight.has_value(), "the in-flight cap store is taken");
+  Check(!flying_refuse.Enqueue("f", big, false), "a re-put during upload over the cap is refused");
+  Check(flying_refuse.Held("f") == nullptr, "a refused re-put drops the held blob");
+  if (inflight) {
+    Check(!flying_refuse.Finish(*inflight) &&
+              !flying_refuse.TakeReady(now, &soonest).has_value(),
+          "a refused re-put during upload does not re-queue the old blob");
+  }
+
+  // A later disk store must not upload the blob that was held when the disk
+  // write failed. A null blob is what tells the worker to read the disk value.
+  daemon::UploadQueue replaced(journal);
+  const auto held_v1 = std::make_shared<const std::string>("v1");
+  Check(replaced.Enqueue("h", held_v1, true), "the held value is queued");
+  Check(replaced.Enqueue("h", nullptr, true), "a disk store of the same key is accepted");
+  const auto from_disk = replaced.TakeReady(now, &soonest);
+  const std::string replaced_blob =
+      from_disk && from_disk->blob ? *from_disk->blob : std::string();
+  CheckEq(replaced_blob, "", "a disk store replaces a held blob");
+
+  daemon::UploadQueue reread(journal);
+  Check(reread.Enqueue("r", held_v1, false), "the in-flight held value is queued");
+  const auto old_held = reread.TakeReady(now, &soonest);
+  Check(old_held.has_value(), "the held value is in flight");
+  Check(reread.Enqueue("r", nullptr, false), "a disk store during that upload is accepted");
+  Check(reread.Held("r") == nullptr, "the disk store drops the held value");
+  Check(reread.held_bytes() == held_v1->size(),
+        "an in-flight blob stays in the held byte count");
+  if (old_held) {
+    Check(reread.Finish(*old_held), "finishing the held upload re-queues the disk store");
+    const auto disk_again = reread.TakeReady(now, &soonest);
+    const std::string reread_blob =
+        disk_again && disk_again->blob ? *disk_again->blob : std::string();
+    CheckEq(reread_blob, "", "a disk store during upload is re-read from disk");
+  }
+
+  daemon::UploadQueue pins("");
+  const auto pin_old = std::make_shared<const std::string>("aaaa");
+  const auto pin_new = std::make_shared<const std::string>("bbbbbbbb");
+  Check(pins.Enqueue("p", pin_old, false), "the pinned store is queued");
+  const auto pin_flight = pins.TakeReady(now, &soonest);
+  Check(pin_flight.has_value() && pins.Enqueue("p", pin_new, false),
+        "a rewrite while uploading is held too");
+  Check(pins.held_bytes() == pin_old->size() + pin_new->size(),
+        "an in-flight blob stays in the held byte count beside the new one");
+
+  daemon::UploadQueue budget("");
+  const auto budget_old = std::make_shared<const std::string>("old");
+  const auto budget_new = std::make_shared<const std::string>("new");
+  Check(budget.Enqueue("t", budget_old, false), "a budget store is queued");
+  auto budget_item = budget.TakeReady(now, &soonest);
+  Check(budget_item.has_value(), "the budget upload is in flight");
+  if (budget_item) {
+    budget_item->attempts = 2;
+    Check(budget.Enqueue("t", budget_new, false), "a rewrite during the budget upload is accepted");
+    budget.Requeue(*budget_item);
+    int tries = 0;
+    auto cur = budget.TakeReady(now, &soonest);
+    while (cur) {
+      ++tries;
+      if (++cur->attempts >= 3) break;
+      budget.Requeue(*cur);
+      cur = budget.TakeReady(now, &soonest);
+    }
+    CheckEq(std::to_string(tries), "3", "a rewritten upload gets three attempts");
+  }
+
+  daemon::UploadQueue accounted("");
+  uint64_t queued_n = 0;
+  bool merged = false;
+  Check(accounted.Enqueue("k", first_blob, false, &merged), "the counted store is queued");
+  if (!merged) ++queued_n;
+  merged = false;
+  Check(accounted.Enqueue("k", second_blob, false, &merged), "the counted rewrite is accepted");
+  if (!merged) ++queued_n;
+  const uint64_t pending = accounted.size();
+  CheckEq(std::to_string(queued_n), std::to_string(pending),
+          "a merged re-put is not counted as queued");
 }
 
 void TestHeldHitLayer() {

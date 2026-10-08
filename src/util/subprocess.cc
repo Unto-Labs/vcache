@@ -5,10 +5,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -46,7 +49,25 @@ void PumpPipes(int out_fd, int err_fd, std::string* out, std::string* err) {
   }
 }
 
+uint64_t WallElapsedMs(const struct timespec& start, const struct timespec& end) {
+  int64_t sec = static_cast<int64_t>(end.tv_sec) - static_cast<int64_t>(start.tv_sec);
+  int64_t nsec = static_cast<int64_t>(end.tv_nsec) - static_cast<int64_t>(start.tv_nsec);
+  if (nsec < 0) {
+    --sec;
+    nsec += 1000000000L;
+  }
+  if (sec < 0) return 0;
+  return static_cast<uint64_t>(sec) * 1000u +
+         static_cast<uint64_t>(nsec / 1000000L);
+}
+
 }  // namespace
+
+uint64_t RssKbFromRuMaxrss(long ru_maxrss, bool ru_maxrss_is_bytes) {
+  if (ru_maxrss <= 0) return 0;
+  const auto raw = static_cast<uint64_t>(ru_maxrss);
+  return ru_maxrss_is_bytes ? raw / 1024u : raw;
+}
 
 ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
   ProcResult result;
@@ -60,6 +81,11 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
     if (out_pipe[0] >= 0) { ::close(out_pipe[0]); ::close(out_pipe[1]); }
     return result;
   }
+
+  // Wall time covers the whole child, including descendants the driver
+  // waits for, not just the time spent in exec.
+  struct timespec wall_start {};
+  ::clock_gettime(CLOCK_MONOTONIC, &wall_start);
 
   pid_t pid = ::fork();
   if (pid < 0) {
@@ -106,8 +132,19 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
   if (err_pipe[0] >= 0) ::close(err_pipe[0]);
 
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  struct rusage usage {};
+  while (::wait4(pid, &status, 0, &usage) < 0 && errno == EINTR) {
   }
+  struct timespec wall_end {};
+  ::clock_gettime(CLOCK_MONOTONIC, &wall_end);
+  result.wall_ms = WallElapsedMs(wall_start, wall_end);
+  // macOS counts bytes; Linux counts kibibytes. The field above is kibibytes.
+#ifdef __APPLE__
+  constexpr bool kRuMaxrssIsBytes = true;
+#else
+  constexpr bool kRuMaxrssIsBytes = false;
+#endif
+  result.max_rss_kb = RssKbFromRuMaxrss(usage.ru_maxrss, kRuMaxrssIsBytes);
   if (WIFEXITED(status)) {
     result.exit_code = WEXITSTATUS(status);
   } else if (WIFSIGNALED(status)) {

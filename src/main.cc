@@ -18,6 +18,7 @@
 #include "args/compiler_args.h"
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/link.h"
 #include "core/config.h"
 #include "core/roots.h"
@@ -50,6 +51,7 @@ void PrintUsage() {
       "  -h, --help            show this help\n"
       "  -V, --version         show the version\n"
       "  -s, --show-stats      show cache statistics\n"
+      "      --show-costs      show compile and link memory and wall time\n"
       "  -z, --zero-stats      reset statistics counters\n"
       "  -C, --clear           delete all cached entries\n"
       "      --show-config     show the effective configuration\n"
@@ -318,6 +320,12 @@ int ShowStats(const vcache::core::Config& config) {
   return 0;
 }
 
+int ShowCosts(const vcache::core::Config& config) {
+  const std::string text = vcache::core::FormatCosts(config.disk.dir);
+  std::fputs(text.c_str(), stdout);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -380,6 +388,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (first == "-s" || first == "--show-stats") return ShowStats(config);
+    if (first == "--show-costs") return ShowCosts(config);
     if (first == "-z" || first == "--zero-stats") {
       return vcache::core::ZeroStats(config.disk.dir) ? 0 : 1;
     }

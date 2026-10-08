@@ -4,6 +4,7 @@
 // straight to execvp so paths containing spaces or quotes cannot be misparsed.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,6 +16,15 @@ struct ProcResult {
   bool signalled = false;   // true when the child died from a signal
   std::string stdout_data;  // empty unless capture_stdout was requested
   std::string stderr_data;  // empty unless capture_stderr was requested
+
+  // Peak resident set of the waited-for child, in kibibytes, and wall time
+  // from just before fork to just after wait. Linux reports ru_maxrss in
+  // kibibytes already; macOS reports bytes. Both land here as kibibytes.
+  // For a compiler driver this is the largest descendant it waited for
+  // (cc1/cc1plus, or the linker and its LTO jobs), which is the peak that
+  // matters. A spawn that never happened leaves both at zero.
+  uint64_t max_rss_kb = 0;
+  uint64_t wall_ms = 0;
 };
 
 struct ProcOptions {
@@ -33,5 +43,10 @@ struct ProcOptions {
 // Runs argv[0] with `argv`. Returns exit_code == -1 if the process could not be
 // spawned at all.
 ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts = {});
+
+// Converts a wait4 ru_maxrss into kibibytes. `ru_maxrss_is_bytes` is true on
+// macOS, where the kernel counts bytes, and false on Linux, where the same
+// field is already kibibytes. A non-positive reading is zero.
+uint64_t RssKbFromRuMaxrss(long ru_maxrss, bool ru_maxrss_is_bytes);
 
 }  // namespace vcache::util

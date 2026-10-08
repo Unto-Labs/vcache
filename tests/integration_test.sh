@@ -848,6 +848,87 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9d. Cost records"
+
+mkdir -p "$WORK/cost-src"
+cat > "$WORK/cost-src/t.cc" << 'EOF'
+int cost_probe() { return 1; }
+EOF
+reset_cache
+COST_LOG="$WORK/cost.log"
+rm -f "$COST_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "cost compile is a miss" "$(misses)" "1"
+
+cost_key=$(sed -n 's/.*\] key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$COST_LOG" | head -1)
+cost_entry="$VCACHE_DIR/${cost_key:0:2}/${cost_key:2}"
+cost_rss=$(grep -a -o 'max_rss_kb: [0-9][0-9]*' "$cost_entry" 2>/dev/null | head -1 | awk '{print $2}')
+if [[ -n "${cost_rss:-}" && "$cost_rss" -gt 0 ]]; then
+  ok "blob meta carries max_rss_kb > 0"
+else
+  bad "blob meta carries max_rss_kb > 0 (key=${cost_key:-missing} rss=${cost_rss:-missing})"
+fi
+if grep -a -q 'wall_ms: [0-9]' "$cost_entry" 2>/dev/null; then
+  ok "blob meta carries wall_ms"
+else
+  bad "blob meta carries wall_ms"
+fi
+
+cost_show=$("$VCACHE" --show-costs)
+if printf '%s\n' "$cost_show" | grep -q '^compile records 1 '; then
+  ok "--show-costs lists the compile with records 1"
+else
+  bad "--show-costs lists the compile with records 1"
+  printf '%s\n' "$cost_show" | sed 's/^/         /'
+fi
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "exactly one cost: compile line on a miss" "$cost_lines" "1"
+cost_any=$(grep -c 'cost: ' "$COST_LOG" || true)
+check "the preprocess probe is not recorded as a cost" "$cost_any" "1"
+
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "the second cost compile hits" "$(hits)" "1"
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "a hit adds no cost line" "$cost_lines" "1"
+
+cat > "$WORK/cost-src/bad.cc" << 'EOF'
+int broken() { return
+EOF
+COST_FAIL_LOG="$WORK/cost-fail.log"
+rm -f "$COST_FAIL_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_FAIL_LOG" \
+    "$VCACHE" g++ -c bad.cc -o "$WORK/cost-bad.o" ) >/dev/null 2>&1 || true
+cost_fail=$(grep -c 'cost: compile .* exit=' "$COST_FAIL_LOG" || true)
+check "a failed compile is still recorded, with its exit" "$cost_fail" "1"
+cost_fail_any=$(grep -c 'cost: ' "$COST_FAIL_LOG" || true)
+check "a failed compile records exactly one cost line" "$cost_fail_any" "1"
+
+mkdir -p "$WORK/cost-die"
+gxx=$(command -v g++)
+cat > "$WORK/cost-die/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then
+    exec $gxx "\$@"
+  fi
+done
+kill -ABRT \$\$
+EOF
+chmod +x "$WORK/cost-die/cc"
+cat > "$WORK/cost-die/t.cc" << 'EOF'
+int live() { return 1; }
+EOF
+COST_SIG_LOG="$WORK/cost-signal.log"
+rm -f "$COST_SIG_LOG"
+( cd "$WORK/cost-die" && VCACHE_COMPILER_CHECK=mtime VCACHE_ROOTS="$WORK/cost-die=proj" \
+    VCACHE_LOG="$COST_SIG_LOG" \
+    "$VCACHE" "$WORK/cost-die/cc" -c t.cc -o "$WORK/cost-die.o" ) >/dev/null 2>&1 || true
+cost_sig=$(grep -c 'cost: compile .* exit=' "$COST_SIG_LOG" || true)
+check "a compiler killed by a signal is still recorded, with its exit" "$cost_sig" "1"
+
+# --------------------------------------------------------------------------
 section "10. cache management commands"
 
 reset_cache

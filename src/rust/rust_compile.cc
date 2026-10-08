@@ -10,6 +10,7 @@
 
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/depfile.h"
 #include "core/stats.h"
 #include "hash/hasher.h"
@@ -570,6 +571,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   VCACHE_LOG("rust compile: " + util::Join(cmd, " "));
   util::ProcResult compiled = util::Run(cmd, {.capture_stderr = true});
+  core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
+                          compiled);
 
   if (compiled.exit_code != 0) {
     if (!compiled.stderr_data.empty()) {
@@ -618,6 +621,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
+  core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
   media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);

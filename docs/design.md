@@ -118,6 +118,22 @@ The checksum is not paranoia: a silently corrupt object linked into a binary is
 far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
 
+The metadata section is not part of any cache key. A stored compile or link
+appends `max_rss_kb` and `wall_ms`, taken from `wait4` on that process. For a
+gcc or clang driver the figure is the peak of the largest process the driver
+waited for: cc1 or cc1plus, and for an `-flto` link the linker together with
+the LTO jobs it waited for. The value is recorded as reported. macOS counts
+`ru_maxrss` in bytes and Linux in kibibytes; the stored number is kibibytes
+on both.
+
+The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
+file holds the last eight observations of one codegen class (operation,
+canonical source or link output, language, and the optimisation and debug
+flags — not the source text and not include paths). `--clear` removes cache
+entries and leaves `costs/` alone, as it leaves the compiler-version memos.
+A failure to write one is logged (`cost: could not record`) and does not fail
+the build. `vcache --show-costs` summarises the records.
+
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,
 which bounds eviction work to 1/256th of the cache — cheap enough to run inline

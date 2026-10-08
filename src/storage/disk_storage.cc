@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/cost.h"
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -164,6 +165,9 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
 
 void DiskStorage::Trim() {
   if (read_only_) return;
+  // Cost files are not cache entries. Put()'s TrimGlobal does not come here,
+  // so a store does not pay for walking costs/.
+  core::PruneStaleCostFiles(dir_);
   // An explicit trim has no hysteresis to preserve: evict whenever the cache
   // is above the target rather than waiting for it to cross max_size_.
   const auto target = static_cast<uint64_t>(max_size_ * kTrimTargetFraction);

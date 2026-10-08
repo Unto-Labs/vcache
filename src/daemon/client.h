@@ -16,6 +16,7 @@
 namespace vcache::daemon {
 
 uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms);
+uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key);
 
 class CompileSessionHandle {
  public:

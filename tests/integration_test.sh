@@ -590,6 +590,100 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9e. Rust: a rustc rebuilt in place is a new toolchain"
+
+# `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo
+# keyed only by path and size answers the new binary from the old banner.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  real_rustc=$(command -v rustc)
+  banner=$("$real_rustc" -vV)
+  mkdir -p "$WORK/rustc-swap/bin"
+  write_fake_rustc() {  # $1 = dest, $2 = release value
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf '%s\n' 'if [ "$1" = "-vV" ]; then'
+      printf '%s\n' "cat <<'END'"
+      printf '%s\n' "$banner" | sed "s/^release: .*/release: $2/"
+      printf '%s\n' 'END'
+      printf '%s\n' 'exit 0'
+      printf '%s\n' 'fi'
+      printf 'exec %q "$@"\n' "$real_rustc"
+    } > "$1"
+    chmod +x "$1"
+  }
+  write_fake_rustc "$WORK/rustc-swap/rustc-a" "9.9.1"
+  write_fake_rustc "$WORK/rustc-swap/rustc-b" "9.9.2"
+  size_a=$(wc -c < "$WORK/rustc-swap/rustc-a" | tr -d ' ')
+  size_b=$(wc -c < "$WORK/rustc-swap/rustc-b" | tr -d ' ')
+  check "the two fake rustc scripts are the same size" "$size_a" "$size_b"
+  if cmp -s "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/rustc-b"; then
+    bad "the two fake rustc scripts differ"
+  else
+    ok "the two fake rustc scripts differ"
+  fi
+  cp "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+
+  swap_log="$WORK/rustc-swap.log"
+  : > "$swap_log"
+  swap_compile() {
+    ( cd "$WORK/rust-a" && VCACHE_ROOTS="$WORK/rust-a=crate" VCACHE_LOG="$swap_log" \
+        "$VCACHE" "$WORK/rustc-swap/bin/rustc" --crate-name demo --crate-type lib \
+        -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rust-a/out" src/lib.rs ) \
+        >/dev/null
+  }
+  swap_compile
+  check "the first swapped rustc compile misses" "$(misses)" "1"
+  key_before=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | head -1)
+  swap_compile
+  check "the same rustc hits" "$(hits)" "1"
+
+  cp "$WORK/rustc-swap/rustc-b" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+  touch -d '+2 seconds' "$WORK/rustc-swap/bin/rustc"
+  swap_compile
+  check "a rebuilt rustc misses" "$(misses)" "2"
+  key_after=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | tail -1)
+  if [[ -n "$key_before" && "$key_before" != "$key_after" ]]; then
+    ok "a rebuilt rustc logs a different rust key"
+  else
+    bad "a rebuilt rustc logs a different rust key (before ${key_before:-missing}, after ${key_after:-missing})"
+  fi
+
+  # Same banner at two paths with different mtimes. The cache key is the
+  # banner, so the second checkout hits. mtime stays in the local memo.
+  reset_cache
+  for tree in rustc-share-a rustc-share-b; do
+    mkdir -p "$WORK/$tree/src"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+mod helper;
+pub fn location() -> &'static str { file!() }
+pub fn value() -> u32 { helper::value() }
+EOF
+    cat > "$WORK/$tree/src/helper.rs" <<'EOF'
+pub fn value() -> u32 { 42 }
+EOF
+    cp "$WORK/rustc-swap/rustc-a" "$WORK/$tree/rustc"
+    chmod +x "$WORK/$tree/rustc"
+  done
+  touch -d '2020-01-01 00:00:00' "$WORK/rustc-share-a/rustc"
+  touch -d '2024-06-01 00:00:00' "$WORK/rustc-share-b/rustc"
+  ( cd "$WORK/rustc-share-a" && VCACHE_ROOTS="$WORK/rustc-share-a=crate" \
+      "$VCACHE" "$WORK/rustc-share-a/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-a/out" src/lib.rs ) \
+      >/dev/null
+  check "the first copy of one rustc banner misses" "$(misses)" "1"
+  ( cd "$WORK/rustc-share-b" && VCACHE_ROOTS="$WORK/rustc-share-b=crate" \
+      "$VCACHE" "$WORK/rustc-share-b/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-b/out" src/lib.rs ) \
+      >/dev/null
+  check "two rustc copies with one banner share an entry" "$(hits)" "1"
+fi
+
+# --------------------------------------------------------------------------
 section "9b. Rust crates that read the environment"
 
 # rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
@@ -845,6 +939,134 @@ EOF
     "$(VCACHE_RUST_DEP_INFO=always "$VCACHE" --show-config | grep -c 'rust dep-info: *always')" "1"
 else
   skipped "rustc not installed"
+fi
+
+# --------------------------------------------------------------------------
+section "9d. Cost records"
+
+mkdir -p "$WORK/cost-src"
+cat > "$WORK/cost-src/t.cc" << 'EOF'
+int cost_probe() { return 1; }
+EOF
+reset_cache
+COST_LOG="$WORK/cost.log"
+rm -f "$COST_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "cost compile is a miss" "$(misses)" "1"
+
+cost_key=$(sed -n 's/.*\] key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$COST_LOG" | head -1)
+cost_entry="$VCACHE_DIR/${cost_key:0:2}/${cost_key:2}"
+cost_rss=$(grep -a -o 'max_rss_kb: [0-9][0-9]*' "$cost_entry" 2>/dev/null | head -1 | awk '{print $2}')
+if [[ -n "${cost_rss:-}" && "$cost_rss" -gt 0 ]]; then
+  ok "blob meta carries max_rss_kb > 0"
+else
+  bad "blob meta carries max_rss_kb > 0 (key=${cost_key:-missing} rss=${cost_rss:-missing})"
+fi
+if grep -a -q 'wall_ms: [0-9]' "$cost_entry" 2>/dev/null; then
+  ok "blob meta carries wall_ms"
+else
+  bad "blob meta carries wall_ms"
+fi
+
+cost_show=$("$VCACHE" --show-costs)
+if printf '%s\n' "$cost_show" | grep -q '^compile records 1 '; then
+  ok "--show-costs lists the compile with records 1"
+else
+  bad "--show-costs lists the compile with records 1"
+  printf '%s\n' "$cost_show" | sed 's/^/         /'
+fi
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "exactly one cost: compile line on a miss" "$cost_lines" "1"
+cost_any=$(grep -c 'cost: ' "$COST_LOG" || true)
+check "the preprocess probe is not recorded as a cost" "$cost_any" "1"
+
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "the second cost compile hits" "$(hits)" "1"
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "a hit adds no cost line" "$cost_lines" "1"
+
+cat > "$WORK/cost-src/bad.cc" << 'EOF'
+int broken() { return
+EOF
+COST_FAIL_LOG="$WORK/cost-fail.log"
+rm -f "$COST_FAIL_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_FAIL_LOG" \
+    "$VCACHE" g++ -c bad.cc -o "$WORK/cost-bad.o" ) >/dev/null 2>&1 || true
+cost_fail=$(grep -c 'cost: compile .* exit=' "$COST_FAIL_LOG" || true)
+check "a failed compile is still recorded, with its exit" "$cost_fail" "1"
+cost_fail_any=$(grep -c 'cost: ' "$COST_FAIL_LOG" || true)
+check "a failed compile records exactly one cost line" "$cost_fail_any" "1"
+
+mkdir -p "$WORK/cost-die"
+gxx=$(command -v g++)
+cat > "$WORK/cost-die/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then
+    exec $gxx "\$@"
+  fi
+done
+kill -ABRT \$\$
+EOF
+chmod +x "$WORK/cost-die/cc"
+cat > "$WORK/cost-die/t.cc" << 'EOF'
+int live() { return 1; }
+EOF
+COST_SIG_LOG="$WORK/cost-signal.log"
+rm -f "$COST_SIG_LOG"
+( cd "$WORK/cost-die" && VCACHE_COMPILER_CHECK=mtime VCACHE_ROOTS="$WORK/cost-die=proj" \
+    VCACHE_LOG="$COST_SIG_LOG" \
+    "$VCACHE" "$WORK/cost-die/cc" -c t.cc -o "$WORK/cost-die.o" ) >/dev/null 2>&1 || true
+cost_sig=$(grep -c 'cost: compile .* exit=' "$COST_SIG_LOG" || true)
+check "a compiler killed by a signal is still recorded, with its exit" "$cost_sig" "1"
+
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/cost-rust/src"
+  cat > "$WORK/cost-rust/src/lib.rs" << 'EOF'
+pub fn cost_rust() -> u32 { 1 }
+EOF
+  RLOG="$WORK/cost-rust.log"
+  rm -f "$RLOG"
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rustc miss logs exactly one cost: rustc line" \
+    "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the rust dep-info run is not a cost record" \
+    "$(grep -c 'cost: ' "$RLOG" || true)" "1"
+  check "the rust miss did run dep-info" \
+    "$(grep -c 'rust dep-info:' "$RLOG" || true)" "1"
+  rkey=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$RLOG" | head -1)
+  rentry="$VCACHE_DIR/${rkey:0:2}/${rkey:2}"
+  if grep -a -q 'max_rss_kb: [0-9]' "$rentry" 2>/dev/null; then
+    ok "a rustc blob meta carries max_rss_kb"
+  else
+    bad "a rustc blob meta carries max_rss_kb"
+  fi
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+else
+  skipped "rustc not installed"
+fi
+
+if [[ "$(uname -s)" == Linux ]]; then
+  reset_cache
+  mkdir -p "$WORK/cost-link"
+  printf 'int main(void){return 0;}\n' > "$WORK/cost-link/main.c"
+  gcc -c "$WORK/cost-link/main.c" -o "$WORK/cost-link/main.o"
+  LLOG="$WORK/cost-link.log"
+  rm -f "$LLOG"
+  ( cd "$WORK/cost-link" && VCACHE_LINK_CACHE=1 VCACHE_ROOTS="$WORK/cost-link=proj" \
+      VCACHE_LOG="$LLOG" "$VCACHE" gcc main.o -o main )
+  check "a link logs exactly one cost: link line" \
+    "$(grep -c 'cost: link' "$LLOG" || true)" "1"
+else
+  skipped "link cost records are Linux-only"
 fi
 
 # --------------------------------------------------------------------------
@@ -1407,6 +1629,137 @@ else
 fi
 "$VCACHE" --stop-daemon >/dev/null 2>&1
 unset VCACHE_DAEMON VCACHE_DAEMON_IDLE_TIMEOUT
+
+# --------------------------------------------------------------------------
+section "10d. Jobserver"
+
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+check "jobserver is off by default" \
+  "$("$VCACHE" --start-daemon >/dev/null && [[ ! -p "$VCACHE_DIR/daemon/jobserver.fifo" ]] && echo yes)" "yes"
+check "--jobserver-env without a pool exits 1" \
+  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+
+export VCACHE_DAEMON_JOBSERVER=1
+export VCACHE_DAEMON_JOBSERVER_JOBS=2
+export VCACHE_DAEMON_IDLE_TIMEOUT=60
+check "a jobserver daemon starts" \
+  "$("$VCACHE" --start-daemon | grep -c 'daemon started')" "1"
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+check "the jobserver fifo exists" "$([[ -p "$JS_FIFO" ]] && echo yes)" "yes"
+check "jobserver tokens total" "$(daemon_stat 'jobserver tokens total')" "2"
+check "jobserver tokens free" "$(daemon_stat 'jobserver tokens free')" "2"
+check "jobserver tokens withdrawn" "$(daemon_stat 'jobserver tokens withdrawn')" "0"
+check "--jobserver-env prints the fifo MAKEFLAGS line" \
+  "$("$VCACHE" --jobserver-env)" "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
+
+mkdir -p "$WORK/js"
+cat > "$WORK/js/tick.sh" << 'EOF'
+#!/bin/sh
+file=$1
+exec 9>>"$file.lock"
+flock 9
+cur=0; max=0
+if read -r cur max < "$file"; then :; fi
+cur=$((cur + 1))
+if [ "$cur" -gt "$max" ]; then max=$cur; fi
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+sleep 1
+flock 9
+cur=0; max=0
+read -r cur max < "$file"
+cur=$((cur - 1))
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+EOF
+chmod +x "$WORK/js/tick.sh"
+cat > "$WORK/js/Makefile" << 'EOF'
+.PHONY: all t1 t2 t3 t4 t5 t6
+all: t1 t2 t3 t4 t5 t6
+t1 t2 t3 t4 t5 t6:
+	sh tick.sh count
+EOF
+cat > "$WORK/js/build.ninja" << 'EOF'
+rule tick
+  command = sh tick.sh count
+build t1: tick
+build t2: tick
+build t3: tick
+build t4: tick
+build t5: tick
+build t6: tick
+build all: phony t1 t2 t3 t4 t5 t6
+default all
+EOF
+
+js_max() { awk '{ print $2 }' "$WORK/js/count"; }
+# The printed line contains a space. An unquoted $(...) splits it, and env
+# then keeps only MAKEFLAGS=-j. Quoting passes the whole assignment.
+js_flags=$("$VCACHE" --jobserver-env)
+printf '0 0\n' > "$WORK/js/count"
+mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
+check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
+check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+
+# PATH ninja on this machine is a wrapper that appends -j, which makes ninja
+# ignore the fifo. The real client is /usr/bin/ninja.
+ninja_bin=/usr/bin/ninja
+if [[ -x "$ninja_bin" ]] && \
+   [[ "$(printf '%s\n' 1.13 "$("$ninja_bin" --version)" | sort -V | head -1)" == "1.13" ]]; then
+  printf '0 0\n' > "$WORK/js/count"
+  nj_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" "$3" >/dev/null' _ \
+    "$WORK/js" "$js_flags" "$ninja_bin")
+  check "ninja under the jobserver finishes" "$([[ "$nj_out" != *timeout* ]] && echo yes)" "yes"
+  check "ninja under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "ninja >= 1.13 not installed"
+fi
+
+printf '0 0\n' > "$WORK/js/count"
+( cd "$WORK/js" && env -u MAKEFLAGS make -j6 ) >/dev/null
+check "make -j6 without the jobserver runs 6 wide" "$(js_max)" "6"
+
+"$VCACHE" --stop-daemon >/dev/null
+check "stopping the daemon removes the fifo" "$([[ ! -p "$JS_FIFO" ]] && echo yes)" "yes"
+
+# A token held past one idle timeout must not retire the daemon. The second
+# timeout is what retires a pool whose client has gone away with a token.
+reset_cache
+VCACHE_DAEMON_IDLE_TIMEOUT=3 "$VCACHE" --start-daemon >/dev/null
+JS_READY=$(date +%s)
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+JS_PID=$(daemon_pid)
+(
+  exec 3<>"$JS_FIFO"
+  IFS= read -r -n 1 -u 3
+  sleep 8
+  printf '+' >&3
+) &
+JS_HOLDER=$!
+held=0
+for _ in $(seq 1 30); do
+  if [[ "$(daemon_stat 'jobserver tokens free')" == "1" ]]; then held=1; break; fi
+  sleep 0.1
+done
+check "a client holds one jobserver token" "$held" "1"
+while (( $(date +%s) < JS_READY + 4 )); do sleep 0.2; done
+check "the daemon stays up while a token is out past one idle timeout" \
+  "$(kill -0 "$JS_PID" 2>/dev/null && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+kill "$JS_HOLDER" 2>/dev/null || true
+wait "$JS_HOLDER" 2>/dev/null || true
+
+reset_cache
+"$VCACHE" --start-daemon >/dev/null
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+rm -f "$JS_FIFO"
+check "--jobserver-env exits 1 when the fifo is missing" \
+  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
 
 # --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"

@@ -40,6 +40,8 @@ upload_threads = 4      # background S3 uploaders
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | `<cache dir>/daemon/sock` |
 | `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | `false` |
 | `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | `false` |
+| `daemon.jobserver` | `VCACHE_DAEMON_JOBSERVER` | off |
+| `daemon.jobserver_jobs` | `VCACHE_DAEMON_JOBSERVER_JOBS` | online CPUs |
 
 ## Commands
 
@@ -49,6 +51,7 @@ upload_threads = 4      # background S3 uploaders
 | `vcache --stop-daemon` | Wait for pending uploads to finish, then stop it. Prints how many uploaded, failed and were skipped. |
 | `vcache --daemon-status` | Pid, socket, lookups by layer, stores, the upload queue. |
 | `vcache --daemon-foreground` | Run in the foreground, for a service manager or a debugger. |
+| `vcache --jobserver-env` | Print `MAKEFLAGS=-j --jobserver-auth=fifo:<path>` for the running pool, or exit 1. |
 
 `--show-stats` also says whether a daemon is running.
 
@@ -135,6 +138,51 @@ Restart it, or let `idle_timeout` retire it, when credentials rotate. A client
 with a *different* access key id is refused rather than served with the
 daemon's identity.
 
+## Jobserver mode
+
+With `daemon.jobserver` on, the daemon keeps one GNU-make fifo of job slots
+for every build on the machine. A build script exports the line from
+`vcache --jobserver-env`:
+
+```text
+MAKEFLAGS=-j --jobserver-auth=fifo:<cache dir>/daemon/jobserver.fifo
+```
+
+The bare `-j` is what tells make it is a client of that fifo rather than the
+owner of a new pool. The fifo holds `daemon.jobserver_jobs - 1` '+' bytes
+(online CPUs when the count is unset). Each top-level jobserver client
+(make, ninja, cargo) holds one implicit slot, so the pool caps concurrent
+jobs at N-1 shared + 1 per concurrent top-level build (measured with N=2:
+one make 2, two makes 3, three makes 4). make and ninja count that implicit
+slot as already taken — the slot a parent make would have spent to launch
+them — and draw every further job from the fifo, so writing the full count
+would let them run one job too many. A job reads one byte before it starts
+and writes it back when it finishes. The daemon holds the fifo open
+read-write, so a client closing does not look like end-of-file to the
+others.
+
+Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
+fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
+does not print) and ignores the fifo when its own command line passes `-j`.
+cargo and rustc speak the same protocol through the `jobserver` crate; that
+is checked separately before a sibling repo relies on it.
+
+A build that still has the `MAKEFLAGS` line after the daemon has gone falls
+back to the tool's own default. ninja warns and uses its usual `-j`. A client
+that writes back more tokens than it took grows the pool, which is the same
+property make's own fifo has. A client that dies holding a token loses it
+until the daemon restarts.
+
+`--daemon-status` shows `jobserver tokens total`, `free` and `withdrawn`.
+Withdrawn stays 0 until the pool can give slots back under memory pressure.
+The daemon does not treat a build blocked on the fifo as a connected client,
+so while any token is out it waits through the idle timeout twice before
+exiting, and the idle log line names that doubled wait. An explicit 0, a
+negative `jobserver_jobs`, or a value above the platform integer maximum
+warns and uses the online-CPU default. If the fifo cannot be created the
+daemon still runs, and `--jobserver-env` exits 1. It also exits 1 when the
+status still names a pool but the path is no longer a fifo.
+
 ## Files
 
 Everything lives under `<cache dir>/daemon/`, which the disk layer never walks:
@@ -145,6 +193,7 @@ Everything lives under `<cache dir>/daemon/`, which the disk layer never walks:
 | `pid` | the running daemon's pid |
 | `sock` | the Unix socket |
 | `log` | lifecycle, refusals and upload failures; rotated at 4 MiB |
+| `jobserver.fifo` | the job-slot fifo, present only while `daemon.jobserver` is on |
 | `pending/<key>` | the upload journal |
 | `start-failed` | the reason the last `auto` start failed, which also gates the retry |
 
@@ -231,8 +280,9 @@ The seam is inactive when the variable is absent.
 
 The wait bound is the larger of twice the waiter's own recorded wall time and
 30 seconds, capped at the 300-second reply timeout. Without a usable cost record
-the bound is 30 seconds. Cost lookup is wired after the cost-record feature is
-merged. A waiter still occupies its build tool's job slot while it waits.
+the bound is 30 seconds. It uses the highest wall time in the matching cost
+record, rather than only its latest observation. A waiter still occupies its
+build tool's job slot while it waits.
 Decision logs include holder pid, bound and elapsed wait; the client receives
 this metadata with its scheduling reply. Session loss never fails the build.
 

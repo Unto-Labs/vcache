@@ -115,7 +115,7 @@ std::optional<std::string> ReadFile(const std::string& path) {
   return contents;
 }
 
-bool WriteFileAtomic(const std::string& path, std::string_view contents) {
+bool WriteFileAtomic(const std::string& path, std::string_view contents, bool durable) {
   const std::string dir = DirName(path);
   if (!dir.empty() && !MakeDirs(dir)) return false;
 
@@ -158,7 +158,8 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents) {
     written += static_cast<size_t>(n);
   }
   // Cache entries must survive a crash intact, so flush before the rename.
-  if (ok && ::fsync(fd) != 0) {
+  // A cost file is a statistic: losing it costs an estimate, not a wrong object.
+  if (ok && durable && ::fsync(fd) != 0) {
     saved_errno = errno;
     ok = false;
   }

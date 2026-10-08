@@ -10,6 +10,7 @@
 
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/depfile.h"
 #include "core/stats.h"
 #include "daemon/client.h"
@@ -24,6 +25,35 @@
 namespace fs = std::filesystem;
 
 namespace vcache::rust {
+
+// A relink after a source change often keeps the same byte count. The memo
+// key therefore includes mtime, or the new binary is answered from the
+// previous banner and every later crate hits the old toolchain. mtime stays
+// out of the banner hash: that hash is what other machines share.
+std::string ResolveRustcFingerprint(const std::string& rustc,
+                                    const std::string& cache_dir) {
+  const std::string real = util::RealPath(rustc).value_or(rustc);
+  const uint64_t size = util::FileSize(real).value_or(0);
+  const int64_t mtime = util::FileMtime(real).value_or(0);
+
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("rustc-version-memo-v2");
+  memo_key.UpdateDelimited(real);
+  memo_key.UpdateU64(size);
+  memo_key.UpdateU64(static_cast<uint64_t>(mtime));
+  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
+
+  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
+
+  util::ProcResult probe =
+      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
+  const std::string banner = probe.stdout_data + probe.stderr_data;
+  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
+
+  util::WriteFileAtomic(memo_path, banner);
+  return hash::HashString(banner);
+}
+
 namespace {
 
 using core::Counter;
@@ -42,30 +72,6 @@ int RunPassthrough(const std::vector<std::string>& argv) {
     return 127;
   }
   return result.exit_code;
-}
-
-// Identity of the rustc toolchain. `rustc -vV` reports version, commit hash and
-// host triple, all machine-independent, so entries stay shareable through S3.
-std::string ResolveRustcFingerprint(const std::string& rustc,
-                                    const std::string& cache_dir) {
-  const std::string real = util::RealPath(rustc).value_or(rustc);
-  uint64_t size = util::FileSize(real).value_or(0);
-
-  hash::Hasher memo_key;
-  memo_key.UpdateDelimited("rustc-version-memo-v1");
-  memo_key.UpdateDelimited(real);
-  memo_key.UpdateU64(size);
-  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
-
-  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
-
-  util::ProcResult probe =
-      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
-  const std::string banner = probe.stdout_data + probe.stderr_data;
-  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
-
-  util::WriteFileAtomic(memo_path, banner);
-  return hash::HashString(banner);
 }
 
 // What rustc's dep-info says the crate reads.
@@ -556,7 +562,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   auto session = daemon::DaemonClient::OpenCompileSession(config);
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
-    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(std::nullopt));
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile && try_entry_hit()) {
       session->ReleaseLease(true);
       return 0;
@@ -583,6 +590,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   VCACHE_LOG("rust compile: " + util::Join(cmd, " "));
   util::ProcResult compiled = util::Run(cmd, {.capture_stderr = true});
+  core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
+                          compiled);
 
   if (compiled.exit_code != 0) {
     if (!compiled.stderr_data.empty()) {
@@ -631,6 +640,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
+  core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
   if (session) session->ReleaseLease(put.stored);

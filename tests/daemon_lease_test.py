@@ -64,7 +64,7 @@ os.execvp(real, [real] + sys.argv[1:])
     def contents(path):
         return path.read_text() if path.exists() else ""
 
-    def pair(label, operation="c", ending="stored", settings=None):
+    def pair(label, operation="c", ending="stored", settings=None, recorded_cost=False):
         if selected and label not in selected:
             return
         case = work / label
@@ -103,6 +103,15 @@ os.execvp(real, [real] + sys.argv[1:])
                     (tree / "source.c").write_text("int value(void) { return 42; }\n")
                     arguments = [str(compilers / "gcc"), "-c", "source.c", "-o", "out.o"]
                     outputs.append(tree / "out.o")
+                if index == 0 and recorded_cost:
+                    recorded_operation = {"c": "compile", "rust": "rustc", "link": "link"}[operation]
+                    fixtures = [subprocess.run(
+                        [str(binary.with_name("vcache_test")), "--write-lease-cost-fixture",
+                         env["VCACHE_DIR"], build_env["VCACHE_ROOTS"], recorded_operation,
+                         str(wall_ms), *arguments], env=build_env, cwd=tree,
+                        capture_output=True, timeout=5) for wall_ms in (20000, 5000)]
+                    check(all(fixture.returncode == 0 for fixture in fixtures),
+                          label + ": production writer primes two cost observations")
                 if index == 0 and ending == "failed":
                     build_env["VCACHE_TEST_FAIL"] = "1"
                 inherited_fds = ()
@@ -168,7 +177,8 @@ os.execvp(real, [real] + sys.argv[1:])
                       row(env, "cache hit (disk)", 1, "--show-stats"),
                       label + ": wrapper stats count one miss and one restored hit")
                 check("lease: waiting on holder pid " in contents(logs[1]) and
-                      "up to 30000 ms" in contents(logs[1]),
+                      ("up to 40000 ms" if recorded_cost else "up to 30000 ms") in
+                      contents(logs[1]),
                       label + ": waiter logs holder pid and bounded wait duration")
             elif ending in ("failed", "gone", "shutdown"):
                 reason = "failed" if ending == "failed" else "gone"
@@ -209,6 +219,10 @@ os.execvp(real, [real] + sys.argv[1:])
     if shutil.which("rustc"):
         pair("rust-stored", "rust")
     pair("link-stored", "link")
+    pair("cost-c", recorded_cost=True)
+    if shutil.which("rustc"):
+        pair("cost-rust", "rust", recorded_cost=True)
+    pair("cost-link", "link", recorded_cost=True)
     pair("holder-failed", ending="failed")
     pair("holder-gone", ending="gone")
     pair("daemon-shutdown", ending="shutdown")

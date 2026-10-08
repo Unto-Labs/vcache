@@ -14,6 +14,7 @@
 #include <cstring>
 #include <ctime>
 
+#include "core/cost.h"
 #include "daemon/protocol.h"
 #include "daemon/server.h"
 #include "util/fs.h"
@@ -34,6 +35,14 @@ uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms) {
   if (!recorded_wall_ms) return 30000;
   if (*recorded_wall_ms >= cap_ms / 2) return cap_ms;
   return std::max<uint64_t>(30000, 2 * *recorded_wall_ms);
+}
+
+uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key) {
+  std::optional<uint64_t> max_wall_ms;
+  for (const auto& observation : core::LoadCompileCost(cache_dir, cost_key).observations) {
+    max_wall_ms = std::max(max_wall_ms.value_or(0), observation.wall_ms);
+  }
+  return LeaseWaitBoundMs(max_wall_ms);
 }
 
 void CompileSessionHandle::Unavailable(const std::string& why) {

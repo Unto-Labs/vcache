@@ -13,6 +13,7 @@
 
 #include "args/link_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/link_trace.h"
 #include "core/stats.h"
 #include "daemon/client.h"
@@ -363,7 +364,9 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   }
   auto session = daemon::DaemonClient::OpenCompileSession(config);
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
-    const auto outcome = session->AcquireLease(pre_key, daemon::LeaseWaitBoundMs(std::nullopt));
+    const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(pre_key,
+        daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile) {
       entries.clear();
       load_entries();
@@ -393,6 +396,9 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
   opts.env.emplace_back("LD_PRELOAD", tracer);
   util::ProcResult result = util::Run(argv, opts);
+  // Same rule as a compile: a link that dies is still a sample, and -flto's
+  // figure is whatever wait4 reported for the largest waited-for child.
+  RecordCompileCost(cache_dir, "link", parsed.output, "", parsed.key_args, roots, result);
 
   if (!result.stderr_data.empty()) {
     ::fputs(result.stderr_data.c_str(), stderr);
@@ -482,6 +488,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   storage::Blob out_blob;
   out_blob.stderr_text = roots.CanonicalizeText(result.stderr_data);
+  AppendCostMeta(&out_blob.meta, result.max_rss_kb, result.wall_ms);
   for (const std::string& path : outputs) {
     auto digest = hash::HashFile(path);
     if (!digest) {

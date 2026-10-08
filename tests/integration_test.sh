@@ -2680,6 +2680,20 @@ check "followed by one reason line per reason" \
 "$VCACHE" --zero-stats >/dev/null
 check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"
 
+section "10a. Compile sessions"
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$TOP/tests/daemon_session_test.py" "$VCACHE" "$WORK/compile-sessions" \
+    > "$WORK/compile-sessions.report" 2> "$WORK/compile-sessions.errors"
+  session_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/compile-sessions.report"
+  check "compile session integration driver completes" "$session_test_exit" "0"
+  if [[ "$session_test_exit" != 0 ]]; then cat "$WORK/compile-sessions.errors"; fi
+else
+  bad "compile session integration requires python3"
+fi
+
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

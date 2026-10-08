@@ -38,6 +38,8 @@ upload_threads = 4      # background S3 uploaders
 | `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | `900` |
 | `daemon.upload_threads` | `VCACHE_DAEMON_UPLOAD_THREADS` | `4` |
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | `<cache dir>/daemon/sock` |
+| `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | `false` |
+| `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | `false` |
 
 ## Commands
 
@@ -213,14 +215,32 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | put | key, blob | ok + stored flag + errors |
 | status | — | ok + text |
 | shutdown | — | ok + failed-upload count + summary, once uploads have drained |
+| session open | —, immediately after hello | ok, holding this connection until compile completion |
 
-Compiles use one connection per request. A compile spends nearly all its life
-running the compiler between its lookup and its store, and holding a connection
-across that would keep a daemon that is shutting down waiting on it.
+Get and Put use one connection per request. Protocol version 2 also supports
+**compile sessions**: one separate connection per cache miss when
+`daemon.single_flight` or `daemon.admission` is enabled. These switches default
+to false; this session scaffolding carries the scheduling operations added by
+those features. Read-only clients and daemon-off invocations hold no session.
+
+A session opens after key computation and lookup, before the real compile or
+link, and closes after output restoration and stores, or on failure. It has no
+idle timeout: a compiler can legitimately run for an hour. An open session keeps
+the daemon alive, and `--daemon-status` reports `compile sessions N`.
+Shutdown sends a terminal error and closes sessions immediately, while ordinary
+requests and uploads retain their existing drain behavior. A missing, refused,
+or interrupted session logs `session: daemon unavailable (...)`, and the compile
+continues. Successful sessions log their opening and closing duration.
+
+The daemon allows one session per peer pid on Linux. Sessions and ordinary
+connections share the 1024-connection limit; a `-j128` build can hold up to 128
+sessions alongside its cache requests. A client that never sends another message
+keeps one server thread until its socket closes. Sessions are memory-only and
+are dropped on restart.
 
 A new op, distributed compilation for example, is a version bump. Clients and
 daemons that disagree on the version refuse each other at hello and fall back
-cleanly.
+cleanly. Version 1 and version 2 refuse each other with both versions in the reason.
 
 ## Not done yet
 

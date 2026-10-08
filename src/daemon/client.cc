@@ -3,6 +3,7 @@
 #include "daemon/client.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -31,6 +32,54 @@ constexpr int kReplyTimeoutSeconds = 300;
 constexpr std::time_t kStartRetrySeconds = 60;
 
 }  // namespace
+
+CompileSession::~CompileSession() {
+  pollfd state{fd_, POLLIN, 0};
+  if (::poll(&state, 1, 0) > 0) {
+    std::string why = "daemon connection closed";
+    ::fcntl(fd_, F_SETFL, ::fcntl(fd_, F_GETFL) | O_NONBLOCK);
+    std::string reply;
+    if (RecvFrame(fd_, &reply)) {
+      Reader in(reply);
+      uint8_t status = 0;
+      std::string reason;
+      if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError) &&
+          in.Str(&reason) && in.done()) why = reason;
+    }
+    VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
+  }
+  ::close(fd_);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - opened_at_).count();
+  VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms");
+}
+
+std::unique_ptr<CompileSession> DaemonClient::OpenCompileSession(const core::Config& config) {
+  if (config.daemon.mode == core::DaemonMode::kOff || config.read_only ||
+      (!config.daemon.single_flight && !config.daemon.admission)) return nullptr;
+  std::string why;
+  auto client = Connect(config, &why);
+  if (client != nullptr) {
+    Writer request;
+    request.U8(static_cast<uint8_t>(Op::kSessionOpen));
+    std::string reply;
+    if (SendFrame(client->fd_, request.data()) && RecvFrame(client->fd_, &reply)) {
+      Reader in(reply);
+      uint8_t status = 0;
+      if (in.U8(&status) && status == static_cast<uint8_t>(Status::kOk) && in.done()) {
+        auto session = std::unique_ptr<CompileSession>(new CompileSession(client->fd_));
+        client->fd_ = -1;
+        VCACHE_LOG("session: opened");
+        return session;
+      }
+      if (!in.Str(&why) || !in.done()) why = "malformed session reply";
+    } else {
+      why = "daemon did not answer session open";
+    }
+  }
+  VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
+  return nullptr;
+}
 
 DaemonClient::~DaemonClient() { Close(); }
 

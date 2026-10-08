@@ -26,7 +26,7 @@ namespace vcache::daemon {
 // Bumped on any incompatible change to a frame. A mismatch is refused at
 // kHello, which makes a client and daemon from different releases fall back
 // cleanly instead of misparsing each other.
-constexpr uint64_t kProtocolVersion = 1;
+constexpr uint64_t kProtocolVersion = 2;
 
 enum class Op : uint8_t {
   kHello = 1,     // u64 version, str fingerprint
@@ -34,6 +34,7 @@ enum class Op : uint8_t {
   kPut = 3,       // str key, str value
   kStatus = 4,    // (nothing)
   kShutdown = 5,  // (nothing); the reply comes once uploads have drained
+  kSessionOpen = 6,  // (nothing); keeps this connection for the compile's lifetime
 };
 
 enum class Status : uint8_t {

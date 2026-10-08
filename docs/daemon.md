@@ -164,8 +164,20 @@ others.
 Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
 fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
 does not print) and ignores the fifo when its own command line passes `-j`.
-cargo and rustc speak the same protocol through the `jobserver` crate; that
-is checked separately before a sibling repo relies on it.
+cargo and rustc speak the same protocol through the `jobserver` crate. With
+cargo and rustc 1.97.1, `strace -f` of one `cargo build` of a five-crate
+workspace under this `MAKEFLAGS`, with and without `RUSTC_WRAPPER=vcache`,
+shows cargo and every rustc it spawns opening the fifo `O_RDWR`, then
+reading and writing back `+` bytes. The fifo form needs no inherited
+descriptors, so the wrapper does not have to forward any. The pool held the same bytes after
+the build as before it:
+
+```text
+openat(AT_FDCWD, "<cache dir>/daemon/jobserver.fifo", O_RDWR|O_CLOEXEC) = 3
+openat(AT_FDCWD, "<cache dir>/daemon/jobserver.fifo", O_RDWR|O_CLOEXEC) = 4
+read(3, "+", 1) = 1
+write(4, "+", 1) = 1
+```
 
 A build that still has the `MAKEFLAGS` line after the daemon has gone falls
 back to the tool's own default. ninja warns and uses its usual `-j`. A client

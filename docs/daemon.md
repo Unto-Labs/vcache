@@ -377,6 +377,67 @@ estimate, elapsed wait and admission arithmetic. `--daemon-status` adds
 `longest wait ms`. The first two values are in kB. Reservations and waiters are
 memory-only and disappear on restart.
 
+## Measuring
+
+`tests/concurrent_worktrees_bench.sh` builds one repository in two or three
+git worktrees at once and records what the scheduler changed. Run it by hand;
+it is not part of `make test`.
+
+```sh
+tests/concurrent_worktrees_bench.sh --repo ~/src/tree --build 'cargo build --workspace' \
+    --clean 'cargo clean' --worktrees 3 --features jobserver_elastic --temperature cold
+tests/concurrent_worktrees_bench.sh --matrix --repo ~/src/tree --build 'ninja -C build' \
+    --clean 'ninja -C build -t clean' --masquerade 'gcc g++ cc c++' --worktrees 2,3
+```
+
+Feature sets are cumulative:
+
+| Set | Daemon | Single-flight | Admission | Jobserver |
+| --- | --- | --- | --- | --- |
+| `off` | off | | | |
+| `single_flight` | on | on | | |
+| `admission` | on | on | on | |
+| `jobserver_fixed` | on | on | on | on, `jobserver_min_jobs` = `--jobs`, so nothing is withdrawn |
+| `jobserver_elastic` | on | on | on | on, `jobserver_min_jobs` from `--min-jobs` or the default |
+
+The worktrees are detached at the repository's HEAD under
+`--scratch` (default `/build/$USER/claude-tmp/bench-vcache`) and reused on
+later runs; `--setup` runs once in each new one. Every run gets a fresh store
+under its run directory, its own daemon with `idle_timeout = 0`, and stops
+that daemon at the end, so a daemon serving your usual `VCACHE_DIR` is never
+touched. A cold run starts from that empty store. A warm run first builds
+worktree 1 alone with the daemon off, then runs `--clean` everywhere and
+measures. In the jobserver sets the builds get `MAKEFLAGS` from
+`--jobserver-env`, so the build command must not pass `-j`.
+
+Each build sees `VCACHE_ROOTS` mapping its worktree and its
+`CARGO_TARGET_DIR` (`<scratch>/targets/<n>`) to fixed names, so the trees
+share keys. It also sees `RUSTC_WRAPPER=vcache` and `FBG_VCACHE=0`, which
+stops a repository's own vcache setup from moving `VCACHE_DIR`. C and C++
+reach vcache only through `--masquerade`, which links the named compilers to
+vcache ahead of `PATH` and drops ccache directories from it.
+
+One row per run goes to `<run>/summary.tsv`, and to `--tsv` when given
+(`--matrix` defaults to `<scratch>/results.tsv`). The columns are:
+- the wall time of the slowest build and of each build, and each exit code
+- the lowest `MemAvailable` from the 1 Hz `samples.csv`
+- kernel OOM kills from `dmesg` or the kernel journal, and systemd-oomd kills,
+  or `n/a` when neither log is readable
+- cache hits and misses from `--show-stats`
+- `compiles deduplicated`, `leases expired`, `reserve waits` and
+  `longest wait ms` from `--daemon-status`
+- the highest `jobserver tokens withdrawn` seen by the sampler, and
+  `jobserver tokens restored total`
+- per build, the number of `lease: waiting` lines and the total
+  `reserve: request waited` time in its `VCACHE_LOG`
+- the number of `reserve: waiting` lines in the daemon's log
+
+The run directory keeps each build's output and `VCACHE_LOG`, the
+daemon's `VCACHE_LOG` and `log`, the final `--daemon-status` and `--show-stats`,
+and `samples.csv`. `samples.csv` also records compile sessions, leases, reserved
+memory and free and withdrawn tokens each second. The store is emptied with
+`--clear` after the run unless `--keep-store` is given.
+
 ## Protocol
 
 Every message is one frame: an 8-byte little-endian length, then the body. A

@@ -10,9 +10,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 
+#include "core/cost.h"
 #include "daemon/protocol.h"
 #include "daemon/server.h"
 #include "util/fs.h"
@@ -21,11 +23,6 @@
 namespace vcache::daemon {
 namespace {
 
-// A daemon that has stopped answering must not hang the build. This is longer
-// than any single S3 request the daemon can be making on a lookup's behalf,
-// including its retries, so it only fires on a daemon that is truly stuck.
-constexpr int kReplyTimeoutSeconds = 300;
-
 // After a failed auto-start, compiles in the next minute do not try again. A
 // cache directory the daemon cannot use would otherwise cost every compile in
 // a parallel build a fork, an exec and a failure.
@@ -33,7 +30,116 @@ constexpr std::time_t kStartRetrySeconds = 60;
 
 }  // namespace
 
-CompileSession::~CompileSession() {
+uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms) {
+  constexpr uint64_t cap_ms = kReplyTimeoutSeconds * 1000;
+  if (!recorded_wall_ms) return 30000;
+  if (*recorded_wall_ms >= cap_ms / 2) return cap_ms;
+  return std::max<uint64_t>(30000, 2 * *recorded_wall_ms);
+}
+
+uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key) {
+  std::optional<uint64_t> max_wall_ms;
+  for (const auto& observation : core::LoadCompileCost(cache_dir, cost_key).observations) {
+    max_wall_ms = std::max(max_wall_ms.value_or(0), observation.wall_ms);
+  }
+  return LeaseWaitBoundMs(max_wall_ms);
+}
+
+void CompileSessionHandle::Unavailable(const std::string& why) {
+  if (fd_ < 0) return;
+  VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
+  ::close(fd_);
+  fd_ = -1;
+  leased_key_.clear();
+}
+
+bool CompileSessionHandle::Request(const std::string& request, std::string* reply) {
+  if (fd_ < 0) return false;
+  pollfd pending{fd_, POLLIN, 0};
+  bool terminal_pending = ::poll(&pending, 1, 0) > 0;
+  if (!terminal_pending && !SendFrame(fd_, request)) {
+    terminal_pending = ::poll(&pending, 1, 0) > 0;
+    if (!terminal_pending) {
+      Unavailable("daemon connection closed");
+      return false;
+    }
+  }
+  if (!RecvFrame(fd_, reply)) {
+    Unavailable("daemon connection closed");
+    return false;
+  }
+  Reader in(*reply);
+  uint8_t status = 0;
+  std::string why;
+  if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError)) {
+    if (!in.Str(&why) || !in.done()) why = "malformed session reply";
+    Unavailable(why);
+    return false;
+  }
+  if (terminal_pending) {
+    Unavailable("unexpected session reply");
+    return false;
+  }
+  return true;
+}
+
+LeaseOutcome CompileSessionHandle::AcquireLease(const std::string& key, uint64_t bound_ms) {
+  Writer request;
+  request.U8(static_cast<uint8_t>(Op::kLeaseAcquire));
+  request.Str(key);
+  request.U64(bound_ms);
+  std::string reply;
+  if (!Request(request.data(), &reply)) {
+    VCACHE_LOG("lease: holder gone, compiling");
+    return LeaseOutcome::kCompile;
+  }
+  Reader in(reply);
+  uint8_t status = 0, outcome = 0, reason = 0;
+  uint64_t holder_pid = 0, waited_ms = 0;
+  if (!in.U8(&status) || status != static_cast<uint8_t>(Status::kOk) ||
+      !in.U8(&outcome) || outcome > 2 || !in.U8(&reason) || reason > 4 ||
+      !in.U64(&holder_pid) || !in.U64(&waited_ms) || !in.done()) {
+    Unavailable("malformed lease reply");
+    return LeaseOutcome::kCompile;
+  }
+  const auto result = static_cast<LeaseOutcome>(outcome);
+  if (result == LeaseOutcome::kGranted) {
+    leased_key_ = key;
+    VCACHE_LOG("lease: acquired " + key.substr(0, 16));
+  } else {
+    VCACHE_LOG("lease: waiting on holder pid " + std::to_string(holder_pid) + " up to " +
+               std::to_string(bound_ms) + " ms (waited " + std::to_string(waited_ms) + " ms)");
+    if (result == LeaseOutcome::kStored) {
+      VCACHE_LOG("lease: holder stored, serving hit after " + std::to_string(waited_ms) + " ms");
+    } else {
+      const auto compile_reason = static_cast<LeaseCompileReason>(reason);
+      VCACHE_LOG(compile_reason == LeaseCompileReason::kHolderFailed
+                     ? "lease: holder failed, compiling"
+                     : compile_reason == LeaseCompileReason::kBound
+                           ? "lease: wait bound reached, compiling"
+                           : "lease: holder gone, compiling");
+    }
+  }
+  return result;
+}
+
+void CompileSessionHandle::ReleaseLease(bool stored) {
+  if (leased_key_.empty()) return;
+  const std::string key = std::move(leased_key_);
+  leased_key_.clear();
+  Writer request;
+  request.U8(static_cast<uint8_t>(Op::kLeaseRelease));
+  request.Str(key);
+  request.U8(stored ? 0 : 1);
+  std::string reply;
+  if (Request(request.data(), &reply) && reply != std::string(1, '\0')) {
+    Unavailable("malformed lease release reply");
+  }
+  VCACHE_LOG("lease: released " + key.substr(0, 16) + (stored ? " stored" : " failed"));
+}
+
+CompileSessionHandle::~CompileSessionHandle() {
+  ReleaseLease(false);
   pollfd state{fd_, POLLIN, 0};
   if (::poll(&state, 1, 0) > 0) {
     std::string why = "daemon connection closed";
@@ -48,13 +154,13 @@ CompileSession::~CompileSession() {
     }
     VCACHE_LOG("session: daemon unavailable (" + why + "), continuing");
   }
-  ::close(fd_);
+  if (fd_ >= 0) ::close(fd_);
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - opened_at_).count();
   VCACHE_LOG("session: closed after " + std::to_string(elapsed_ms) + " ms");
 }
 
-std::unique_ptr<CompileSession> DaemonClient::OpenCompileSession(const core::Config& config) {
+std::unique_ptr<CompileSessionHandle> DaemonClient::OpenCompileSession(const core::Config& config) {
   if (config.daemon.mode == core::DaemonMode::kOff || config.read_only ||
       (!config.daemon.single_flight && !config.daemon.admission)) return nullptr;
   std::string why;
@@ -67,7 +173,8 @@ std::unique_ptr<CompileSession> DaemonClient::OpenCompileSession(const core::Con
       Reader in(reply);
       uint8_t status = 0;
       if (in.U8(&status) && status == static_cast<uint8_t>(Status::kOk) && in.done()) {
-        auto session = std::unique_ptr<CompileSession>(new CompileSession(client->fd_));
+        auto session =
+            std::unique_ptr<CompileSessionHandle>(new CompileSessionHandle(client->fd_));
         client->fd_ = -1;
         VCACHE_LOG("session: opened");
         return session;

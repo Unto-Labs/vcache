@@ -882,7 +882,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // invocation. A hit does not clear it: the media still failed.
   bool media_failed = false;
 
-  if (!config.recache && cache != nullptr) {
+  const auto try_hit = [&]() {
+    if (cache == nullptr) return false;
     storage::GetResult got = cache->Get(key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
@@ -892,19 +893,29 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("hit on " + got.layer);
         RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
                                                    : Counter::kHitDisk);
-        if (media_failed && config.error_on_cache_media_failure) {
-          return kCacheMediaFailureExit;
-        }
-        return 0;
+        return true;
       }
       VCACHE_LOG("hit on " + got.layer + " but entry was unusable; recompiling");
     }
+    return false;
+  };
+  if (!config.recache && try_hit()) {
+    return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
   }
-  RecordCounter(cache_dir, Counter::kMiss);
 
   // ---- miss: compile for real ---------------------------------------------
 
   auto session = daemon::DaemonClient::OpenCompileSession(config);
+  if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
+    const auto cost_key = ComputeCostKey("compile", parsed.source,
+        args::LanguageName(parsed.language), parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
+    if (outcome != daemon::LeaseOutcome::kCompile && try_hit()) {
+      session->ReleaseLease(true);
+      return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+    }
+  }
+  RecordCounter(cache_dir, Counter::kMiss);
 
   // Compile to a temporary and move into place only on success, so a failed
   // build never leaves a half-written object where make expects a good one.
@@ -1001,6 +1012,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  if (session) session->ReleaseLease(put.stored);
   media_failed |= ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     RecordCounter(cache_dir, Counter::kStored);

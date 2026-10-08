@@ -250,6 +250,52 @@ separately, and a client that reuses its connection waits on the delayed-ACK
 timer. Real endpoints do not do this. Measured without it, the daemon looked
 *slower* on S3 hits (1.48 s against 1.37 s).
 
+## Single-flight
+
+Set `daemon.single_flight = true` (`VCACHE_DAEMON_SINGLE_FLIGHT=1`) to share
+one compile of a missed key across concurrent worktrees. It defaults to false.
+A compile session holds a memory-only `KeyLease`; another compile of the same
+key waits for its holder to store or release it. Different keys remain independent.
+C and Rust lease the entry key. Links lease the pre-key that locates their
+result manifest. Rust's dep-info and manifest keys never receive compile leases.
+Read-only clients and speculative lookups hold no compile lease. Recache requests
+compile independently so they still replace existing entries.
+
+After a stored reply the waiter uses an ordinary Get and restores the outputs.
+A failed holder, a lost session, daemon shutdown, or the wait bound makes it
+compile locally. A missing or unusable entry after a stored reply also compiles:
+release-stored can precede Put, so that ordering remains safe without guaranteeing
+a hit. A granted holder rechecks the cache too, covering a store between its
+initial miss and acquire. A restored result counts as a normal cache hit; only
+a wrapper that actually compiles records a miss.
+
+If a holder closes while a Put of its key is already in flight, the lease stays
+held until that Put finishes: success wakes stored, failure wakes compile. A
+close with no Put in flight wakes compile immediately. The waiter's own bound
+still limits its wait if storage stalls; there is no timer grace on holder close.
+The test-only `VCACHE_DAEMON_TEST_BLOCK_PUT=<fifo>` seam pauses the first Put
+after marking it in flight, for at most five seconds. A byte `s` permits storage;
+any other byte or timeout makes that Put's disk read-only and skips remote stores.
+The seam is inactive when the variable is absent.
+
+The wait bound is the larger of twice the waiter's own recorded wall time and
+30 seconds, capped at the 300-second reply timeout. Without a usable cost record
+the bound is 30 seconds. It uses the highest wall time in the matching cost
+record, rather than only its latest observation. A waiter still occupies its
+build tool's job slot while it waits.
+Decision logs include holder pid, bound and elapsed wait; the client receives
+this metadata with its scheduling reply. Session loss never fails the build.
+
+`--daemon-status` shows `leases held`, `leases waiting`, lifetime `leases expired`
+and `compiles deduplicated`. A stored wake increments the deduplication counter;
+the subsequent Get can still miss after eviction. Restart drops all leases and
+waiters continue locally. Concurrent S3 Gets also share one fetch through the
+key table, without holding a compile lease or affecting compile deduplication
+counters. Fetch waits are bounded by the same 300-second reply timeout and log
+their elapsed duration.
+
+Measured cross-worktree deduplication: pending the scheduler benchmark.
+
 ## Protocol
 
 Every message is one frame: an 8-byte little-endian length, then the body. A
@@ -265,6 +311,17 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | status | — | ok + text |
 | shutdown | — | ok + failed-upload count + summary, once uploads have drained |
 | session open | —, immediately after hello | ok, holding this connection until compile completion |
+| lease acquire | key, bound ms | ok + outcome + compile reason + holder pid + waited ms |
+| lease release | key, stored or failed | ok |
+| any session op, or idle session | — | terminal error + "daemon shutting down" |
+
+Any session frame may be a terminal `error + "daemon shutting down"`. Shutdown
+sends this frame to idle sessions too, then closes their sockets. A terminal
+frame replaces a pending scheduling reply; clients continue locally.
+
+Lease outcomes are one-byte `granted`, `stored`, or `compile`. Compile reasons
+are one-byte `none`, `holder_failed`, `holder_gone`, `bound`, or `shutdown`.
+Holder pid (zero if unknown) and waited milliseconds are unsigned 64-bit integers.
 
 Get and Put use one connection per request. Protocol version 2 also supports
 **compile sessions**: one separate connection per cache miss when
@@ -293,9 +350,6 @@ cleanly. Version 1 and version 2 refuse each other with both versions in the rea
 
 ## Not done yet
 
-- **Deduplicating concurrent S3 lookups.** Two compiles that miss the same key
-  at the same moment both fetch it. This is rare in practice, because keys are
-  per translation unit.
 - **Refreshing credentials.** See above.
 - **Deciding eviction centrally.** The disk layer still evicts the way it did
   without a daemon (see `design.md`). It works unchanged with or without one,

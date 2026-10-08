@@ -48,7 +48,8 @@ os.execvp('gcc', ['gcc'] + sys.argv[1:])
         if name.startswith("VCACHE_"):
             del environment[name]
     environment.update(VCACHE_DIR=str(work / "cache"), VCACHE_DAEMON="on",
-                       VCACHE_DAEMON_IDLE_TIMEOUT="0", VCACHE_COMPILER_CHECK="none")
+                       VCACHE_DAEMON_IDLE_TIMEOUT="0", VCACHE_COMPILER_CHECK="none",
+                       VCACHE_DAEMON_SINGLE_FLIGHT="1", VCACHE_DAEMON_ADMISSION="1")
 
     def command(*arguments, env=None):
         try:

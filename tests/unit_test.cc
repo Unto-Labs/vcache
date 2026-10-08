@@ -2757,6 +2757,56 @@ void TestRustcFingerprint() {
           "two rustc files with one banner share a fingerprint");
 }
 
+void TestRustOutputNames() {
+  Section("rust::output names");
+
+  Check(rust::IsSafeOutputName("a/b/c.rmeta"), "a/b/c.rmeta is a safe output name");
+  Check(rust::IsSafeOutputName("./a.rlib"), "./a.rlib is a safe output name");
+  Check(!rust::IsSafeOutputName("../x"), "../x is not a safe output name");
+  Check(!rust::IsSafeOutputName("a/../../x"), "a/../../x is not a safe output name");
+  Check(!rust::IsSafeOutputName("/etc/x"), "/etc/x is not a safe output name");
+  Check(!rust::IsSafeOutputName(""), "an empty output name is not safe");
+  const std::string nul_name("a\0b", 3);
+  Check(!rust::IsSafeOutputName(nul_name), "an output name with a NUL is not safe");
+  Check(rust::IsSafeOutputName("a/..b/c"), "a/..b/c is a safe output name");
+
+  auto scratch = util::MakeTempDir("vcache-rust-names-");
+  Check(scratch.has_value(), "output-name scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string out = *scratch + "/out";
+  util::MakeDirs(out);
+  const auto parent_before = util::ListFilesRecursive(*scratch);
+  storage::BlobFile safe;
+  safe.name = "kept.rlib";
+  safe.contents = "kept";
+  storage::BlobFile escape;
+  escape.name = "../escape";
+  escape.contents = "nope";
+  const core::RootMap roots;
+  Check(!rust::RestoreOutputs({safe, escape}, out, roots, {}),
+        "a blob named ../escape is refused");
+  Check(!util::FileExists(out + "/kept.rlib"), "a refused restore writes nothing");
+  Check(!util::FileExists(*scratch + "/escape"),
+        "a refused restore writes nothing outside the output directory");
+  Check(util::ListFilesRecursive(*scratch).size() == parent_before.size(),
+        "a refused restore leaves the parent directory unchanged");
+
+  const std::string cap = *scratch + "/cap";
+  util::MakeDirs(cap);
+  util::WriteFileAtomic(cap + "/lib.rlib", "ok");
+  util::WriteFileAtomic(*scratch + "/outside-target", "out");
+  Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
+        "a symlink out of the capture directory can be planted");
+  std::vector<storage::BlobFile> captured;
+  Check(!rust::CaptureOutputs(cap, roots, {}, &captured),
+        "capturing a name that escapes the output directory fails");
+}
+
 void TestJobserver() {
   Section("daemon::jobserver");
 
@@ -2902,6 +2952,7 @@ int main() {
   TestRunRusage();
   TestCost();
   TestRustcFingerprint();
+  TestRustOutputNames();
   TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);

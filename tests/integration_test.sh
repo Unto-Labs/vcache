@@ -1050,6 +1050,12 @@ EOF
       "$VCACHE" rustc --crate-name costrust --crate-type lib \
       --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
   check "a rust hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  ( cd "$WORK/cost-rust" && VCACHE_RUST_DEP_INFO=always \
+      VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust key hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the always policy hits on the rust key" "$(hits)" "2"
 else
   skipped "rustc not installed"
 fi
@@ -1480,7 +1486,11 @@ check "its state directory is private" \
 
 export VCACHE_DAEMON=on
 compile_a "$WORK/d1.o"
-compile_b "$WORK/d2.o"
+DLOG="$WORK/daemon-disk-hit.log"
+rm -f "$DLOG"
+( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" VCACHE_LOG="$DLOG" \
+    "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/d2.o" ) 2>/dev/null
+check "a disk hit logs hit on disk" "$(grep -c 'hit on disk' "$DLOG" || true)" "1"
 check "a compile through the daemon misses, then" "$(misses)" "1"
 check "the other checkout hits through the daemon" "$(hits)" "1"
 check "the daemon served both lookups" "$(daemon_stat 'lookups')" "2"
@@ -1629,6 +1639,108 @@ else
 fi
 "$VCACHE" --stop-daemon >/dev/null 2>&1
 unset VCACHE_DAEMON VCACHE_DAEMON_IDLE_TIMEOUT
+
+# --------------------------------------------------------------------------
+section "11c. A held blob is a memory hit"
+
+# With the disk layer off, a store waits in the upload queue. The next lookup
+# is served from that queue. The client logs the layer and still counts a
+# disk hit: the stats file's positional lines are a format other tools read.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "held-hit test: python3 not installed"
+else
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/held-s3"
+  MOCK_S3_LATENCY_MS=3000 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_DISK=0
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/held1.o" ) 2>/dev/null
+  check "the held-blob compile misses" "$(misses)" "1"
+  HLOG="$WORK/held-hit.log"
+  rm -f "$HLOG"
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" VCACHE_LOG="$HLOG" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/held2.o" ) 2>/dev/null
+  check "a held hit logs hit on memory" "$(grep -c 'hit on memory' "$HLOG" || true)" "1"
+  check "a held hit counts as a disk hit" "$(hits)" "1"
+  check "the daemon counts a memory hit" "$(daemon_stat 'hit (memory)')" "1"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_DISK VCACHE_DAEMON
+fi
+
+# --------------------------------------------------------------------------
+section "11. Daemon uploads survive eviction"
+
+# A later compile must not evict an entry whose upload is still journalled.
+# The mock answers slowly so the journal is still there when the cache trims.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "upload eviction test: python3 not installed"
+else
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/evict-s3"
+  MOCK_S3_LATENCY_MS=300 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_CACHE_SIZE=16K
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  mkdir -p "$WORK/evict-src"
+  for n in 1 2 3 4 5; do
+    printf 'int evict_%d(void){return %d;}\n' "$n" "$n" > "$WORK/evict-src/f$n.c"
+    ( cd "$WORK/evict-src" && VCACHE_ROOTS="$WORK/evict-src=proj" \
+        "$VCACHE" gcc -c "f$n.c" -o "$WORK/evict$n.o" ) >/dev/null
+  done
+  for _ in $(seq 1 80); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then break; fi
+    sleep 0.1
+  done
+  check "eviction does not skip an upload" "$(daemon_stat 'skipped')" "0"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  check "the bucket received all five compiles" \
+    "$(find "$S3DIR" -type f | wc -l | tr -d ' ')" "5"
+  kill "$S3PID" 2>/dev/null || true
+  wait "$S3PID" 2>/dev/null || true
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_CACHE_SIZE VCACHE_DAEMON
+fi
 
 # --------------------------------------------------------------------------
 section "10d. Jobserver"

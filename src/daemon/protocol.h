@@ -117,4 +117,8 @@ std::string ConfigFingerprint(const core::Config& config);
 // "setting: daemon has X, client has Y", or the empty string if they agree.
 std::string FingerprintMismatch(const std::string& ours, const std::string& theirs);
 
+// Layer name for a blob served from the upload queue. The client logs it.
+// Anything other than "s3" still counts as a disk hit.
+inline const char* HeldHitLayerName() { return "memory"; }
+
 }  // namespace vcache::daemon

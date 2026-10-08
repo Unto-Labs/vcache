@@ -293,6 +293,26 @@ void SubstituteDir(core::DepFile* dep, const std::string& from,
   }
 }
 
+}  // namespace
+
+// A blob name is joined onto the output directory. `..` or an absolute name
+// would write outside it, including a name captured from a symlink whose
+// target is not in the directory.
+bool IsSafeOutputName(std::string_view name) {
+  if (name.empty() || name.find('\0') != std::string_view::npos) return false;
+  if (name.front() == '/') return false;
+  std::size_t begin = 0;
+  while (begin < name.size()) {
+    const std::size_t slash = name.find('/', begin);
+    const std::size_t end = slash == std::string_view::npos ? name.size() : slash;
+    const std::string_view component = name.substr(begin, end - begin);
+    if (component == "..") return false;
+    if (slash == std::string_view::npos) return true;
+    begin = slash + 1;
+  }
+  return true;
+}
+
 // Collects every file produced under `dir` as a blob file set, canonicalising
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
@@ -309,6 +329,7 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     storage::BlobFile file;
     file.name = fs::relative(entry.path(), fs::path(dir), ec).string();
     if (ec) return false;
+    if (!IsSafeOutputName(file.name)) return false;
 
     // cargo runs build scripts and binary crates directly out of the output
     // directory, so an entry that restores the bytes but not the execute bit
@@ -339,16 +360,26 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
                     const std::string& out_dir, const RootMap& roots,
                     const std::vector<std::string>& path_env_vars) {
   for (const storage::BlobFile& file : files) {
+    if (!IsSafeOutputName(file.name)) {
+      VCACHE_LOG("rust: refusing stored file name '" + file.name + "'");
+      return false;
+    }
+  }
+  for (const storage::BlobFile& file : files) {
     const std::string target = out_dir + "/" + file.name;
-    std::string contents = file.contents;
+    // A dep-info file is rewritten into this checkout. Every other file is
+    // written from the bytes already in the blob.
+    const std::string* bytes = &file.contents;
+    std::string rewritten;
     if (util::EndsWith(file.name, ".d")) {
-      if (auto dep = core::ParseDepFile(contents)) {
+      if (auto dep = core::ParseDepFile(file.contents)) {
         core::RemapDepFile(&*dep, roots, MapDirection::kLocalize, path_env_vars);
         SubstituteDir(&*dep, std::string(kOutDirPlaceholder), out_dir);
-        contents = core::RenderDepFile(*dep);
+        rewritten = core::RenderDepFile(*dep);
+        bytes = &rewritten;
       }
     }
-    if (!util::WriteFileAtomic(target, contents)) {
+    if (!util::WriteFileAtomic(target, *bytes)) {
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }
@@ -366,6 +397,8 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   }
   return true;
 }
+
+namespace {
 
 // Names the first path-valued env dep whose local value, which the key left out,
 // still appears in the entry: another checkout must not be served this path.

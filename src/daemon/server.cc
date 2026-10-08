@@ -1045,7 +1045,7 @@ void Server::HandleGet(Reader* in, Writer* out) {
     auto it = held_.find(key);
     if (it != held_.end()) {
       value = *it->second;
-      layer = "disk";
+      layer = HeldHitLayerName();
       counters_.hits_memory++;
     }
   }

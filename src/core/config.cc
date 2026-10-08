@@ -147,6 +147,24 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     }
   }
 
+  if (auto d = root["daemon"].as_table()) {
+    if (auto v = TomlString(*d, "mode")) {
+      if (!ParseDaemonMode(*v, &config->daemon.mode)) {
+        config->warnings.push_back("daemon.mode: unknown mode '" + *v +
+                                   "' (expected off, on or auto)");
+      }
+    }
+    if (auto v = TomlInt(*d, "idle_timeout")) {
+      if (*v >= 0) config->daemon.idle_timeout_seconds = static_cast<int>(*v);
+    }
+    if (auto v = TomlInt(*d, "upload_threads")) {
+      if (*v > 0) config->daemon.upload_threads = static_cast<int>(*v);
+    }
+    if (auto v = TomlString(*d, "socket")) {
+      config->daemon.socket = util::ExpandTilde(*v);
+    }
+  }
+
   if (auto vc = root["vcache"].as_table()) {
     for (std::string& spec : TomlStringArray(*vc, "roots", &config->warnings)) {
       config->root_specs.push_back(std::move(spec));
@@ -283,6 +301,36 @@ void ApplyEnvironment(Config* config) {
     }
   }
 
+  if (auto v = Env("VCACHE_DAEMON")) {
+    if (!ParseDaemonMode(*v, &config->daemon.mode)) {
+      config->warnings.push_back("VCACHE_DAEMON: unknown mode '" + *v +
+                                 "' (expected off, on or auto)");
+    }
+  }
+  if (auto v = Env("VCACHE_DAEMON_IDLE_TIMEOUT")) {
+    char* end = nullptr;
+    const long n = std::strtol(v->c_str(), &end, 10);
+    if (end != v->c_str() && *end == '\0' && n >= 0) {
+      config->daemon.idle_timeout_seconds = static_cast<int>(n);
+    } else {
+      config->warnings.push_back("VCACHE_DAEMON_IDLE_TIMEOUT: expected seconds, got '" +
+                                 *v + "'");
+    }
+  }
+  if (auto v = Env("VCACHE_DAEMON_UPLOAD_THREADS")) {
+    char* end = nullptr;
+    const long n = std::strtol(v->c_str(), &end, 10);
+    if (end != v->c_str() && *end == '\0' && n > 0 && n <= 256) {
+      config->daemon.upload_threads = static_cast<int>(n);
+    } else {
+      config->warnings.push_back("VCACHE_DAEMON_UPLOAD_THREADS: expected 1-256, got '" +
+                                 *v + "'");
+    }
+  }
+  if (auto v = Env("VCACHE_DAEMON_SOCKET")) {
+    config->daemon.socket = util::ExpandTilde(*v);
+  }
+
   if (auto v = Env("VCACHE_DEP_SCAN")) {
     if (!ParseDepScanPolicy(*v, &config->dep_scan_policy)) {
       config->warnings.push_back("VCACHE_DEP_SCAN: unknown policy '" + *v +
@@ -352,12 +400,37 @@ bool ParseRustDepInfoPolicy(std::string_view name, RustDepInfoPolicy* out) {
   return false;
 }
 
+bool ParseDaemonMode(std::string_view name, DaemonMode* out) {
+  if (name == "off" || name == "0" || name == "false") {
+    *out = DaemonMode::kOff;
+    return true;
+  }
+  if (name == "on" || name == "1" || name == "true") {
+    *out = DaemonMode::kOn;
+    return true;
+  }
+  if (name == "auto") {
+    *out = DaemonMode::kAuto;
+    return true;
+  }
+  return false;
+}
+
 const char* RustDepInfoPolicyName(RustDepInfoPolicy policy) {
   switch (policy) {
     case RustDepInfoPolicy::kManifest: return "manifest";
     case RustDepInfoPolicy::kAlways: return "always";
   }
   return "manifest";
+}
+
+const char* DaemonModeName(DaemonMode mode) {
+  switch (mode) {
+    case DaemonMode::kOff: return "off";
+    case DaemonMode::kOn: return "on";
+    case DaemonMode::kAuto: return "auto";
+  }
+  return "off";
 }
 
 Config LoadConfig() {
@@ -408,6 +481,19 @@ std::string DescribeConfig(const Config& config) {
       out << config.s3.max_size << " bytes (enforced by --trim)\n";
     } else {
       out << "uncapped\n";
+    }
+  }
+  out << "daemon:           " << DaemonModeName(config.daemon.mode) << "\n";
+  if (config.daemon.mode != DaemonMode::kOff) {
+    out << "  idle timeout:   ";
+    if (config.daemon.idle_timeout_seconds > 0) {
+      out << config.daemon.idle_timeout_seconds << " s\n";
+    } else {
+      out << "none\n";
+    }
+    out << "  upload threads: " << config.daemon.upload_threads << "\n";
+    if (!config.daemon.socket.empty()) {
+      out << "  socket:         " << config.daemon.socket << "\n";
     }
   }
   out << "roots:            "

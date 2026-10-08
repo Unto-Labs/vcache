@@ -37,6 +37,7 @@ struct CurlApi {
   CURLcode (*easy_perform)(CURL* handle) = nullptr;
   CURLcode (*easy_getinfo)(CURL* handle, CURLINFO info, ...) = nullptr;
   void (*easy_cleanup)(CURL* handle) = nullptr;
+  void (*easy_reset)(CURL* handle) = nullptr;
   const char* (*easy_strerror)(CURLcode code) = nullptr;
   curl_slist* (*slist_append)(curl_slist* list, const char* value) = nullptr;
   void (*slist_free_all)(curl_slist* list) = nullptr;

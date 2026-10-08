@@ -14,6 +14,7 @@ reference, not an introduction.
 - [Incoming prefix-map flags](#incoming-prefix-map-flags)
 - [Disk cache](#disk-cache)
 - [S3 cache](#s3-cache)
+- [Cache daemon](#cache-daemon)
 - [Cache behaviour switches](#cache-behaviour-switches)
 - [Cache key inputs](#cache-key-inputs)
 - [Logging and diagnostics](#logging-and-diagnostics)
@@ -108,6 +109,10 @@ timeout        = 30                # seconds
 | `cache.s3.assume_no_list_bucket` | *(none)* | — | `false` |
 | `cache.s3.ttl_days` | `VCACHE_S3_TTL_DAYS` | — | `30` |
 | `cache.s3.size` | `VCACHE_S3_CACHE_SIZE` | — | `0` (uncapped) |
+| `daemon.mode` | `VCACHE_DAEMON` | — | `off` |
+| `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | — | `900` |
+| `daemon.upload_threads` | `VCACHE_DAEMON_UPLOAD_THREADS` | — | `4` |
+| `daemon.socket` | `VCACHE_DAEMON_SOCKET` | — | `<cache dir>/daemon/sock` |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -626,6 +631,24 @@ S3 turns itself off, with a warning, if:
 
 - it is enabled but no `bucket` is set; or
 - credentials are absent and `no_credentials` is not set.
+
+## Cache daemon
+
+`daemon.mode` (`VCACHE_DAEMON`) sends lookups and stores through one
+long-lived process per cache directory instead of opening the cache layers in
+every compile. With the daemon, S3 uploads run in the background and S3
+connections are reused between compiles. It is `off` by default. `on` uses a
+running daemon, and `auto` starts one when none is running. Either way, a
+compile falls back to in-process layers whenever the daemon is unavailable.
+
+A daemon serves only clients whose cache settings match its own: the
+directory, the size, read-only, and the bucket, prefix, endpoint and identity.
+A client that differs is refused and runs in-process. Because uploads are
+asynchronous, `--error-on-cache-media-failure` reports a failed upload when
+`vcache --stop-daemon` runs, not during the compile.
+
+See [daemon.md](daemon.md) for the commands, the files it keeps, running it
+under systemd, and measurements.
 
 ## Cache behaviour switches
 

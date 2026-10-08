@@ -144,8 +144,29 @@ void CacheChain::AddLayer(std::unique_ptr<Storage> layer) {
   if (layer != nullptr) layers_.push_back(std::move(layer));
 }
 
+void CacheChain::SetRemote(std::unique_ptr<RemoteCache> remote,
+                           std::function<void(CacheChain*)> build_local) {
+  remote_ = std::move(remote);
+  build_local_ = std::move(build_local);
+}
+
+void CacheChain::FallBackToLocal() {
+  VCACHE_LOG(remote_->Name() + " stopped answering; using local cache layers");
+  remote_.reset();
+  if (build_local_) {
+    auto build = std::move(build_local_);
+    build_local_ = nullptr;
+    build(this);
+  }
+}
+
 GetResult CacheChain::Get(const std::string& key) {
   GetResult result;
+  if (remote_ != nullptr) {
+    if (remote_->Get(key, &result)) return result;
+    result = GetResult();
+    FallBackToLocal();
+  }
   for (size_t i = 0; i < layers_.size(); ++i) {
     std::string value;
     if (!layers_[i]->Get(key, &value)) {
@@ -177,6 +198,11 @@ GetResult CacheChain::Get(const std::string& key) {
 
 PutResult CacheChain::Put(const std::string& key, const std::string& value) {
   PutResult result;
+  if (remote_ != nullptr) {
+    if (remote_->Put(key, value, &result)) return result;
+    result = PutResult();
+    FallBackToLocal();
+  }
   for (auto& layer : layers_) {
     if (!layer->writable()) continue;
     if (layer->Put(key, value)) {
@@ -193,6 +219,7 @@ PutResult CacheChain::Put(const std::string& key, const std::string& value) {
 
 std::vector<std::string> CacheChain::LayerNames() const {
   std::vector<std::string> names;
+  if (remote_ != nullptr) names.push_back(remote_->Name());
   names.reserve(layers_.size());
   for (const auto& layer : layers_) names.push_back(layer->Name());
   return names;

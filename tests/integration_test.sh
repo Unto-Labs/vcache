@@ -1050,6 +1050,12 @@ EOF
       "$VCACHE" rustc --crate-name costrust --crate-type lib \
       --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
   check "a rust hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  ( cd "$WORK/cost-rust" && VCACHE_RUST_DEP_INFO=always \
+      VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust key hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the always policy hits on the rust key" "$(hits)" "2"
 else
   skipped "rustc not installed"
 fi

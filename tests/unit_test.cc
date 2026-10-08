@@ -2557,6 +2557,14 @@ void TestCost() {
                                {"-O2", "-fdebug-prefix-map=/a=/b"}, roots_a),
           core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
           "a debug prefix map is not part of the cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fprofile-use=/a/x.profdata"}, roots_a),
+          core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fprofile-use=/b/x.profdata"}, roots_a),
+          "a path-valued -fprofile-use is not part of the cost key");
+  Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-flto=thin"}, roots_a) !=
+            core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-flto=full"}, roots_a),
+        "-flto=thin and -flto=full are different cost keys");
   Check(core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2021"}, roots_a) !=
             core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2018"}, roots_a),
         "--edition stays in the cost key");

@@ -3,6 +3,7 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <poll.h>
 #include <signal.h>
@@ -10,6 +11,10 @@
 #include <sys/un.h>
 
 #include <cerrno>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -34,10 +39,12 @@
 #include "args/rustc_args.h"
 #include "core/compile.h"
 #include "core/config.h"
+#include "core/cost.h"
 #include "core/depfile.h"
 #include "core/preprocessed.h"
 #include "core/roots.h"
 #include "core/stats.h"
+#include "daemon/jobserver.h"
 #include "daemon/protocol.h"
 #include "daemon/client.h"
 #include "daemon/server.h"
@@ -49,7 +56,9 @@
 #include "storage/s3_storage.h"
 #include "storage/storage.h"
 #include "util/fs.h"
+#include "util/log.h"
 #include "util/str.h"
+#include "util/subprocess.h"
 
 namespace fs = std::filesystem;
 
@@ -2638,6 +2647,326 @@ void TestStats() {
         "a link without -o is declined as no -o");
 }
 
+namespace {
+
+std::string AllocHelperPath() {
+  if (util::FileExists("bin/vcache_test_alloc")) return "bin/vcache_test_alloc";
+  if (auto self = util::SelfPath()) {
+    const std::string beside = util::DirName(*self) + "/vcache_test_alloc";
+    if (util::FileExists(beside)) return beside;
+  }
+  return {};
+}
+
+void TestRunRusage() {
+  Section("util::Run rusage");
+
+  Check(util::RssKbFromRuMaxrss(65536, false) == 65536,
+        "Linux ru_maxrss is already kibibytes");
+  Check(util::RssKbFromRuMaxrss(static_cast<long>(65536) * 1024, true) == 65536,
+        "macOS ru_maxrss in bytes converts to kibibytes");
+  Check(util::RssKbFromRuMaxrss(0, true) == 0 && util::RssKbFromRuMaxrss(-1, false) == 0,
+        "a non-positive ru_maxrss is zero kibibytes");
+
+  const util::ProcResult exited = util::Run({"/bin/sh", "-c", "exit 3"});
+  Check(exited.exit_code == 3 && !exited.signalled,
+        "wait4 reports the same exit code as waitpid");
+
+  const util::ProcResult killed = util::Run({"/bin/sh", "-c", "kill -ABRT $$"});
+  Check(killed.signalled && killed.exit_code == 128 + SIGABRT,
+        "a child killed by a signal is reported with exit 128 plus the signal");
+
+  const util::ProcResult slept = util::Run({"/bin/sleep", "0.2"});
+  Check(slept.exit_code == 0 && slept.wall_ms >= 150 && slept.wall_ms < 10000,
+        "wall_ms covers the child and stays below 10000");
+
+  const std::string helper = AllocHelperPath();
+  Check(!helper.empty(), "bin/vcache_test_alloc exists");
+  if (helper.empty()) return;
+
+  const util::ProcResult big = util::Run({helper, "64"});
+  Check(big.exit_code == 0 && big.max_rss_kb >= 65536,
+        "64 MiB child reports max_rss_kb >= 65536 (got " + std::to_string(big.max_rss_kb) + ")");
+  Check(big.wall_ms < 10000, "64 MiB child wall_ms is below 10000");
+
+  const util::ProcResult small = util::Run({helper, "1"});
+  Check(small.exit_code == 0 && small.max_rss_kb < 65536 && small.wall_ms < 10000,
+        "1 MiB child reports max_rss_kb < 65536 (got " + std::to_string(small.max_rss_kb) + ")");
+}
+
+void TestCost() {
+  Section("core::cost");
+
+  TempCacheDir tree_a;
+  TempCacheDir tree_b;
+  const core::RootMap roots_a = MakeRoots({tree_a.path() + "=proj"});
+  const core::RootMap roots_b = MakeRoots({tree_b.path() + "=proj"});
+  Check(!roots_a.roots().empty() && !roots_b.roots().empty(), "cost-key roots resolved");
+  if (roots_a.roots().empty() || roots_b.roots().empty()) return;
+
+  const std::string file_a = roots_a.roots().front().path + "/a.cc";
+  const std::string file_b = roots_b.roots().front().path + "/a.cc";
+  util::WriteFileAtomic(file_a, "int a(){return 1;}");
+  util::WriteFileAtomic(file_b, "int a(){return 2;} /* different bytes */");
+
+  const std::vector<std::string> noisy = {"-O2", "-g", "-I", "/tmp/inc", "-DFOO", "-include",
+                                          "x.h", "-o", "a.o", "/tmp/a.cc", "-fPIC"};
+  const std::vector<std::string> bare = {"-O2", "-g", "-fPIC"};
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++", noisy, roots_a),
+          core::ComputeCostKey("compile", file_b, "c++", bare, roots_b),
+          "different contents and roots with the same canonical path share a cost key");
+  Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a) !=
+            core::ComputeCostKey("compile", file_a, "c++", {"-O3"}, roots_a),
+        "-O2 and -O3 are different cost keys");
+  Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a) !=
+            core::ComputeCostKey("link", file_a, "c++", {"-O2"}, roots_a),
+        "compile and link are different cost keys");
+  Check(core::ComputeCostKey("compile", file_a, "c", {"-O2"}, roots_a) !=
+            core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
+        "C and C++ are different cost keys");
+  Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-march=x86-64"}, roots_a) !=
+            core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
+        "-march stays in the cost key");
+  Check(core::ComputeCostKey("rustc", file_a, "rust", {"-C", "opt-level=2"}, roots_a) !=
+            core::ComputeCostKey("rustc", file_a, "rust", {"-C", "opt-level=3"}, roots_a),
+        "-C opt-level stays in the rustc cost key");
+  CheckEq(core::ComputeCostKey("rustc", file_a, "rust",
+                               {"-C", "opt-level=2", "-C", "metadata=aaa", "-C",
+                                "extra-filename=-aaa"},
+                               roots_a),
+          core::ComputeCostKey("rustc", file_a, "rust",
+                               {"-C", "opt-level=2", "-C", "metadata=bbb", "-C",
+                                "extra-filename=-bbb"},
+                               roots_a),
+          "rustc metadata and extra-filename share one cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fdebug-prefix-map=/a=/b"}, roots_a),
+          core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
+          "a debug prefix map is not part of the cost key");
+  Check(core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2021"}, roots_a) !=
+            core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2018"}, roots_a),
+        "--edition stays in the cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-g1"}, roots_a),
+          core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-g1", "-DDEBUG"}, roots_a),
+          "-D is not part of the cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-isystem", "/usr/include"},
+                               roots_a),
+          core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
+          "-isystem is not part of the cost key");
+
+  TempCacheDir cache;
+  const core::RootMap roots = MakeRoots({cache.path() + "=proj"});
+  const std::string source = roots.roots().front().path + "/a.cc";
+  util::WriteFileAtomic(source, "int x;");
+  const std::string log_path = cache.path() + "/run.log";
+  ::setenv("VCACHE_LOG", log_path.c_str(), 1);
+  util::InitLogging();
+
+  auto record = [&](uint64_t rss, int exit_code, bool signalled) {
+    util::ProcResult proc;
+    proc.exit_code = exit_code;
+    proc.signalled = signalled;
+    proc.max_rss_kb = rss;
+    proc.wall_ms = rss;
+    core::RecordCompileCost(cache.path(), "compile", source, "c++", {"-O2"}, roots, proc);
+  };
+
+  record(10, 0, false);
+  const std::string key = core::ComputeCostKey("compile", source, "c++", {"-O2"}, roots);
+  core::CompileCost one = core::LoadCompileCost(cache.path(), key);
+  Check(one.observations.size() == 1 && one.observations.back().max_rss_kb == 10,
+        "the first recorded compile creates a one-line cost file");
+
+  record(11, 0, false);
+  core::CompileCost two = core::LoadCompileCost(cache.path(), key);
+  Check(two.observations.size() == 2 && two.observations.back().max_rss_kb == 11 &&
+            two.observations.front().max_rss_kb == 10,
+        "a cost file under 8 observations appends, newest last");
+
+  record(100, 0, false);
+  record(40, 0, false);
+  const auto estimate = core::EstimateMaxRssKb(cache.path(), key);
+  Check(estimate.has_value() && *estimate == 100,
+        "the estimate is the max, not the mean and not the last observation");
+
+  for (uint64_t rss = 1; rss <= 6; ++rss) record(rss, 0, false);
+  // Observations so far: 10, 11, 100, 40, then 1..6. That is 10. The last 8
+  // are 100, 40, 1, 2, 3, 4, 5, 6.
+  core::CompileCost capped = core::LoadCompileCost(cache.path(), key);
+  Check(capped.observations.size() == 8, "a cost file keeps only the last 8 observations");
+  Check(capped.observations.front().max_rss_kb == 100 && capped.observations.back().max_rss_kb == 6,
+        "the oldest observations are dropped and the newest stays last");
+
+  util::WriteFileAtomic(cache.path() + "/costs/" + key, "not a cost file\n");
+  Check(core::LoadCompileCost(cache.path(), key).observations.empty(),
+        "a corrupt cost file reads as empty");
+  Check(!core::EstimateMaxRssKb(cache.path(), key).has_value(),
+        "a corrupt cost file has no estimate");
+  record(7, 0, false);
+  core::CompileCost rewritten = core::LoadCompileCost(cache.path(), key);
+  Check(rewritten.observations.size() == 1 && rewritten.observations.front().max_rss_kb == 7,
+        "the next record rewrites a corrupt cost file");
+
+  const std::string shown = core::FormatCosts(cache.path());
+  Check(shown.find("compile records 1 ") != std::string::npos,
+        "--show-costs prints a compile row with records 1");
+  Check(shown.find("max_rss_kb p50=7 max=7") != std::string::npos,
+        "--show-costs p50 of one observation is that observation");
+  Check(shown.find(rewritten.source) != std::string::npos,
+        "--show-costs prints the source path of a cost key");
+
+  record(9, 1, false);
+  auto logged = util::ReadFile(log_path);
+  Check(logged && logged->find("cost: compile ") != std::string::npos &&
+            logged->find(" exit=1") != std::string::npos,
+        "a failed compile is recorded with its exit in the log");
+
+  record(8, 128 + SIGABRT, true);
+  logged = util::ReadFile(log_path);
+  Check(logged && logged->find(" exit=" + std::to_string(128 + SIGABRT)) != std::string::npos,
+        "a signalled compile is recorded with its exit in the log");
+
+  util::ProcResult link_proc;
+  link_proc.exit_code = 0;
+  link_proc.max_rss_kb = 77;
+  link_proc.wall_ms = 5;
+  core::RecordCompileCost(cache.path(), "link", source, "", {"-flto"}, roots, link_proc);
+  const std::string link_key = core::ComputeCostKey("link", source, "", {"-flto"}, roots);
+  const core::CompileCost link_cost = core::LoadCompileCost(cache.path(), link_key);
+  Check(link_cost.observations.size() == 1 && link_cost.observations.front().max_rss_kb == 77,
+        "a link records the waited-for peak unchanged, including -flto");
+
+  std::string meta = "compiler: g++\nroots:\n";
+  core::AppendCostMeta(&meta, 12, 34);
+  Check(meta.find("max_rss_kb: 12\n") != std::string::npos &&
+            meta.find("wall_ms: 34\n") != std::string::npos,
+        "blob meta gains max_rss_kb and wall_ms lines");
+
+  storage::DiskStorage disk(cache.path(), 4096, false);
+  Check(disk.Clear(), "clearing the cache succeeds");
+  Check(util::FileExists(cache.path() + "/costs/" + key),
+        "clear leaves cost records, like compiler memos");
+
+  TempCacheDir blocked;
+  util::WriteFileAtomic(blocked.path() + "/costs", "not a directory\n");
+  const core::RootMap blocked_roots = MakeRoots({blocked.path() + "=proj"});
+  util::ProcResult proc;
+  proc.exit_code = 0;
+  proc.max_rss_kb = 1;
+  proc.wall_ms = 1;
+  core::RecordCompileCost(blocked.path(), "compile", source, "c++", {"-O2"}, blocked_roots, proc);
+  logged = util::ReadFile(log_path);
+  Check(logged && logged->find("cost: could not record (") != std::string::npos,
+        "a cost file that cannot be written is logged and does not fail the record");
+
+  TempCacheDir aged_cache;
+  const core::RootMap aged_roots = MakeRoots({aged_cache.path() + "=proj"});
+  const std::string aged_source = aged_roots.roots().front().path + "/a.cc";
+  util::WriteFileAtomic(aged_source, "int x;");
+  util::ProcResult aged_proc;
+  aged_proc.exit_code = 0;
+  aged_proc.max_rss_kb = 4;
+  aged_proc.wall_ms = 4;
+  core::RecordCompileCost(aged_cache.path(), "compile", aged_source, "c++", {"-O0"}, aged_roots,
+                          aged_proc);
+  core::RecordCompileCost(aged_cache.path(), "compile", aged_source, "c++", {"-O2"}, aged_roots,
+                          aged_proc);
+  const std::string old_key =
+      core::ComputeCostKey("compile", aged_source, "c++", {"-O0"}, aged_roots);
+  const std::string fresh_key =
+      core::ComputeCostKey("compile", aged_source, "c++", {"-O2"}, aged_roots);
+  const std::string old_path = aged_cache.path() + "/costs/" + old_key;
+  auto old_text = util::ReadFile(old_path);
+  Check(old_text.has_value(), "the production writer created the cost file to age");
+  if (old_text) {
+    std::string text = *old_text;
+    if (!text.empty() && text.back() == '\n') text.pop_back();
+    const size_t nl = text.rfind('\n');
+    const std::string line = nl == std::string::npos ? text : text.substr(nl + 1);
+    const size_t sp = line.rfind(' ');
+    const uint64_t forty_days_ago =
+        static_cast<uint64_t>(std::time(nullptr)) - 40ull * 24 * 60 * 60;
+    const std::string aged_line = line.substr(0, sp + 1) + std::to_string(forty_days_ago);
+    const std::string rewritten =
+        (nl == std::string::npos ? std::string() : text.substr(0, nl + 1)) + aged_line + "\n";
+    util::WriteFileAtomic(old_path, rewritten);
+  }
+  storage::DiskStorage trimmer(aged_cache.path(), 1ull << 30, false);
+  trimmer.Trim();
+  Check(!util::FileExists(old_path), "a cost file 40 days old is removed by trim");
+  Check(util::FileExists(aged_cache.path() + "/costs/" + fresh_key),
+        "a cost file from today survives trim");
+}
+
+void TestJobserver() {
+  Section("daemon::jobserver");
+
+  CheckEq(daemon::JobserverMakeFlagsLine("/tmp/vcache-jobserver.fifo"),
+          "MAKEFLAGS=-j --jobserver-auth=fifo:/tmp/vcache-jobserver.fifo\n",
+          "--jobserver-env output format");
+
+  TempCacheDir dir;
+  const std::string path = dir.path() + "/jobserver.fifo";
+  ::mkfifo(path.c_str(), 0600);
+  {
+    const int stale = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
+    if (stale >= 0) {
+      const char extra = 'x';
+      ssize_t ignored = ::write(stale, &extra, 1);
+      (void)ignored;
+      ::close(stale);
+    }
+  }
+  std::string error;
+  auto pool = daemon::JobserverPool::Open(path, 3, &error);
+  Check(pool.has_value(), "a stale fifo is replaced (" + error + ")");
+  if (!pool) return;
+
+  struct stat st {};
+  Check(::stat(path.c_str(), &st) == 0 && S_ISFIFO(st.st_mode) && (st.st_mode & 0777) == 0600,
+        "the fifo is mode 0600");
+  Check(pool->total() == 3 && pool->fifo_bytes() == 2 && pool->free_tokens() == 3 &&
+            pool->withdrawn() == 0,
+        "the fifo holds slots-1 bytes and reports N jobs free");
+
+  const int reader = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+  char token = 0;
+  Check(reader >= 0 && ::read(reader, &token, 1) == 1 && token == '+',
+        "a client can take one token");
+  Check(pool->free_tokens() == 2, "taking a token leaves N-1");
+  const int writer = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
+  const char back = '+';
+  Check(writer >= 0 && ::write(writer, &back, 1) == 1, "a client can return a token");
+  Check(pool->free_tokens() == 3, "returning a token restores N");
+  if (reader >= 0) ::close(reader);
+  if (writer >= 0) ::close(writer);
+
+  pool.reset();
+  Check(::lstat(path.c_str(), &st) != 0, "destroying the pool removes the fifo");
+
+  ::setenv("VCACHE_DAEMON_JOBSERVER", "1", 1);
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "-2", 1);
+  const core::Config negative = core::LoadConfig();
+  bool warned = false;
+  for (const std::string& warning : negative.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(negative.daemon.jobserver && negative.daemon.jobserver_jobs == 0 && warned,
+        "a negative jobserver_jobs warns and uses the online-CPU default");
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "0", 1);
+  const core::Config zero = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : zero.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(zero.daemon.jobserver_jobs == 0 && warned,
+        "jobserver_jobs of 0 warns and uses the online-CPU default");
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER");
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
+}
+
+}  // namespace
+
 int main() {
   TestStringUtils();
   TestRootMap();
@@ -2673,6 +3002,9 @@ int main() {
   TestStats();
   // Writes files too.
   TestRustManifest();
+  TestRunRusage();
+  TestCost();
+  TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

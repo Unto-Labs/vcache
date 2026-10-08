@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Unto Labs
 // SPDX-License-Identifier: Apache-2.0
+#include "daemon/jobserver.h"
 #include "daemon/server.h"
 
 #include <fcntl.h>
@@ -180,6 +181,7 @@ class Server {
 
   void Shutdown();
   bool Idle() const;
+  void StartJobserver();
 
   const core::Config config_;
   const std::string state_dir_;
@@ -192,6 +194,7 @@ class Server {
   int lock_fd_ = -1;
   int listen_fd_ = -1;
   ino_t socket_inode_ = 0;
+  std::unique_ptr<JobserverPool> jobserver_;
 
   bool s3_enabled_ = false;
   bool s3_writable_ = false;
@@ -613,6 +616,7 @@ std::string Server::StatusText() {
   auto row = [](const std::string& name, const std::string& value) {
     std::string line = name;
     if (line.size() < 22) line.append(22 - line.size(), ' ');
+    else line.push_back(' ');
     return line + value + "\n";
   };
   auto n = [](const std::atomic<uint64_t>& v) { return std::to_string(v.load()); };
@@ -657,6 +661,13 @@ std::string Server::StatusText() {
   s += row("  skipped", n(counters_.uploads_skipped));
   s += row("  pending", std::to_string(pending + static_cast<size_t>(in_flight)));
   s += row("  held in memory", std::to_string(held) + " bytes");
+  if (jobserver_) {
+    const int free = jobserver_->free_tokens();
+    s += row("jobserver tokens total", std::to_string(jobserver_->total()));
+    s += row("jobserver tokens free",
+             free < 0 ? std::string("unknown") : std::to_string(free));
+    s += row("jobserver tokens withdrawn", std::to_string(jobserver_->withdrawn()));
+  }
   return s;
 }
 
@@ -767,10 +778,15 @@ void Server::Serve(int fd) {
 bool Server::Idle() const {
   if (config_.daemon.idle_timeout_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!sessions_.empty() || connections_.size() > sessions_.size() ||
-      !queue_.empty() || in_flight_ != 0) return false;
+  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+  // A build blocked in read() on the fifo is not a socket client, so the
+  // ordinary idle clock would exit under it and take the tokens with it.
+  // One extra timeout is enough to tell "the build went quiet" from "the
+  // build is still holding slots".
+  int periods = 1;
+  if (jobserver_ && jobserver_->free_tokens() < jobserver_->total()) periods = 2;
   return Clock::now() - last_activity_ >
-         std::chrono::seconds(config_.daemon.idle_timeout_seconds);
+         std::chrono::seconds(config_.daemon.idle_timeout_seconds) * periods;
 }
 
 // Only the user the daemon runs as may talk to it. The directory permissions
@@ -795,6 +811,11 @@ void Server::Shutdown() {
   struct stat st;
   if (::lstat(socket_path_.c_str(), &st) == 0 && st.st_ino == socket_inode_) {
     ::unlink(socket_path_.c_str());
+  }
+  if (jobserver_) {
+    const std::string path = jobserver_->path();
+    jobserver_.reset();
+    log_.Line("jobserver: removed " + path);
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
@@ -860,6 +881,24 @@ void SignalReady(int* ready_fd, char code, const std::string& message) {
   *ready_fd = -1;
 }
 
+void Server::StartJobserver() {
+  if (!config_.daemon.jobserver) return;
+  int jobs = config_.daemon.jobserver_jobs;
+  if (jobs <= 0) {
+    const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+    jobs = online > 0 ? static_cast<int>(online) : 1;
+  }
+  std::string why;
+  auto pool = JobserverPool::Open(state_dir_ + "/jobserver.fifo", jobs, &why);
+  if (!pool) {
+    log_.Line("jobserver: not started (" + why + ")");
+    return;
+  }
+  log_.Line("jobserver: pool " + pool->path() + " with " + std::to_string(pool->total()) +
+            " tokens");
+  jobserver_ = std::make_unique<JobserverPool>(std::move(*pool));
+}
+
 int Server::Run(int ready_fd) {
   std::string error;
   if (!PrepareStateDir(&error)) {
@@ -894,6 +933,7 @@ int Server::Run(int ready_fd) {
 
   SetUpS3();
   RecoverJournal();
+  StartJobserver();
   log_.Line("listening on " + socket_path_);
   SignalReady(&ready_fd, 'R', "");
 

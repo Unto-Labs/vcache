@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "args/compiler_args.h"
+#include "core/cost.h"
 #include "core/depfile.h"
 #include "core/manifest.h"
 #include "core/preprocessed.h"
@@ -916,6 +917,10 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
   util::ProcResult compiled = util::Run(compile_cmd, {.capture_stderr = true});
+  // Recorded on a failed compile too: an OOM kill is the sample that matters
+  // most, and the cost file is not the cache entry.
+  RecordCompileCost(cache_dir, "compile", parsed.source,
+                    args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
 
   if (!compiled.stderr_data.empty()) {
     ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);
@@ -993,6 +998,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   blob.meta = "compiler: " + compiler_id.description + "\n" +
               "language: " + args::LanguageName(parsed.language) + "\n" +
               "roots:\n" + roots.DebugString();
+  AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
   media_failed |= ReportCacheMediaErrors(put.errors, cache_dir);

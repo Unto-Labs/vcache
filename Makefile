@@ -258,6 +258,7 @@ VCACHE_SRCS := \
   $(SRC)/core/manifest.cc \
   $(SRC)/core/preprocessed.cc \
   $(SRC)/core/stats.cc \
+  $(SRC)/core/cost.cc \
   $(SRC)/core/compile.cc \
   $(SRC)/core/link_trace.cc \
   $(SRC)/core/link.cc \
@@ -272,7 +273,8 @@ VCACHE_SRCS := \
   $(SRC)/storage/curl_api.cc \
   $(SRC)/daemon/protocol.cc \
   $(SRC)/daemon/client.cc \
-  $(SRC)/daemon/server.cc
+  $(SRC)/daemon/server.cc \
+  $(SRC)/daemon/jobserver.cc
 
 MAIN_SRC := $(SRC)/main.cc
 
@@ -300,7 +302,7 @@ MAIN_OBJ    := $(patsubst $(TOP)/%.cc,$(OBJDIR)/%.o,$(MAIN_SRC))
 BLAKE3_OBJS := $(patsubst $(TP)/%.c,$(OBJDIR)/tp/%.o,$(BLAKE3_C)) \
                $(patsubst $(TP)/%.S,$(OBJDIR)/tp/%.o,$(BLAKE3_S))
 
-TEST_SRCS := $(wildcard $(TOP)/tests/*.cc)
+TEST_SRCS := $(filter-out $(TOP)/tests/vcache_test_alloc.cc,$(wildcard $(TOP)/tests/*.cc))
 TEST_OBJS := $(patsubst $(TOP)/%.cc,$(OBJDIR)/%.o,$(TEST_SRCS))
 
 ALL_OBJS := $(VCACHE_OBJS) $(MAIN_OBJ) $(BLAKE3_OBJS) $(TEST_OBJS)
@@ -334,7 +336,13 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 	@mkdir -p $(BINDIR)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test: $(BINDIR)/vcache_test $(BINDIR)/vcache $(TRACER_SO)
+# Allocates and touches N mebibytes, then exits. The rusage unit test runs it
+# under util::Run so wait4 has a child whose peak RSS is known.
+$(BINDIR)/vcache_test_alloc: $(TOP)/tests/vcache_test_alloc.cc
+	@mkdir -p $(BINDIR)
+	$(CXX) -O2 -o $@ $<
+
+test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test
 	@$(TOP)/tests/integration_test.sh
 

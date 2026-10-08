@@ -654,6 +654,13 @@ opens one compile session on each cache miss; read-only clients and daemon-off
 invocations skip it. Scheduling operations build on this protocol version 2
 session; lookups and stores keep their own connections.
 
+`daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots
+that make, ninja and cargo share. `daemon.jobserver_jobs`
+(`VCACHE_DAEMON_JOBSERVER_JOBS`) is the number of '+' tokens; unset means
+the machine's online CPUs, and 0 or a negative value warns and does the same.
+`vcache --jobserver-env` prints the `MAKEFLAGS` line, or exits 1 when no pool
+is running. See [daemon.md](daemon.md) for the protocol and the tool versions.
+
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.
 
@@ -919,7 +926,11 @@ $ VCACHE_LOG=/tmp/vcache.log make -j16
 Each line carries a timestamp and pid, so a parallel build stays readable when
 many processes append to one file. Every cache decision is logged — the
 preprocessing command, the computed key, hit or miss and from which layer, the
-compile command, and the compiler's own stderr when preprocessing fails.
+compile command, and the compiler's own stderr when preprocessing fails. A
+compile or link that actually ran (a miss, including one that failed or was
+killed) also logs `cost:` with its peak RSS, wall time and cost key. Hits do
+not. A cost file that could not be written logs `cost: could not record` and
+the build continues.
 
 Inspection commands:
 
@@ -928,9 +939,19 @@ Inspection commands:
 | `vcache --show-config` | The fully resolved configuration, plus any warnings |
 | `vcache --show-roots` | The root mapping for the current directory |
 | `vcache --show-stats` | Counters, why runs were not cached, hit rate, cache size |
+| `vcache --show-costs` | Per-operation memory and wall time, and the largest cost keys |
 | `vcache --zero-stats` | Reset counters |
 | `vcache --clear` | Delete all entries |
 | `vcache --trim` | Evict until under the size limit |
+
+`--clear` deletes cached entries. It leaves `<cache>/costs/` and the
+compiler-version memos in place: those are local records, not results another
+machine would share.
+
+`--show-costs` prints one row per operation (`compile`, `rustc`, `link`) with
+the number of observations and the median and maximum of `max_rss_kb` and
+`wall_ms`, then up to ten cost keys with the largest peak and their canonical
+source path.
 
 `--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
 indented under each, plus a *passthrough* row for runs that fell back to the

@@ -2803,6 +2803,22 @@ void TestJobserver() {
   pool.reset();
   Check(::lstat(path.c_str(), &st) != 0, "destroying the pool removes the fifo");
 
+  auto replaced_pool = daemon::JobserverPool::Open(path, 2, &error);
+  Check(replaced_pool.has_value(), "opened a pool whose fifo will be replaced (" + error + ")");
+  if (replaced_pool) {
+    Check(::unlink(path.c_str()) == 0, "the pool fifo can be removed by path");
+    Check(::mkfifo(path.c_str(), 0600) == 0, "a new fifo can take the same path");
+    struct stat replaced {};
+    const bool replaced_ok = ::lstat(path.c_str(), &replaced) == 0 && S_ISFIFO(replaced.st_mode);
+    const ino_t replaced_ino = replaced.st_ino;
+    replaced_pool.reset();
+    struct stat after {};
+    Check(replaced_ok && ::lstat(path.c_str(), &after) == 0 && S_ISFIFO(after.st_mode) &&
+              after.st_ino == replaced_ino,
+          "destroying the pool leaves a replaced fifo in place");
+    ::unlink(path.c_str());
+  }
+
   ::setenv("VCACHE_DAEMON_JOBSERVER", "1", 1);
   ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "-2", 1);
   const core::Config negative = core::LoadConfig();
@@ -2820,6 +2836,29 @@ void TestJobserver() {
   }
   Check(zero.daemon.jobserver_jobs == 0 && warned,
         "jobserver_jobs of 0 warns and uses the online-CPU default");
+
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "2147483648", 1);
+  const core::Config huge_env = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : huge_env.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(huge_env.daemon.jobserver_jobs == 0 && warned,
+        "a jobserver_jobs above INT_MAX from the environment warns and uses the online-CPU default");
+
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
+  TempCacheDir toml_dir;
+  const std::string toml_path = toml_dir.path() + "/vcache.toml";
+  util::WriteFileAtomic(toml_path, "[daemon]\njobserver_jobs = 3000000000\n");
+  ::setenv("VCACHE_CONFIG", toml_path.c_str(), 1);
+  const core::Config huge_toml = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : huge_toml.warnings) {
+    if (warning.find("daemon.jobserver_jobs") != std::string::npos) warned = true;
+  }
+  Check(huge_toml.daemon.jobserver_jobs == 0 && warned,
+        "a jobserver_jobs above INT_MAX from toml warns and uses the online-CPU default");
+  ::unsetenv("VCACHE_CONFIG");
   ::unsetenv("VCACHE_DAEMON_JOBSERVER");
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }

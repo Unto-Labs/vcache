@@ -1751,6 +1751,14 @@ check "the daemon stays up while a token is out past one idle timeout" \
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 kill "$JS_HOLDER" 2>/dev/null || true
 wait "$JS_HOLDER" 2>/dev/null || true
+
+reset_cache
+"$VCACHE" --start-daemon >/dev/null
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+rm -f "$JS_FIFO"
+check "--jobserver-env exits 1 when the fifo is missing" \
+  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
 
 # --------------------------------------------------------------------------

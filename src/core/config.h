@@ -134,8 +134,8 @@ struct DaemonConfig {
 
   // Fixed GNU-make fifo of job slots for every build on this machine.
   // Off until a build script exports the line from --jobserver-env.
-  // jobserver_jobs == 0 means "online CPUs"; an explicit 0 or a negative
-  // value is a warning and the same default.
+  // jobserver_jobs == 0 means "online CPUs"; an explicit 0, a negative
+  // value, or a value above INT_MAX is a warning and the same default.
   bool jobserver = false;
   int jobserver_jobs = 0;
 };

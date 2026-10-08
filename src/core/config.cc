@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/config.h"
 
+#include <climits>
 #include <cstdlib>
 #include <sstream>
 
@@ -165,7 +166,7 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     }
     if (auto v = TomlBool(*d, "jobserver")) config->daemon.jobserver = *v;
     if (auto v = TomlInt(*d, "jobserver_jobs")) {
-      if (*v > 0) {
+      if (*v > 0 && *v <= static_cast<int64_t>(INT_MAX)) {
         config->daemon.jobserver_jobs = static_cast<int>(*v);
       } else {
         config->warnings.push_back(
@@ -348,7 +349,7 @@ void ApplyEnvironment(Config* config) {
     if (end == v->c_str() || *end != '\0') {
       config->warnings.push_back(
           "VCACHE_DAEMON_JOBSERVER_JOBS: expected a job count, got '" + *v + "'");
-    } else if (n <= 0) {
+    } else if (n <= 0 || n > INT_MAX) {
       config->warnings.push_back(
           "VCACHE_DAEMON_JOBSERVER_JOBS: " + *v +
           " is not a pool size; using online CPUs");

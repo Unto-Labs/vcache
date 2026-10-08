@@ -148,12 +148,16 @@ MAKEFLAGS=-j --jobserver-auth=fifo:<cache dir>/daemon/jobserver.fifo
 
 The bare `-j` is what tells make it is a client of that fifo rather than the
 owner of a new pool. The fifo holds `daemon.jobserver_jobs - 1` '+' bytes
-(online CPUs when the count is unset). make and ninja count one slot as
-already taken — the slot a parent make would have spent to launch them — and
-draw every further job from the fifo, so writing the full count would let
-them run one job too many. A job reads one byte before it starts and writes
-it back when it finishes. The daemon holds the fifo open read-write, so a
-client closing does not look like end-of-file to the others.
+(online CPUs when the count is unset). Each top-level jobserver client
+(make, ninja, cargo) holds one implicit slot, so the pool caps concurrent
+jobs at N-1 shared + 1 per concurrent top-level build (measured with N=2:
+one make 2, two makes 3, three makes 4). make and ninja count that implicit
+slot as already taken — the slot a parent make would have spent to launch
+them — and draw every further job from the fifo, so writing the full count
+would let them run one job too many. A job reads one byte before it starts
+and writes it back when it finishes. The daemon holds the fifo open
+read-write, so a client closing does not look like end-of-file to the
+others.
 
 Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
 fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
@@ -171,9 +175,11 @@ until the daemon restarts.
 Withdrawn stays 0 until the pool can give slots back under memory pressure.
 The daemon does not treat a build blocked on the fifo as a connected client,
 so while any token is out it waits through the idle timeout twice before
-exiting. An explicit 0 or a negative `jobserver_jobs` warns and uses the
-online-CPU default. If the fifo cannot be created the daemon still runs, and
-`--jobserver-env` exits 1.
+exiting, and the idle log line names that doubled wait. An explicit 0, a
+negative `jobserver_jobs`, or a value above the platform integer maximum
+warns and uses the online-CPU default. If the fifo cannot be created the
+daemon still runs, and `--jobserver-env` exits 1. It also exits 1 when the
+status still names a pool but the path is no longer a fifo.
 
 ## Files
 

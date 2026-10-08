@@ -31,13 +31,25 @@ index = os.environ['VCACHE_TEST_INDEX']
 counter = folder / 'counter'
 def change(delta):
     if not counter.exists(): return
-    with counter.open('r+') as state:
-        fcntl.flock(state, fcntl.LOCK_EX)
-        current, peak, started = map(int, state.read().split())
+    with (folder / 'counter.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current, peak, started = map(int, counter.read_text().split())
         current += delta
         if delta > 0: started += 1
-        state.seek(0); state.truncate()
-        state.write(f'{current} {max(peak, current)} {started}\\n'); state.flush()
+        snapshot = folder / ('counter.' + index)
+        with snapshot.open('w') as state:
+            state.truncate(); state.flush()
+            pause = os.environ.get('VCACHE_TEST_COUNTER_GATE')
+            if pause and delta > 0 and started == 1:
+                (folder / 'counter.paused').write_text('ready')
+                barrier = os.open(pause, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    if not select.select([barrier], [], [], 5)[0] or not os.read(barrier, 1):
+                        sys.exit(78)
+                finally:
+                    os.close(barrier)
+            state.write(f'{current} {max(peak, current)} {started}\\n'); state.flush()
+        os.replace(snapshot, counter)
 change(1)
 (folder / (index + '.entered')).write_text(str(os.getpid()))
 gate = os.open(folder / (index + '.gate'), os.O_RDONLY | os.O_NONBLOCK)
@@ -69,6 +81,10 @@ sys.exit(result)
         folder = case / label
         folder.mkdir()
         (folder / "counter").write_text("0 0 0\n")
+        counter_gate = folder / "counter.gate"
+        os.mkfifo(counter_gate)
+        counter_descriptor = os.open(counter_gate, os.O_RDWR | os.O_NONBLOCK)
+        descriptors.append(counter_descriptor)
         gates = []
         for index in range(4):
             name = "t" + str(index)
@@ -85,6 +101,7 @@ sys.exit(result)
         build_env = env | {"MAKEFLAGS": flags, "MAKELEVEL": "0", "MFLAGS": "",
                            "VCACHE_DAEMON_ADMISSION": "1" if admission else "0",
                            "VCACHE_RECACHE": "1", "VCACHE_TEST_FOLDER": str(folder),
+                           "VCACHE_TEST_COUNTER_GATE": str(counter_gate),
                            "VCACHE_ROOTS": str(folder) + "=peers"}
         fixtures = [subprocess.run([str(writer), "--write-admission-cost-fixture",
                                    env["VCACHE_DIR"], build_env["VCACHE_ROOTS"], "compile",
@@ -96,6 +113,12 @@ sys.exit(result)
         process = subprocess.Popen(["make"], cwd=folder, env=build_env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         processes.append(process)
+
+        paused = poll_until(lambda: (folder / "counter.paused").exists())
+        check(paused, label + ": compiler counter writer pauses between truncate and write")
+        check(paused and (folder / "counter").read_text() == "0 0 0\n",
+              label + ": counter readers retain a complete snapshot while its writer is paused")
+        os.write(counter_descriptor, b"x")
 
         def counts():
             try:

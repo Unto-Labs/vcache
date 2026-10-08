@@ -361,6 +361,10 @@ peak sum of the live tree's RSS. It keeps those peaks in memory until restart;
 the cost files and `--show-costs` still report `wait4`'s largest descendant
 peak, which can be smaller than the simultaneous tree sum. Admission
 measurements use the daemon's granted estimate in kB and its sampled tree sum.
+The client logs the granted estimate returned by the daemon. With an older
+protocol v2 daemon, it retries the legacy reserve request and labels its
+estimate as requested because the granted estimate is unavailable. Legacy
+clients keep their original reserve reply format.
 Every 500 ms the daemon reads
 `MemAvailable`, then sums `VmRSS` over each compiler's live process tree,
 including children and grandchildren. A spawn samples only the new tree

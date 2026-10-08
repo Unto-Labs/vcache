@@ -2815,6 +2815,12 @@ void TestRustOutputNames() {
         "capturing a name that escapes the output directory fails");
 }
 
+void TestHeldHitLayer() {
+  Section("daemon::held hit");
+  CheckEq(std::string(daemon::HeldHitLayerName()), "memory",
+          "a held hit replies with layer memory");
+}
+
 void TestJobserver() {
   Section("daemon::jobserver");
 
@@ -2961,6 +2967,7 @@ int main() {
   TestCost();
   TestRustcFingerprint();
   TestRustOutputNames();
+  TestHeldHitLayer();
   TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);

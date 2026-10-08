@@ -24,6 +24,9 @@
 // them after it restarts rather than losing them.
 #pragma once
 
+#include <chrono>
+#include <cstdint>
+
 #include "core/config.h"
 
 namespace vcache::daemon {
@@ -32,6 +35,12 @@ namespace vcache::daemon {
 constexpr int kServerOk = 0;
 constexpr int kServerFailed = 1;
 constexpr int kServerAlreadyRunning = 3;
+
+std::chrono::steady_clock::time_point LeaseWaitDeadline(
+    std::chrono::steady_clock::time_point started, uint64_t bound_ms,
+    std::chrono::steady_clock::duration memory_queued);
+std::chrono::steady_clock::time_point MemoryReserveDeadline(
+    std::chrono::steady_clock::time_point started, uint64_t bound_ms);
 
 // Runs the daemon in the calling process until it is stopped, idles out, or
 // receives SIGTERM/SIGINT. When `ready_fd` is >= 0, a single status byte is

@@ -1647,6 +1647,7 @@ struct LeasePeer {
   uint64_t last_waited_ms = 0;
   bool request_pending = false;
   pid_t compiler_pid = -1;
+  uint64_t reservation_sequence = 0;
 
   explicit LeasePeer(const SessionDaemon& server) {
     int control[2];
@@ -1690,8 +1691,10 @@ struct LeasePeer {
           daemon::Reader worker_request(reply);
           uint8_t code = 0;
           uint64_t rss_kb = 0, depth = 0;
+          std::string mode;
           if (!worker_request.U8(&code) || !worker_request.U64(&rss_kb) ||
-              !worker_request.U64(&depth) || rss_kb > 65536 || depth > 2) ::_exit(2);
+              !worker_request.U64(&depth) || !worker_request.Str(&mode) ||
+              rss_kb > 65536 || depth > 2) ::_exit(2);
           int worker_ready[2], worker_stop[2];
           if (::pipe(worker_ready) != 0 || ::pipe(worker_stop) != 0) ::_exit(2);
           worker_pid = ::fork();
@@ -1701,7 +1704,7 @@ struct LeasePeer {
             ::close(session_fd);
             ::close(worker_ready[0]);
             ::close(worker_stop[1]);
-            if (depth > 0) {
+            if (depth > 0 || !mode.empty()) {
               const std::string helper = util::DirName(util::SelfPath().value_or("")) +
                                          "/vcache_test_alloc";
               const std::string mib = std::to_string(rss_kb / 1024);
@@ -1709,7 +1712,8 @@ struct LeasePeer {
               const std::string ready_fd = std::to_string(worker_ready[1]);
               const std::string stop_fd = std::to_string(worker_stop[0]);
               ::execl(helper.c_str(), helper.c_str(), mib.c_str(), levels.c_str(),
-                      ready_fd.c_str(), stop_fd.c_str(), nullptr);
+                      ready_fd.c_str(), stop_fd.c_str(),
+                      mode.empty() ? nullptr : mode.c_str(), nullptr);
               ::_exit(2);
             }
             std::vector<char> memory(rss_kb * 1024, 'm');
@@ -1730,6 +1734,14 @@ struct LeasePeer {
           daemon::Writer worker_reply;
           worker_reply.U64(started ? worker_pid : 0);
           if (!daemon::SendFrame(control[1], worker_reply.data())) break;
+          continue;
+        }
+        if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 250) {
+          daemon::Reader signal(reply);
+          uint8_t code = 0, byte = 0;
+          const bool sent = signal.U8(&code) && signal.U8(&byte) && signal.done() &&
+                            worker_stop_fd >= 0 && ::write(worker_stop_fd, &byte, 1) == 1;
+          if (!daemon::SendFrame(control[1], std::string(1, sent ? '\0' : '\1'))) break;
           continue;
         }
         if (!reply.empty() && static_cast<uint8_t>(reply[0]) == 252) {
@@ -1793,10 +1805,12 @@ struct LeasePeer {
     return request_pending;
   }
 
-  bool Reserve(uint64_t estimate_kb, uint64_t bound_ms = 3000) {
+  bool Reserve(uint64_t estimate_kb, uint64_t bound_ms = 3000,
+               const std::string& cost_key = "") {
     daemon::Writer request;
     request.U8(9);
-    request.Str(std::string(64, 'a'));
+    request.Str(cost_key.empty() ? std::string(32, 'a') + std::to_string(pid) + "b" +
+                                  std::to_string(++reservation_sequence) : cost_key);
     request.U64(estimate_kb);
     request.U64(bound_ms);
     request_pending = daemon::SendFrame(control_fd, request.data());
@@ -1844,11 +1858,12 @@ struct LeasePeer {
     return request_pending && Released();
   }
 
-  pid_t StartCompiler(uint64_t rss_kb, uint64_t depth = 0) {
+  pid_t StartCompiler(uint64_t rss_kb, uint64_t depth = 0, const std::string& mode = "") {
     daemon::Writer request;
     request.U8(253);
     request.U64(rss_kb);
     request.U64(depth);
+    request.Str(mode);
     std::string reply;
     uint64_t worker_pid = 0;
     if (!daemon::SendFrame(control_fd, request.data()) ||
@@ -1857,6 +1872,15 @@ struct LeasePeer {
     if (!in.U64(&worker_pid) || !in.done()) return -1;
     compiler_pid = static_cast<pid_t>(worker_pid);
     return compiler_pid;
+  }
+
+  bool SignalCompiler(char byte) {
+    daemon::Writer request;
+    request.U8(250);
+    request.U8(byte);
+    std::string reply;
+    return daemon::SendFrame(control_fd, request.data()) &&
+           daemon::RecvFrame(control_fd, &reply) && reply == std::string(1, '\0');
   }
 
   void StopCompiler() {
@@ -2624,6 +2648,161 @@ void TestAdmissionReview() {
     session.reset();
     ::unsetenv("VCACHE_LOG");
     util::InitLogging();
+  }
+}
+
+void TestAdmissionBoundsAndTreePeaks() {
+  Section("daemon::admission bounds and tree peaks");
+  const auto memory_reserved = [](const SessionDaemon& server) {
+    const auto status = server.Status();
+    const auto row = status.find("memory reserved");
+    return row == std::string::npos ? uint64_t{0} :
+        std::strtoull(status.c_str() + row + 15, nullptr, 10);
+  };
+  const auto started = std::chrono::steady_clock::now();
+  for (const uint64_t bound : {uint64_t{0}, uint64_t{50}, daemon::kMemoryWaitBoundMs,
+                               daemon::kMemoryWaitBoundMs + 1, UINT64_MAX}) {
+    const auto deadline = daemon::MemoryReserveDeadline(started, bound);
+    Check(deadline - started == std::chrono::milliseconds(
+              std::min(bound, daemon::kMemoryWaitBoundMs)),
+          "server reserve deadline caps requested milliseconds: " + std::to_string(bound));
+  }
+  struct DeadlineCase {
+    uint64_t bound_ms;
+    int64_t queue_ms, expected_ms;
+    const char* name;
+  };
+  for (const auto& row : std::vector<DeadlineCase>{
+      {100, -50, 100, "a negative queue duration cannot shorten a lease deadline"},
+      {100, 50, 150, "a lease deadline adds only overlapping holder queue time"},
+      {300000, 600000, 900000, "lease deadline reaches exactly the 600 second pause cap"},
+      {300000, 600001, 900000, "lease deadline rejects queue time above the 600 second cap"},
+      {UINT64_MAX, 86400000, 900000,
+       "huge bounds and queue time still cap lease wait at 900 seconds"}}) {
+    Check(daemon::LeaseWaitDeadline(started, row.bound_ms,
+                                   std::chrono::milliseconds(row.queue_ms)) - started ==
+              std::chrono::milliseconds(row.expected_ms), row.name);
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(8192);
+    holder.MemoryOutcome(0);
+    queued.Reserve(8192, UINT64_MAX);
+    Check(PollUntil([&] {
+      return LeaseStat(server, "memory waiting", 1) &&
+          util::ReadFile(server.directory + "/memory-log").value_or("").find(
+              "reserve: wait bound 600000 ms") != std::string::npos;
+    }, 1000), "a real reserve request above the server cap logs a 600000 ms bound");
+    holder.Close();
+    Check(queued.MemoryOutcome(0, 1000), "a capped reserve still wakes as soon as memory is free");
+  }
+  {
+    SessionDaemon server(0, false, false, 262144);
+    core::RootMap roots;
+    roots.AddIfUncovered(server.directory, "tree-cost");
+    const std::string source = server.directory + "/parallel-link";
+    util::ProcResult observation;
+    observation.max_rss_kb = 32768;
+    core::RecordCompileCost(server.config.disk.dir, "link", source, "", {"-flto"}, roots,
+                            observation);
+    const std::string key = core::ComputeCostKey("link", source, "", {"-flto"}, roots);
+    const auto client_estimate = daemon::MemoryEstimateKb(server.config, key, true);
+    LeasePeer first(server);
+    first.Reserve(client_estimate, 3000, key);
+    first.MemoryOutcome(0);
+    const pid_t compiler = first.StartCompiler(32768, 1, "parallel");
+    Check(compiler > 0 && first.Spawned(compiler) && PollUntil([&] {
+      const auto status = server.Status();
+      const auto row = status.find("memory realised");
+      return row != std::string::npos &&
+             std::strtoull(status.c_str() + row + 15, nullptr, 10) >= 65536;
+    }, 1000), "parallel compiler children contribute their summed RSS to the sampled peak");
+    LeasePeer blocker(server), queued(server);
+    blocker.Reserve(262144);
+    blocker.MemoryOutcome(0);
+    queued.Reserve(client_estimate, 3000, key);
+    Check(PollUntil([&] { return LeaseStat(server, "memory waiting", 1); }, 1000),
+          "a matching cost request can queue before the preceding tree peak is released");
+    first.StopCompiler();
+    Check(PollUntil([&] { return LeaseStat(server, "memory reserved", 262144); }, 1500),
+          "parallel compiler exit releases its reservation before another estimate");
+    blocker.Close();
+    Check(queued.MemoryOutcome(0) && memory_reserved(server) >= 65536,
+          "a queued matching cost key refreshes its tree-peak estimate before grant");
+    queued.Close();
+    PollUntil([&] { return LeaseStat(server, "memory reserved", 0); }, 1000);
+    LeasePeer next(server), unrelated(server);
+    next.Reserve(client_estimate, 3000, key);
+    Check(next.MemoryOutcome(0) && memory_reserved(server) >= 65536,
+          "the next matching cost key reserves its observed tree-sum peak above wait4 RSS");
+    unrelated.Reserve(1024);
+    Check(unrelated.MemoryOutcome(0) &&
+              util::ReadFile(server.directory + "/memory-log").value_or("").find(
+                  "reserve: granted 1024 kB") != std::string::npos,
+          "tree-sum learning does not inflate an unrelated cost key");
+    next.Close();
+    unrelated.Close();
+    LeasePeer larger(server);
+    larger.Reserve(131072, 3000, key);
+    Check(larger.MemoryOutcome(0) && LeaseStat(server, "memory reserved", 131072),
+          "an existing larger estimate stays above the learned tree-sum peak");
+  }
+  {
+    SessionDaemon server(0, false, false, 90000);
+    LeasePeer holder(server), queued(server);
+    holder.Reserve(65536);
+    holder.MemoryOutcome(0);
+    const pid_t compiler = holder.StartCompiler(49152, 2, "zombie");
+    holder.Spawned(compiler);
+    queued.Reserve(65536);
+    Check(compiler > 0 && queued.MemoryOutcome(0, 1500),
+          "an unreaped zombie sibling does not void its live grandchild's RSS sample");
+  }
+  {
+    SessionDaemon server(0, false, false, 262144);
+    LeasePeer holder(server);
+    const std::string key(64, 'd');
+    holder.Reserve(1024, 3000, key);
+    holder.MemoryOutcome(0);
+    const pid_t compiler = holder.StartCompiler(8192, 1, "grow");
+    holder.Spawned(compiler);
+    const auto realised = [&] {
+      const auto status = server.Status();
+      const auto row = status.find("memory realised");
+      return row == std::string::npos ? uint64_t{0} :
+          std::strtoull(status.c_str() + row + 15, nullptr, 10);
+    };
+    holder.SignalCompiler('G');
+    const bool grew = PollUntil([&] { return realised() >= 16384; }, 1500);
+    holder.SignalCompiler('G');
+    const bool grew_again = PollUntil([&] { return realised() >= 24576; }, 1500);
+    const auto log = util::ReadFile(server.directory + "/memory-log").value_or("");
+    const auto overshoot = log.find("reserve: rss overshoot");
+    Check(grew && grew_again && overshoot != std::string::npos &&
+              log.find("reserve: rss overshoot", overshoot + 1) == std::string::npos,
+          "a growing overshoot logs once while retaining its largest sampled peak");
+    holder.SignalCompiler('S');
+    Check(PollUntil([&] { return realised() > 0 && realised() < 16384; }, 1500),
+          "the live tree's RSS can shrink after its observed peak");
+    holder.StopCompiler();
+    PollUntil([&] { return LeaseStat(server, "memory reserved", 0); }, 1500);
+    LeasePeer next(server);
+    next.Reserve(1024, 3000, key);
+    Check(next.MemoryOutcome(0) && memory_reserved(server) >= 24576,
+          "tree-sum estimates retain the peak after the live sample shrinks");
+  }
+  {
+    SessionDaemon server(0, false, false, 8192);
+    LeasePeer holder(server);
+    holder.Reserve(4096);
+    holder.MemoryOutcome(0);
+    holder.Spawned(2000000000);
+    holder.Close();
+    Check(PollUntil([&] {
+      return util::ReadFile(server.directory + "/memory-log").value_or("").find(
+          "reserve: 2000000000 unsampled of 4096 at release") != std::string::npos;
+    }, 1000), "an invisible compiler release reports unsampled rather than a zero RSS observation");
   }
 }
 
@@ -5220,6 +5399,7 @@ int main(int argc, char** argv) {
   TestAdmissionProcessTree();
   TestAdmissionReview();
   TestManifestPause();
+  TestAdmissionBoundsAndTreePeaks();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

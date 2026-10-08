@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -47,9 +48,23 @@
 #include "util/str.h"
 
 namespace vcache::daemon {
-namespace {
 
 using Clock = std::chrono::steady_clock;
+
+Clock::time_point LeaseWaitDeadline(Clock::time_point started, uint64_t bound_ms,
+                                    Clock::duration memory_queued) {
+  return started + std::chrono::milliseconds(std::min<uint64_t>(
+      bound_ms, kReplyTimeoutSeconds * 1000)) +
+      std::min(std::max(memory_queued, Clock::duration::zero()),
+          std::chrono::duration_cast<Clock::duration>(
+              std::chrono::milliseconds(kMemoryWaitBoundMs)));
+}
+
+Clock::time_point MemoryReserveDeadline(Clock::time_point started, uint64_t bound_ms) {
+  return started + std::chrono::milliseconds(std::min(bound_ms, kMemoryWaitBoundMs));
+}
+
+namespace {
 
 std::atomic<bool> g_signalled{false};
 
@@ -220,9 +235,11 @@ struct KeyLease {
 struct MemoryReservation {
   ~MemoryReservation() { if (pid_fd >= 0) ::close(pid_fd); }
   std::weak_ptr<CompileSession> session;
+  std::string cost_key;
   uint64_t estimate_kb = 0;
   uint64_t realised_kb = 0;
   uint64_t peak_rss_kb = 0;
+  bool rss_sampled = false;
   pid_t compiler_pid = 0;
   int pid_fd = -1;
   std::optional<Clock::time_point> fallback_started;
@@ -230,6 +247,7 @@ struct MemoryReservation {
 
 struct MemoryWait {
   std::shared_ptr<CompileSession> session;
+  std::string cost_key;
   uint64_t estimate_kb = 0;
   Clock::time_point started = Clock::now();
   std::optional<Clock::time_point> queued_deadline;
@@ -273,11 +291,8 @@ std::optional<uint64_t> ProcessTreeRssKb(pid_t root_pid) {
     const std::string process = "/proc/" + std::to_string(pid);
     const auto status = util::ReadFile(process + "/status");
     const auto rss_kb = status ? StatusNumber(*status, "VmRSS") : std::nullopt;
-    if (!rss_kb) {
-      if (pid != root_pid && ::kill(pid, 0) != 0 && errno == ESRCH) continue;
-      return std::nullopt;
-    }
-    total_kb = SaturatingAddKb(total_kb, *rss_kb);
+    if (!rss_kb && pid == root_pid) return std::nullopt;
+    total_kb = SaturatingAddKb(total_kb, rss_kb.value_or(0));
     std::error_code error;
     for (std::filesystem::directory_iterator task(process + "/task", error), end;
          !error && task != end; task.increment(error)) {
@@ -293,9 +308,9 @@ std::optional<uint64_t> ProcessTreeRssKb(pid_t root_pid) {
 }
 
 std::string ReservationReleaseLog(const MemoryReservation& reservation) {
-  return "reserve: " + std::to_string(reservation.compiler_pid) + " rss " +
-      std::to_string(reservation.peak_rss_kb) + " of " +
-      std::to_string(reservation.estimate_kb) + " at release";
+  return "reserve: " + std::to_string(reservation.compiler_pid) +
+      (reservation.rss_sampled ? " rss " + std::to_string(reservation.peak_rss_kb) : " unsampled") +
+      " of " + std::to_string(reservation.estimate_kb) + " at release";
 }
 
 void AwaitAdmissionTestGate(const char* variable, const std::string& message) {
@@ -367,6 +382,7 @@ class Server {
   void UpdateAdmission(std::unique_lock<std::mutex>& lock,
                        std::optional<int> spawned_fd = std::nullopt, bool periodic = false);
   void GrantMemoryWaiters();
+  void RememberTreePeak(const MemoryReservation& reservation);
   void EndMemoryQueue(const std::shared_ptr<MemoryWait>& waiter);
   void AdmissionWorker();
   uint64_t UnrealisedKb() const;
@@ -422,13 +438,13 @@ class Server {
   std::map<int, std::shared_ptr<CompileSession>> sessions_;
   std::map<std::string, KeyLease> leases_;
   std::map<int, std::shared_ptr<MemoryReservation>> reservations_;
+  std::map<std::string, uint64_t> tree_peak_rss_kb_;
   std::deque<std::shared_ptr<MemoryWait>> memory_waiters_;
   uint64_t mem_available_kb_ = 0;
   bool meminfo_known_ = false;
   bool meminfo_failure_logged_ = false;
   bool admission_sampling_ = false;
   bool test_rss_blocked_ = false;
-  Clock::time_point meminfo_read_at_{};
   Clock::time_point rss_read_at_{};
   uint64_t reserve_waits_ = 0;
   uint64_t longest_reserve_wait_ms_ = 0;
@@ -775,7 +791,6 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
   }
   bound_ms = std::min<uint64_t>(bound_ms, kReplyTimeoutSeconds * 1000);
   const auto started = Clock::now();
-  const auto deadline = started + std::chrono::milliseconds(bound_ms);
   std::unique_lock<std::mutex> lock(mutex_);
   LeaseOutcome outcome = LeaseOutcome::kCompile;
   LeaseCompileReason reason = LeaseCompileReason::kShutdown;
@@ -799,9 +814,7 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
       auto wait_deadline = [&] {
         const auto queued_time = holder ? MemoryQueueTime(*holder, Clock::now()) -
                                          queue_time_at_start : Clock::duration::zero();
-        return deadline + std::min(std::max(queued_time, Clock::duration::zero()),
-            std::chrono::duration_cast<Clock::duration>(
-                std::chrono::milliseconds(kMemoryWaitBoundMs)));
+        return LeaseWaitDeadline(started, bound_ms, queued_time);
       };
       lease->waiters.insert(session->fd);
       VCACHE_LOG("lease: waiting on holder pid " + std::to_string(holder_pid) + " up to " +
@@ -943,7 +956,6 @@ void Server::UpdateAdmission(std::unique_lock<std::mutex>& lock,
   if (available_kb) {
     mem_available_kb_ = *available_kb;
     meminfo_known_ = true;
-    meminfo_read_at_ = now;
   } else if (!meminfo_failure_logged_) {
     meminfo_failure_logged_ = true;
     meminfo_warning = true;
@@ -956,16 +968,19 @@ void Server::UpdateAdmission(std::unique_lock<std::mutex>& lock,
     if (found == reservations_.end() || found->second != sample.reservation) continue;
     auto& reservation = *found->second;
     if (sample.released) {
+      RememberTreePeak(reservation);
       messages.push_back(ReservationReleaseLog(reservation));
       reservations_.erase(found);
     } else if (sample.rss_kb) {
       if (!reservation.fallback_started && *sample.rss_kb > reservation.peak_rss_kb) {
-        reservation.peak_rss_kb = *sample.rss_kb;
-        if (*sample.rss_kb > reservation.estimate_kb) {
+        if (*sample.rss_kb > reservation.estimate_kb &&
+            reservation.peak_rss_kb <= reservation.estimate_kb) {
           messages.push_back("reserve: rss overshoot " + std::to_string(reservation.compiler_pid) +
               " by " + std::to_string(*sample.rss_kb - reservation.estimate_kb) + " kB");
         }
+        reservation.peak_rss_kb = *sample.rss_kb;
       }
+      if (!reservation.fallback_started) reservation.rss_sampled = true;
       if (available_kb || !meminfo_known_ || reservation.fallback_started) {
         reservation.realised_kb = *sample.rss_kb;
       }
@@ -1011,10 +1026,15 @@ void Server::GrantMemoryWaiters() {
       waiter->changed.notify_all();
       continue;
     }
+    const auto peak = tree_peak_rss_kb_.find(waiter->cost_key);
+    if (peak != tree_peak_rss_kb_.end()) {
+      waiter->estimate_kb = std::max(waiter->estimate_kb, peak->second);
+    }
     const uint64_t available_kb = AvailableKb();
     if (!reservations_.empty() && available_kb < waiter->estimate_kb) break;
     auto reservation = std::make_shared<MemoryReservation>();
     reservation->session = waiter->session;
+    reservation->cost_key = waiter->cost_key;
     reservation->estimate_kb = waiter->estimate_kb;
     VCACHE_LOG("reserve: granted " + std::to_string(waiter->estimate_kb) + " kB after " +
                std::to_string(waited_ms) + " ms (available " + std::to_string(available_kb) +
@@ -1025,6 +1045,12 @@ void Server::GrantMemoryWaiters() {
     waiter->outcome = MemoryOutcome::kGranted;
     waiter->changed.notify_all();
   }
+}
+
+void Server::RememberTreePeak(const MemoryReservation& reservation) {
+  if (reservation.peak_rss_kb == 0) return;
+  auto& peak = tree_peak_rss_kb_[reservation.cost_key];
+  peak = std::max(peak, reservation.peak_rss_kb);
 }
 
 void Server::HandleMemoryReserve(Reader* in, Writer* out,
@@ -1045,11 +1071,9 @@ void Server::HandleMemoryReserve(Reader* in, Writer* out,
   }
   auto waiter = std::make_shared<MemoryWait>();
   waiter->session = session;
+  waiter->cost_key = cost_key;
   waiter->estimate_kb = estimate_kb;
-  const auto max_bound_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      Clock::time_point::max() - waiter->started).count();
-  const auto deadline = waiter->started + std::chrono::milliseconds(
-      std::min<uint64_t>(bound_ms, max_bound_ms));
+  const auto deadline = MemoryReserveDeadline(waiter->started, bound_ms);
   AwaitAdmissionTestGate("VCACHE_DAEMON_TEST_RESERVE_GATE", "reserve: test reserve blocked");
   std::unique_lock<std::mutex> lock(mutex_);
   UpdateAdmission(lock);
@@ -1067,7 +1091,10 @@ void Server::HandleMemoryReserve(Reader* in, Writer* out,
       session->memory_queued_at = Clock::now();
       ++reserve_waits_;
       VCACHE_LOG("reserve: waiting (" + std::to_string(AvailableKb()) + " < " +
-                 std::to_string(estimate_kb) + ") behind " + std::to_string(behind));
+                 std::to_string(waiter->estimate_kb) + ") behind " + std::to_string(behind));
+      VCACHE_LOG("reserve: wait bound " +
+                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     deadline - waiter->started).count()) + " ms");
     }
   }
   waiter->changed.wait_until(lock, deadline,
@@ -1117,8 +1144,10 @@ void Server::HandleCompilerSpawned(Reader* in, Writer* out,
   const auto found = reservations_.find(session->fd);
   if (found != reservations_.end() && !stop_requested_.load()) {
     replacement->session = found->second->session;
+    replacement->cost_key = found->second->cost_key;
     replacement->estimate_kb = found->second->estimate_kb;
     replacement->peak_rss_kb = found->second->peak_rss_kb;
+    replacement->rss_sampled = found->second->rss_sampled;
     found->second = std::move(replacement);
     UpdateAdmission(lock, session->fd);
   }
@@ -1573,6 +1602,7 @@ void Server::Serve(int fd) {
     ExpireLeases(session->second);
     const auto reservation = reservations_.find(fd);
     if (reservation != reservations_.end()) {
+      RememberTreePeak(*reservation->second);
       reservation_log = ReservationReleaseLog(*reservation->second);
     }
     reservations_.erase(fd);

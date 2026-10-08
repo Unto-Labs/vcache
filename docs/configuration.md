@@ -662,7 +662,10 @@ switches off also serves scheduling requests from clients that enable them.
 Admission reserves memory before the actual compile or link. It uses the
 largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
 and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
-integer defaults are in kB. A wait lasts at most ten minutes; reaching that
+integer defaults are in kB. Within the daemon lifetime, a matching cost key also
+uses at least the observed peak sum of the live compiler tree's RSS. This can
+exceed the largest descendant peak recorded by `wait4` in the cost file.
+A wait lasts at most ten minutes, enforced by the server; reaching that
 bound or losing the daemon runs the compiler unreserved and logs the decision.
 
 `daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots

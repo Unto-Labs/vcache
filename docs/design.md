@@ -202,8 +202,10 @@ separate processes do.
 - The statistics file is updated under `flock(2)` for a few microseconds per
   compilation.
 - Two processes computing the same key simply both compile and both store the
-  same bytes. Adding cross-process locking to prevent that would cost more than
-  the duplicated work.
+  same bytes by default. With `daemon.single_flight` enabled, a compile session
+  holds a memory-only key lease and peers wait within a bounded interval before
+  restoring the stored result or compiling themselves. This can avoid repeated
+  work across concurrent worktrees; it remains off by default.
 
 ## Parsing choices
 

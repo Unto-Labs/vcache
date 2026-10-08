@@ -2694,6 +2694,20 @@ else
   bad "compile session integration requires python3"
 fi
 
+section "10b. Single-flight"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+    > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
+  lease_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+  done < "$WORK/single-flight.report"
+  check "single-flight integration driver completes" "$lease_test_exit" "0"
+  if [[ "$lease_test_exit" != 0 ]]; then cat "$WORK/single-flight.errors"; fi
+else
+  bad "single-flight integration requires python3"
+fi
+
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

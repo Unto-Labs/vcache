@@ -22,6 +22,22 @@ namespace {
 constexpr size_t kMaxCostObservations = 8;
 constexpr size_t kLargestCostKeys = 10;
 
+// A profile file, plugin, or sanitizer list is a checkout path. Keeping it
+// would split one codegen class across worktrees. -flto=thin stays: the
+// value is not a path.
+bool IsPathValuedCxxFlag(std::string_view arg) {
+  constexpr std::string_view kNamed[] = {
+      "-fprofile-use=",          "-fprofile-instr-use=",    "-fprofile-prefix-map=",
+      "-fcoverage-prefix-map=", "-fplugin=",               "-fsanitize-ignorelist=",
+      "-fsanitize-blacklist=",  "-fcrash-diagnostics-dir=", "-fmodules-cache-path=",
+  };
+  for (const std::string_view prefix : kNamed) {
+    if (util::StartsWith(arg, prefix)) return true;
+  }
+  const size_t eq = arg.find('=');
+  return eq != std::string_view::npos && arg.find('/', eq + 1) != std::string_view::npos;
+}
+
 // Cargo rewrites `-C metadata` and `-C extra-filename` on a lockfile or feature
 // change. Keeping every flag that is not a path would split one crate's cost
 // estimate across those hashes. The class is therefore an allow-list of the
@@ -38,6 +54,7 @@ bool IsKeptCxxFlag(std::string_view arg) {
       util::StartsWith(arg, "-fmacro-prefix-map")) {
     return false;
   }
+  if (IsPathValuedCxxFlag(arg)) return false;
   return true;
 }
 

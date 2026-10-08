@@ -664,6 +664,46 @@ void TestPreprocessedNormalization() {
         "does not fire on ordinary code");
 }
 
+void TestReadFile() {
+  Section("util::ReadFile");
+
+  auto scratch = util::MakeTempDir("vcache-readfile-");
+  Check(scratch.has_value(), "readfile scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string empty_path = *scratch + "/empty";
+  util::WriteFileAtomic(empty_path, "");
+  const auto empty = util::ReadFile(empty_path);
+  Check(empty.has_value() && empty->empty(), "an empty file reads as an empty string");
+
+  const std::string three_path = *scratch + "/three";
+  util::WriteFileAtomic(three_path, "abc");
+  const auto three = util::ReadFile(three_path);
+  Check(three.has_value() && *three == "abc", "a 3-byte file reads back those bytes");
+
+  const std::string big_path = *scratch + "/big";
+  std::string pattern(64ull << 20, '\0');
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    pattern[i] = static_cast<char>(i * 131u);
+  }
+  Check(util::WriteFileAtomic(big_path, pattern), "the 64 MiB fixture was written");
+  const auto big = util::ReadFile(big_path);
+  Check(big.has_value() && big->size() == pattern.size(), "a 64 MiB file reads back its size");
+  const auto file_hash = hash::HashFile(big_path);
+  Check(big.has_value() && file_hash.has_value() && hash::HashString(*big) == *file_hash,
+        "a 64 MiB file matches hash::HashFile");
+
+  Check(!util::ReadFile(*scratch + "/missing").has_value(), "a missing path reads as nullopt");
+
+  const auto status = util::ReadFile("/proc/self/status");
+  Check(status.has_value() && !status->empty() && status->rfind("Name:", 0) == 0,
+        "/proc/self/status is non-empty and starts with Name:");
+}
+
 void TestBlob() {
   Section("storage::Blob");
 
@@ -703,6 +743,24 @@ void TestBlob() {
         "detects truncation");
   Check(!storage::DeserializeBlob("garbage", &ignored), "rejects a bad magic");
   Check(!storage::DeserializeBlob("", &ignored), "rejects empty input");
+
+  storage::Blob two;
+  two.files.push_back(storage::BlobFile{"a.rlib", "aaa"});
+  two.files.push_back(storage::BlobFile{"b.rmeta", "bbb"});
+  const std::string two_enc = storage::SerializeBlob(two);
+  storage::Blob two_back;
+  Check(storage::DeserializeBlob(two_enc, &two_back) && two_back.files.size() == 2 &&
+            two_back.files[0].name == "a.rlib" && two_back.files[0].contents == "aaa" &&
+            two_back.files[1].name == "b.rmeta" && two_back.files[1].contents == "bbb",
+        "a two-file blob round-trips byte-exact");
+  const auto body_byte = two_enc.find("aaa");
+  Check(body_byte != std::string::npos, "the two-file body contains its payload");
+  if (body_byte != std::string::npos) {
+    std::string flipped = two_enc;
+    flipped[body_byte] = static_cast<char>(flipped[body_byte] ^ 0x01);
+    Check(!storage::DeserializeBlob(flipped, &ignored),
+          "flipping one body byte is rejected");
+  }
 }
 
 // An in-memory layer, so the chain's fan-out and backfill rules can be checked
@@ -2239,6 +2297,66 @@ size_t CountFiles(const std::string& dir) {
   return util::ListFilesRecursive(dir).size();
 }
 
+void TestDiskTrimPins() {
+  Section("storage::disk trim");
+
+  const std::string payload(4096, 'a');
+  const std::string k1 = "aa1111";
+  const std::string k2 = "bb2222";
+  const std::string k3 = "cc3333";
+
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "two entries fit under the high water");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    Check(disk.Put(k3, payload), "the store that crosses the budget succeeds");
+    Check(util::FileExists(EntryPath(tmp.path(), k1)), "a pending upload is not evicted");
+    Check(!util::FileExists(EntryPath(tmp.path(), k2)), "an unpinned older entry is evicted");
+    Check(util::FileExists(EntryPath(tmp.path(), k3)), "the new entry stays");
+  }
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "the control stores two entries");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    Check(disk.Put(k3, payload), "the control store succeeds");
+    Check(!util::FileExists(EntryPath(tmp.path(), k1)),
+          "without a pending marker the oldest entry is evicted");
+  }
+  {
+    TempCacheDir tmp;
+    for (const std::string& key : {k1, k2, k3}) {
+      util::MakeDirs(tmp.path() + "/" + key.substr(0, 2));
+      util::WriteFileAtomic(EntryPath(tmp.path(), key), payload);
+      util::MakeDirs(tmp.path() + "/daemon/pending");
+      util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + key, "");
+    }
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    const pid_t pid = ::fork();
+    Check(pid >= 0, "the all-pinned trim can be watched");
+    if (pid == 0) {
+      ::alarm(2);
+      disk.Trim();
+      _exit(0);
+    }
+    if (pid > 0) {
+      int status = 0;
+      ::waitpid(pid, &status, 0);
+      Check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "an all-pinned trim finishes");
+    }
+    Check(util::FileExists(EntryPath(tmp.path(), k1)) &&
+              util::FileExists(EntryPath(tmp.path(), k2)) &&
+              util::FileExists(EntryPath(tmp.path(), k3)),
+          "an all-pinned trim removes nothing");
+  }
+}
+
 void TestDiskStorageEviction() {
   Section("disk storage: global eviction");
 
@@ -2744,6 +2862,14 @@ void TestCost() {
                                {"-O2", "-fdebug-prefix-map=/a=/b"}, roots_a),
           core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),
           "a debug prefix map is not part of the cost key");
+  CheckEq(core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fprofile-use=/a/x.profdata"}, roots_a),
+          core::ComputeCostKey("compile", file_a, "c++",
+                               {"-O2", "-fprofile-use=/b/x.profdata"}, roots_a),
+          "a path-valued -fprofile-use is not part of the cost key");
+  Check(core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-flto=thin"}, roots_a) !=
+            core::ComputeCostKey("compile", file_a, "c++", {"-O2", "-flto=full"}, roots_a),
+        "-flto=thin and -flto=full are different cost keys");
   Check(core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2021"}, roots_a) !=
             core::ComputeCostKey("rustc", file_a, "rust", {"--edition", "2018"}, roots_a),
         "--edition stays in the cost key");
@@ -2944,6 +3070,62 @@ void TestRustcFingerprint() {
           "two rustc files with one banner share a fingerprint");
 }
 
+void TestRustOutputNames() {
+  Section("rust::output names");
+
+  Check(rust::IsSafeOutputName("a/b/c.rmeta"), "a/b/c.rmeta is a safe output name");
+  Check(rust::IsSafeOutputName("./a.rlib"), "./a.rlib is a safe output name");
+  Check(!rust::IsSafeOutputName("../x"), "../x is not a safe output name");
+  Check(!rust::IsSafeOutputName("a/../../x"), "a/../../x is not a safe output name");
+  Check(!rust::IsSafeOutputName("/etc/x"), "/etc/x is not a safe output name");
+  Check(!rust::IsSafeOutputName(""), "an empty output name is not safe");
+  const std::string nul_name("a\0b", 3);
+  Check(!rust::IsSafeOutputName(nul_name), "an output name with a NUL is not safe");
+  Check(rust::IsSafeOutputName("a/..b/c"), "a/..b/c is a safe output name");
+
+  auto scratch = util::MakeTempDir("vcache-rust-names-");
+  Check(scratch.has_value(), "output-name scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string out = *scratch + "/out";
+  util::MakeDirs(out);
+  const auto parent_before = util::ListFilesRecursive(*scratch);
+  storage::BlobFile safe;
+  safe.name = "kept.rlib";
+  safe.contents = "kept";
+  storage::BlobFile escape;
+  escape.name = "../escape";
+  escape.contents = "nope";
+  const core::RootMap roots;
+  Check(!rust::RestoreOutputs({safe, escape}, out, roots, {}),
+        "a blob named ../escape is refused");
+  Check(!util::FileExists(out + "/kept.rlib"), "a refused restore writes nothing");
+  Check(!util::FileExists(*scratch + "/escape"),
+        "a refused restore writes nothing outside the output directory");
+  Check(util::ListFilesRecursive(*scratch).size() == parent_before.size(),
+        "a refused restore leaves the parent directory unchanged");
+
+  const std::string cap = *scratch + "/cap";
+  util::MakeDirs(cap);
+  util::WriteFileAtomic(cap + "/lib.rlib", "ok");
+  util::WriteFileAtomic(*scratch + "/outside-target", "out");
+  Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
+        "a symlink out of the capture directory can be planted");
+  std::vector<storage::BlobFile> captured;
+  Check(!rust::CaptureOutputs(cap, roots, {}, &captured),
+        "capturing a name that escapes the output directory fails");
+}
+
+void TestHeldHitLayer() {
+  Section("daemon::held hit");
+  CheckEq(std::string(daemon::HeldHitLayerName()), "memory",
+          "a held hit replies with layer memory");
+}
+
 void TestJobserver() {
   Section("daemon::jobserver");
 
@@ -3081,6 +3263,7 @@ int main() {
   // disk cache does on every Put -- primes the cache in the parent, the child
   // inherits it, and the strict-umask assertion fails.
   TestDiskStorageEviction();
+  TestDiskTrimPins();
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
@@ -3088,8 +3271,13 @@ int main() {
   // Writes files too.
   TestRustManifest();
   TestRunRusage();
+  // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
+  // and a forked child is charged that high-water mark until exec replaces it.
+  TestReadFile();
   TestCost();
   TestRustcFingerprint();
+  TestRustOutputNames();
+  TestHeldHitLayer();
   TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);

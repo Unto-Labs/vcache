@@ -21,8 +21,6 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-
 #include "util/str.h"
 
 // glibc gained the copy_file_range(2) wrapper in 2.27; older hosts (EL7) take the byte-copy fallback.
@@ -106,12 +104,62 @@ bool MakeDirs(const std::string& path) {
   return false;
 }
 
+namespace {
+
+// Appends until read(2) returns 0. A /proc file reports st_size 0 and still
+// has bytes, so the sized read below is not enough on its own.
+bool ReadToEof(int fd, std::string* out) {
+  char buf[8192];
+  while (true) {
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return true;
+    out->append(buf, static_cast<size_t>(n));
+  }
+}
+
+}  // namespace
+
 std::optional<std::string> ReadFile(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return std::nullopt;
-  std::string contents((std::istreambuf_iterator<char>(in)),
-                       std::istreambuf_iterator<char>());
-  if (in.bad()) return std::nullopt;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return std::nullopt;
+
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    ::close(fd);
+    return std::nullopt;
+  }
+
+  std::string contents;
+  if (S_ISREG(st.st_mode) && st.st_size > 0) {
+    contents.resize(static_cast<size_t>(st.st_size));
+    size_t got = 0;
+    while (got < contents.size()) {
+      const ssize_t n = ::read(fd, contents.data() + got, contents.size() - got);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        ::close(fd);
+        return std::nullopt;
+      }
+      if (n == 0) {
+        contents.resize(got);
+        break;
+      }
+      got += static_cast<size_t>(n);
+    }
+    // The file may have grown past the size fstat reported.
+    if (got == static_cast<size_t>(st.st_size) && !ReadToEof(fd, &contents)) {
+      ::close(fd);
+      return std::nullopt;
+    }
+  } else if (!ReadToEof(fd, &contents)) {
+    ::close(fd);
+    return std::nullopt;
+  }
+  ::close(fd);
   return contents;
 }
 

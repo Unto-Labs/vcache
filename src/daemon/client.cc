@@ -37,6 +37,10 @@ uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms) {
   return std::max<uint64_t>(30000, 2 * *recorded_wall_ms);
 }
 
+uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms) {
+  return bound_ms / 1000 + (bound_ms % 1000 != 0) + 15;
+}
+
 uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key) {
   std::optional<uint64_t> max_wall_ms;
   for (const auto& observation : core::LoadCompileCost(cache_dir, cost_key).observations) {
@@ -53,7 +57,8 @@ void CompileSessionHandle::Unavailable(const std::string& why) {
   leased_key_.clear();
 }
 
-bool CompileSessionHandle::Request(const std::string& request, std::string* reply) {
+bool CompileSessionHandle::Request(const std::string& request, std::string* reply,
+                                   std::string* refusal) {
   if (fd_ < 0) return false;
   pollfd pending{fd_, POLLIN, 0};
   bool terminal_pending = ::poll(&pending, 1, 0) > 0;
@@ -72,7 +77,14 @@ bool CompileSessionHandle::Request(const std::string& request, std::string* repl
   uint8_t status = 0;
   std::string why;
   if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError)) {
-    if (!in.Str(&why) || !in.done()) why = "malformed session reply";
+    if (!in.Str(&why) || !in.done()) {
+      Unavailable("malformed session reply");
+      return false;
+    }
+    if (refusal && !terminal_pending && why != "daemon shutting down") {
+      *refusal = why;
+      return false;
+    }
     Unavailable(why);
     return false;
   }
@@ -88,9 +100,15 @@ LeaseOutcome CompileSessionHandle::AcquireLease(const std::string& key, uint64_t
   request.U8(static_cast<uint8_t>(Op::kLeaseAcquire));
   request.Str(key);
   request.U64(bound_ms);
-  std::string reply;
-  if (!Request(request.data(), &reply)) {
-    VCACHE_LOG("lease: holder gone, compiling");
+  timeval timeout{static_cast<time_t>(SchedulingReplyTimeoutSeconds(bound_ms)), 0};
+  ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  std::string reply, refusal;
+  const bool answered = Request(request.data(), &reply, &refusal);
+  timeout.tv_sec = kReplyTimeoutSeconds;
+  if (fd_ >= 0) ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  if (!answered) {
+    VCACHE_LOG(refusal.empty() ? "lease: holder gone, compiling" :
+               "lease: daemon refused (" + refusal + "), compiling");
     return LeaseOutcome::kCompile;
   }
   Reader in(reply);

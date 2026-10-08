@@ -254,11 +254,13 @@ timer. Real endpoints do not do this. Measured without it, the daemon looked
 
 Set `daemon.single_flight = true` (`VCACHE_DAEMON_SINGLE_FLIGHT=1`) to share
 one compile of a missed key across concurrent worktrees. It defaults to false.
+The switches control each client's requests. The daemon always serves scheduler
+operations, so a tree can enable them after another tree has started the daemon.
 A compile session holds a memory-only `KeyLease`; another compile of the same
 key waits for its holder to store or release it. Different keys remain independent.
 C and Rust lease the entry key. Links lease the pre-key that locates their
 result manifest. Rust's dep-info and manifest keys never receive compile leases.
-Read-only clients and speculative lookups hold no compile lease. Recache requests
+Read-only clients hold no compile lease. Recache requests
 compile independently so they still replace existing entries.
 
 After a stored reply the waiter uses an ordinary Get and restores the outputs.
@@ -273,6 +275,8 @@ If a holder closes while a Put of its key is already in flight, the lease stays
 held until that Put finishes: success wakes stored, failure wakes compile. A
 close with no Put in flight wakes compile immediately. The waiter's own bound
 still limits its wait if storage stalls; there is no timer grace on holder close.
+Put completes a lease only when its peer pid matches the holder's pid. If either
+pid is unavailable, the daemon accepts the Put as it did before pid checks.
 The test-only `VCACHE_DAEMON_TEST_BLOCK_PUT=<fifo>` seam pauses the first Put
 after marking it in flight, for at most five seconds. A byte `s` permits storage;
 any other byte or timeout makes that Put's disk read-only and skips remote stores.
@@ -285,6 +289,9 @@ record, rather than only its latest observation. A waiter still occupies its
 build tool's job slot while it waits.
 Decision logs include holder pid, bound and elapsed wait; the client receives
 this metadata with its scheduling reply. Session loss never fails the build.
+The socket receive timeout exceeds a scheduling bound by 15 seconds, allowing
+the bound reply to arrive. Disconnect checks run outside the shared server lock
+at most every 250 ms; holder completion wakes the lease condition immediately.
 
 `--daemon-status` shows `leases held`, `leases waiting`, lifetime `leases expired`
 and `compiles deduplicated`. A stored wake increments the deduplication counter;

@@ -38,6 +38,7 @@
 #include "core/roots.h"
 #include "core/stats.h"
 #include "daemon/jobserver.h"
+#include "daemon/upload_queue.h"
 #include "daemon/protocol.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
@@ -2933,6 +2934,64 @@ void TestRustOutputNames() {
         "capturing a name that escapes the output directory fails");
 }
 
+void TestUploadGeneration() {
+  Section("daemon::upload generation");
+
+  auto scratch = util::MakeTempDir("vcache-upload-");
+  Check(scratch.has_value(), "upload scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string journal = *scratch + "/pending";
+  util::MakeDirs(journal);
+  const auto now = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point soonest;
+
+  daemon::UploadQueue queued(journal);
+  const auto first_blob = std::make_shared<const std::string>("v1");
+  const auto second_blob = std::make_shared<const std::string>("v2-value");
+  Check(queued.Enqueue("k", first_blob, true), "the first store is queued");
+  Check(queued.Enqueue("k", second_blob, true), "a rewrite while queued is accepted");
+  const auto yielded = queued.TakeReady(now, &soonest);
+  Check(yielded.has_value() && yielded->blob && *yielded->blob == "v2-value" &&
+            yielded->generation == 2,
+        "dequeue yields the rewritten blob once");
+  Check(!queued.TakeReady(now, &soonest).has_value(), "a rewrite while queued is one upload");
+  Check(queued.held_bytes() == second_blob->size(),
+        "replacing a held blob adjusts the held byte count");
+
+  const std::string disk_journal = *scratch + "/disk-pending";
+  util::MakeDirs(disk_journal);
+  daemon::UploadQueue disk(disk_journal);
+  Check(disk.Enqueue("m", nullptr, true), "a disk store is queued");
+  const auto old = disk.TakeReady(now, &soonest);
+  Check(old.has_value() && old->generation == 1, "the first disk upload is generation 1");
+  Check(disk.Enqueue("m", nullptr, true), "a rewrite during upload is accepted");
+  Check(disk.Finish(*old), "finishing the old generation re-queues");
+  Check(disk.JournalExists("m"), "the journal stays while a rewrite is re-queued");
+  const auto newer = disk.TakeReady(now, &soonest);
+  Check(newer.has_value() && newer->generation == 2,
+        "the re-queued upload is the newer generation");
+  Check(!disk.Finish(*newer) && disk.empty(),
+        "finishing the current generation empties the queue");
+
+  daemon::UploadQueue once("");
+  const auto only = std::make_shared<const std::string>("only");
+  Check(once.Enqueue("once", only, false), "a single store is queued");
+  const auto one = once.TakeReady(now, &soonest);
+  Check(one.has_value() && !once.Finish(*one) && !once.TakeReady(now, &soonest).has_value(),
+        "a single store is uploaded once");
+
+  daemon::UploadQueue tiny("", 10);
+  const auto small = std::make_shared<const std::string>(std::string(6, 'a'));
+  const auto big = std::make_shared<const std::string>(std::string(20, 'b'));
+  Check(tiny.Enqueue("z", small, false), "a blob under the cap is held");
+  Check(!tiny.Enqueue("z", big, false), "a blob over the cap is refused");
+  Check(tiny.generation("z") == 1, "a refused enqueue does not bump the generation");
+}
+
 void TestHeldHitLayer() {
   Section("daemon::held hit");
   CheckEq(std::string(daemon::HeldHitLayerName()), "memory",
@@ -3089,6 +3148,7 @@ int main() {
   TestCost();
   TestRustcFingerprint();
   TestRustOutputNames();
+  TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();
 

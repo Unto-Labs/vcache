@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon/jobserver.h"
 #include "daemon/server.h"
+#include "daemon/upload_queue.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -124,24 +125,14 @@ struct Counters {
   std::atomic<uint64_t> uploads_recovered{0};
 };
 
-// One pending upload. An entry the disk layer holds is queued by key alone and
-// read back when its turn comes, which keeps a long queue cheap and lets the
-// journal be nothing but file names. Without a disk layer the blob itself has
-// to wait in memory.
-struct Upload {
-  std::string key;
-  std::shared_ptr<const std::string> blob;  // null: read it from disk
-  int attempts = 0;
-  Clock::time_point not_before{};
-};
-
 class Server {
  public:
   explicit Server(const core::Config& config)
       : config_(config),
         state_dir_(StateDir(config)),
         socket_path_(SocketPath(config)),
-        fingerprint_(ConfigFingerprint(config)) {}
+        fingerprint_(ConfigFingerprint(config)),
+        uploads_(state_dir_ + "/pending") {}
 
   int Run(int ready_fd);
 
@@ -168,11 +159,6 @@ class Server {
   bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
                bool journal);
   void UploadWorker();
-  void FinishUpload(const Upload& item);
-  std::string JournalPath(const std::string& key) const {
-    return state_dir_ + "/pending/" + key;
-  }
-
   void Shutdown();
   bool Idle() const;
   // Seconds of quiet this process waits before exiting. Twice the configured
@@ -210,17 +196,11 @@ class Server {
   std::string drain_summary_;
 
   // Upload queue, also under `mutex_`.
-  std::deque<Upload> queue_;
-  std::set<std::string> queued_keys_;  // queued or in flight; dedupes repeats
-  std::map<std::string, std::shared_ptr<const std::string>> held_;  // memory blobs
-  uint64_t held_bytes_ = 0;
+  UploadQueue uploads_;
   int in_flight_ = 0;
   bool workers_stop_ = false;
   std::vector<std::thread> workers_;
 
-  // A store without a disk layer holds its blob in memory until uploaded. Past
-  // this the store uploads synchronously instead, which is slower but bounded.
-  static constexpr uint64_t kMaxHeldBytes = 1ull << 30;
   static constexpr int kMaxUploadAttempts = 3;
   static constexpr size_t kMaxConnections = 1024;
 };
@@ -371,34 +351,11 @@ void Server::RecoverJournal() {
 bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
                      bool journal) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (queued_keys_.count(key) != 0) return true;  // already on its way
-  if (blob != nullptr) {
-    if (held_bytes_ + blob->size() > kMaxHeldBytes) return false;
-    held_bytes_ += blob->size();
-    held_[key] = blob;
-  }
-  if (journal) {
-    // An empty file is the whole record; creating it is what makes the upload
-    // survive this process.
-    const int fd = ::open(JournalPath(key).c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-    if (fd >= 0) ::close(fd);
-  }
-  queued_keys_.insert(key);
-  queue_.push_back(Upload{key, std::move(blob)});
+  if (!uploads_.Enqueue(key, std::move(blob), journal)) return false;
   counters_.uploads_queued++;
   lock.unlock();
   cv_.notify_all();
   return true;
-}
-
-void Server::FinishUpload(const Upload& item) {
-  ::unlink(JournalPath(item.key).c_str());
-  std::lock_guard<std::mutex> lock(mutex_);
-  queued_keys_.erase(item.key);
-  if (item.blob != nullptr) {
-    held_bytes_ -= item.blob->size();
-    held_.erase(item.key);
-  }
 }
 
 void Server::UploadWorker() {
@@ -408,17 +365,10 @@ void Server::UploadWorker() {
   for (;;) {
     // The first item whose retry delay has passed. Retries go to the back, so
     // this is nearly always the front.
-    auto ready = queue_.end();
     Clock::time_point soonest = Clock::time_point::max();
-    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
-      if (it->not_before <= Clock::now()) {
-        ready = it;
-        break;
-      }
-      soonest = std::min(soonest, it->not_before);
-    }
-    if (ready == queue_.end()) {
-      if (workers_stop_ && queue_.empty()) return;
+    auto ready = uploads_.TakeReady(Clock::now(), &soonest);
+    if (!ready) {
+      if (workers_stop_ && uploads_.empty()) return;
       if (soonest == Clock::time_point::max()) {
         cv_.wait(lock);
       } else {
@@ -426,8 +376,7 @@ void Server::UploadWorker() {
       }
       continue;
     }
-    Upload item = std::move(*ready);
-    queue_.erase(ready);
+    UploadItem item = std::move(*ready);
     ++in_flight_;
     lock.unlock();
 
@@ -461,10 +410,15 @@ void Server::UploadWorker() {
                 (s3->failed() ? s3->last_error() : std::string("rejected")));
     }
 
-    if (done) FinishUpload(item);
     lock.lock();
     --in_flight_;
-    if (!done) queue_.push_back(std::move(item));
+    if (done) {
+      if (uploads_.Finish(item)) {
+        log_.Line("daemon: re-queued " + item.key + " (rewritten during upload)");
+      }
+    } else {
+      uploads_.Requeue(std::move(item));
+    }
     cv_.notify_all();
   }
 }
@@ -528,9 +482,8 @@ void Server::HandleGet(Reader* in, Writer* out) {
     // Stored moments ago, still waiting for its upload, and no disk layer to
     // have put it in. Serving it is what makes the queue invisible to builds.
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = held_.find(key);
-    if (it != held_.end()) {
-      value = *it->second;
+    if (auto held = uploads_.Held(key)) {
+      value = *held;
       layer = HeldHitLayerName();
       counters_.hits_memory++;
     }
@@ -624,9 +577,9 @@ std::string Server::StatusText() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     active = connections_.size();
-    pending = queue_.size();
+    pending = uploads_.size();
     in_flight = in_flight_;
-    held = held_bytes_;
+    held = uploads_.held_bytes();
   }
   const auto uptime =
       std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started_).count();
@@ -733,7 +686,7 @@ bool Server::Idle() const {
   const int limit_seconds = IdleLimitSeconds();
   if (limit_seconds <= 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!connections_.empty() || !queue_.empty() || in_flight_ != 0) return false;
+  if (!connections_.empty() || !uploads_.empty() || in_flight_ != 0) return false;
   return Clock::now() - last_activity_ > std::chrono::seconds(limit_seconds);
 }
 
@@ -779,7 +732,7 @@ void Server::Shutdown() {
     cv_.wait_for(lock, std::chrono::seconds(5), [&] { return others() == 0; });
   }
 
-  const size_t pending = queue_.size() + static_cast<size_t>(in_flight_);
+  const size_t pending = uploads_.size() + static_cast<size_t>(in_flight_);
   if (pending > 0) log_.Line("draining " + std::to_string(pending) + " uploads");
   workers_stop_ = true;
   cv_.notify_all();

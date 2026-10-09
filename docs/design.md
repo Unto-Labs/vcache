@@ -136,6 +136,12 @@ entries and leaves `costs/` alone, as it leaves the compiler-version memos.
 A failure to write one is logged (`cost: could not record`) and does not fail
 the build. `vcache --show-costs` summarises the records.
 
+Each compile, dependency scan and link works in a scratch directory under
+`<cache>/tmp/` (the system temp dir only when that cannot be created). It is
+removed when vcache exits; a vcache that is killed mid-compile cannot, so
+`--trim`, and a store that triggers an eviction check, remove any scratch
+directory not modified for six hours.
+
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,
 which bounds eviction work to 1/256th of the cache — cheap enough to run inline

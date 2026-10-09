@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
@@ -836,6 +837,49 @@ void TestManifestPause() {
   Check(elapsed_ms >= 400 && elapsed_ms < 2000,
         "a fifo with no writer returns at the test bound (took " + std::to_string(elapsed_ms) +
             "ms)");
+}
+
+void TestScratchDirs() {
+  Section("util::MakeScratchDir");
+
+  auto cache = util::MakeTempDir("vcache-scratch-test-");
+  Check(cache.has_value(), "scratch test cache exists");
+  if (!cache) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*cache};
+
+  const auto scratch = util::MakeScratchDir(*cache, "vcache-");
+  Check(scratch.has_value() && util::StartsWith(*scratch, *cache + "/tmp/vcache-") &&
+            util::IsDirectory(*scratch),
+        "a compile's scratch directory is created under <cache>/tmp");
+
+  const std::string not_a_dir = *cache + "/plain-file";
+  util::WriteFileAtomic(not_a_dir, "x");
+  const auto fallback = util::MakeScratchDir(not_a_dir, "vcache-");
+  Check(fallback.has_value() && !util::StartsWith(*fallback, not_a_dir) && util::IsDirectory(*fallback),
+        "a cache dir that cannot hold tmp/ falls back to the system temp dir");
+  if (fallback) util::RemoveRecursive(*fallback);
+
+  const auto stale = util::MakeScratchDir(*cache, "vcache-");
+  const auto fresh = util::MakeScratchDir(*cache, "vcache-");
+  Check(stale.has_value() && fresh.has_value(), "two scratch directories created");
+  if (!stale || !fresh) return;
+  util::WriteFileAtomic(*stale + "/pp.i", "left by a killed compile");
+  const timeval seven_hours_ago[2] = {{::time(nullptr) - 7 * 3600, 0}, {::time(nullptr) - 7 * 3600, 0}};
+  ::utimes(stale->c_str(), seven_hours_ago);
+  const std::string stale_file = *cache + "/tmp/stray-file";
+  util::WriteFileAtomic(stale_file, "x");
+  ::utimes(stale_file.c_str(), seven_hours_ago);
+
+  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 1,
+        "the sweep removes exactly the one old directory");
+  Check(!util::IsDirectory(*stale), "a scratch directory older than the limit is removed");
+  Check(util::IsDirectory(*fresh), "a scratch directory in use is kept");
+  Check(util::FileExists(stale_file), "a plain file under tmp/ is left alone");
+  Check(util::RemoveStaleScratchDirs(*cache + "/missing", 0) == 0,
+        "a cache without tmp/ sweeps nothing");
 }
 
 void TestReadFile() {
@@ -5532,6 +5576,7 @@ int main(int argc, char** argv) {
   TestRunRusage();
   // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
   // and a forked child is charged that high-water mark until exec replaces it.
+  TestScratchDirs();
   TestReadFile();
   TestCost();
   TestMemoryEstimates();

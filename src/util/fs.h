@@ -81,6 +81,15 @@ std::string CurrentDir();
 // Creates a uniquely named directory under the system temp dir and returns it.
 std::optional<std::string> MakeTempDir(const std::string& prefix);
 
+// A compile's scratch directory, under `<cache_dir>/tmp`, or the system temp dir
+// when that cannot be created. A compile killed mid-run cannot remove it; inside
+// the cache, RemoveStaleScratchDirs does.
+std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix);
+
+// Removes the scratch directories under `<cache_dir>/tmp` last modified more than
+// `max_age_seconds` ago and returns how many it removed.
+size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds);
+
 bool RemoveRecursive(const std::string& path);
 bool RemoveFile(const std::string& path);
 

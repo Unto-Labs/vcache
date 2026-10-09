@@ -485,7 +485,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
     }
   }
 
-  auto temp_dir = util::MakeTempDir("vcache-rs-");
+  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-rs-");
   if (!temp_dir) {
     core::RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);

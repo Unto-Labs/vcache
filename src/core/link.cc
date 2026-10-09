@@ -380,7 +380,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   // ---- miss: run the link under the tracer --------------------------------
 
-  auto temp_dir = util::MakeTempDir("vcache-link-");
+  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-link-");
   if (!temp_dir) {
     RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);

@@ -576,15 +576,33 @@ Recommended defaults for a build environment script:
 
 | Feature | Default | Why |
 | --- | --- | --- |
-| `daemon.single_flight` | off until both defects below are fixed, then on | It cuts cold compile work by half (2 trees) to two thirds (3 trees). Today the 30 s no-record bound and the Rust cost-key collision make cold Rust builds 10-30 s slower. C++ with cost records gains 35-47% |
+| `daemon.single_flight` | on | It cuts cold compile work by half (2 trees) to two thirds (3 trees). With the two defects below fixed, cold builds were 5-26% faster and never slower |
 | `daemon.admission` | off | No gain or loss measured and no memory pressure reached. Measure again with heavier configurations (`-O3 -ggdb3`, release links) |
 | `daemon.jobserver` (fixed pool) | off | No gain measured |
 | elastic pool (`jobserver_min_jobs` below `jobserver_jobs`) | off | No gain measured. It withdraws in response to a queue that the default estimates inflate, not to real memory pressure |
 
-The two defects: a lease waiter with no cost record should get a longer bound,
-or keep waiting while the holder's session is open, rather than 30 s; and the
-Rust cost key should include the crate name, so that registry crates stop
-sharing records.
+The matrix above found two defects, both since fixed: a lease waiter with no
+cost record gave up after 30 seconds (it now waits up to the reply timeout),
+and the Rust cost key left out the crate name, so registry crates shared one
+record (it now includes `--crate-name`).
+
+#### After the fixes
+
+The cold rows again, on 2026-10-09 with the fixed binary, `off` against
+`single_flight`. Every build ran in one cgroup slice capped at 30 CPUs and
+64 GiB, so all the trees of a run shared 30 CPUs; compare these rows only with
+each other. Cargo ran 30 jobs per build, and the C++ builds `-j26` (the same
+formula, with `nproc` at 30). Each run started from an empty store, so no key
+had a cost record.
+
+| Cold, 30 CPUs shared | Rust `off` | Rust `single_flight` | C++ `off` | C++ `single_flight` |
+| --- | --- | --- | --- | --- |
+| 2 worktrees | 123.7 | 117.1 (-5%) | 51.1 | 43.7 (-14%) |
+| 3 worktrees | 131.8 | 110.8 (-16%) | 63.1 | 46.6 (-26%) |
+| Misses, 2 / 3 worktrees | 674 / 879 | 362 / 367 | 834 / 1247 | 436 / 453 |
+| Deduplicated, 2 / 3 worktrees | - | 327 / 640 | - | 400 / 790 |
+
+No lease expired and no waiter recompiled a key, and nothing was OOM-killed.
 
 ## Protocol
 

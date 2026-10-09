@@ -323,7 +323,8 @@ The seam is inactive when the variable is absent.
 
 The wait bound is the larger of twice the waiter's own recorded wall time and
 30 seconds, capped at the 300-second reply timeout. Without a usable cost record
-the bound is 30 seconds. It uses the highest wall time in the matching cost
+the bound is the 300-second reply timeout: the key may be the longest compile in
+the build, and a holder that dies releases its waiters at once. It uses the highest wall time in the matching cost
 record, rather than only its latest observation. A waiter still occupies its
 build tool's job slot while it waits.
 Time the holder spends queued for memory pauses this lease bound, for up to
@@ -344,9 +345,7 @@ counters. Fetch waits are bounded by the same 300-second reply timeout and log
 their elapsed duration.
 
 Measured cross-worktree deduplication: see [Results](#results) under
-Measuring. Each key is compiled once, but a waiter with no usable cost record
-gives up after 30 seconds and compiles again, which there cost more than the
-deduplication saved.
+Measuring.
 
 ## Memory admission
 

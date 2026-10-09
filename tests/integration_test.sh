@@ -759,6 +759,32 @@ EOF
   else
     bad "the key records whether incremental is on"
   fi
+
+  # The restored artifacts above are the stored ones by construction. A real
+  # compile into another incremental directory shows the bytes do not depend on
+  # it, which is what makes leaving the directory out of the key sound. rustc
+  # names each codegen-unit object with a random per-session suffix, so even a
+  # recompile into the same directory differs there; that suffix is normalised.
+  VCACHE_RECACHE=1 rust_inc inc-t4 -C "incremental=$WORK/inc-t4/incremental"
+  check "a recache compile runs rustc in its own incremental directory" \
+    "$([[ -n "$(ls -A "$WORK/inc-t4/incremental" 2>/dev/null)" ]] && echo yes)" "yes"
+  session_suffix() {
+    LC_ALL=C grep -aoE 'inc\.[a-z0-9]+\.[a-z0-9]+\.rcgu\.o' "$1" | head -1 | cut -d. -f3
+  }
+  t1_suffix=$(session_suffix "$WORK/inc-t1/deps/libinc.rlib")
+  t4_suffix=$(session_suffix "$WORK/inc-t4/deps/libinc.rlib")
+  if [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
+      LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
+        cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; then
+    ok "libinc.rlib compiled in another incremental directory matches apart from the session"
+  else
+    bad "libinc.rlib compiled in another incremental directory matches apart from the session"
+  fi
+  if cmp -s "$WORK/inc-t1/deps/libinc.rmeta" "$WORK/inc-t4/deps/libinc.rmeta"; then
+    ok "libinc.rmeta compiled in another incremental directory is byte-identical"
+  else
+    bad "libinc.rmeta compiled in another incremental directory is byte-identical"
+  fi
 else
   skipped "rustc not installed"
 fi

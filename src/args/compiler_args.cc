@@ -30,6 +30,7 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
       "-aux-info",   "-B",          "--param",     "-T",
       "-u",          "-z",          "-target",     "--sysroot",
       "-iframework", "-F",          "-system-header-prefix",
+      "-include-pch",
   };
   return *kSet;
 }
@@ -409,12 +410,12 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
   CompilerArgs result;
 
   if (raw_argv.empty()) {
-    result.uncacheable = "empty command line";
+    result.uncacheable = core::Reason::kEmptyCommandLine;
     return result;
   }
 
   if (!ExpandResponseFiles(raw_argv, &result.argv)) {
-    result.uncacheable = "malformed or too deeply nested @response-file";
+    result.uncacheable = core::Reason::kBadResponseFile;
     result.argv = raw_argv;
     return result;
   }
@@ -426,7 +427,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
   std::string dep_target_flagged;
   bool saw_dep_output_flag = false;   // -MD/-MMD: depfile is a side output
   bool saw_dep_only_flag = false;     // -M/-MM: dependencies replace compilation
-  std::vector<std::string> pending_uncacheable;
+  std::vector<core::Decision> pending_uncacheable;
 
   for (size_t i = 1; i < result.argv.size(); ++i) {
     const std::string& arg = result.argv[i];
@@ -437,7 +438,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       continue;
     }
     if (arg == "-") {
-      pending_uncacheable.push_back("reads source from stdin");
+      pending_uncacheable.emplace_back(core::Reason::kSourceFromStdin);
       result.base_args.push_back(arg);
       continue;
     }
@@ -488,7 +489,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
         // -MG lets a dependency name a header that does not exist yet, which a
         // manifest of file hashes cannot verify: the missing file reads the
         // same whether or not it was supposed to appear.
-        pending_uncacheable.push_back("unsupported flag -MG");
+        pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, arg);
         result.dep_args.push_back(arg);
       } else {
         // -MP: affects depfile content only.
@@ -558,16 +559,28 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     // .pcm records the paths of the modules *it* imports: hashing the one file
     // named on the command line would not cover the transitive set, and the
     // preprocessor does not expand `import` the way it expands `#include`.
+    //
+    // -fpch-preprocess: -E names the .gch, not the header text; .gch bytes vary.
+    // -fno-validate-pch: the key covers the header text, and clang would then
+    // accept a PCH built before that header was edited.
     if (arg == "-save-temps" || StartsWith(arg, "-save-temps=") ||
-        arg == "-fsyntax-only" || StartsWith(arg, "-specs=") ||
+        arg == "-fsyntax-only" || arg == "-fpch-preprocess" || arg == "-fno-validate-pch" ||
+        StartsWith(arg, "-specs=") ||
         StartsWith(arg, "-fprofile-generate") || StartsWith(arg, "-fprofile-use") ||
         StartsWith(arg, "-fauto-profile") || arg == "-frepo" ||
         StartsWith(arg, "-fmodules") || StartsWith(arg, "-fmodule-file=") ||
         StartsWith(arg, "-fmodule-map-file=") ||
         StartsWith(arg, "-fprebuilt-module-path=") ||
         StartsWith(arg, "-fprofile-instr-use")) {
-      pending_uncacheable.push_back("unsupported flag " + arg);
+      pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, arg);
       result.base_args.push_back(arg);
+      continue;
+    }
+    if (arg == "-Xclang" && i + 1 < result.argv.size() &&
+        result.argv[i + 1] == "-fno-validate-pch") {
+      pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, result.argv[i + 1]);
+      result.base_args.push_back(arg);
+      result.base_args.push_back(result.argv[++i]);
       continue;
     }
 
@@ -582,7 +595,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     // check does not care, and neither driver rejects the other's spelling
     // reliably enough to make the distinction load-bearing.
     if (IsSideOutputFlag(arg)) {
-      pending_uncacheable.push_back("flag writes a second output file: " + arg);
+      pending_uncacheable.emplace_back(core::Reason::kSecondOutputFile, arg);
       result.base_args.push_back(arg);
       // Value-taking forms must have their value consumed too, or it gets
       // mistaken for a source file and changes what the parse thinks it is
@@ -636,12 +649,12 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
   // ---- Validate the shape of the invocation -------------------------------
 
   if (sources.empty()) {
-    result.uncacheable = "no input file";
+    result.uncacheable = core::Reason::kNoInputFile;
     return result;
   }
   if (sources.size() > 1) {
     result.uncacheable =
-        "multiple input files (" + std::to_string(sources.size()) + ")";
+        core::Decision(core::Reason::kMultipleInputs, std::to_string(sources.size()));
     return result;
   }
   result.source = sources[0];
@@ -650,7 +663,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
                                        : LanguageFromXFlag(explicit_x);
 
   if (result.preprocess_only) {
-    result.uncacheable = "preprocess-only invocation (-E)";
+    result.uncacheable = core::Reason::kPreprocessOnly;
     return result;
   }
   // -M/-MM without -c emits a dependency list instead of an object. That is a
@@ -658,15 +671,15 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
   result.dep_only = saw_dep_only_flag && !result.compile_only;
 
   if (!result.dep_only && !result.compile_only && !result.assemble_only) {
-    result.uncacheable = "not a compile-only invocation (no -c)";
+    result.uncacheable = core::Reason::kNotCompileOnly;
     return result;
   }
   if (result.language == Language::kUnknown) {
-    result.uncacheable = "unrecognised source language for " + result.source;
+    result.uncacheable = core::Decision(core::Reason::kUnknownLanguage, result.source);
     return result;
   }
   if (result.language == Language::kAssembler) {
-    result.uncacheable = "plain assembly is not preprocessed";
+    result.uncacheable = core::Reason::kPlainAssembly;
     return result;
   }
   if (!pending_uncacheable.empty()) {
@@ -682,7 +695,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     result.output.clear();
     result.generates_deps = true;
     if (result.depfile == "-" || result.depfile == "/dev/null") {
-      result.uncacheable = "dependency output is not a regular file";
+      result.uncacheable = core::Reason::kDepfileNotAFile;
     }
     return result;
   }
@@ -692,7 +705,7 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
         DefaultOutputFor(result.source, result.compile_only, result.assemble_only);
   }
   if (result.output == "-" || result.output == "/dev/null") {
-    result.uncacheable = "output is not a regular file";
+    result.uncacheable = core::Reason::kOutputNotAFile;
     return result;
   }
 

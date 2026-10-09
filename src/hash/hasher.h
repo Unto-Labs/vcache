@@ -5,6 +5,7 @@
 // several GB/s, which matters because preprocessor output is the bulk input.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>

@@ -8,6 +8,7 @@
 // concern of core/compile.cc.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>

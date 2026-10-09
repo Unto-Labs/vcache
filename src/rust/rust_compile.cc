@@ -6,12 +6,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 
 #include "args/rustc_args.h"
 #include "core/compile.h"
 #include "core/depfile.h"
 #include "core/stats.h"
 #include "hash/hasher.h"
+#include "rust/rust_manifest.h"
 #include "storage/storage.h"
 #include "util/fs.h"
 #include "util/log.h"
@@ -25,9 +27,11 @@ namespace {
 
 using core::Counter;
 using core::MapDirection;
+using core::Reason;
 using core::RootMap;
 
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v1";
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v3";
+constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v1";
 
 int RunPassthrough(const std::vector<std::string>& argv) {
   VCACHE_LOG("rust passthrough: " + util::Join(argv, " "));
@@ -63,17 +67,22 @@ std::string ResolveRustcFingerprint(const std::string& rustc,
   return hash::HashString(banner);
 }
 
-// Asks rustc which files this crate reads. Returns the source paths, or an
-// empty vector on failure.
-std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
-                                            const RootMap& roots,
-                                            const std::string& temp_dir) {
+// What rustc's dep-info says the crate reads.
+struct CrateInputs {
+  std::vector<std::string> sources;
+  std::vector<core::DepEnv> env_deps;
+};
+
+// Asks rustc which files and environment variables this crate reads. Sources
+// are empty on failure.
+CrateInputs CollectCrateInputs(const args::RustcArgs& parsed,
+                               const std::string& temp_dir) {
   const std::string dep_dir = temp_dir + "/depinfo";
   if (!util::MakeDirs(dep_dir)) return {};
 
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
-  for (const std::string& arg : parsed.base_args) cmd.push_back(arg);
+  for (const std::string& arg : parsed.dep_info_args) cmd.push_back(arg);
   cmd.push_back("--emit=dep-info");
   cmd.push_back("--out-dir");
   cmd.push_back(dep_dir);
@@ -86,7 +95,8 @@ std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
     return {};
   }
 
-  std::vector<std::string> sources;
+  CrateInputs inputs;
+  std::vector<std::string>& sources = inputs.sources;
   std::error_code ec;
   for (const auto& entry : fs::directory_iterator(dep_dir, ec)) {
     if (ec) break;
@@ -101,64 +111,160 @@ std::vector<std::string> CollectSourceFiles(const args::RustcArgs& parsed,
     for (const core::DepRule& rule : dep->rules) {
       for (const std::string& prereq : rule.prerequisites) sources.push_back(prereq);
     }
+    for (core::DepEnv& env : dep->env_deps) {
+      VCACHE_LOG("rust env-dep " + env.name +
+                 (env.value ? "=" + *env.value : std::string(" (unset)")));
+      inputs.env_deps.push_back(std::move(env));
+    }
   }
 
   // rustc repeats each source across several rules; one hash per file is
   // enough, and a stable order keeps the key deterministic.
   std::sort(sources.begin(), sources.end());
   sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
-  return sources;
+  return inputs;
 }
 
-std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
-                       const std::string& rustc_fingerprint,
-                       const core::Config& config,
-                       const std::vector<std::string>& sources) {
-  hash::Hasher hasher;
-  hasher.UpdateDelimited(kCacheKeyVersion);
-  hasher.UpdateDelimited(rustc_fingerprint);
-  hasher.UpdateDelimited(roots.Fingerprint());
+// Digests every --extern, sorted by name. nullopt if a dependency cannot be
+// read, since then nothing pins what would be linked.
+std::optional<std::vector<RustExtern>> HashExterns(const args::RustcArgs& parsed) {
+  std::vector<RustExtern> externs;
+  for (const args::ExternCrate& ext : parsed.externs) {
+    RustExtern hashed{ext.name, ""};
+    if (!ext.path.empty()) {
+      auto digest = hash::HashFile(ext.path);
+      if (!digest) {
+        VCACHE_LOG("rust: could not read extern " + ext.path);
+        return std::nullopt;
+      }
+      hashed.digest = std::move(*digest);
+    }
+    externs.push_back(std::move(hashed));
+  }
+  std::sort(externs.begin(), externs.end(), [](const RustExtern& a, const RustExtern& b) {
+    return a.name != b.name ? a.name < b.name : a.digest < b.digest;
+  });
+  return externs;
+}
 
+// Canonical path and digest of every source. Hashed once, so the key and the
+// manifest state recorded beside it cannot see two different contents.
+std::optional<std::vector<core::ManifestFile>> HashSources(
+    const std::vector<std::string>& sources, const RootMap& roots) {
+  std::vector<core::ManifestFile> files;
+  for (const std::string& path : sources) {
+    auto digest = hash::HashFile(path);
+    if (!digest) {
+      VCACHE_LOG("rust: could not read source " + path);
+      return std::nullopt;
+    }
+    files.emplace_back(roots.Canonicalize(path), std::move(*digest));
+  }
+  return files;
+}
+
+// The part of both keys that comes from the invocation itself.
+void HashInvocation(const args::RustcArgs& parsed, const RootMap& roots,
+                    const std::string& rustc_fingerprint, hash::Hasher* hasher) {
+  hasher->UpdateDelimited(rustc_fingerprint);
+  hasher->UpdateDelimited(roots.Fingerprint());
   for (const std::string& arg : parsed.key_args) {
-    hasher.UpdateDelimited(roots.Canonicalize(arg));
+    hasher->UpdateDelimited(roots.Canonicalize(arg));
   }
   // --emit decides which artifacts land in the output directory, so it is part
   // of the key even though vcache passes it separately.
   std::vector<std::string> emit = parsed.emit_kinds;
   std::sort(emit.begin(), emit.end());
-  for (const std::string& kind : emit) hasher.UpdateDelimited(kind);
+  for (const std::string& kind : emit) hasher->UpdateDelimited(kind);
+}
 
-  // Every reachable source: canonical path plus contents.
-  for (const std::string& path : sources) {
-    hasher.UpdateDelimited(roots.Canonicalize(path));
-    if (!hasher.UpdateFile(path)) {
-      VCACHE_LOG("rust: could not read source " + path);
-      return "";
-    }
+void HashExtraEnv(const core::Config& config, hash::Hasher* hasher) {
+  for (const std::string& name : config.extra_env_vars) {
+    const char* value = std::getenv(name.c_str());
+    hasher->UpdateDelimited(name);
+    hasher->UpdateDelimited(value != nullptr ? value : "");
+  }
+}
+
+std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
+                       const std::string& rustc_fingerprint,
+                       const core::Config& config, const RustManifestState& inputs) {
+  hash::Hasher hasher;
+  hasher.UpdateDelimited(kCacheKeyVersion);
+  HashInvocation(parsed, roots, rustc_fingerprint, &hasher);
+
+  for (const auto& [canonical_path, digest] : inputs.files) {
+    hasher.UpdateDelimited(canonical_path);
+    hasher.UpdateDelimited(digest);
+  }
+
+  // Raw unless named in rust_path_env_vars: rustc does not remap env values,
+  // so a path-valued variable such as OUT_DIR may be baked into the artifact.
+  // A canonicalised one is checked for that before its entry is stored.
+  for (const core::DepEnv& env : inputs.env_deps) {
+    hasher.UpdateDelimited(env.name);
+    hasher.UpdateDelimited(env.value ? "=" + *env.value : std::string("unset"));
   }
 
   // Dependencies by content rather than by path, so a differently located
   // target directory still hits.
-  std::vector<args::ExternCrate> externs = parsed.externs;
-  std::sort(externs.begin(), externs.end(),
-            [](const args::ExternCrate& a, const args::ExternCrate& b) {
-              return a.name < b.name;
-            });
-  for (const args::ExternCrate& ext : externs) {
+  for (const RustExtern& ext : inputs.externs) {
     hasher.UpdateDelimited(ext.name);
-    if (ext.path.empty()) continue;
-    if (!hasher.UpdateFile(ext.path)) {
-      VCACHE_LOG("rust: could not read extern " + ext.path);
-      return "";
-    }
+    if (!ext.digest.empty()) hasher.UpdateDelimited(ext.digest);
   }
 
-  for (const std::string& name : config.extra_env_vars) {
-    const char* value = std::getenv(name.c_str());
-    hasher.UpdateDelimited(name);
-    hasher.UpdateDelimited(value != nullptr ? value : "");
-  }
+  HashExtraEnv(config, &hasher);
   return hasher.Hex();
+}
+
+// Everything known before rustc runs. The crate root's canonical path is in it
+// because the recorded module paths are relative to that root: two crates with
+// identical roots in different places must not share states.
+std::string ComputeManifestKey(const args::RustcArgs& parsed, const RootMap& roots,
+                               const std::string& rustc_fingerprint,
+                               const core::Config& config,
+                               const std::string& source_digest,
+                               const std::vector<RustExtern>& externs) {
+  hash::Hasher hasher;
+  hasher.UpdateDelimited(kManifestKeyVersion);
+  HashInvocation(parsed, roots, rustc_fingerprint, &hasher);
+  hasher.UpdateDelimited(roots.Canonicalize(parsed.source));
+  hasher.UpdateDelimited(source_digest);
+  for (const RustExtern& ext : externs) hasher.UpdateDelimited(ext.name);
+  HashExtraEnv(config, &hasher);
+  return hasher.Hex();
+}
+
+std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
+                                            const std::string& manifest_key,
+                                            const std::string& cache_dir,
+                                            bool* media_failed) {
+  std::vector<RustManifestState> states;
+  storage::GetResult got = cache->Get(manifest_key);
+  *media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
+  storage::Blob blob;
+  if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
+    VCACHE_LOG("rust manifest: none stored");
+    return states;
+  }
+  if (!ParseRustManifest(blob.dep_manifest, &states)) {
+    VCACHE_LOG("rust manifest: did not parse; starting a new one");
+    states.clear();
+  }
+  return states;
+}
+
+void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
+                   const std::vector<RustManifestState>& states,
+                   const std::string& cache_dir, bool* media_failed) {
+  storage::Blob blob;
+  blob.dep_manifest = RenderRustManifest(states);
+  blob.has_dep_manifest = true;
+  blob.meta = "rust dep-info manifest\nstates: " + std::to_string(states.size()) + "\n";
+  const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
+  *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
+  VCACHE_LOG(put.stored ? "rust manifest: stored " + std::to_string(states.size()) + " states"
+                        : std::string("rust manifest: could not store"));
 }
 
 // Stands in for the output directory inside stored dep-info. rustc records the
@@ -183,6 +289,7 @@ void SubstituteDir(core::DepFile* dep, const std::string& from,
 // Collects every file produced under `dir` as a blob file set, canonicalising
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
+                    const std::vector<std::string>& path_env_vars,
                     std::vector<storage::BlobFile>* files) {
   std::error_code ec;
   for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
@@ -206,7 +313,7 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     // gcc does not to .d files, so it has to be rewritten explicitly.
     if (util::EndsWith(file.name, ".d")) {
       if (auto dep = core::ParseDepFile(*contents)) {
-        core::RemapDepFile(&*dep, roots, MapDirection::kCanonicalize);
+        core::RemapDepFile(&*dep, roots, MapDirection::kCanonicalize, path_env_vars);
         SubstituteDir(&*dep, dir, std::string(kOutDirPlaceholder));
         file.contents = core::RenderDepFile(*dep);
       } else {
@@ -222,13 +329,14 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
 
 // Writes a captured file set into the real output directory.
 bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
-                    const std::string& out_dir, const RootMap& roots) {
+                    const std::string& out_dir, const RootMap& roots,
+                    const std::vector<std::string>& path_env_vars) {
   for (const storage::BlobFile& file : files) {
     const std::string target = out_dir + "/" + file.name;
     std::string contents = file.contents;
     if (util::EndsWith(file.name, ".d")) {
       if (auto dep = core::ParseDepFile(contents)) {
-        core::RemapDepFile(&*dep, roots, MapDirection::kLocalize);
+        core::RemapDepFile(&*dep, roots, MapDirection::kLocalize, path_env_vars);
         SubstituteDir(&*dep, std::string(kOutDirPlaceholder), out_dir);
         contents = core::RenderDepFile(*dep);
       }
@@ -252,6 +360,47 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   return true;
 }
 
+// Names the first path-valued env dep whose local value, which the key left out,
+// still appears in the entry: another checkout must not be served this path.
+std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& env_deps,
+                                               const std::vector<std::string>& path_env_vars,
+                                               const RootMap& roots, const storage::Blob& blob) {
+  for (const core::DepEnv& env : env_deps) {
+    if (!env.value || std::find(path_env_vars.begin(), path_env_vars.end(), env.name) ==
+                          path_env_vars.end()) {
+      continue;
+    }
+    const char* raw = std::getenv(env.name.c_str());
+    if (raw == nullptr || *raw == '\0' || roots.Canonicalize(raw) == raw) continue;
+    const std::string_view local(raw);
+    if (blob.stderr_text.find(local) != std::string::npos) return env.name;
+    for (const storage::BlobFile& file : blob.files) {
+      if (file.contents.find(local) != std::string::npos) return env.name + " in " + file.name;
+    }
+  }
+  return std::nullopt;
+}
+
+// Restores a cached entry and replays its diagnostics. False if the entry is
+// unusable, in which case the caller recompiles.
+bool ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed,
+              const RootMap& roots, const std::vector<std::string>& path_env_vars) {
+  storage::Blob blob;
+  if (!storage::DeserializeBlob(got.value, &blob) || blob.files.empty() ||
+      !RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars)) {
+    return false;
+  }
+  if (!blob.stderr_text.empty()) {
+    const std::string text = roots.LocalizeText(blob.stderr_text);
+    ::fwrite(text.data(), 1, text.size(), stderr);
+  }
+  return true;
+}
+
+Counter HitCounter(const storage::GetResult& got) {
+  return got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
+}
+
 }  // namespace
 
 int RunRustCompile(const std::vector<std::string>& argv,
@@ -261,8 +410,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   args::RustcArgs parsed = args::ParseRustc(argv);
   if (!parsed.cacheable()) {
-    VCACHE_LOG("rust uncacheable: " + *parsed.uncacheable);
-    core::RecordCounter(cache_dir, Counter::kUncacheable);
+    core::RecordDecision(cache_dir, *parsed.uncacheable);
     return RunPassthrough(argv);
   }
 
@@ -278,7 +426,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
                   parsed.incoming_prefix_maps.front().c_str());
         return 1;
       case core::IncomingMapPolicy::kKeep:
-        core::RecordCounter(cache_dir, Counter::kUncacheable);
+        core::RecordDecision(cache_dir, Reason::kKeptPrefixMaps);
         return RunPassthrough(argv);
       case core::IncomingMapPolicy::kStrip:
         VCACHE_LOG("rust: stripped incoming remap flags");
@@ -287,7 +435,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   auto temp_dir = util::MakeTempDir("vcache-rs-");
-  if (!temp_dir) return RunPassthrough(argv);
+  if (!temp_dir) {
+    core::RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
   struct TempDirGuard {
     std::string path;
     ~TempDirGuard() { util::RemoveRecursive(path); }
@@ -296,41 +447,101 @@ int RunRustCompile(const std::vector<std::string>& argv,
   const std::string rustc_fingerprint =
       ResolveRustcFingerprint(parsed.compiler, cache_dir);
 
-  const std::vector<std::string> sources =
-      CollectSourceFiles(parsed, roots, *temp_dir);
-  if (sources.empty()) {
-    VCACHE_LOG("rust: no dependency information; falling back");
-    core::RecordCounter(cache_dir, Counter::kPreprocessFailed);
+  const std::optional<std::vector<RustExtern>> externs = HashExterns(parsed);
+  if (!externs) {
+    core::RecordDecision(cache_dir, Reason::kNoCacheKey);
     return RunPassthrough(argv);
   }
 
-  const std::string key =
-      ComputeKey(parsed, roots, rustc_fingerprint, config, sources);
-  if (key.empty()) return RunPassthrough(argv);
-  VCACHE_LOG("rust key " + key + " for " + parsed.source);
-
   if (!util::MakeDirs(parsed.out_dir)) {
-    VCACHE_LOG("rust: cannot create out-dir " + parsed.out_dir);
+    core::RecordDecision(cache_dir, {Reason::kOutDirUnwritable, parsed.out_dir});
     return RunPassthrough(argv);
   }
 
   // Tracks whether any layer was broken, as opposed to cold, for this run.
   bool media_failed = false;
 
+  // ---- manifest: answer from a remembered dep-info run --------------------
+
+  std::string manifest_key;
+  std::vector<RustManifestState> states;
+  if (config.rust_dep_info_policy == core::RustDepInfoPolicy::kManifest &&
+      cache != nullptr) {
+    if (auto source_digest = hash::HashFile(parsed.source)) {
+      manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, config,
+                                        *source_digest, *externs);
+      VCACHE_LOG("rust manifest key " + manifest_key + " for " + parsed.source);
+      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed);
+    }
+  }
+
+  if (!config.recache && !manifest_key.empty()) {
+    for (size_t i = 0; i < states.size(); ++i) {
+      const std::string which =
+          "state " + std::to_string(i + 1) + " of " + std::to_string(states.size());
+      if (auto mismatch = FindRustStateMismatch(states[i], *externs, roots,
+                                                config.rust_path_env_vars)) {
+        VCACHE_LOG("rust manifest: " + which + " rejected: " + *mismatch);
+        continue;
+      }
+      storage::GetResult got = cache->Get(states[i].key);
+      media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
+      if (!got.hit || !ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
+        VCACHE_LOG("rust manifest: " + which + " matched but its entry is " +
+                   (got.hit ? "unusable" : "gone"));
+        continue;
+      }
+      VCACHE_LOG("rust key " + states[i].key + " for " + parsed.source);
+      VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
+      core::RecordCounter(cache_dir, HitCounter(got));
+      if (i > 0 && !config.read_only) {
+        StoreManifest(cache, manifest_key, RecordRustState(states[i], states),
+                      cache_dir, &media_failed);
+      }
+      return 0;
+    }
+  }
+
+  // ---- dep-info: ask rustc what the crate reads ---------------------------
+
+  const CrateInputs inputs = CollectCrateInputs(parsed, *temp_dir);
+  if (inputs.sources.empty()) {
+    core::RecordDecision(cache_dir, Reason::kNoRustDepInfo);
+    return RunPassthrough(argv);
+  }
+
+  auto source_files = HashSources(inputs.sources, roots);
+  if (!source_files) {
+    core::RecordDecision(cache_dir, Reason::kNoCacheKey);
+    return RunPassthrough(argv);
+  }
+
+  RustManifestState fresh;
+  fresh.files = std::move(*source_files);
+  for (const core::DepEnv& env : inputs.env_deps) {
+    fresh.env_deps.push_back(
+        {env.name, KeyedEnvDepValue(env.name, env.value, config.rust_path_env_vars, roots)});
+  }
+  fresh.externs = *externs;
+  fresh.key = ComputeKey(parsed, roots, rustc_fingerprint, config, fresh);
+  const std::string& key = fresh.key;
+  VCACHE_LOG("rust key " + key + " for " + parsed.source);
+
+  // Records what this dep-info run found, once its entry is known to exist.
+  const auto record_state = [&]() {
+    if (manifest_key.empty() || config.read_only) return;
+    StoreManifest(cache, manifest_key, RecordRustState(fresh, states), cache_dir,
+                  &media_failed);
+  };
+
   if (!config.recache && cache != nullptr) {
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
-      storage::Blob blob;
-      if (storage::DeserializeBlob(got.value, &blob) && !blob.files.empty() &&
-          RestoreOutputs(blob.files, parsed.out_dir, roots)) {
-        if (!blob.stderr_text.empty()) {
-          const std::string text = roots.LocalizeText(blob.stderr_text);
-          ::fwrite(text.data(), 1, text.size(), stderr);
-        }
+      if (ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
         VCACHE_LOG("rust hit on " + got.layer);
-        core::RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
-                                                         : Counter::kHitDisk);
+        core::RecordCounter(cache_dir, HitCounter(got));
+        record_state();
         return 0;
       }
       VCACHE_LOG("rust: unusable cache entry; recompiling");
@@ -341,7 +552,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // ---- miss: compile into a staging directory -----------------------------
 
   const std::string stage_dir = *temp_dir + "/out";
-  if (!util::MakeDirs(stage_dir)) return RunPassthrough(argv);
+  if (!util::MakeDirs(stage_dir)) {
+    core::RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
 
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
@@ -366,11 +580,14 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   std::vector<storage::BlobFile> files;
-  if (!CaptureOutputs(stage_dir, roots, &files)) {
-    VCACHE_LOG("rust: could not capture outputs; rerunning directly");
+  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars, &files)) {
+    core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
-  if (!RestoreOutputs(files, parsed.out_dir, roots)) return RunPassthrough(argv);
+  if (!RestoreOutputs(files, parsed.out_dir, roots, config.rust_path_env_vars)) {
+    core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
+    return RunPassthrough(argv);
+  }
 
   // Only now, with the artifacts in place. rustc announces each one on stderr
   // as a JSON "artifact" message, and cargo uses those to start a dependent
@@ -393,6 +610,12 @@ int RunRustCompile(const std::vector<std::string>& argv,
   storage::Blob blob;
   blob.files = std::move(files);
   blob.stderr_text = roots.CanonicalizeText(compiled.stderr_data);
+
+  if (auto leaked = FindEnvPathInOutput(inputs.env_deps, config.rust_path_env_vars, roots,
+                                        blob)) {
+    core::RecordDecision(cache_dir, {Reason::kEnvPathInOutput, *leaked});
+    return compiled.exit_code;
+  }
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
 
@@ -400,6 +623,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     core::RecordCounter(cache_dir, Counter::kStored);
+    record_state();
   } else {
     core::RecordCounter(cache_dir, Counter::kStoreFailed);
   }

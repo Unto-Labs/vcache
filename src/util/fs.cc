@@ -25,6 +25,13 @@
 
 #include "util/str.h"
 
+// glibc gained the copy_file_range(2) wrapper in 2.27; older hosts (EL7) take the byte-copy fallback.
+#if defined(__GLIBC__)
+#define VCACHE_HAVE_COPY_FILE_RANGE __GLIBC_PREREQ(2, 27)
+#else
+#define VCACHE_HAVE_COPY_FILE_RANGE 1
+#endif
+
 namespace fs = std::filesystem;
 
 namespace vcache::util {
@@ -199,7 +206,7 @@ bool CloneFile(const std::string& from, const std::string& to) {
   // and merely slower.
   ok = ::ioctl(dst, FICLONE, src) == 0;
 #endif
-#if defined(__linux__)
+#if defined(__linux__) && VCACHE_HAVE_COPY_FILE_RANGE
   if (!ok) {
     // Kernel-side copy: no user-space buffer, and the filesystem may still
     // share extents underneath. Linux-only.

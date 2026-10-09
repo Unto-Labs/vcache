@@ -13,5 +13,7 @@ licence and retain their own terms:
                         third-party/tomlplusplus/LICENSE
   Boost 1.86.0 (subset) Boost Software License 1.0
                         third-party/boost/LICENSE
+  curl 8.14.1 (subset)  curl licence
+                        third-party/curl/COPYING
   gperftools 2.16       BSD 3-clause
                         fetched at build time; licence ships in the tarball

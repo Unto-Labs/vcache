@@ -590,6 +590,290 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9b. Rust crates that read the environment"
+
+# rustc lists each variable read by env!/option_env! as a "# env-dep:" line in
+# its dep-info. Those are key inputs, not source files to hash.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-env-a rust-env-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+pub const COMMIT: Option<&str> = option_env!("DEMO_UNSET");
+pub const SET: &str = env!("DEMO_SET");
+EOF
+  done
+  envlog="$WORK/rust-env.log"
+  rust_env() {  # $1 = tree; the caller's environment decides DEMO_SET/DEMO_UNSET
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=envcrate" VCACHE_LOG="$envlog" \
+        "$VCACHE" rustc --crate-name demo --edition 2021 --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) 2>/dev/null
+  }
+
+  : > "$envlog"
+  DEMO_SET=1 rust_env rust-env-a
+  check "env-reading crate is a miss, not a passthrough" "$(misses)" "1"
+  check "env deps are not hashed as sources" \
+    "$(grep -c 'could not read source' "$envlog")" "0"
+  check "env deps are logged as env deps" \
+    "$(grep -c 'rust env-dep DEMO_UNSET (unset)' "$envlog")" "1"
+  check "restored dep-info keeps the env-dep lines for cargo" \
+    "$(grep -cx '# env-dep:DEMO_SET=1' "$WORK/rust-env-a/out/demo.d")" "1"
+  cp "$WORK/rust-env-a/out/libdemo.rlib" "$WORK/rust-env-a.rlib"
+
+  DEMO_SET=1 rust_env rust-env-a
+  check "same environment hits" "$(hits)" "1"
+
+  DEMO_SET=2 rust_env rust-env-a
+  check "a changed value misses" "$(misses)" "2"
+
+  DEMO_SET=1 DEMO_UNSET=x rust_env rust-env-a
+  check "setting an unset variable misses" "$(misses)" "3"
+
+  DEMO_SET=1 rust_env rust-env-b
+  check "a second directory hits" "$(hits)" "2"
+  if cmp -s "$WORK/rust-env-a.rlib" "$WORK/rust-env-b/out/libdemo.rlib"; then
+    ok "env-reading rlibs are byte-identical across directories"
+  else
+    bad "env-reading rlibs are byte-identical across directories"
+  fi
+else
+  printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
+section "9b2. Rust: path-valued env deps named in VCACHE_RUST_PATH_ENV_VARS"
+
+# A crate with a build script include!s generated code from OUT_DIR, which cargo
+# points into each checkout's own target directory. Listed, the value is keyed
+# canonically and the crate hits from another checkout; a crate that bakes the
+# value into its artifact is never stored.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-out-a rust-out-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/target/out" "$WORK/$tree/deps"
+    echo 'pub fn answer() -> u32 { 42 }' > "$WORK/$tree/target/out/gen.rs"
+    echo 'include!(concat!(env!("OUT_DIR"), "/gen.rs"));' > "$WORK/$tree/src/lib.rs"
+    echo 'pub const DIR: &str = env!("OUT_DIR");' > "$WORK/$tree/src/baked.rs"
+  done
+  outlog="$WORK/rust-out.log"
+  # rust_out TREE SOURCE [env assignments...]
+  rust_out() {
+    local tree=$1 source=$2; shift 2
+    ( cd "$WORK/$tree" && env OUT_DIR="$WORK/$tree/target/out" VCACHE_LOG="$outlog" \
+        VCACHE_ROOTS="$WORK/$tree=crate:$WORK/$tree/target=target" "$@" \
+        "$VCACHE" rustc --crate-name "$(basename "$source" .rs)" --edition 2021 \
+        --crate-type lib --emit=dep-info,link --out-dir "$WORK/$tree/deps" "src/$source" ) 2>/dev/null
+  }
+
+  rust_out rust-out-a lib.rs
+  rust_out rust-out-b lib.rs
+  check "unlisted, OUT_DIR keeps another checkout from hitting" "$(misses)" "2"
+
+  reset_cache
+  rust_out rust-out-a lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  rust_out rust-out-b lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "listed, OUT_DIR hits from another checkout" "$(hits)" "1"
+  if cmp -s "$WORK/rust-out-a/deps/liblib.rlib" "$WORK/rust-out-b/deps/liblib.rlib"; then
+    ok "the served rlib is byte-identical to the compiled one"
+  else
+    bad "the served rlib is byte-identical to the compiled one"
+  fi
+  check "the restored dep-info names this checkout's OUT_DIR for cargo" \
+    "$(grep -cx "# env-dep:OUT_DIR=$WORK/rust-out-b/target/out" "$WORK/rust-out-b/deps/lib.d")" "1"
+  check "and its generated source" \
+    "$(grep -c "^$WORK/rust-out-b/target/out/gen.rs:" "$WORK/rust-out-b/deps/lib.d")" "1"
+  rust_out rust-out-b lib.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "the restored checkout then hits through the manifest" "$(hits)" "2"
+
+  reset_cache
+  rust_out rust-out-a baked.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "a crate that bakes OUT_DIR in is not stored" \
+    "$("$VCACHE" --show-stats | sed -n 's/^ *env path in output *//p')" "1"
+  rust_out rust-out-b baked.rs VCACHE_RUST_PATH_ENV_VARS=OUT_DIR
+  check "so another checkout compiles its own" "$(misses)" "2"
+  check "and its rlib holds its own path" \
+    "$(grep -qa "$WORK/rust-out-b/target/out" "$WORK/rust-out-b/deps/libbaked.rlib" && echo yes)" "yes"
+else
+  printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
+section "9c. Rust: the incremental directory is not part of the key"
+
+# cargo passes -C incremental=<target-dir>/<profile>/incremental to every
+# workspace crate, so two target directories are two checkouts here. Only the
+# crate is under a root; the incremental directories are not.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/rust-inc/src"
+  cat > "$WORK/rust-inc/src/lib.rs" <<'EOF'
+pub fn twice(x: u32) -> u32 { x * 2 }
+pub fn label(x: u32) -> String { format!("value {x}") }
+EOF
+  # rust_inc TARGET [extra rustc args...]
+  rust_inc() {
+    local target=$1; shift
+    ( cd "$WORK/rust-inc" && VCACHE_ROOTS="$WORK/rust-inc=crate" \
+        VCACHE_LOG="$WORK/$target.log" \
+        "$VCACHE" rustc --crate-name inc --crate-type lib -C debuginfo=2 \
+        --emit=dep-info,metadata,link --out-dir "$WORK/$target/deps" "$@" \
+        src/lib.rs ) 2>/dev/null
+  }
+  rust_key_of() { sed -n 's/.*rust key \([0-9a-f]*\) for .*/\1/p' "$WORK/$1.log" | head -1; }
+
+  rust_inc inc-t1 -C "incremental=$WORK/inc-t1/incremental"
+  check "first incremental compile is a miss" "$(misses)" "1"
+  check "the miss leaves rustc's incremental state in its own directory" \
+    "$([[ -n "$(ls -A "$WORK/inc-t1/incremental" 2>/dev/null)" ]] && echo yes)" "yes"
+
+  rust_inc inc-t2 -Cincremental="$WORK/inc-t2/incremental"
+  check "a different incremental directory still hits" "$(hits)" "1"
+  check "the key ignores the incremental directory" \
+    "$(rust_key_of inc-t2)" "$(rust_key_of inc-t1)"
+  for artifact in libinc.rlib libinc.rmeta; do
+    if cmp -s "$WORK/inc-t1/deps/$artifact" "$WORK/inc-t2/deps/$artifact"; then
+      ok "restored $artifact is byte-identical to the compiled one"
+    else
+      bad "restored $artifact is byte-identical to the compiled one"
+    fi
+  done
+  check "restored dep-info matches the compiled one apart from its directory" \
+    "$(sed "s#$WORK/inc-t1/#$WORK/inc-t2/#g" "$WORK/inc-t1/deps/inc.d")" \
+    "$(cat "$WORK/inc-t2/deps/inc.d")"
+  # The entry holds the --emit artifacts only; rustc's session state is never
+  # captured, so a hit has none to restore.
+  check "a hit restores exactly the emitted artifacts" \
+    "$(cd "$WORK/inc-t2/deps" && find . -mindepth 1 | sort | tr '\n' ' ')" \
+    "./inc.d ./libinc.rlib ./libinc.rmeta "
+  check "a hit does not create the incremental directory" \
+    "$([[ -e "$WORK/inc-t2/incremental" ]] && echo exists || echo absent)" "absent"
+
+  # Incremental mode raises rustc's default codegen-unit count, which changes
+  # the objects, so whether it is on stays in the key: a non-incremental compile
+  # of the same crate gets its own entry.
+  rust_inc inc-t3
+  check "a non-incremental compile does not share the incremental entry" "$(misses)" "2"
+  if [[ -n "$(rust_key_of inc-t3)" && "$(rust_key_of inc-t3)" != "$(rust_key_of inc-t1)" ]]; then
+    ok "the key records whether incremental is on"
+  else
+    bad "the key records whether incremental is on"
+  fi
+
+  # The restored artifacts above are the stored ones by construction. A real
+  # compile into another incremental directory shows the bytes do not depend on
+  # it, which is what makes leaving the directory out of the key sound. rustc
+  # names each codegen-unit object with a random per-session suffix, so even a
+  # recompile into the same directory differs there; that suffix is normalised.
+  VCACHE_RECACHE=1 rust_inc inc-t4 -C "incremental=$WORK/inc-t4/incremental"
+  check "a recache compile runs rustc in its own incremental directory" \
+    "$([[ -n "$(ls -A "$WORK/inc-t4/incremental" 2>/dev/null)" ]] && echo yes)" "yes"
+  session_suffix() {
+    LC_ALL=C grep -aoE 'inc\.[a-z0-9]+\.[a-z0-9]+\.rcgu\.o' "$1" | head -1 | cut -d. -f3
+  }
+  t1_suffix=$(session_suffix "$WORK/inc-t1/deps/libinc.rlib")
+  t4_suffix=$(session_suffix "$WORK/inc-t4/deps/libinc.rlib")
+  if [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
+      LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
+        cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; then
+    ok "libinc.rlib compiled in another incremental directory matches apart from the session"
+  else
+    bad "libinc.rlib compiled in another incremental directory matches apart from the session"
+  fi
+  if cmp -s "$WORK/inc-t1/deps/libinc.rmeta" "$WORK/inc-t4/deps/libinc.rmeta"; then
+    ok "libinc.rmeta compiled in another incremental directory is byte-identical"
+  else
+    bad "libinc.rmeta compiled in another incremental directory is byte-identical"
+  fi
+else
+  skipped "rustc not installed"
+fi
+
+# --------------------------------------------------------------------------
+section "9d. Rust: manifest-verified lookups skip the dep-info run"
+
+# rustc's dep-info run expands every macro, so on a hit it can cost more than
+# everything else vcache does. A remembered state whose files, env values and
+# extern digests all still match answers the lookup without it.
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  for tree in rust-man-a rust-man-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+mod helper;
+pub const DATA: &str = include_str!("data.txt");
+pub const COMMIT: Option<&str> = option_env!("DEMO_UNSET");
+pub fn value() -> u32 { helper::value() }
+EOF
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/helper.rs"
+    echo 'hello' > "$WORK/$tree/src/data.txt"
+  done
+  manlog="$WORK/rust-man.log"
+  rust_man() {  # $1 = tree; each run gets a fresh log
+    : > "$manlog"
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=mancrate" VCACHE_LOG="$manlog" \
+        "$VCACHE" rustc --crate-name man --edition 2021 --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) 2>/dev/null
+  }
+  dep_info_runs() { grep -c 'rust dep-info:' "$manlog"; }
+  logged() { grep -cF "$1" "$manlog"; }
+
+  rust_man rust-man-a
+  check "first manifest-mode compile is a miss" "$(misses)" "1"
+  check "a miss asks rustc for dep-info" "$(dep_info_runs)" "1"
+  check "the miss records one state" "$(logged 'rust manifest: stored 1 states')" "1"
+  cp "$WORK/rust-man-a/out/libman.rlib" "$WORK/rust-man-a.rlib"
+
+  rust_man rust-man-a
+  check "an unchanged crate hits" "$(hits)" "1"
+  check "the hit skips the dep-info run" "$(dep_info_runs)" "0"
+  check "the hit names the state that matched" "$(logged 'rust manifest hit: state 1 of 1')" "1"
+
+  echo 'pub fn value() -> u32 { 43 }' > "$WORK/rust-man-a/src/helper.rs"
+  rust_man rust-man-a
+  check "an edited module misses" "$(misses)" "2"
+  check "the rejection names the edited module" \
+    "$(logged 'state 1 of 1 rejected: src/helper.rs changed')" "1"
+  check "the manifest now holds two states" "$(logged 'rust manifest: stored 2 states')" "1"
+
+  echo 'pub fn value() -> u32 { 42 }' > "$WORK/rust-man-a/src/helper.rs"
+  rust_man rust-man-a
+  check "reverting the module hits" "$(hits)" "2"
+  check "the reverted hit skips the dep-info run" "$(dep_info_runs)" "0"
+  check "the reverted hit uses the second state" "$(logged 'rust manifest hit: state 2 of 2')" "1"
+
+  echo 'changed' > "$WORK/rust-man-a/src/data.txt"
+  rust_man rust-man-a
+  check "an edited include_str! file misses" "$(misses)" "3"
+  check "the rejection names the included file" \
+    "$(logged 'state 1 of 2 rejected: src/data.txt changed')" "1"
+  echo 'hello' > "$WORK/rust-man-a/src/data.txt"
+
+  DEMO_UNSET=x rust_man rust-man-a
+  check "setting a variable the crate reads misses" "$(misses)" "4"
+  check "the rejection names the variable" \
+    "$(logged "state 1 of 3 rejected: env DEMO_UNSET is 'x', was unset")" "1"
+
+  VCACHE_RUST_DEP_INFO=always rust_man rust-man-a
+  check "rust_dep_info=always still hits" "$(hits)" "3"
+  check "rust_dep_info=always runs dep-info" "$(dep_info_runs)" "1"
+  check "rust_dep_info=always leaves the manifest alone" "$(logged 'rust manifest')" "0"
+
+  rust_man rust-man-b
+  check "a second directory hits" "$(hits)" "4"
+  check "the second directory skips the dep-info run" "$(dep_info_runs)" "0"
+  if cmp -s "$WORK/rust-man-a.rlib" "$WORK/rust-man-b/out/libman.rlib"; then
+    ok "the manifest hit restores a byte-identical rlib"
+  else
+    bad "the manifest hit restores a byte-identical rlib"
+  fi
+  check "show-config reports the policy" \
+    "$(VCACHE_RUST_DEP_INFO=always "$VCACHE" --show-config | grep -c 'rust dep-info: *always')" "1"
+else
+  skipped "rustc not installed"
+fi
+
+# --------------------------------------------------------------------------
 section "10. cache management commands"
 
 reset_cache
@@ -1363,6 +1647,91 @@ check "and still writes the dependency file" "$([[ -s "$WORK/off.d" ]] && echo y
 ( cd "$WORK/dep-a" && VCACHE_ROOTS="$WORK/dep-a=proj" \
     "$VCACHE" gcc -M -I inc src/missing.c -o "$WORK/bad.d" ) 2>/dev/null
 check "a scan of a missing source fails" "$?" "1"
+
+# The source's path is part of the question, not only its content. Identical
+# sources reached by different canonical paths must not share a state: the
+# recorded headers still name the first directory and still verify, so the
+# second would be served the first one's dependency list.
+mkdir -p "$WORK/depsrc/a" "$WORK/depsrc/b" "$WORK/depsrc/c" "$WORK/depsrc/d"
+for tree in a b c d; do
+  printf '#include "x.h"\nint v = V;\n' > "$WORK/depsrc/$tree/main.c"
+done
+printf '#define V 1\n' > "$WORK/depsrc/a/x.h"
+printf '#define V 2\n/* different size */\n' > "$WORK/depsrc/b/x.h"
+cp "$WORK/depsrc/a/x.h" "$WORK/depsrc/c/x.h"
+cp "$WORK/depsrc/a/x.h" "$WORK/depsrc/d/x.h"
+
+# One word per line, so vcache's unwrapped rendering compares equal to gcc's.
+dep_words() { tr -d '\\' < "$1" | tr -s ' \t\n' '\n' | sed '/^$/d'; }
+
+# Runs the compiler itself in the same place, and checks vcache's answer
+# against it word for word.
+#   check_depsrc_answer LABEL DIR OUTFILE args...
+check_depsrc_answer() {
+  local label=$1 dir=$2 out=$3; shift 3
+  ( cd "$dir" && gcc "$@" ) > "$WORK/depsrc-expected.d" 2>/dev/null
+  if [[ -s "$out" ]] &&
+     [[ "$(dep_words "$out")" == "$(dep_words "$WORK/depsrc-expected.d")" ]]; then
+    ok "$label"
+  else
+    bad "$label (got: $(tr '\n' ' ' < "$out"))"
+  fi
+}
+
+for mode in "-MM" "-M -MP"; do
+  read -ra mflags <<< "$mode"
+
+  reset_cache
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" a/main.c ) > "$WORK/ps-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b.d" 2>/dev/null
+  check "$mode: from a parent directory, b/main.c misses after a/main.c" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc" "$WORK/ps-b.d" "${mflags[@]}" b/main.c
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b2.d" 2>/dev/null
+  check "$mode: repeating b hits its own state" "$(hits)" "1"
+  check_depsrc_answer "$mode: and replays b's dependency list" \
+    "$WORK/depsrc" "$WORK/ps-b2.d" "${mflags[@]}" b/main.c
+  printf '#define V 3\n' > "$WORK/depsrc/b/x.h"
+  ( cd "$WORK/depsrc" && "$VCACHE" gcc "${mflags[@]}" b/main.c ) > "$WORK/ps-b3.d" 2>/dev/null
+  check "$mode: editing b/x.h invalidates b's state" "$(misses)" "3"
+  printf '#define V 2\n/* different size */\n' > "$WORK/depsrc/b/x.h"
+
+  reset_cache
+  ( cd "$WORK/depsrc/a" && VCACHE_ROOTS="$WORK/depsrc=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/a/main.c" ) > "$WORK/or-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc/b" && VCACHE_ROOTS="$WORK/depsrc=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/b/main.c" ) > "$WORK/or-b.d" 2>/dev/null
+  check "$mode: one root over both, b misses after a" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc/b" "$WORK/or-b.d" "${mflags[@]}" "$WORK/depsrc/b/main.c"
+
+  reset_cache
+  ( cd "$WORK/depsrc/a" && VCACHE_MAP_CWD=0 \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/a/main.c" ) > "$WORK/nr-a.d" 2>/dev/null
+  ( cd "$WORK/depsrc/b" && VCACHE_MAP_CWD=0 \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/b/main.c" ) > "$WORK/nr-b.d" 2>/dev/null
+  check "$mode: with no roots at all, b misses after a" "$(misses)" "2"
+  check_depsrc_answer "$mode: and gets b's own dependency list" \
+    "$WORK/depsrc/b" "$WORK/nr-b.d" "${mflags[@]}" "$WORK/depsrc/b/main.c"
+
+  # The sharing that is intended: one relative path under the mapped cwd, and
+  # per-checkout roots naming both copies by one canonical path.
+  reset_cache
+  ( cd "$WORK/depsrc/c" && "$VCACHE" gcc "${mflags[@]}" main.c ) > "$WORK/rel-c.d" 2>/dev/null
+  ( cd "$WORK/depsrc/d" && "$VCACHE" gcc "${mflags[@]}" main.c ) > "$WORK/rel-d.d" 2>/dev/null
+  check "$mode: the same relative path in a copied tree still hits" "$(hits)" "1"
+  check_depsrc_answer "$mode: and replays the local dependency list" \
+    "$WORK/depsrc/d" "$WORK/rel-d.d" "${mflags[@]}" main.c
+
+  reset_cache
+  ( cd "$WORK/depsrc/c" && VCACHE_ROOTS="$WORK/depsrc/c=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/c/main.c" ) > "$WORK/pc-c.d" 2>/dev/null
+  ( cd "$WORK/depsrc/d" && VCACHE_ROOTS="$WORK/depsrc/d=proj" \
+      "$VCACHE" gcc "${mflags[@]}" "$WORK/depsrc/d/main.c" ) > "$WORK/pc-d.d" 2>/dev/null
+  check "$mode: per-checkout roots still hit" "$(hits)" "1"
+  check_depsrc_answer "$mode: and the restored paths name this checkout" \
+    "$WORK/depsrc/d" "$WORK/pc-d.d" "${mflags[@]}" "$WORK/depsrc/d/main.c"
+done
 
 # --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"
@@ -2173,6 +2542,169 @@ check "a file without .incbin is still cached" "$(misses)" "1"
 check "and is not counted uncacheable" "$(uncacheable)" "0"
 
 fi
+
+# --------------------------------------------------------------------------
+section "precompiled headers"
+
+# A precompiled header records the absolute paths and mtimes of its inputs, so
+# generating one is declined; a stored copy would be wrong in another directory.
+# Using one is cacheable only while the preprocessed text still expands the
+# header, which is what each compiler block below pins down.
+make_pch_tree() {
+  mkdir -p "$1"
+  printf '#define FOO 1\nstruct S { int x; };\n' > "$1/h.h"
+  printf 'int f() { S s{FOO}; return s.x; }\n' > "$1/main.cc"
+}
+
+if command -v clang++ >/dev/null 2>&1; then
+  reset_cache
+  make_pch_tree "$WORK/pch-clang-a"
+  make_pch_tree "$WORK/pch-clang-b"
+  # clang rejects a PCH built at another -O level, so both steps pass -O2.
+  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
+    ( cd "$d" && VCACHE_ROOTS="$d=proj" \
+        "$VCACHE" clang++ -O2 -x c++-header -c h.h -Xclang -emit-pch -o h.pch ) 2>/dev/null
+  done
+  check "clang PCH generation is declined" "$(uncacheable)" "2"
+  check "and the PCH is still written" \
+    "$([[ -s "$WORK/pch-clang-a/h.pch" && -s "$WORK/pch-clang-b/h.pch" ]] && echo yes)" "yes"
+
+  # clang -E re-emits the PCH's header text, so the key covers the header even
+  # though the .pch bytes never reach it.
+  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
+    ( cd "$d" && VCACHE_ROOTS="$d=proj" "$VCACHE" clang++ -O2 -c \
+        -Xclang -include-pch -Xclang "$d/h.pch" main.cc -o main.o ) 2>/dev/null
+  done
+  check "a compile using the PCH is cached" "$(misses)" "1"
+  check "and hits from another directory" "$(hits)" "1"
+  if cmp -s "$WORK/pch-clang-a/main.o" "$WORK/pch-clang-b/main.o"; then
+    ok "PCH objects are byte-identical across directories"
+  else
+    bad "PCH objects are byte-identical across directories"
+  fi
+
+  # The driver spelling takes its value as a separate argument, which must not
+  # be read as a second input file.
+  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
+    ( cd "$d" && VCACHE_ROOTS="$d=proj" "$VCACHE" clang++ -O2 -c \
+        -include-pch "$d/h.pch" main.cc -o driver.o ) 2>/dev/null
+  done
+  check "the driver's -include-pch spelling is cached too" "$(uncacheable)" "2"
+  check "and hits from another directory" "$(hits)" "2"
+
+  # An edited header leaves the PCH stale: clang refuses it, so vcache must not
+  # answer from an entry either.
+  pa="$WORK/pch-clang-a"
+  hits_before=$(hits)
+  printf '#define FOO 1\nstruct S { int x; int y; };\n' > "$pa/h.h"
+  if ( cd "$pa" && VCACHE_ROOTS="$pa=proj" "$VCACHE" clang++ -O2 -c \
+         -Xclang -include-pch -Xclang "$pa/h.pch" main.cc -o stale.o ) 2>/dev/null; then
+    bad "a stale PCH still fails the compile"
+  else
+    ok "a stale PCH still fails the compile"
+  fi
+  check "and is not answered from the cache" "$(hits)" "$hits_before"
+  ( cd "$pa" && VCACHE_ROOTS="$pa=proj" \
+      "$VCACHE" clang++ -O2 -x c++-header -c h.h -Xclang -emit-pch -o h.pch ) 2>/dev/null
+  misses_before=$(misses)
+  ( cd "$pa" && VCACHE_ROOTS="$pa=proj" "$VCACHE" clang++ -O2 -c \
+      -Xclang -include-pch -Xclang "$pa/h.pch" main.cc -o main.o ) 2>/dev/null
+  check "a rebuilt PCH for the edited header is a new key" \
+    "$(misses)" "$((misses_before + 1))"
+else
+  skipped "clang++ is not installed"
+fi
+
+if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | grep -qi clang; then
+  reset_cache
+  make_pch_tree "$WORK/pch-gcc-a"
+  make_pch_tree "$WORK/pch-gcc-b"
+  for d in "$WORK/pch-gcc-a" "$WORK/pch-gcc-b"; do
+    ( cd "$d" && VCACHE_ROOTS="$d=proj" \
+        "$VCACHE" g++ -O2 -x c++-header -c h.h -o h.h.gch ) 2>/dev/null
+  done
+  check "gcc .gch generation is declined" "$(uncacheable)" "2"
+  # Without this the checks below would pass on a textual include alone.
+  check "and gcc picks the .gch up" \
+    "$(cd "$WORK/pch-gcc-a" && g++ -O2 -H -c -include h.h main.cc -o /dev/null 2>&1 \
+         | grep -c '^! .*h\.h\.gch')" "1"
+
+  # gcc -E expands the header textually even when a valid .gch sits beside it.
+  for d in "$WORK/pch-gcc-a" "$WORK/pch-gcc-b"; do
+    ( cd "$d" && VCACHE_ROOTS="$d=proj" \
+        "$VCACHE" g++ -O2 -c -include h.h main.cc -o main.o ) 2>/dev/null
+  done
+  check "a compile using the .gch is cached" "$(misses)" "1"
+  check "and hits from another directory" "$(hits)" "1"
+  if cmp -s "$WORK/pch-gcc-a/main.o" "$WORK/pch-gcc-b/main.o"; then
+    ok ".gch objects are byte-identical across directories"
+  else
+    bad ".gch objects are byte-identical across directories"
+  fi
+
+  # -fpch-preprocess leaves only a pragma naming the .gch, so two different
+  # .gch files would preprocess identically.
+  pg="$WORK/pch-gcc-a"
+  if ( cd "$pg" && VCACHE_ROOTS="$pg=proj" "$VCACHE" g++ -O2 -c -fpch-preprocess \
+         -include h.h main.cc -o pp.o ) 2>/dev/null && [[ -s "$pg/pp.o" ]]; then
+    ok "-fpch-preprocess still compiles"
+  else
+    bad "-fpch-preprocess still compiles"
+  fi
+  check "and is declined" "$(uncacheable)" "3"
+else
+  skipped "g++ is not installed, or is clang"
+fi
+
+# --------------------------------------------------------------------------
+section "--show-stats breaks decisions down by reason"
+
+# The positional counters say how many invocations were declined; the reason
+# rows say which rule declined them, under the same names the log uses.
+reason_row() { printf '  %-20s%s' "$1" "$2"; }
+uncacheable_block() {
+  "$VCACHE" --show-stats | awk '/^uncacheable /{ shown = 1; print; next }
+                                shown && /^  /{ print; next }
+                                { shown = 0 }'
+}
+
+reset_cache
+mkdir -p "$WORK/reasons"
+printf 'int r(void){return 3;}\nint main(void){return r() - 3;}\n' > "$WORK/reasons/r.c"
+"$VCACHE" --zero-stats >/dev/null
+( cd "$WORK/reasons" && VCACHE_ROOTS="$WORK/reasons=proj" "$VCACHE" gcc -c r.c -o r.o ) 2>/dev/null
+( cd "$WORK/reasons" && VCACHE_ROOTS="$WORK/reasons=proj" "$VCACHE" gcc -c r.c -o r.o ) 2>/dev/null
+( cd "$WORK/reasons" && "$VCACHE" cc r.o -o r ) 2>/dev/null
+( cd "$WORK/reasons" && "$VCACHE" gcc -E r.c -o r.i ) 2>/dev/null
+expected_uncacheable=2
+expected_block="$(printf 'uncacheable         2\n%s\n%s' \
+  "$(reason_row link 1)" "$(reason_row 'preprocess only' 1)")"
+if command -v rustc >/dev/null 2>&1; then
+  printf 'pub fn f() -> i32 { 3 }\n' > "$WORK/reasons/lib.rs"
+  ( cd "$WORK/reasons" && "$VCACHE" rustc --crate-name reasons --crate-type lib \
+      --emit=link lib.rs ) 2>/dev/null
+  expected_uncacheable=3
+  expected_block="$(printf 'uncacheable         3\n%s\n%s\n%s' "$(reason_row link 1)" \
+    "$(reason_row 'no --out-dir' 1)" "$(reason_row 'preprocess only' 1)")"
+else
+  skipped "rustc without --out-dir (no rustc on PATH)"
+fi
+
+check "the compile missed once" "$(misses)" "1"
+check "and hit once" "$(hits)" "1"
+check "and stored one entry" "$(stat_of 'entries stored')" "1"
+check "the link, -E and rustc runs are uncacheable" "$(uncacheable)" "$expected_uncacheable"
+check "nothing failed to preprocess" "$(stat_of 'preprocess failed')" "0"
+check "each uncacheable run is listed under its reason" "$(uncacheable_block)" "$expected_block"
+check "no passthrough row when nothing fell back" \
+  "$("$VCACHE" --show-stats | grep -c '^passthrough' || true)" "0"
+check "the stats file keeps the nine positional lines first" \
+  "$(head -9 "$VCACHE_DIR/stats" | grep -cE '^[0-9]+$')" "9"
+check "followed by one reason line per reason" \
+  "$(tail -n +10 "$VCACHE_DIR/stats" | grep -cE $'^reason\t[^\t]+\t[0-9]+$')" \
+  "$((expected_uncacheable))"
+"$VCACHE" --zero-stats >/dev/null
+check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

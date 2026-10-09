@@ -12,6 +12,7 @@
 
 #include "args/compiler_args.h"
 #include "core/depfile.h"
+#include "core/manifest.h"
 #include "core/preprocessed.h"
 #include "core/stats.h"
 #include "hash/hasher.h"
@@ -407,31 +408,17 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v1";
+constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v2";
 constexpr std::string_view kManifestHeader = "vcache-depmanifest-2";
-
-// How many header states one manifest remembers. A manifest maps a command line
-// to several possible answers, one per set of header contents seen, because the
-// key cannot include what it has not read yet. Without that, alternating
-// between two branches would miss every time: the entry for the state you just
-// left is the one that gets overwritten. Eight covers branch-switching; the
-// cost of a stale tail entry is one wasted hash pass.
-constexpr size_t kMaxManifestEntries = 8;
 
 // One remembered state: the files a scan read, and where its answer is stored.
 struct DepManifestEntry {
   std::string result_key;
-  std::vector<std::pair<std::string, std::string>> files;  // canonical path, digest
+  std::vector<ManifestFile> files;
 };
 
-// Everything on the command line that can change which files a dependency scan
-// reads or what it writes about them. Unlike a compile there is no preprocessed
-// text to stand in for -I/-D, so those go in verbatim -- canonicalised, so two
-// checkouts still agree.
-//
-// Left out: the compiler itself (its identity is hashed separately) and the
-// flags naming where the answer goes, since the answer's content does not
-// depend on them.
+}  // namespace
+
 std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
                                         const RootMap& roots,
                                         bool keep_link_args) {
@@ -450,19 +437,15 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
       if (args::LinkOnlyFlagTakesValue(arg) && i + 1 < parsed.argv.size()) ++i;
       continue;
     }
-    if (arg == parsed.source) {
-      // The path is irrelevant once canonicalised; the content is hashed below.
-      out.push_back("--vcache-source");
-      continue;
-    }
     out.push_back(roots.Canonicalize(arg));
   }
   return out;
 }
 
+namespace {
+
 // A header line, then per entry an "entry <key>" line followed by one
-// "<hex digest> <canonical path>" line per file. The digest comes first so a
-// path containing spaces still parses by taking the rest of the line.
+// RenderManifestFile line per file.
 std::string RenderManifest(const std::vector<DepManifestEntry>& entries) {
   std::string out(kManifestHeader);
   out.push_back('\n');
@@ -470,10 +453,8 @@ std::string RenderManifest(const std::vector<DepManifestEntry>& entries) {
     out += "entry ";
     out += entry.result_key;
     out.push_back('\n');
-    for (const auto& [path, digest] : entry.files) {
-      out += digest;
-      out.push_back(' ');
-      out += path;
+    for (const ManifestFile& file : entry.files) {
+      out += RenderManifestFile(file);
       out.push_back('\n');
     }
   }
@@ -493,29 +474,9 @@ bool ParseManifest(const std::string& text, std::vector<DepManifestEntry>* entri
       continue;
     }
     if (entries->empty()) return false;
-    const size_t space = line.find(' ');
-    if (space != hash::kDigestHexLen) return false;
-    entries->back().files.emplace_back(line.substr(space + 1), line.substr(0, space));
-  }
-  return true;
-}
-
-// True when every recorded file still hashes to what the manifest says. A file
-// that has been deleted, changed or replaced makes this false, and the entry is
-// then not used -- which is the whole guarantee behind this mode.
-bool ManifestStillHolds(const std::vector<std::pair<std::string, std::string>>& files,
-                        const RootMap& roots) {
-  for (const auto& [canonical_path, digest] : files) {
-    const std::string local = roots.Localize(canonical_path);
-    auto actual = hash::HashFile(local);
-    if (!actual) {
-      VCACHE_LOG("dep manifest: " + local + " is gone");
-      return false;
-    }
-    if (*actual != digest) {
-      VCACHE_LOG("dep manifest: " + local + " changed");
-      return false;
-    }
+    ManifestFile file;
+    if (!ParseManifestFile(line, &file)) return false;
+    entries->back().files.push_back(std::move(file));
   }
   return true;
 }
@@ -539,8 +500,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   const args::CompilerArgs parsed = args::Parse(argv);
 
   if (config.dep_scan_policy == DepScanPolicy::kUncacheable) {
-    VCACHE_LOG("dep scan: policy is 'uncacheable'");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kDepScanPolicy);
     return RunPassthrough(argv);
   }
 
@@ -551,12 +511,14 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   std::string native_target;
   if (!parsed.native_flags.empty()) {
     if (config.native_target_policy == NativeTargetPolicy::kUncacheable) {
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetPolicy, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     native_target = ResolveNativeTarget(parsed, compiler_id, cache_dir);
     if (native_target.empty()) {
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetUnresolved, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
   }
@@ -566,7 +528,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // fight over one entry.
   auto source_digest = hash::HashFile(parsed.source);
   if (!source_digest) {
-    VCACHE_LOG("dep scan: cannot read " + parsed.source);
+    RecordDecision(cache_dir, {Reason::kUnreadableSource, parsed.source});
     return RunPassthrough(argv);
   }
 
@@ -615,7 +577,12 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   if (!config.recache && cache != nullptr) {
     for (const DepManifestEntry& entry : entries) {
-      if (!ManifestStillHolds(entry.files, roots)) continue;
+      // A file that has been deleted, changed or replaced rules the entry out,
+      // which is the whole guarantee behind this mode.
+      if (auto stale = FindStaleManifestFile(entry.files, roots)) {
+        VCACHE_LOG("dep manifest: " + *stale);
+        continue;
+      }
       storage::GetResult result = cache->Get(entry.result_key);
       media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
       storage::Blob blob;
@@ -639,7 +606,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // ---- miss: run the scan for real ----------------------------------------
 
   auto temp_dir = util::MakeTempDir("vcache-dep-");
-  if (!temp_dir) return RunPassthrough(argv);
+  if (!temp_dir) {
+    RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
   struct TempDirGuard {
     std::string path;
     ~TempDirGuard() { util::RemoveRecursive(path); }
@@ -672,7 +642,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   auto text = util::ReadFile(tmp_out);
   if (!text) {
-    VCACHE_LOG("dep scan: produced no output; rerunning directly");
+    RecordDecision(cache_dir, Reason::kNoDepScanOutput);
     return RunPassthrough(argv);
   }
 
@@ -681,7 +651,10 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     // Emit what the compiler said rather than nothing, and do not store an
     // entry vcache cannot replay faithfully.
     VCACHE_LOG("dep scan: output did not parse; passing it through unstored");
-    if (!EmitDepOutput(parsed.depfile, *text)) return RunPassthrough(argv);
+    if (!EmitDepOutput(parsed.depfile, *text)) {
+      RecordDecision(cache_dir, {Reason::kDepfileUnwritable, parsed.depfile});
+      return RunPassthrough(argv);
+    }
     RecordCounter(cache_dir, Counter::kStoreFailed);
     return media_fail_exit();
   }
@@ -691,7 +664,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // only gcc's line wrapping differs, and the unwrapped form is the one cargo
   // can also read.
   if (!EmitDepOutput(parsed.depfile, RenderDepFile(*dep))) {
-    VCACHE_LOG("dep scan: could not write " + parsed.depfile);
+    RecordDecision(cache_dir, {Reason::kDepfileUnwritable, parsed.depfile});
     return RunPassthrough(argv);
   }
 
@@ -702,7 +675,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   // Every prerequisite becomes a manifest entry. -MP's phony rules carry no
   // prerequisites and contribute nothing, which is correct: they name the same
   // headers the first rule already lists.
-  std::vector<std::pair<std::string, std::string>> files;
+  std::vector<ManifestFile> files;
   for (const DepRule& rule : dep->rules) {
     for (const std::string& prereq : rule.prerequisites) {
       auto digest = hash::HashFile(prereq);
@@ -743,19 +716,11 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
     return media_fail_exit();
   }
 
-  // Newest first, so the states in active use stay ahead of the tail that gets
-  // dropped, and so lookup checks the likely match before hashing for others.
   DepManifestEntry fresh;
   fresh.result_key = result_key;
   fresh.files = std::move(files);
-
-  std::vector<DepManifestEntry> updated;
-  updated.push_back(std::move(fresh));
-  for (DepManifestEntry& entry : entries) {
-    if (entry.result_key == result_key) continue;  // superseded
-    if (updated.size() >= kMaxManifestEntries) break;
-    updated.push_back(std::move(entry));
-  }
+  const std::vector<DepManifestEntry> updated = PrependManifestState(
+      std::move(fresh), std::move(entries), &DepManifestEntry::result_key);
 
   storage::Blob manifest_blob;
   manifest_blob.dep_manifest = RenderManifest(updated);
@@ -805,8 +770,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   args::CompilerArgs parsed = args::Parse(argv);
 
   if (!parsed.cacheable()) {
-    VCACHE_LOG("uncacheable: " + *parsed.uncacheable);
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, *parsed.uncacheable);
     return RunPassthrough(argv);
   }
 
@@ -833,8 +797,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                   parsed.incoming_prefix_maps.front().c_str());
         return 1;
       case IncomingMapPolicy::kKeep:
-        VCACHE_LOG("incoming prefix maps kept; not caching");
-        RecordCounter(cache_dir, Counter::kUncacheable);
+        RecordDecision(cache_dir, Reason::kKeptPrefixMaps);
         return RunPassthrough(argv);
       case IncomingMapPolicy::kStrip:
         VCACHE_LOG("stripped incoming prefix maps: " +
@@ -852,16 +815,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   std::string native_target;
   if (!parsed.native_flags.empty()) {
     if (config.native_target_policy == NativeTargetPolicy::kUncacheable) {
-      VCACHE_LOG("uncacheable: native target flags (" +
-                 util::Join(parsed.native_flags, " ") + ") and policy is 'uncacheable'");
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetPolicy, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     native_target = ResolveNativeTarget(parsed, compiler_id, cache_dir);
     if (native_target.empty()) {
-      VCACHE_LOG("uncacheable: could not resolve " +
-                 util::Join(parsed.native_flags, " "));
-      RecordCounter(cache_dir, Counter::kUncacheable);
+      RecordDecision(cache_dir,
+                     {Reason::kNativeTargetUnresolved, util::Join(parsed.native_flags, " ")});
       return RunPassthrough(argv);
     }
     VCACHE_LOG("native target " + native_target.substr(0, 16) + " for " +
@@ -870,7 +831,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   auto temp_dir = util::MakeTempDir("vcache-");
   if (!temp_dir) {
-    VCACHE_LOG("could not create temp dir; falling back");
+    RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);
   }
   struct TempDirGuard {
@@ -890,9 +851,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (pp.exit_code != 0) {
     // The compilation itself will fail too; let the compiler produce the real
     // diagnostics rather than reporting a vcache-shaped error.
-    VCACHE_LOG("preprocessing failed with exit code " + std::to_string(pp.exit_code) +
-               ": " + pp.stderr_data.substr(0, 512));
-    RecordCounter(cache_dir, Counter::kPreprocessFailed);
+    RecordDecision(cache_dir, {Reason::kPreprocessorError,
+                               "exit code " + std::to_string(pp.exit_code) + ": " +
+                                   pp.stderr_data.substr(0, 512)});
     return RunPassthrough(argv);
   }
 
@@ -900,7 +861,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const std::string key = ComputeKey(parsed, roots, compiler_id, config,
                                      native_target, preprocessed, &saw_incbin);
   if (key.empty()) {
-    VCACHE_LOG("could not compute cache key; falling back");
+    RecordDecision(cache_dir, Reason::kNoCacheKey);
     return RunPassthrough(argv);
   }
   // The preprocessed text is the whole of what vcache knows about this
@@ -908,9 +869,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // never mentions. Two builds can preprocess identically and still owe
   // different objects, so there is no key that would be honest here.
   if (saw_incbin) {
-    VCACHE_LOG("uncacheable: .incbin names a file the assembler reads, whose "
-               "contents the preprocessed text does not carry");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kIncbin);
     return RunPassthrough(argv);
   }
   VCACHE_LOG("key " + key + " for " + parsed.source + " -> " + parsed.output);
@@ -976,7 +935,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   }
 
   if (!util::LinkOrCopy(tmp_output, parsed.output)) {
-    VCACHE_LOG("could not place object at " + parsed.output + "; rerunning directly");
+    RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.output});
     return RunPassthrough(argv);
   }
 

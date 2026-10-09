@@ -284,9 +284,8 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   if (!parsed.is_link) return 0;
   *handled = true;
 
-  if (!parsed.uncacheable.empty()) {
-    VCACHE_LOG("uncacheable link: " + parsed.uncacheable);
-    RecordCounter(cache_dir, Counter::kUncacheable);
+  if (parsed.uncacheable) {
+    RecordDecision(cache_dir, *parsed.uncacheable);
     return RunPassthrough(argv);
   }
 
@@ -294,15 +293,13 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0) {
     // Without the tracer there is no absent set, and without an absent set a
     // hit cannot be shown to be sound. Decline rather than cache on a guess.
-    VCACHE_LOG("uncacheable link: tracer not found at " + tracer);
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, {Reason::kNoTracer, tracer});
     return RunPassthrough(argv);
   }
   if (!config.disk.enabled) {
     // Link outputs are content-addressed sidecars in the disk cache. A remote
     // blob alone only contains their digests and cannot materialise a hit.
-    VCACHE_LOG("uncacheable link: link caching requires the disk cache");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kLinkWithoutDisk);
     return RunPassthrough(argv);
   }
   const char* inherited_preload = std::getenv("LD_PRELOAD");
@@ -310,8 +307,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     // A preloaded library can change linker behaviour, and it is loaded before
     // this tracer can observe it. Decline rather than key only its pathname and
     // miss an in-place content change.
-    VCACHE_LOG("uncacheable link: an existing LD_PRELOAD is active");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, {Reason::kInheritedPreload, inherited_preload});
     return RunPassthrough(argv);
   }
 
@@ -364,7 +360,10 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   // ---- miss: run the link under the tracer --------------------------------
 
   auto temp_dir = util::MakeTempDir("vcache-link-");
-  if (!temp_dir) return RunPassthrough(argv);
+  if (!temp_dir) {
+    RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
   struct TempDirGuard {
     std::string path;
     ~TempDirGuard() { util::RemoveRecursive(path); }
@@ -392,8 +391,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   // caching this link at all.
   struct stat incomplete_st;
   if (::stat((trace_log + ".incomplete").c_str(), &incomplete_st) == 0) {
-    VCACHE_LOG("link: the trace is incomplete; not storing");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kIncompleteTrace);
     return 0;
   }
 
@@ -406,8 +404,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     // The tracer produced nothing about the process tree, which means it was
     // not loaded -- a statically linked linker, or a hardened loader. Storing
     // an entry whose input set may be partial would be worse than not caching.
-    VCACHE_LOG("link: tracer saw no processes; not storing");
-    RecordCounter(cache_dir, Counter::kUncacheable);
+    RecordDecision(cache_dir, Reason::kUntracedLinker);
     return 0;
   }
 

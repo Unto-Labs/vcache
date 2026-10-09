@@ -24,6 +24,9 @@ PATH=$(tr ':' '\n' <<<"$PATH" | grep -vE '/s?ccache(/|$)' | paste -sd: -)
 TMPBASE="${TMPDIR:-/tmp}"
 while [[ "$TMPBASE" == */ && "$TMPBASE" != "/" ]]; do TMPBASE="${TMPBASE%/}"; done
 WORK="$(mktemp -d "$TMPBASE/vcache-it-XXXXXX")"
+# Anything a killed process leaves in a temp dir then goes when the work dir does.
+export TMPDIR="$WORK/tmp"
+mkdir -p "$TMPDIR"
 # A slow PUT dies on SIGTERM when the disposition is the default. The flight
 # mock is not stopped by its own case: the next start is what signals it, and
 # only if that pid is still the one the shell holds. A parent that ignores
@@ -263,6 +266,18 @@ if debug_info "$WORK/a.o" | grep -q "checkout-a"; then
 else
   ok "debug info does not leak the local path"
 fi
+
+check "a finished compile leaves no scratch directory in the cache" \
+  "$(find "$VCACHE_DIR/tmp" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "a finished compile leaves nothing in TMPDIR" \
+  "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'vcache-*' | wc -l | tr -d ' ')" "0"
+mkdir -p "$VCACHE_DIR/tmp/vcache-killed" "$VCACHE_DIR/tmp/vcache-running"
+touch -d '7 hours ago' "$VCACHE_DIR/tmp/vcache-killed"
+"$VCACHE" --trim >/dev/null 2>&1
+check "--trim removes a scratch directory a killed compile left" \
+  "$([[ -d $VCACHE_DIR/tmp/vcache-killed ]] && echo kept || echo removed)" "removed"
+check "--trim keeps a recent scratch directory" \
+  "$([[ -d $VCACHE_DIR/tmp/vcache-running ]] && echo kept || echo removed)" "kept"
 
 # --------------------------------------------------------------------------
 section "2. out-of-tree builds (cwd differs, source tree does not)"

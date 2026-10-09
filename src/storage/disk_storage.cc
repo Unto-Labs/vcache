@@ -21,6 +21,8 @@ namespace vcache::storage {
 namespace {
 
 constexpr int kShardCount = 256;
+// No compile runs this long, so a scratch directory this old was left by a killed one.
+constexpr int64_t kStaleScratchSeconds = 6 * 3600;
 
 // Evict down to this fraction of the budget so a shard that is exactly at the
 // limit does not trigger a scan on every single store.
@@ -111,6 +113,7 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
   const uint64_t before =
       shard_size >= value.size() ? shard_size - value.size() : 0;
   if (shard_size / shard_budget != before / shard_budget) {
+    util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
     TrimGlobal(max_size_, static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
   }
   return true;
@@ -189,6 +192,10 @@ void DiskStorage::Trim() {
   // Cost files are not cache entries. Put()'s TrimGlobal does not come here,
   // so a store does not pay for walking costs/.
   core::PruneStaleCostFiles(dir_);
+  const size_t stale_scratch = util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
+  if (stale_scratch > 0) {
+    VCACHE_LOG("disk: removed " + std::to_string(stale_scratch) + " stale scratch directories");
+  }
   // An explicit trim has no hysteresis to preserve: evict whenever the cache
   // is above the target rather than waiting for it to cross max_size_.
   const auto target = static_cast<uint64_t>(max_size_ * kTrimTargetFraction);

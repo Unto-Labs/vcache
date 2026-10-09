@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include "util/str.h"
 
@@ -354,14 +355,45 @@ std::string CurrentDir() {
   return std::string(buf);
 }
 
-std::optional<std::string> MakeTempDir(const std::string& prefix) {
-  const char* base = std::getenv("TMPDIR");
-  std::string dir = (base != nullptr && *base != '\0') ? base : "/tmp";
+namespace {
+
+std::optional<std::string> MakeTempDirUnder(const std::string& dir, const std::string& prefix) {
   std::string tmpl = dir + "/" + prefix + "XXXXXX";
   std::vector<char> buf(tmpl.begin(), tmpl.end());
   buf.push_back('\0');
   if (::mkdtemp(buf.data()) == nullptr) return std::nullopt;
   return std::string(buf.data());
+}
+
+std::string ScratchRoot(const std::string& cache_dir) { return cache_dir + "/tmp"; }
+
+}  // namespace
+
+std::optional<std::string> MakeTempDir(const std::string& prefix) {
+  const char* base = std::getenv("TMPDIR");
+  return MakeTempDirUnder((base != nullptr && *base != '\0') ? base : "/tmp", prefix);
+}
+
+std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix) {
+  if (!cache_dir.empty() && MakeDirs(ScratchRoot(cache_dir))) {
+    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), prefix)) return dir;
+  }
+  return MakeTempDir(prefix);
+}
+
+size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds) {
+  std::error_code ec;
+  fs::directory_iterator it(ScratchRoot(cache_dir), ec);
+  if (ec) return 0;
+  const int64_t now = static_cast<int64_t>(::time(nullptr));
+  size_t removed = 0;
+  for (const auto& entry : it) {
+    struct stat st{};
+    if (::lstat(entry.path().c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+    if (now - static_cast<int64_t>(st.st_mtime) <= max_age_seconds) continue;
+    if (RemoveRecursive(entry.path().string())) ++removed;
+  }
+  return removed;
 }
 
 bool RemoveRecursive(const std::string& path) {

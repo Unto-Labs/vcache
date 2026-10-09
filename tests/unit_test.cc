@@ -1678,8 +1678,11 @@ void TestRustManifest() {
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
 
-  const std::string root = *scratch + "/a";
-  const std::string other_root = *scratch + "/b";
+  // Root specs are symlink-resolved and Canonicalize matches the spelling as
+  // given, so every test path is built from the resolved scratch directory.
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string root = base + "/a";
+  const std::string other_root = base + "/b";
   for (const std::string& tree : {root, other_root}) {
     util::MakeDirs(tree + "/src");
     util::WriteFileAtomic(tree + "/src/lib.rs", "mod helper;\n");

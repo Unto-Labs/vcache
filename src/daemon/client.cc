@@ -32,7 +32,9 @@ constexpr std::time_t kStartRetrySeconds = 60;
 
 uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms) {
   constexpr uint64_t cap_ms = kReplyTimeoutSeconds * 1000;
-  if (!recorded_wall_ms) return 30000;
+  // An unknown compile may be the longest in the build; a dead holder releases
+  // its waiters at once, so the full bound only costs time if the holder hangs.
+  if (!recorded_wall_ms) return cap_ms;
   if (*recorded_wall_ms >= cap_ms / 2) return cap_ms;
   return std::max<uint64_t>(30000, 2 * *recorded_wall_ms);
 }

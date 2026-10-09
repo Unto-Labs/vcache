@@ -177,7 +177,7 @@ os.execvp(real, [real] + sys.argv[1:])
                       row(env, "cache hit (disk)", 1, "--show-stats"),
                       label + ": wrapper stats count one miss and one restored hit")
                 check("lease: waiting on holder pid " in contents(logs[1]) and
-                      ("up to 40000 ms" if recorded_cost else "up to 30000 ms") in
+                      ("up to 40000 ms" if recorded_cost else "up to 300000 ms") in
                       contents(logs[1]),
                       label + ": waiter logs holder pid and bounded wait duration")
             elif ending in ("failed", "gone", "shutdown"):

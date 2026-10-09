@@ -69,7 +69,7 @@ bool IsKeptLinkFlag(std::string_view arg) {
          util::StartsWith(arg, "-fuse-ld=");
 }
 
-// `--edition`, `--crate-type` and `--target`, either joined (`--edition=2021`)
+// `--crate-name`, `--edition`, `--crate-type` and `--target`, either joined (`--edition=2021`)
 // or as the flag plus its following argument. `--target-cpu` does not match
 // `--target`: the next character would be `-`, not `=`.
 bool TakeNamedFlag(const std::vector<std::string>& args, size_t* i, std::string_view name,
@@ -103,7 +103,10 @@ std::vector<std::string> CostFlagClass(std::string_view operation,
         kept.push_back(arg);
         continue;
       }
-      if (TakeNamedFlag(key_args, &i, "--edition", &kept) ||
+      // Registry crates all compile `src/lib.rs` under a cwd root, so without the
+      // crate name every one of them shares a single cost record.
+      if (TakeNamedFlag(key_args, &i, "--crate-name", &kept) ||
+          TakeNamedFlag(key_args, &i, "--edition", &kept) ||
           TakeNamedFlag(key_args, &i, "--crate-type", &kept) ||
           TakeNamedFlag(key_args, &i, "--target", &kept)) {
         continue;

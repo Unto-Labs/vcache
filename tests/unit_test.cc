@@ -2017,8 +2017,8 @@ bool PutLeaseBlob(const SessionDaemon& server, const std::string& key, int timeo
 
 void TestKeyLeases() {
   Section("daemon::lease");
-  Check(daemon::LeaseWaitBoundMs(std::nullopt) == 30000,
-        "no recorded duration bounds a lease wait at 30000 ms");
+  Check(daemon::LeaseWaitBoundMs(std::nullopt) == daemon::kReplyTimeoutSeconds * 1000,
+        "no recorded duration waits up to the reply timeout");
   Check(daemon::LeaseWaitBoundMs(5000) == 30000,
         "a 5000 ms record keeps the 30000 ms minimum");
   Check(daemon::LeaseWaitBoundMs(20000) == 40000,
@@ -4520,6 +4520,14 @@ void TestCost() {
                                 "extra-filename=-bbb"},
                                roots_a),
           "rustc metadata and extra-filename share one cost key");
+  Check(core::ComputeCostKey("rustc", file_a, "rust", {"--crate-name", "serde", "-C", "opt-level=2"},
+                             roots_a) !=
+            core::ComputeCostKey("rustc", file_a, "rust",
+                                 {"--crate-name", "syn", "-C", "opt-level=2"}, roots_a),
+        "two crates compiling the same canonical source have different cost keys");
+  CheckEq(core::ComputeCostKey("rustc", file_a, "rust", {"--crate-name", "serde"}, roots_a),
+          core::ComputeCostKey("rustc", file_b, "rust", {"--crate-name", "serde"}, roots_b),
+          "one crate in two worktrees shares a cost key");
   CheckEq(core::ComputeCostKey("compile", file_a, "c++",
                                {"-O2", "-fdebug-prefix-map=/a=/b"}, roots_a),
           core::ComputeCostKey("compile", file_a, "c++", {"-O2"}, roots_a),

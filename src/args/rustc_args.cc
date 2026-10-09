@@ -23,7 +23,7 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
       "-A",           "-D",           "-F",             "--cfg",
       "--check-cfg",  "--error-format", "--json",       "--color",
       "--sysroot",    "--explain",    "-o",             "--print",
-      "--cap-lints",  "--remap-path-scope",
+      "--cap-lints",  "--remap-path-scope", "--codegen",
   };
   return *kSet;
 }
@@ -118,6 +118,8 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       result.key_args.push_back(arg);
       continue;
     }
+    // One spelling, so the key and the -C incremental check see both as one.
+    if (opt == "--codegen") opt = "-C";
 
     // Options vcache manages itself, kept out of base_args.
     if (opt == "--out-dir") {

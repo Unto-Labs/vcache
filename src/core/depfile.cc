@@ -6,6 +6,7 @@
 #include <boost/spirit/home/x3.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -168,10 +169,22 @@ void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction,
     for (std::string& p : rule.prerequisites) map_one(p);
   }
   for (DepEnv& env : dep->env_deps) {
-    if (env.value && std::find(path_env_vars.begin(), path_env_vars.end(), env.name) !=
-                         path_env_vars.end()) {
-      map_one(*env.value);
+    if (!env.value || std::find(path_env_vars.begin(), path_env_vars.end(), env.name) ==
+                          path_env_vars.end()) {
+      continue;
     }
+    // A root reached through a symlink has two local spellings and Localize
+    // picks one, while cargo compares the restored value with its own as a
+    // string and rebuilds on any difference. The live value is the spelling
+    // cargo set, so it wins whenever it names the same canonical path.
+    if (direction == MapDirection::kLocalize) {
+      const char* current = std::getenv(env.name.c_str());
+      if (current != nullptr && roots.Canonicalize(current) == *env.value) {
+        *env.value = current;
+        continue;
+      }
+    }
+    map_one(*env.value);
   }
 }
 

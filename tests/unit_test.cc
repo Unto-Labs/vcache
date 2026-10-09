@@ -632,6 +632,44 @@ void TestDepFileEnvDeps() {
     CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
             "/work/b/out", "a listed path env value is localised on restore");
   }
+
+  // cargo compares the restored env-dep value with its own OUT_DIR as a string,
+  // so a root reached through two spellings must restore the one cargo uses.
+  auto scratch = util::MakeTempDir("vcache-depfile-");
+  Check(scratch.has_value(), "depfile scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string resolved_tree = base + "/resolved-tree";
+  const std::string alias_tree = base + "/l";
+  util::MakeDirs(resolved_tree + "/out");
+  std::error_code link_ec;
+  fs::create_directory_symlink(resolved_tree, alias_tree, link_ec);
+  Check(!link_ec, "alias symlink created");
+  const core::RootMap aliased = MakeRoots({alias_tree + "=proj"});
+  auto localized_out_dir = [&](const char* current) {
+    if (current == nullptr) {
+      ::unsetenv("OUT_DIR");
+    } else {
+      ::setenv("OUT_DIR", current, 1);
+    }
+    auto dep = core::ParseDepFile("a.d: /vcache/proj/a.rs\n\n# env-dep:OUT_DIR=/vcache/proj/out\n");
+    if (!dep || dep->env_deps.empty()) return std::string("unparsed");
+    core::RemapDepFile(&*dep, aliased, core::MapDirection::kLocalize, {"OUT_DIR"});
+    ::unsetenv("OUT_DIR");
+    return dep->env_deps[0].value.value_or("unset");
+  };
+  CheckEq(localized_out_dir((resolved_tree + "/out").c_str()), resolved_tree + "/out",
+          "the resolved spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir((alias_tree + "/out").c_str()), alias_tree + "/out",
+          "the alias spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir("/elsewhere/out"), aliased.Localize("/vcache/proj/out"),
+          "an OUT_DIR of another tree does not replace the stored value");
+  CheckEq(localized_out_dir(nullptr), aliased.Localize("/vcache/proj/out"),
+          "an unset OUT_DIR restores through the roots");
 }
 
 void TestPreprocessedNormalization() {
@@ -3301,6 +3339,18 @@ void TestCompilerArgs() {
     const auto cc1_pch = args::Parse({"clang++", "-c", "-Xclang", "-include-pch",
                                       "-Xclang", "h.pch", "a.cc", "-o", "a.o"});
     Check(cc1_pch.cacheable(), "-Xclang -include-pch -Xclang h.pch is cacheable");
+
+    // An unvalidated PCH may predate an edit to the header the key now covers.
+    const auto driver_unvalidated = args::Parse(
+        {"clang++", "-c", "-fno-validate-pch", "-include-pch", "h.pch", "a.cc", "-o", "a.o"});
+    CheckEq(driver_unvalidated.uncacheable ? driver_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-fno-validate-pch is declined");
+    const auto cc1_unvalidated =
+        args::Parse({"clang++", "-c", "-Xclang", "-fno-validate-pch", "-include-pch", "h.pch",
+                     "a.cc", "-o", "a.o"});
+    CheckEq(cc1_unvalidated.uncacheable ? cc1_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-Xclang -fno-validate-pch is declined");
+    CheckEq(cc1_unvalidated.source, "a.cc", "-Xclang's value is not a source file");
   }
   Check(args::Parse({"gcc", "-c", "a.S", "-o", "a.o"}).cacheable(),
         "preprocessed assembly is cacheable");
@@ -3447,10 +3497,12 @@ void TestRustcArgs() {
   };
   // cargo points -C incremental into the target directory, which differs
   // between checkouts.
-  const std::vector<std::vector<std::string>> incremental_spellings = {
-      {"-C", "incremental=/a/b"}, {"-Cincremental=/a/b"}};
-  for (const std::vector<std::string>& spelling : incremental_spellings) {
-    const std::string form = spelling.size() == 2 ? "separate" : "joined";
+  const std::vector<std::pair<std::string, std::vector<std::string>>> incremental_spellings = {
+      {"separate", {"-C", "incremental=/a/b"}},
+      {"joined", {"-Cincremental=/a/b"}},
+      {"long separate", {"--codegen", "incremental=/a/b"}},
+      {"long joined", {"--codegen=incremental=/a/b"}}};
+  for (const auto& [form, spelling] : incremental_spellings) {
     std::vector<std::string> argv = {"rustc", "--emit=link", "--out-dir", "o",
                                      "-C", "opt-level=3"};
     argv.insert(argv.end(), spelling.begin(), spelling.end());
@@ -3538,8 +3590,11 @@ void TestRustManifest() {
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
 
-  const std::string root = *scratch + "/a";
-  const std::string other_root = *scratch + "/b";
+  // Root specs are symlink-resolved and Canonicalize matches the spelling as
+  // given, so every test path is built from the resolved scratch directory.
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string root = base + "/a";
+  const std::string other_root = base + "/b";
   for (const std::string& tree : {root, other_root}) {
     util::MakeDirs(tree + "/src");
     util::WriteFileAtomic(tree + "/src/lib.rs", "mod helper;\n");

@@ -561,8 +561,10 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     // preprocessor does not expand `import` the way it expands `#include`.
     //
     // -fpch-preprocess: -E names the .gch, not the header text; .gch bytes vary.
+    // -fno-validate-pch: the key covers the header text, and clang would then
+    // accept a PCH built before that header was edited.
     if (arg == "-save-temps" || StartsWith(arg, "-save-temps=") ||
-        arg == "-fsyntax-only" || arg == "-fpch-preprocess" ||
+        arg == "-fsyntax-only" || arg == "-fpch-preprocess" || arg == "-fno-validate-pch" ||
         StartsWith(arg, "-specs=") ||
         StartsWith(arg, "-fprofile-generate") || StartsWith(arg, "-fprofile-use") ||
         StartsWith(arg, "-fauto-profile") || arg == "-frepo" ||
@@ -572,6 +574,13 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
         StartsWith(arg, "-fprofile-instr-use")) {
       pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, arg);
       result.base_args.push_back(arg);
+      continue;
+    }
+    if (arg == "-Xclang" && i + 1 < result.argv.size() &&
+        result.argv[i + 1] == "-fno-validate-pch") {
+      pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, result.argv[i + 1]);
+      result.base_args.push_back(arg);
+      result.base_args.push_back(result.argv[++i]);
       continue;
     }
 

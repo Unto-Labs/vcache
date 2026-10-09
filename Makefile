@@ -345,6 +345,7 @@ $(BINDIR)/vcache_test_alloc: $(TOP)/tests/vcache_test_alloc.cc
 
 test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test
+	@CXX="$(CXX)" CURL_CFLAGS="$(CURL_CFLAGS)" $(TOP)/tests/curl_abi_check.sh
 	@$(TOP)/tests/integration_test.sh
 
 # Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and

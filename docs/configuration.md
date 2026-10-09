@@ -739,12 +739,20 @@ $ export VCACHE_RUST_PATH_ENV_VARS=OUT_DIR   # comma-separated
 ```
 
 The value is canonicalised wherever it is compared: in the key, in the Rust
-manifest, and in the `# env-dep:` line of the cached dep-info, which a hit
-localises again so cargo sees this checkout's own value. A crate can still bake
-the value into its artifact, as `const DIR: &str = env!("OUT_DIR")` does. After
-each compile vcache looks for the local value in every output and in rustc's
-diagnostics, and if it is there the entry is not stored; `--show-stats` counts
-those runs as `env path in output`. A value outside every root is keyed as it is.
+manifest, and in the `# env-dep:` line of the cached dep-info. A hit writes that
+line back with the variable's current value, spelled exactly as cargo set it, so
+cargo does not see a changed variable and rebuild. A value outside every root is
+keyed as it is.
+
+List only variables that crates use to locate files, as `include!` uses
+`OUT_DIR`. A crate can still bake the value into its artifact, as
+`const DIR: &str = env!("OUT_DIR")` does. After each compile vcache searches every
+output and rustc's diagnostics for the local value verbatim, and if it is there
+the entry is not stored; `--show-stats` counts those runs as `env path in output`.
+That search is a heuristic. It does not see a value the crate derives from the
+path (`env!("OUT_DIR").len()`, a hash of it) or one stored compressed, as in
+dylib and proc-macro metadata, and such an entry would serve one checkout's path
+to another.
 
 ### `native_target`
 

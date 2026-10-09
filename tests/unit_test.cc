@@ -608,6 +608,44 @@ void TestDepFileEnvDeps() {
     CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
             "/work/b/out", "a listed path env value is localised on restore");
   }
+
+  // cargo compares the restored env-dep value with its own OUT_DIR as a string,
+  // so a root reached through two spellings must restore the one cargo uses.
+  auto scratch = util::MakeTempDir("vcache-depfile-");
+  Check(scratch.has_value(), "depfile scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string resolved_tree = base + "/resolved-tree";
+  const std::string alias_tree = base + "/l";
+  util::MakeDirs(resolved_tree + "/out");
+  std::error_code link_ec;
+  fs::create_directory_symlink(resolved_tree, alias_tree, link_ec);
+  Check(!link_ec, "alias symlink created");
+  const core::RootMap aliased = MakeRoots({alias_tree + "=proj"});
+  auto localized_out_dir = [&](const char* current) {
+    if (current == nullptr) {
+      ::unsetenv("OUT_DIR");
+    } else {
+      ::setenv("OUT_DIR", current, 1);
+    }
+    auto dep = core::ParseDepFile("a.d: /vcache/proj/a.rs\n\n# env-dep:OUT_DIR=/vcache/proj/out\n");
+    if (!dep || dep->env_deps.empty()) return std::string("unparsed");
+    core::RemapDepFile(&*dep, aliased, core::MapDirection::kLocalize, {"OUT_DIR"});
+    ::unsetenv("OUT_DIR");
+    return dep->env_deps[0].value.value_or("unset");
+  };
+  CheckEq(localized_out_dir((resolved_tree + "/out").c_str()), resolved_tree + "/out",
+          "the resolved spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir((alias_tree + "/out").c_str()), alias_tree + "/out",
+          "the alias spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir("/elsewhere/out"), aliased.Localize("/vcache/proj/out"),
+          "an OUT_DIR of another tree does not replace the stored value");
+  CheckEq(localized_out_dir(nullptr), aliased.Localize("/vcache/proj/out"),
+          "an unset OUT_DIR restores through the roots");
 }
 
 void TestPreprocessedNormalization() {

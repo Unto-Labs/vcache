@@ -50,7 +50,8 @@ std::string RenderDepFile(const DepFile& dep);
 // values of the env deps named in `path_env_vars`. Other env-dep values are left
 // alone: the cache key holds them raw, so a hit already has the local value.
 // `direction` decides which way: kCanonicalize for storing, kLocalize for
-// restoring into the current working tree.
+// restoring into the current working tree, where a listed env dep takes this
+// process's own value of the variable when that canonicalises to the stored one.
 enum class MapDirection { kCanonicalize, kLocalize };
 void RemapDepFile(DepFile* dep, const RootMap& roots, MapDirection direction,
                   const std::vector<std::string>& path_env_vars = {});

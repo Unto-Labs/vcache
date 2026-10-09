@@ -1479,6 +1479,18 @@ void TestCompilerArgs() {
     const auto cc1_pch = args::Parse({"clang++", "-c", "-Xclang", "-include-pch",
                                       "-Xclang", "h.pch", "a.cc", "-o", "a.o"});
     Check(cc1_pch.cacheable(), "-Xclang -include-pch -Xclang h.pch is cacheable");
+
+    // An unvalidated PCH may predate an edit to the header the key now covers.
+    const auto driver_unvalidated = args::Parse(
+        {"clang++", "-c", "-fno-validate-pch", "-include-pch", "h.pch", "a.cc", "-o", "a.o"});
+    CheckEq(driver_unvalidated.uncacheable ? driver_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-fno-validate-pch is declined");
+    const auto cc1_unvalidated =
+        args::Parse({"clang++", "-c", "-Xclang", "-fno-validate-pch", "-include-pch", "h.pch",
+                     "a.cc", "-o", "a.o"});
+    CheckEq(cc1_unvalidated.uncacheable ? cc1_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-Xclang -fno-validate-pch is declined");
+    CheckEq(cc1_unvalidated.source, "a.cc", "-Xclang's value is not a source file");
   }
   Check(args::Parse({"gcc", "-c", "a.S", "-o", "a.o"}).cacheable(),
         "preprocessed assembly is cacheable");

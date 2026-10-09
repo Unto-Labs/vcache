@@ -258,5 +258,9 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   macro the compile does not, and gcc uses a `.gch` it never checks against an
   edited header; in both cases the expanded text describes a different
   compilation from the one that ran. Build PCHs with the flags and headers of
-  the compiles that use them, as build systems do.
+  the compiles that use them, as build systems do. A stale `.gch` stores an
+  object under the edited header's key. With an S3 tier that entry is shared
+  with every other host and stays until it expires, so clearing the local cache
+  does not remove it. clang's `-fno-validate-pch`, which removes the one check
+  that catches a stale PCH, is declined.
 - **GCS** is not implemented. The `Storage` interface is where it would go.

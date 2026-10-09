@@ -41,6 +41,20 @@ namespace {
 
 constexpr const char* kVersion = "vcache 1.3.0";
 
+// Masquerade hops through vcache within one compiler's process chain. A real
+// chain is short (rustc running a masqueraded linker is two); a cycle is not.
+constexpr const char* kMasqueradeDepthEnv = "VCACHE_MASQUERADE_DEPTH";
+constexpr long kMaxMasqueradeDepth = 4;
+
+long MasqueradeDepthFromEnv() {
+  const char* text = std::getenv(kMasqueradeDepthEnv);
+  if (text == nullptr) return 0;
+  char* end = nullptr;
+  const long depth = std::strtol(text, &end, 10);
+  if (end == text || *end != '\0' || depth < 0) return 0;
+  return depth;
+}
+
 void PrintUsage() {
   std::printf(
       "%s -- compilation cache for C, C++ and Rust\n"
@@ -412,6 +426,19 @@ int main(int argc, char** argv) {
       ::fprintf(stderr, "vcache: cannot find a real %s on PATH\n", self_base.c_str());
       return 127;
     }
+    // A wrapper such as ccache also runs the first other same-named binary on
+    // PATH. With its directory after this symlink's, the two run each other
+    // without end, so count the hops and stop.
+    const long masquerade_depth = MasqueradeDepthFromEnv();
+    if (masquerade_depth >= kMaxMasqueradeDepth) {
+      ::fprintf(stderr,
+                "vcache: masquerading as %s led back to vcache %ld times; %s on PATH "
+                "runs vcache again. Take its directory off PATH or put the real "
+                "compiler before it.\n",
+                self_base.c_str(), masquerade_depth, real->c_str());
+      return 127;
+    }
+    ::setenv(kMasqueradeDepthEnv, std::to_string(masquerade_depth + 1).c_str(), 1);
     command.push_back(*real);
     for (int i = 1; i < argc; ++i) command.push_back(argv[i]);
   } else {

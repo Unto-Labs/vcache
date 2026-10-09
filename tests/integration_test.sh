@@ -12,6 +12,10 @@ set -uo pipefail
 TOP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VCACHE="$TOP/bin/vcache"
 
+# A compiler wrapper's directory on PATH (ccache, sccache) would sit between
+# the masquerade link and the real compiler; the suite tests vcache alone.
+PATH=$(tr ':' '\n' <<<"$PATH" | grep -vE '/s?ccache(/|$)' | paste -sd: -)
+
 # $TMPDIR ends in a slash on macOS, which would make every path here carry a
 # doubled separator -- ".../T//vcache-it-XXXX/..." -- and vcache deliberately
 # does not match such a spelling against a root (see RootMap::Canonicalize).
@@ -581,6 +585,32 @@ check "masquerade compile is a miss" "$(misses)" "1"
     VCACHE_ROOTS="$WORK/checkout-b=proj" \
     g++ -g -O2 -c -I include src/lib.cc -o "$WORK/m2.o" ) 2>/dev/null
 check "masquerade hits across checkouts" "$(hits)" "1"
+
+# A wrapper that runs the next other same-named binary on PATH, as ccache does,
+# placed after the masquerade link: vcache and it run each other. The wrapper
+# gives up by itself after 20 hops so a regression fails rather than hangs.
+mkdir -p "$WORK/wrapper"
+cat > "$WORK/wrapper/g++" <<'EOF'
+#!/usr/bin/env bash
+hops=$(( ${WRAPPER_HOPS:-0} + 1 ))
+(( hops > 20 )) && exit 99
+export WRAPPER_HOPS=$hops
+self=$(realpath "$0")
+IFS=: read -ra dirs <<<"$PATH"
+for dir in "${dirs[@]}"; do
+  candidate="$dir/g++"
+  [[ -x $candidate && $(realpath "$candidate") != "$self" ]] && exec "$candidate" "$@"
+done
+exit 127
+EOF
+chmod +x "$WORK/wrapper/g++"
+loop_err=$( cd "$WORK/checkout-a" && PATH="$WORK/bin:$WORK/wrapper:$PATH" \
+    VCACHE_ROOTS="$WORK/checkout-a=proj" \
+    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/m3.o" 2>&1 >/dev/null )
+loop_rc=$?
+check "a wrapper that runs vcache again stops the masquerade" "$loop_rc" "127"
+check "the refusal names the loop" \
+  "$(grep -q 'led back to vcache 4 times' <<<"$loop_err" && echo yes)" "yes"
 
 # --------------------------------------------------------------------------
 section "9. Rust"

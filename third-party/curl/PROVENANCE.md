@@ -12,7 +12,7 @@ Makefile probes for `<curl/curl.h>` and puts `include/` on the path otherwise.
 | `COPYING` | the curl licence |
 
 libcurl itself is not here and is never linked: it is opened with `dlopen` when
-an S3 layer is constructed (see `src/storage/curl_api.h`). Its nine entry points
+an S3 layer is constructed (see `src/storage/curl_api.h`). Its ten entry points
 are resolved by name, so no function is declared. What remains is six types
 (`CURL`, `curl_slist`, `curl_off_t`, `CURLcode`, `CURLoption`, `CURLINFO`) and
 eighteen constants: `CURLE_OK`, the fifteen `CURLOPT_` options vcache sets,
@@ -35,4 +35,6 @@ When vcache starts using a new option or info code, add it here with the value
 curl.h gives it, written the same way (`CURLOPTTYPE_* + n`). Then run
 `make test` both ways: without curl's headers, and with them (installed, or
 `make CURL_CFLAGS=-I<dir>` naming a curl source tree's `include/`). Its S3
-section drives every option here against a mock object store.
+section drives every option here against a mock object store, and with real
+headers present `tests/curl_abi_check.sh` compares every constant, type size
+and `curl_slist` offset declared here against them.

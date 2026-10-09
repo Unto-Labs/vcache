@@ -1637,10 +1637,12 @@ void TestRustcArgs() {
   };
   // cargo points -C incremental into the target directory, which differs
   // between checkouts.
-  const std::vector<std::vector<std::string>> incremental_spellings = {
-      {"-C", "incremental=/a/b"}, {"-Cincremental=/a/b"}};
-  for (const std::vector<std::string>& spelling : incremental_spellings) {
-    const std::string form = spelling.size() == 2 ? "separate" : "joined";
+  const std::vector<std::pair<std::string, std::vector<std::string>>> incremental_spellings = {
+      {"separate", {"-C", "incremental=/a/b"}},
+      {"joined", {"-Cincremental=/a/b"}},
+      {"long separate", {"--codegen", "incremental=/a/b"}},
+      {"long joined", {"--codegen=incremental=/a/b"}}};
+  for (const auto& [form, spelling] : incremental_spellings) {
     std::vector<std::string> argv = {"rustc", "--emit=link", "--out-dir", "o",
                                      "-C", "opt-level=3"};
     argv.insert(argv.end(), spelling.begin(), spelling.end());

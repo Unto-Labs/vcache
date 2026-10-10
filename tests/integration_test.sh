@@ -390,6 +390,32 @@ fi
 check "-MMD -MP hits across checkouts" "$(hits)" "1"
 
 # --------------------------------------------------------------------------
+section "3b. an entry stored without a depfile does not serve a -MD compile"
+
+# Dependency flags stay out of the key so both shapes share one entry. An entry
+# stored without -MD has no depfile to replay, and a hit from it would leave
+# make or ninja with no dependency list for the object.
+reset_cache
+mkdir -p "$WORK/md-share"
+printf 'int seven(void) { return 7; }\n' > "$WORK/md-share/t.c"
+( cd "$WORK/md-share" && "$VCACHE" gcc -c t.c -o t.o ) 2>/dev/null
+( cd "$WORK/md-share" && VCACHE_LOG="$WORK/md-share.log" \
+    "$VCACHE" gcc -MD -MF t.d -c t.c -o t.o ) 2>/dev/null
+check "-MD after a plain compile writes its depfile" \
+  "$([[ -s "$WORK/md-share/t.d" ]] && echo written || echo missing)" "written"
+check "-MD after a plain compile is a miss" "$(misses)" "2"
+check "-MD after a plain compile is not a hit" "$(hits)" "0"
+check "the miss names the missing depfile" \
+  "$(grep -c 'has no dependency file' "$WORK/md-share.log" 2>/dev/null)" "1"
+rm -f "$WORK/md-share/t.d"
+( cd "$WORK/md-share" && "$VCACHE" gcc -MD -MF t.d -c t.c -o t.o ) 2>/dev/null
+check "a later -MD compile hits" "$(hits)" "1"
+check "a later -MD compile writes its depfile" \
+  "$([[ -s "$WORK/md-share/t.d" ]] && echo written || echo missing)" "written"
+( cd "$WORK/md-share" && "$VCACHE" gcc -c t.c -o t.o ) 2>/dev/null
+check "a plain compile still hits the entry stored with a depfile" "$(hits)" "2"
+
+# --------------------------------------------------------------------------
 section "4. correctness: different code must not share an entry"
 
 reset_cache

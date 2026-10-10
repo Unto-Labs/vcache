@@ -248,20 +248,7 @@ bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
     VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
     return fail();
   }
-  if (executable) {
-    // Add execute where the umask would have allowed it, not everywhere.
-    // CloneFile has already applied 0666 & ~umask, so under a strict umask the
-    // file is 0600; adding all three execute bits unconditionally would publish
-    // 0711 and let other users run a binary they cannot read.
-    struct stat st;
-    if (::stat(tmp_path.c_str(), &st) != 0) return fail();
-    const mode_t allowed = util::DefaultFileMode();
-    mode_t add = 0;
-    if (allowed & S_IRUSR) add |= S_IXUSR;
-    if (allowed & S_IRGRP) add |= S_IXGRP;
-    if (allowed & S_IROTH) add |= S_IXOTH;
-    if (::chmod(tmp_path.c_str(), st.st_mode | add) != 0) return fail();
-  }
+  if (executable && !util::AddExecuteBitsUnderUmask(tmp_path)) return fail();
   if (::rename(tmp_path.c_str(), output.c_str()) != 0) {
     VCACHE_LOG("link hit: cannot rename the verified output into place: " + output +
                ": " + std::strerror(errno));

@@ -251,6 +251,7 @@ VCACHE_SRCS := \
   $(SRC)/util/subprocess.cc \
   $(SRC)/util/log.cc \
   $(SRC)/hash/hasher.cc \
+  $(SRC)/hash/file_memo.cc \
   $(SRC)/hash/sha256.cc \
   $(SRC)/core/roots.cc \
   $(SRC)/core/config.cc \

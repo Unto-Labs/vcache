@@ -534,7 +534,10 @@ and resets counters.
 Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
 per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
 versions read only the leading counters, and drop the reason lines when they
-next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`.
+next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`,
+and the digests of rustc `--extern` files, keyed by device, inode, size, mtime
+and ctime, in `<dir>/filehash/`; `vcache --trim` removes those not rewritten
+for 30 days.
 
 ## S3 cache
 

@@ -902,8 +902,17 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
       storage::Blob blob;
-      if (storage::DeserializeBlob(got.value, &blob) &&
-          MaterializeHit(blob, parsed, roots)) {
+      const bool blob_decoded = storage::DeserializeBlob(got.value, &blob);
+      // Dependency flags are not in the key, so an entry stored by a compile
+      // without -MD serves this one too, and has no depfile to replay. The
+      // recompile stores one, and the entry then serves both shapes.
+      if (blob_decoded && parsed.generates_deps && !parsed.depfile.empty() &&
+          !blob.has_depfile) {
+        VCACHE_LOG("hit on " + got.layer + " has no dependency file for " + parsed.depfile +
+                   "; recompiling");
+        return false;
+      }
+      if (blob_decoded && MaterializeHit(blob, parsed, roots)) {
         VCACHE_LOG("hit on " + got.layer);
         RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
                                                    : Counter::kHitDisk);

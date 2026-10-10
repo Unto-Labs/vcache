@@ -5456,6 +5456,20 @@ void TestCxxManifest() {
                     .paths.front(),
           dir + "/inc/g.h.gch", "-include finds a .gch in a CPATH directory");
   ::unsetenv("CPATH");
+
+  // The include-directory memos go with --trim's age rule and with --clear.
+  const std::string cache = dir + "/cache";
+  const std::string stale_memo = core::SystemIncludeMemoDir(cache) + "/stale";
+  const std::string young_memo = core::SystemIncludeMemoDir(cache) + "/young";
+  util::WriteFileAtomic(stale_memo, "/usr/include\n");
+  util::WriteFileAtomic(young_memo, "/usr/include\n");
+  Age(stale_memo, 31 * 24 * 3600);
+  Age(young_memo, 29 * 24 * 3600);
+  storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/false);
+  disk.Trim();
+  Check(!util::FileExists(stale_memo), "trim removes an include-directory memo older than 30 days");
+  Check(util::FileExists(young_memo), "trim keeps a younger one");
+  Check(disk.Clear() && !util::FileExists(young_memo), "clear removes the include-directory memos");
 }
 
 void TestRustOutputNames() {

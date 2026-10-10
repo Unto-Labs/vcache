@@ -120,6 +120,11 @@ RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
 // cannot be read.
 std::vector<std::string> ParseSystemIncludeDirs(const std::string& verbose_stderr);
 
+// Where SystemIncludeDirs in compile.cc memoises the list, and the sweep
+// `--trim` runs over it: memos not rewritten for `max_age_seconds` go.
+std::string SystemIncludeMemoDir(const std::string& cache_dir);
+size_t PruneSystemIncludeMemos(const std::string& cache_dir, int64_t max_age_seconds);
+
 // True when `path`, lexically normalised, lies inside one of `dirs`.
 bool UnderAnyDir(const std::string& path, const std::vector<std::string>& dirs);
 

@@ -992,6 +992,11 @@ void StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
 // The compiler's own <...> include directories, from `<compiler> -E -v` in the
 // compile's language with the flags that can move them. Memoised in the cache
 // directory, since the probe is a process; empty when it fails.
+//
+// The probe runs without the CPATH family: gcc lists those directories among
+// its own, and a project header there would pass for a compiler header. That
+// also keeps the memo independent of them. GCC_EXEC_PREFIX and COMPILER_PATH
+// choose which compiler parts run, so they are in the memo key.
 std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
                                            const CompilerId& compiler_id,
                                            const std::string& cache_dir) {
@@ -1009,14 +1014,20 @@ std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
   cmd.insert(cmd.end(), {"-x", NativeProbeLanguage(parsed.language), "-E", "-v", "/dev/null"});
 
   hash::Hasher memo_key;
-  memo_key.UpdateDelimited("system-include-dirs-memo-v1");
+  memo_key.UpdateDelimited("system-include-dirs-memo-v2");
   memo_key.UpdateDelimited(compiler_id.fingerprint);
   for (const std::string& arg : cmd) memo_key.UpdateDelimited(arg);
-  const std::string memo_path = cache_dir + "/sysinc/" + memo_key.Hex();
+  for (const char* name : {"GCC_EXEC_PREFIX", "COMPILER_PATH"}) {
+    const char* value = std::getenv(name);
+    memo_key.UpdateDelimited(value != nullptr ? std::string(name) + "=" + value : "unset");
+  }
+  const std::string memo_path = SystemIncludeMemoDir(cache_dir) + "/" + memo_key.Hex();
   if (auto cached = util::ReadFile(memo_path)) {
     return util::Split(*cached, '\n', /*skip_empty=*/true);
   }
-  util::ProcResult probe = util::Run(cmd, {.capture_stdout = true, .capture_stderr = true});
+  util::ProcOptions options{.capture_stdout = true, .capture_stderr = true};
+  options.unset_env.assign(std::begin(kIncludePathEnvVars), std::end(kIncludePathEnvVars));
+  util::ProcResult probe = util::Run(cmd, options);
   std::vector<std::string> dirs =
       probe.exit_code == 0 ? ParseSystemIncludeDirs(probe.stderr_data) : std::vector<std::string>{};
   if (dirs.empty()) {

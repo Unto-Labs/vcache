@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/cost.h"
+#include "core/cxx_manifest.h"
 #include "hash/file_memo.h"
 #include "util/fs.h"
 #include "util/log.h"
@@ -199,6 +200,12 @@ void DiskStorage::Trim() {
   if (stale_memos > 0) {
     VCACHE_LOG("disk: removed " + std::to_string(stale_memos) + " stale file digest memos");
   }
+  const size_t stale_sysinc =
+      core::PruneSystemIncludeMemos(dir_, kFileDigestMemoMaxAgeSeconds);
+  if (stale_sysinc > 0) {
+    VCACHE_LOG("disk: removed " + std::to_string(stale_sysinc) +
+               " stale compiler include-directory memos");
+  }
   const size_t stale_scratch = util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
   if (stale_scratch > 0) {
     VCACHE_LOG("disk: removed " + std::to_string(stale_scratch) + " stale scratch directories");
@@ -218,6 +225,9 @@ bool DiskStorage::Clear() {
     const std::string shard = dir_ + "/" + buf;
     if (util::IsDirectory(shard) && !util::RemoveRecursive(shard)) ok = false;
   }
+  // Re-probed on the next recording that needs it, so it goes with the entries.
+  const std::string sysinc = core::SystemIncludeMemoDir(dir_);
+  if (util::IsDirectory(sysinc) && !util::RemoveRecursive(sysinc)) ok = false;
   return ok;
 }
 

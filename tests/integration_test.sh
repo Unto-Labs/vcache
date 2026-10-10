@@ -4192,6 +4192,25 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   ( cd "$hp" && VCACHE_LOG="$l" "$VCACHE" g++ -O2 -c sys.cc -o sys.o ) 2>/dev/null
   check "gcc: a system header probing with __has_include still hits through the manifest" \
     "$(grep -c 'preprocessor skipped' "$l")" "1"
+  # gcc lists CPATH directories among its <...> search directories, so a
+  # project header there must not pass for one of the compiler's own.
+  reset_cache
+  cpd="$WORK/mf-cpath"
+  mkdir -p "$cpd/inc"
+  printf '#pragma once\n' > "$cpd/inc/opt.h"
+  printf '#pragma once\n#if __has_include("opt.h")\n#define HAVE_OPT 1\n#else\n#define HAVE_OPT 0\n#endif\n' \
+    > "$cpd/inc/probe.h"
+  printf '#include <probe.h>\nint have_opt = HAVE_OPT;\n' > "$cpd/main.c"
+  l=$(mf_log cpath1)
+  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  check "gcc: a CPATH header probing with __has_include records no manifest state" \
+    "$(grep -c 'not recording: .*inc/probe\.h uses __has_include' "$l")" "1"
+  mv "$cpd/inc/opt.h" "$cpd/opt.h.away"
+  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  ( cd "$cpd" && CPATH="$cpd/inc" gcc -O2 -c main.c -o plain.o ) 2>/dev/null
+  check "gcc: so the object follows the removal of what it probed" \
+    "$(cmp -s "$cpd/m.o" "$cpd/plain.o" && echo same)" "same"
 else
   skipped "__has_include: gcc is not installed, or is clang"
 fi

@@ -950,6 +950,15 @@ says why:
   `__has_include`. gcc's depfile does not name a header that was only probed,
   so deleting it would go unseen; clang's does.
 
+Under gcc that last rule matters in practice. A translation unit whose headers
+use `__has_include` outside the compiler's own include directories records no
+state and stays on the preprocessor; Boost's config headers are one common
+source, as is any header on `CPATH` or `C_INCLUDE_PATH`, which vcache does not
+count as the compiler's own. The compiler's own directories come from
+`<compiler> -E -v`, run without the `CPATH` family and memoised under
+`<dir>/sysinc/`, which `--trim` prunes like `filehash/` and `--clear` empties.
+clang is unaffected: its depfile lists the files `__has_include` probed.
+
 **Precompiled headers.** Neither compiler's depfile names the PCH it loaded,
 so each PCH the command names (`-include-pch F`, `-Xclang -include-pch -Xclang
 F`, or `-include H` with `H.pch` or `H.gch` beside `H`) joins the manifest key,

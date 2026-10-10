@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <set>
 
@@ -287,6 +288,21 @@ std::vector<std::string> ParseSystemIncludeDirs(const std::string& verbose_stder
     }
   }
   return {};
+}
+
+std::string SystemIncludeMemoDir(const std::string& cache_dir) {
+  return cache_dir + "/sysinc";
+}
+
+size_t PruneSystemIncludeMemos(const std::string& cache_dir, int64_t max_age_seconds) {
+  const std::string dir = SystemIncludeMemoDir(cache_dir);
+  if (!util::IsDirectory(dir)) return 0;
+  const int64_t now = static_cast<int64_t>(std::time(nullptr));
+  size_t removed = 0;
+  for (const util::FileEntry& entry : util::ListFilesRecursive(dir)) {
+    if (now - entry.lru_time > max_age_seconds && util::RemoveFile(entry.path)) ++removed;
+  }
+  return removed;
 }
 
 bool UnderAnyDir(const std::string& path, const std::vector<std::string>& dirs) {

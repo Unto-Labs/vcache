@@ -17,6 +17,8 @@ src/
     preprocessed.*     linemarker normalisation while hashing
     depfile.*          Makefile-fragment parsing (Boost.Spirit X3)
     compile.*          the C/C++ pipeline
+    cxx_manifest.*     the C/C++ manifest: key arguments, PCH identity, states
+    manifest.*         what the manifests have in common
     config.*           TOML + environment configuration
     stats.*            persistent counters
     reason.h           why a run was not cached: log text and stats key
@@ -89,6 +91,91 @@ built from what is known before the scan runs:
 
 Each state under that key lists the files the scan read with their digests, and
 is served only while all of them still match.
+
+## The C/C++ manifest
+
+The preprocessor key needs the preprocessed text, so a lookup that computes it
+runs the preprocessor, and that is most of what a hit costs. A compile first
+looks up a manifest instead (`cxx_manifest`, on by default). Its key is built
+from what is known before the preprocessor runs:
+
+- its own key-format version
+- compiler identity and the resolved native target
+- the sorted set of canonical root targets
+- the canonical working directory, since relative `-I` paths and relative
+  sources resolve against it, and the source's canonical path, since quoted
+  includes resolve beside it
+- the source's contents
+- the command line minus the source, `-o` and the depfile path, with `-I`,
+  `-D`, `-include` and friends kept, and the paths in them (joined ones such as
+  `-I/abs/dir` too) canonicalised; `-c` and `-S` are told apart. A `-D` value
+  is kept as written, path or not: it reaches the object as written
+- the files named by keyed flags (sanitizer lists, profiles), by content
+- `hash_env_vars`, and `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
+  `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`, which add include
+  directories
+- the identity of every precompiled header the command names
+
+A state lists every file the depfile of an earlier compile of that key named,
+with its digest, and the result key that compile stored under. A lookup takes
+the first state whose files all still hash the same, through the file-identity
+memo, so an unchanged header costs a `stat`. A state that matches but whose
+entry is gone, or whose entry lacks the depfile this compile asked for, falls
+through to the preprocessor; the preprocessor usually computes the same key,
+which is then not asked for again.
+
+**Where the include set comes from.** The compile's own depfile, as in ccache's
+depend mode. A command with `-MD` writes one. A command with no dependency
+flags gets `-MD -MF <scratch> -MT <output>` added; `-MD` writes the dependency
+list beside the object and changes nothing in it, which a test checks against
+the compiler run directly, and the scratch file is never stored, so the entry
+looks like one from an ordinary compile. `-MMD` omits system headers, so a
+command with it keeps to the preprocessor.
+
+**Result keys.** When `-E` succeeds the result is stored under the ordinary
+preprocessor key, and the state names that key. A tree with the manifest off
+hits what a tree with it on stored, and the reverse; the two modes only differ
+in how they find the key. When `-E` fails with a compiler error but the compile
+succeeds (a PCH consumer whose command lacks an include path the PCH's header
+text needs: `-E` expands that text, the compile loads the PCH) the result is
+stored under a key derived from the manifest key and every recorded file's
+digest, as ccache's depend mode keys every result. Only a manifest lookup can
+name that key. With single-flight, such a compile leases the manifest key, and
+a peer it wakes looks in the manifest. Before the manifest existed, the same
+compile was a *preprocess failed* passthrough; if the compile fails too, it is
+still counted that way.
+
+**Precompiled headers.** clang's depfile lists the PCH's headers but not the
+`.pch`, and gcc's lists neither the `.gch` nor its header, so a PCH joins the
+manifest key from the command line: `-include-pch F`, `-Xclang -include-pch
+-Xclang F`, and `-include H` with `H.pch` or `H.gch` beside `H` in the working
+directory or any directory on the include path. It is identified, in order of
+preference, by `<pch>.sum` (what a build writes for ccache's
+`pch_external_checksum`: a digest of the PCH's inputs, stable where clang's
+PCH bytes are not), by `<pch>.vcache-key` (written by vcache beside a PCH it
+caches), or by the PCH's bytes. A side file older than the PCH is ignored: it
+describes an earlier build. A directory of `.gch` files is declined. gcc also
+uses `H.gch` for a plain `#include "H"`, again listing neither, so under gcc a
+state is not recorded while any directory an `#include` could search holds a
+`.gch` the key does not cover.
+
+**What declines a state.** A file the depfile names that cannot be read, that
+was modified or had its inode changed at or after the moment the compile
+started (it may not be the version the compile read), or whose bytes contain
+`__DATE__`, `__TIME__` or `__TIMESTAMP__`: the digest stays the same while the
+expansion changes, which only the preprocessor key would see. A file that later
+gains such a token changes its digest, so the state is checked again when it is
+next written. For a derived key, `.incbin` declines it as well, since no
+preprocessed text was checked for it. A declined state leaves the entry stored
+under the preprocessor key as usual.
+
+**The shadowing hole.** A depfile names the files a compile read, not the paths
+the preprocessor probed and did not find. A new header that would be found
+earlier on the include path than a recorded one is invisible to the manifest,
+so a lookup can still hit with the old answer until something recorded
+changes. ccache's direct and depend modes have the same hole and document it,
+as does `dep_scan` here. `vcache-fstrace.so` already records absent paths (`M`
+lines) for the link cache; recording them for compiles would close it.
 
 ## Compiler identity
 
@@ -280,28 +367,21 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 
 ## Known limitations
 
-- **Preprocessor mode only.** Every compilation runs the preprocessor, even on a
-  hit. Measured on one translation unit from this repository: a vcache hit takes
-  ~77 ms against ~9 ms for a ccache hit and ~1.50 s to actually compile. The gap
-  is preprocessing. ccache's "direct mode" avoids it by hashing the source plus
-  a manifest of includes recorded from a previous run; the manifest has to be
-  validated against the current file contents, which is why it is a real piece
-  of work rather than a switch. This is the main remaining performance win, and
-  the key derivation is already factored to accommodate it: the manifest path
-  would replace step 4 of the pipeline and reuse everything else, including
-  linemarker-free canonical paths for the recorded include set. The Rust side
-  already has its equivalent: a manifest of earlier `--emit=dep-info` runs,
-  verified by re-hashing every recorded file, lets a hit skip that run (see
-  `rust_dep_info` in `configuration.md`).
+- **A preprocessor hit records no manifest state.** States are recorded from
+  the depfile of a compile that ran. A lookup whose manifest key has no matching
+  state but whose preprocessor key hits (a header edited only in a comment, a
+  PCH rebuilt with different bytes and no `.sum`, an entry another tree stored
+  in preprocessor mode) is served by the preprocessor, and keeps being served
+  that way until the next miss records a state.
 - **Linking is not cached**, matching ccache and sccache.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang
   (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
-  Both hit across directories because `-E` expands the header text, so the key
-  covers the header although the PCH bytes never enter it. gcc's
-  `-fpch-preprocess` swaps that text for a pragma naming the `.gch`, so it is
-  declined.
+  Both hit across directories because `-E` expands the header text, so the
+  preprocessor key covers the header although the PCH bytes never enter it.
+  The manifest key does name the PCH (see above). gcc's `-fpch-preprocess`
+  swaps that text for a pragma naming the `.gch`, so it is declined.
 - **How a PCH was built is not in the key.** clang accepts a PCH that defines a
   macro the compile does not, and gcc uses a `.gch` it never checks against an
   edited header; in both cases the expanded text describes a different

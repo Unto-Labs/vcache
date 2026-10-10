@@ -553,7 +553,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       }
       VCACHE_LOG("rust key " + states[i].key + " for " + parsed.source);
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
-      core::RecordCounter(cache_dir, HitCounter(got));
+      core::RecordCounters(cache_dir, HitCounter(got), core::Counter::kManifestHit);
       if (i > 0 && !config.read_only) {
         StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }

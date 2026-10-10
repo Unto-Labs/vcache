@@ -1219,6 +1219,7 @@ EOF
   check "an unchanged crate hits" "$(hits)" "1"
   check "the hit skips the dep-info run" "$(dep_info_runs)" "0"
   check "the hit names the state that matched" "$(logged 'rust manifest hit: state 1 of 1')" "1"
+  check "and counts as a manifest hit" "$(stat_of 'manifest hits')" "1"
 
   echo 'pub fn value() -> u32 { 43 }' > "$WORK/rust-man-a/src/helper.rs"
   rust_man rust-man-a
@@ -1434,6 +1435,11 @@ check "global trim preserves a skewed shard below the total budget" \
 
 # --------------------------------------------------------------------------
 section "11. S3 layer (against a mock object store)"
+
+# The sections from here to the jobserver count the entries, lookups and
+# stores one compile makes. A C/C++ manifest adds an entry and two lookups to
+# each, so it is off until then; section 19 runs it through the daemon.
+export VCACHE_CXX_MANIFEST=0
 
 if command -v python3 >/dev/null 2>&1; then
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
@@ -2323,6 +2329,8 @@ except Exception: sys.exit(1)
 fi
 
 # --------------------------------------------------------------------------
+unset VCACHE_CXX_MANIFEST
+
 section "10d. Jobserver"
 
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
@@ -3176,7 +3184,8 @@ done
 ( cd "$WORK/a-considerably-longer-cc-two" && \
   "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 check "an in-tree compiler hits across checkouts" "$(hits)" "1"
-check "and only one entry was stored" "$(disk_entries)" "1"
+# The entry and its C/C++ manifest: two compiler identities would store four.
+check "and only one entry was stored" "$(disk_entries)" "2"
 check "and the objects are byte-identical" \
   "$(cmp -s "$WORK/cc-one/lib.o" "$WORK/a-considerably-longer-cc-two/lib.o" \
      && echo same)" "same"
@@ -3816,6 +3825,318 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "19. C/C++ manifest mode"
+
+# A compile first looks up a manifest keyed on what is known before the
+# preprocessor runs. A state whose recorded files all still hash the same names
+# the result key, and the preprocessor never runs.
+manifest_hits() { stat_of "manifest hits"; }
+mf_log() { local f="$WORK/mf-$1.log"; rm -f "$f"; printf '%s' "$f"; }
+mf_tree() {  # $1 dir
+  mkdir -p "$1/src" "$1/inc"
+  printf '#pragma once\nenum { kBase = 1 };\n' > "$1/inc/base.h"
+  printf '#pragma once\n#include "base.h"\nint mid(void);\n' > "$1/inc/mid.h"
+  printf '#include "mid.h"\nint mid(void) { return kBase; }\n' > "$1/src/top.c"
+}
+mf_compile() {  # $1 dir, $2 log, then extra arguments
+  local dir=$1 log=$2; shift 2
+  ( cd "$dir" && VCACHE_ROOTS="$dir=proj" VCACHE_LOG="$log" \
+      "$VCACHE" gcc -O2 -I inc "$@" -c src/top.c -o top.o ) 2>/dev/null
+}
+
+reset_cache
+mf_tree "$WORK/mf-a"
+l=$(mf_log 1); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
+check "the first compile misses" "$(misses)" "1"
+check "and records a manifest state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+l=$(mf_log 2); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
+check "an unchanged compile hits" "$(hits)" "1"
+check "through the manifest" "$(manifest_hits)" "1"
+check "the hit names the manifest and says the preprocessor was skipped" \
+  "$(grep -cE 'cxx manifest hit on disk: [0-9a-f]{16} state 1 of 1; preprocessor skipped' "$l")" "1"
+check "and no preprocessor ran" "$(grep -c '\] preprocess: ' "$l" || true)" "0"
+check "the depfile is still written" "$(grep -c 'inc/base.h' "$WORK/mf-a/top.d")" "1"
+
+echo 'enum { kExtra = 2 };' >> "$WORK/mf-a/inc/base.h"
+l=$(mf_log 3); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
+check "editing an indirect header misses" "$(misses)" "2"
+check "because the state no longer matches" "$(grep -c 'rejected: .*inc/base.h changed' "$l")" "1"
+mf_compile "$WORK/mf-a" "$(mf_log 4)" -MD -MF top.d
+check "the next compile hits through the manifest again" "$(manifest_hits)" "2"
+sed_inplace '$ d' "$WORK/mf-a/inc/base.h"
+l=$(mf_log 5); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
+check "restoring the header hits the first state" "$(manifest_hits)" "3"
+check "which is the second of two" "$(grep -c 'state 2 of 2; preprocessor skipped' "$l")" "1"
+
+# -MMD leaves system headers out of the depfile, so it is not recorded from.
+reset_cache
+l=$(mf_log mmd1); mf_compile "$WORK/mf-a" "$l" -MMD -MF top.d
+l=$(mf_log mmd2); mf_compile "$WORK/mf-a" "$l" -MMD -MF top.d
+check "-MMD still hits" "$(hits)" "1"
+check "through the preprocessor" "$(manifest_hits)" "0"
+check "and says why" "$(grep -c 'cxx manifest: -MMD omits system headers' "$l")" "1"
+
+# Another worktree, named by its own root, verifies its own copies of the
+# files. Absolute joined -I paths are what CMake writes.
+reset_cache
+for t in mf-x mf-y; do mf_tree "$WORK/$t"; mkdir -p "$WORK/$t/build"; done
+mf_abs() {  # $1 tree, $2 log
+  ( cd "$1/build" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+      "$VCACHE" gcc -g -O2 "-I$1/inc" -MD -MT top.o -MF top.d -c "$1/src/top.c" -o top.o ) \
+    2>/dev/null
+}
+mf_abs "$WORK/mf-x" "$(mf_log x)"
+l=$(mf_log y); mf_abs "$WORK/mf-y" "$l"
+check "another worktree hits through the manifest" "$(manifest_hits)" "1"
+check "the objects are byte-identical" \
+  "$(cmp -s "$WORK/mf-x/build/top.o" "$WORK/mf-y/build/top.o" && echo same)" "same"
+check "the replayed depfile names this worktree's headers" \
+  "$(grep -c "$WORK/mf-y/inc/base.h" "$WORK/mf-y/build/top.d")" "1"
+check "and not the other's" "$(grep -c "mf-x" "$WORK/mf-y/build/top.d" || true)" "0"
+printf '#pragma once\nenum { kBase = 3 };\n' > "$WORK/mf-y/inc/base.h"
+mf_abs "$WORK/mf-y" "$(mf_log y2)"
+check "a header edited in that worktree misses there" "$(misses)" "2"
+
+# Both modes store under the preprocessor key, so each finds the other's entry.
+reset_cache
+mf_compile "$WORK/mf-x" "$(mf_log m1)"
+l=$(mf_log m2)
+( cd "$WORK/mf-x" && VCACHE_CXX_MANIFEST=0 VCACHE_ROOTS="$WORK/mf-x=proj" VCACHE_LOG="$l" \
+    "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
+check "preprocessor mode hits an entry manifest mode stored" "$(hits)" "1"
+check "and never looks at a manifest" "$(grep -c 'cxx manifest' "$l" || true)" "0"
+reset_cache
+( cd "$WORK/mf-x" && VCACHE_CXX_MANIFEST=0 VCACHE_ROOTS="$WORK/mf-x=proj" \
+    "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
+l=$(mf_log m4); mf_compile "$WORK/mf-x" "$l"
+check "manifest mode hits an entry preprocessor mode stored" "$(hits)" "1"
+check "through the preprocessor, with no manifest stored yet" \
+  "$(grep -c 'cxx manifest: none stored' "$l")" "1"
+check "VCACHE_CXX_MANIFEST=0 shows in --show-config" \
+  "$(VCACHE_CXX_MANIFEST=0 "$VCACHE" --show-config | grep -c 'c/c++ manifest: *off')" "1"
+
+# A compile without dependency flags asks for a depfile itself. -MD adds no
+# byte to the object, which is checked against the compiler run directly.
+mkdir -p "$WORK/mf-plain"
+printf '#define SEVEN 7\n' > "$WORK/mf-plain/h.h"
+printf '#include "h.h"\nint seven(void) { return SEVEN; }\n' > "$WORK/mf-plain/t.c"
+for cc in gcc clang; do
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    skipped "$cc: not installed"
+    continue
+  fi
+  reset_cache
+  rm -f "$WORK/mf-plain/"*.o "$WORK/mf-plain/"*.d
+  l=$(mf_log "plain-$cc")
+  ( cd "$WORK/mf-plain" && VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" "$cc" -g -O2 -c t.c -o v.o ) 2>/dev/null
+  ( cd "$WORK/mf-plain" && "$cc" -g -O2 -c t.c -o p.o ) 2>/dev/null
+  check "$cc: a compile without -MD records a manifest state" \
+    "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  check "$cc: from a depfile vcache asked for" \
+    "$(grep -cE '\] compile: .* -MD .*-MF [^ ]*/manifest\.d' "$l")" "1"
+  check "$cc: the object equals one compiled without vcache" \
+    "$(cmp -s "$WORK/mf-plain/v.o" "$WORK/mf-plain/p.o" && echo same)" "same"
+  check "$cc: and no depfile is left in the tree" \
+    "$(find "$WORK/mf-plain" -name '*.d' | wc -l | tr -d ' ')" "0"
+  ( cd "$WORK/mf-plain" && VCACHE_MAP_CWD=0 "$VCACHE" "$cc" -g -O2 -c t.c -o v.o ) 2>/dev/null
+  check "$cc: the next compile hits through the manifest" "$(manifest_hits)" "1"
+done
+
+# __TIME__ and friends expand differently on every run while the file hashes
+# the same, so a file using one keeps the compile in preprocessor mode.
+mkdir -p "$WORK/mf-time"
+printf 'const char* built(void) { return __TIME__; }\n' > "$WORK/mf-time/src.c"
+printf '#define STAMP __DATE__\n' > "$WORK/mf-time/stamp.h"
+printf '#include "stamp.h"\nconst char* day(void) { return STAMP; }\n' > "$WORK/mf-time/hdr.c"
+for f in src hdr; do
+  reset_cache
+  l=$(mf_log "time-$f-1")
+  ( cd "$WORK/mf-time" && VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
+  check "$f.c: a time macro records no manifest state" \
+    "$(grep -cE 'cxx manifest: not recording: .* uses __(TIME|DATE)__' "$l")" "1"
+  l=$(mf_log "time-$f-2")
+  ( cd "$WORK/mf-time" && VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
+  check "$f.c: the next compile never takes the manifest path" "$(manifest_hits)" "0"
+  check "$f.c: it runs the preprocessor" "$(grep -c '\] preprocess: ' "$l")" "1"
+done
+
+# gcc uses a .gch beside a header an #include names and lists neither in the
+# depfile, so a state recorded beside one would not see it rebuilt.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  sp="$WORK/mf-stray"
+  mkdir -p "$sp"
+  printf '#define V 1\n' > "$sp/pch.h"
+  printf '#include "pch.h"\nint v = V;\n' > "$sp/main.c"
+  ( cd "$sp" && gcc -O2 -x c-header -c pch.h -o pch.h.gch )
+  l=$(mf_log stray1)
+  ( cd "$sp" && VCACHE_MAP_CWD=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  check "a .gch an #include can reach records no manifest state" \
+    "$(grep -c 'not recording: gcc could have used .*pch\.h\.gch' "$l")" "1"
+  printf '#define V 2\n' > "$sp/pch.h"
+  ( cd "$sp" && gcc -O2 -x c-header -c pch.h -o pch.h.gch )
+  ( cd "$sp" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  ( cd "$sp" && gcc -O2 -c main.c -o plain.o ) 2>/dev/null
+  check "so the object follows the rebuilt .gch" \
+    "$(cmp -s "$sp/m.o" "$sp/plain.o" && echo same)" "same"
+else
+  skipped "stray .gch: gcc is not installed, or is clang"
+fi
+
+# Two compiles of one source with different headers write one manifest. The
+# paused store must keep the state the other worktree wrote while it waited.
+reset_cache
+mf_cw() {  # $1 dir, $2 header value
+  mkdir -p "$1"
+  printf '#include "x.h"\nint v = V;\n' > "$1/main.c"
+  printf '#define V %s\n' "$2" > "$1/x.h"
+}
+mf_cw "$WORK/mfc-a" 1
+mf_cw "$WORK/mfc-b" 2
+mf_cw "$WORK/mfc-c" 3
+mf_cw_compile() {  # $1 dir, $2 log
+  ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+      "$VCACHE" gcc -O2 -MD -MF main.d -c main.c -o main.o ) >/dev/null 2>&1
+}
+mf_cw_compile "$WORK/mfc-a" "$(mf_log cw-a)"
+fifo="$WORK/mf-pause.fifo"
+rm -f "$fifo"
+mkfifo "$fifo"
+cblog=$(mf_log cw-b)
+( cd "$WORK/mfc-b" && VCACHE_ROOTS="$WORK/mfc-b=proj" VCACHE_LOG="$cblog" \
+    VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+    "$VCACHE" gcc -O2 -MD -MF main.d -c main.c -o main.o ) >/dev/null 2>&1 &
+cbpid=$!
+cwaiting=0
+for _ in $(seq 1 200); do
+  if grep -q 'manifest: waiting before put' "$cblog" 2>/dev/null; then cwaiting=1; break; fi
+  if ! kill -0 "$cbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+check "the second manifest store waits" "$cwaiting" "1"
+if [[ "$cwaiting" == 1 ]]; then
+  mf_cw_compile "$WORK/mfc-c" "$(mf_log cw-c)"
+fi
+release_pause_fifo "$fifo" "$cbpid" "$cwaiting"
+wait "$cbpid" || true
+check "and merges into the state stored meanwhile" \
+  "$(grep -c 'cxx manifest: stored 3 states' "$cblog")" "1"
+l=$(mf_log cw-b2); mf_cw_compile "$WORK/mfc-b" "$l"
+check "header 2 hits through the manifest" "$(grep -c 'preprocessor skipped' "$l")" "1"
+l=$(mf_log cw-c2); mf_cw_compile "$WORK/mfc-c" "$l"
+check "header 3 hits through the manifest" "$(grep -c 'preprocessor skipped' "$l")" "1"
+l=$(mf_log cw-a2); mf_cw_compile "$WORK/mfc-a" "$l"
+check "header 1 hits through the manifest" "$(grep -c 'preprocessor skipped' "$l")" "1"
+
+# Lookups and stores go through the daemon like any other.
+if command -v python3 >/dev/null 2>&1; then
+  reset_cache
+  "$VCACHE" --start-daemon >/dev/null
+  mf_tree "$WORK/mf-d"
+  VCACHE_DAEMON=on mf_compile "$WORK/mf-d" "$(mf_log d1)" -MD -MF top.d
+  l=$(mf_log d2); VCACHE_DAEMON=on mf_compile "$WORK/mf-d" "$l" -MD -MF top.d
+  check "a manifest hit through the daemon" "$(grep -c 'preprocessor skipped' "$l")" "1"
+  check "and the daemon served its lookups" \
+    "$("$VCACHE" --daemon-status 2>/dev/null | awk '/^lookups/ {print ($NF >= 5)}')" "1"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+fi
+
+# A PCH is in the manifest key, since the depfile does not name it: clang's
+# lists the PCH's headers but not the .pch, gcc's lists neither.
+if command -v clang++ >/dev/null 2>&1; then
+  pc="$WORK/mf-pch"
+  mkdir -p "$pc/inc"
+  printf '#pragma once\n#define BIG 5\n' > "$pc/inc/big.h"
+  printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$pc/h.h"
+  printf 'int f() { S s{BIG}; return s.x; }\n' > "$pc/main.cc"
+  mf_build_pch() {
+    ( cd "$pc" && clang++ -O2 -I inc -x c++-header -c h.h -Xclang -emit-pch -o h.pch )
+  }
+  mf_use_pch() {  # $1 log, then extra arguments
+    local log=$1; shift
+    ( cd "$pc" && VCACHE_ROOTS="$pc=proj" VCACHE_LOG="$log" "$VCACHE" clang++ -O2 "$@" \
+        -MD -MF main.d -c -include-pch h.pch main.cc -o main.o ) 2>/dev/null
+  }
+
+  reset_cache
+  mf_build_pch
+  mf_use_pch "$(mf_log p1)" -I inc
+  l=$(mf_log p2); mf_use_pch "$l" -I inc
+  check "clang: a PCH consumer hits through the manifest" "$(manifest_hits)" "1"
+  check "clang: keyed on the PCH's bytes" "$(grep -c 'PCH .*h\.pch is bytes' "$l")" "1"
+  # A value the consumer expands: a define it never uses leaves the
+  # preprocessed text, and so the result key, as it was.
+  printf '#pragma once\n#define BIG 6\n' > "$pc/inc/big.h"
+  mf_build_pch
+  mf_use_pch "$(mf_log p3)" -I inc
+  check "clang: editing a header the PCH includes and rebuilding it misses" "$(misses)" "2"
+  mf_use_pch "$(mf_log p4)" -I inc
+  check "clang: and the next compile hits through the manifest" "$(manifest_hits)" "2"
+
+  # A .sum the build wrote stands for the PCH, unless it is older than the PCH.
+  reset_cache
+  printf 'from-the-inputs  -\n' > "$pc/h.pch.sum"
+  l=$(mf_log s1); mf_use_pch "$l" -I inc
+  check "clang: a .sum newer than the PCH keys it" "$(grep -c 'PCH .*h\.pch is sum' "$l")" "1"
+  mf_use_pch "$(mf_log s2)" -I inc
+  check "clang: and the manifest hits on it" "$(manifest_hits)" "1"
+  touch -d '1 hour ago' "$pc/h.pch.sum"
+  l=$(mf_log s3); mf_use_pch "$l" -I inc
+  check "clang: a .sum older than the PCH is ignored" \
+    "$(grep -c 'h\.pch\.sum is older than the PCH' "$l")" "1"
+  check "clang: and the bytes are used instead" "$(grep -c 'PCH .*h\.pch is bytes' "$l")" "1"
+  check "clang: so the state keyed on the .sum is not used" "$(manifest_hits)" "1"
+  rm -f "$pc/h.pch.sum"
+
+  # Without the PCH's include path the consumer compiles but cannot be
+  # preprocessed. Its result key comes from the manifest state instead.
+  reset_cache
+  l=$(mf_log dk1); mf_use_pch "$l"
+  check "clang: a consumer -E cannot handle compiles and misses" "$(misses)" "1"
+  check "clang: under a key derived from what it read" "$(grep -c '\] derived key ' "$l")" "1"
+  check "clang: and is not a preprocess failure" "$(stat_of 'preprocess failed')" "0"
+  mf_use_pch "$(mf_log dk2)"
+  check "clang: the next compile hits the derived key" "$(manifest_hits)" "1"
+  printf '#pragma once\n#define BIG 7\n' > "$pc/inc/big.h"
+  mf_build_pch
+  l=$(mf_log dk3); mf_use_pch "$l"
+  check "clang: editing the PCH's header and rebuilding it misses" "$(misses)" "2"
+  check "clang: and derives a new key" "$(grep -c '\] derived key ' "$l")" "1"
+  mf_use_pch "$(mf_log dk4)"
+  check "clang: which the next compile hits" "$(manifest_hits)" "2"
+else
+  skipped "clang++ is not installed"
+fi
+
+if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | grep -qi clang; then
+  gp="$WORK/mf-gch"
+  mkdir -p "$gp/inc"
+  printf '#pragma once\n#define BIG 5\n' > "$gp/inc/big.h"
+  printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$gp/h.h"
+  printf 'int f() { S s{BIG}; return s.x; }\n' > "$gp/main.cc"
+  mf_build_gch() { ( cd "$gp" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch ); }
+  mf_use_gch() {  # $1 log
+    ( cd "$gp" && VCACHE_ROOTS="$gp=proj" VCACHE_LOG="$1" \
+        "$VCACHE" g++ -O2 -MD -MF main.d -c -include h.h main.cc -o main.o ) 2>/dev/null
+  }
+  reset_cache
+  mf_build_gch
+  l=$(mf_log g1); mf_use_gch "$l"
+  check "gcc: a .gch consumer -E cannot handle compiles and misses" "$(misses)" "1"
+  check "gcc: under a key derived from what it read" "$(grep -c '\] derived key ' "$l")" "1"
+  check "gcc: keyed on the .gch" "$(grep -c 'PCH .*h\.h\.gch is bytes' "$l")" "1"
+  mf_use_gch "$(mf_log g2)"
+  check "gcc: the next compile hits the derived key" "$(manifest_hits)" "1"
+  printf '#pragma once\n#define BIG 6\n' > "$gp/inc/big.h"
+  mf_build_gch
+  mf_use_gch "$(mf_log g3)"
+  check "gcc: editing the .gch's header and rebuilding it misses" "$(misses)" "2"
+else
+  skipped "g++ is not installed, or is clang"
+fi
+
+# --------------------------------------------------------------------------
 section "--show-stats breaks decisions down by reason"
 
 # The positional counters say how many invocations were declined; the reason
@@ -3857,10 +4178,10 @@ check "nothing failed to preprocess" "$(stat_of 'preprocess failed')" "0"
 check "each uncacheable run is listed under its reason" "$(uncacheable_block)" "$expected_block"
 check "no passthrough row when nothing fell back" \
   "$("$VCACHE" --show-stats | grep -c '^passthrough' || true)" "0"
-check "the stats file keeps the nine positional lines first" \
-  "$(head -9 "$VCACHE_DIR/stats" | grep -cE '^[0-9]+$')" "9"
+check "the stats file keeps the ten positional lines first" \
+  "$(head -10 "$VCACHE_DIR/stats" | grep -cE '^[0-9]+$')" "10"
 check "followed by one reason line per reason" \
-  "$(tail -n +10 "$VCACHE_DIR/stats" | grep -cE $'^reason\t[^\t]+\t[0-9]+$')" \
+  "$(tail -n +11 "$VCACHE_DIR/stats" | grep -cE $'^reason\t[^\t]+\t[0-9]+$')" \
   "$((expected_uncacheable))"
 "$VCACHE" --zero-stats >/dev/null
 check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"

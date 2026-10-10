@@ -28,6 +28,10 @@ enum class Counter {
   kStoreFailed,
   kPreprocessFailed,
   kCacheMediaError,
+  // Of the hits above, those a manifest answered: a C or C++ compile that did
+  // not run the preprocessor, a Rust one that did not run dep-info. Last, so
+  // the file an older version wrote still lines up.
+  kManifestHit,
   kCount,  // sentinel
 };
 
@@ -55,6 +59,9 @@ std::string RenderStats(const Stats& stats);
 // Increments one counter in the on-disk stats file. Failures are silent: losing
 // a statistic must never disturb a build.
 void RecordCounter(const std::string& cache_dir, Counter counter);
+
+// Increments both under one lock, for an event that counts twice.
+void RecordCounters(const std::string& cache_dir, Counter first, Counter second);
 
 // Logs the decision and counts it under its reason and outcome. Failures are
 // silent, as for RecordCounter.

@@ -389,8 +389,8 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   `-x c++-header` or clang's `-Xclang -emit-pch` (CMake's form included) is
   keyed like any compile, from the header preprocessed with `-dD`: the PCH
   hands its macro definitions to every compile that loads it, and plain `-E`
-  drops them. Its key also holds the working directory and the command line
-  exactly as typed, not canonicalised. A PCH records the absolute path of
+  drops them. Its key, and its manifest key, hold the working directory and
+  the command line exactly as typed, not canonicalised. A PCH records the absolute path of
   every input, even one named relatively, and clang 22 refuses to load it once
   one is missing ("could not find file ... referenced by AST file"); with
   `-fno-pch-timestamp` it checks only their sizes. So a rebuild of the same

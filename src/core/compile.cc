@@ -888,6 +888,14 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
   hasher.UpdateDelimited(roots.Canonicalize(cwd));
   hasher.UpdateDelimited(roots.Canonicalize(AbsoluteSource(cwd, parsed.source)));
   hasher.UpdateDelimited(*source_digest);
+  // A PCH loads only at the paths that built it, so ComputeKey keys a PCH build
+  // on the raw cwd and argv; a manifest state names that key, and must not
+  // hand a tree at another path the entry.
+  if (parsed.produces_pch) {
+    hasher.UpdateDelimited("pch-built-at");
+    hasher.UpdateDelimited(cwd);
+    for (const std::string& arg : parsed.argv) hasher.UpdateDelimited(arg);
+  }
   const std::vector<std::string> key_args =
       CxxManifestKeyArgs(parsed, roots, compiler_id.is_clang);
   hasher.UpdateU64(key_args.size());

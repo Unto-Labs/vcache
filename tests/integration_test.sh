@@ -703,6 +703,84 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9g. Rust: outputs are placed as rustc left them, or not stored"
+
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  real_rustc=$(command -v rustc)
+  file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+  # A rustc that runs the real one and then runs $2 in the --out-dir of the
+  # compile that emits link. The dep-info pass is left alone. vcache knows
+  # rustc by its name, so each one is `rustc` in its own directory.
+  write_altering_rustc() {  # $1 = dest, $2 = shell command
+    mkdir -p "$(dirname "$1")"
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf '%q "$@" || exit $?\n' "$real_rustc"
+      printf '%s\n' 'case " $* " in *" --emit=dep-info,link "*) ;; *) exit 0 ;; esac'
+      printf '%s\n' 'out=; prev='
+      printf '%s\n' 'for arg in "$@"; do [ "$prev" = --out-dir ] && out=$arg; prev=$arg; done'
+      printf 'cd "$out" && %s\n' "$2"
+    } > "$1"
+    chmod +x "$1"
+  }
+  place_compile() {  # $1 = tree, $2 = rustc
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=crate" \
+        "$VCACHE" "$2" --crate-name demo --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) >/dev/null 2>&1
+  }
+  # cargo creates the out dir; a passthrough rustc needs it to exist.
+  for tree in place-link place-dep-a place-dep-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+  done
+
+  # Captured through the link, the entry held the target's bytes under the
+  # target's name, so the link itself was never placed.
+  reset_cache
+  write_altering_rustc "$WORK/place-rustc/symlink/rustc" "ln -sf libdemo.rlib alias.rlib"
+  place_compile place-link "$WORK/place-rustc/symlink/rustc"
+  check "a compile that leaves a symlink succeeds" "$?" "0"
+  check "a symlink in the stage dir fails the capture" "$(stat_of "capture failed")" "1"
+  check "a symlink in the stage dir stores nothing" "$(disk_entries)" "0"
+  check "the symlink is placed as rustc made it" \
+    "$([[ -L "$WORK/place-link/out/alias.rlib" ]] && echo link)" "link"
+  check "the crate is still placed" \
+    "$([[ -f "$WORK/place-link/out/libdemo.rlib" ]] && echo yes)" "yes"
+
+  # A .d that does not parse keeps the stage dir's path; a hit in another
+  # checkout would write that path as its rule target.
+  reset_cache
+  write_altering_rustc "$WORK/place-rustc/bad-dep/rustc" "printf 'not a make rule\\n' >> demo.d"
+  place_compile place-dep-a "$WORK/place-rustc/bad-dep/rustc"
+  check "a compile with an unparsable .d succeeds" "$?" "0"
+  check "its crate is placed" \
+    "$([[ -f "$WORK/place-dep-a/out/libdemo.rlib" ]] && echo yes)" "yes"
+  check "an unparsable .d is counted" "$(stat_of "unparsed dep-info")" "1"
+  check "an unparsable .d is not stored" "$(disk_entries)" "0"
+  place_compile place-dep-b "$WORK/place-rustc/bad-dep/rustc"
+  check "another checkout is not served the raw .d" "$(hits)" "0"
+  check "and compiles for itself" "$(misses)" "2"
+
+  # Under umask 077 the linker makes a binary 0700. Adding all three execute
+  # bits makes it 0711: runnable by other users who cannot read it.
+  reset_cache
+  for tree in place-umask-a place-umask-b; do
+    mkdir -p "$WORK/$tree/src"
+    echo 'fn main() {}' > "$WORK/$tree/src/main.rs"
+    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" \
+        "$VCACHE" rustc --crate-name umaskbin --crate-type bin \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
+  done
+  check "the umask 077 binary crate hit" "$(hits)" "1"
+  check "a binary placed after a miss under umask 077 is 0700" \
+    "$(file_mode "$WORK/place-umask-a/out/umaskbin")" "700"
+  check "a binary restored from a hit under umask 077 is 0700" \
+    "$(file_mode "$WORK/place-umask-b/out/umaskbin")" "700"
+fi
+
+# --------------------------------------------------------------------------
 section "9e. Rust: a rustc rebuilt in place is a new toolchain"
 
 # `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo

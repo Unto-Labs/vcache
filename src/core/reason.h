@@ -83,6 +83,7 @@ enum class Reason : uint8_t {
   kCaptureFailed,
   kOutDirUnwritable,
   kEnvPathInOutput,
+  kUnparsedDepInfo,
   kCount,  // sentinel
 };
 
@@ -136,6 +137,7 @@ inline constexpr ReasonInfo kReasons[] = {
     {Reason::kCaptureFailed, Outcome::kPassthrough, "capture failed"},
     {Reason::kOutDirUnwritable, Outcome::kPassthrough, "out-dir unwritable"},
     {Reason::kEnvPathInOutput, Outcome::kUncacheable, "env path in output"},
+    {Reason::kUnparsedDepInfo, Outcome::kUncacheable, "unparsed dep-info"},
 };
 
 // A name is a stats-file field and a --show-stats label: unique, free of the

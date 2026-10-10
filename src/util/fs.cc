@@ -64,6 +64,17 @@ mode_t DefaultFileMode() {
   return kMode;
 }
 
+bool AddExecuteBitsUnderUmask(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  const mode_t allowed = DefaultFileMode();
+  mode_t add = 0;
+  if (allowed & S_IRUSR) add |= S_IXUSR;
+  if (allowed & S_IRGRP) add |= S_IXGRP;
+  if (allowed & S_IROTH) add |= S_IXOTH;
+  return ::chmod(path.c_str(), (st.st_mode & 07777) | add) == 0;
+}
+
 namespace {
 
 // std::filesystem throws on many operations; every call here goes through a
@@ -165,17 +176,23 @@ std::optional<std::string> ReadFile(const std::string& path) {
   return contents;
 }
 
-bool WriteFileAtomic(const std::string& path, std::string_view contents, bool durable) {
+namespace {
+
+// Opens a new temporary file beside `path`, creating the directory first, for
+// the caller to fill and rename into place. The name is exclusive, so a stale
+// temp or a writer in another PID namespace is never truncated. Returns -1 with
+// errno set on failure.
+int CreateTempBeside(const std::string& path, std::string* tmp_path) {
   const std::string dir = DirName(path);
-  if (!dir.empty() && !MakeDirs(dir)) return false;
+  if (!dir.empty() && !MakeDirs(dir)) return -1;
 
   std::string tmpl = dir.empty() ? std::string(".vcache-tmp-XXXXXX")
                                  : dir + "/.vcache-tmp-XXXXXX";
   std::vector<char> buf(tmpl.begin(), tmpl.end());
   buf.push_back('\0');
-  int fd = ::mkstemp(buf.data());
-  if (fd < 0) return false;
-  const std::string tmp_path(buf.data());
+  const int fd = ::mkostemp(buf.data(), O_CLOEXEC);
+  if (fd < 0) return -1;
+  *tmp_path = buf.data();
 
   // mkstemp always creates at 0600, which is right for a private temp file and
   // wrong for everything vcache goes on to rename into place: a replayed object
@@ -184,10 +201,21 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
   // reads, and breaks the moment they differ -- a container building as root
   // and a CI user hashing the results afterwards is the case that found this.
   if (::fchmod(fd, DefaultFileMode()) != 0) {
+    const int saved_errno = errno;
     ::close(fd);
-    ::unlink(tmp_path.c_str());
-    return false;
+    ::unlink(tmp_path->c_str());
+    errno = saved_errno;
+    return -1;
   }
+  return fd;
+}
+
+}  // namespace
+
+bool WriteFileAtomic(const std::string& path, std::string_view contents, bool durable) {
+  std::string tmp_path;
+  const int fd = CreateTempBeside(path, &tmp_path);
+  if (fd < 0) return false;
 
   // Callers report std::strerror(errno) when this returns false, so every
   // failure path must hand back the errno of the call that actually failed.
@@ -213,7 +241,12 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
     saved_errno = errno;
     ok = false;
   }
-  ::close(fd);
+  // Without the fsync, a delayed write error (NFS, a full quota) surfaces only
+  // here, and renaming anyway would publish a short file as a complete one.
+  if (::close(fd) != 0 && ok) {
+    saved_errno = errno;
+    ok = false;
+  }
 
   if (ok && ::rename(tmp_path.c_str(), path.c_str()) != 0) {
     saved_errno = errno;
@@ -243,9 +276,8 @@ bool CloneFile(const std::string& from, const std::string& to) {
   struct stat st;
   if (::fstat(src, &st) != 0) { ::close(src); return false; }
 
-  const std::string tmp = to + ".tmp." + std::to_string(::getpid());
-  const int dst =
-      ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  std::string tmp;
+  const int dst = CreateTempBeside(to, &tmp);
   if (dst < 0) { ::close(src); return false; }
 
   bool ok = false;
@@ -297,7 +329,6 @@ bool CloneFile(const std::string& from, const std::string& to) {
     }
   }
 
-  if (ok) ok = ::fchmod(dst, DefaultFileMode()) == 0;
   if (::close(dst) != 0) ok = false;
   ::close(src);
   if (!ok || ::rename(tmp.c_str(), to.c_str()) != 0) {

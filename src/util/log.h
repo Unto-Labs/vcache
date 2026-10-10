@@ -4,6 +4,7 @@
 // diagnosing "why did this miss", so every cache decision writes a line.
 #pragma once
 
+#include <chrono>
 #include <string>
 
 namespace vcache::util {
@@ -17,6 +18,11 @@ void LogLine(const std::string& message);
 
 // Convenience for the common "key: value" shape.
 void LogKV(const std::string& key, const std::string& value);
+
+// Monotonic milliseconds since `started`, to three decimals. Lines that carry
+// it are summed over a whole build, where thousands of sub-millisecond spans
+// printed as 0 would add up to nothing.
+std::string MillisecondsSince(std::chrono::steady_clock::time_point started);
 
 }  // namespace vcache::util
 

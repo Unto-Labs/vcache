@@ -161,6 +161,55 @@ buckets without `ListBucket` permission return it for a missing key.
 **Chain.** First hit wins; the hit is written back into every faster layer it
 passed through. Any backend error is reported as a miss.
 
+## Restoring outputs
+
+A hit writes each output to a temporary file beside it and renames it into
+place, so a reader never sees a partial file. Outputs are not fsynced; cache
+entries are. A torn entry would be served to every later build. A torn output
+is what a crash during an uncached build leaves too, because rustc and gcc do
+not fsync what they write either. If the machine crashes after vcache returns
+and before the output reaches disk, the file can be empty or short while
+cargo's fingerprint, which checks mtimes and not contents, still counts it
+fresh. `cargo clean -p <crate>` recovers.
+
+`VCACHE_LOG` gives each placement one line, so a build's log can be summed.
+"restored" and "placed" time the writes alone; "hit total" runs from asking the
+cache for the entry to the last output in place, so it adds reading the entry,
+checking its checksum and unpacking it. Without the fsync that is most of a
+Rust hit (below).
+
+```
+rust: restored 3 files, 41630234 bytes in 28.512 ms    a Rust hit
+rust: hit total 61.077 ms
+rust: placed 3 files, 41630234 bytes in 9.204 ms       a Rust miss
+hit: restored 2 files, 182311 bytes in 0.207 ms        a C or C++ hit
+hit total 0.391 ms
+```
+
+### Measurements
+
+A clean `cargo build` (dev profile) of sunbird's root workspace on a 128-core
+host, through `build-limited` (30 CPUs): 344 rustc runs, of which a warm build
+serves 341 from the cache, restoring 4,801 MiB. Store and target directory on
+one XFS filesystem, entries in the page cache, daemon off, `sync` before each
+build. Hit builds are four interleaved samples per binary, median and range;
+the fill is one sample. A summed time adds up every process's line, so with
+builds running in parallel it exceeds the wall time.
+
+| | origin/fbg | fsync kept | no fsync |
+|---|---|---|---|
+| warm build, wall | 6.6 s (6.3–7.5) | 6.4 s (5.6–8.7) | 3.6 s (3.3–3.9) |
+| warm build, summed "hit total" | not logged | 42.6 s (36.0–73.0) | 5.7 s (5.1–6.0) |
+| warm build, summed "restored" | not logged | 37.2 s (30.5–68.2) | 1.2 s (0.7–1.6) |
+| fill, wall | 129.8 s | 131.7 s | 118.1 s |
+| fill, summed "placed" | not logged | 21.6 s | 2.3 s |
+
+"fsync kept" is this change with only its `durable = false` arguments
+reverted. Without the fsync a warm build's restore cost is mostly reading and
+checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
+1,234 MiB restored) showed the same shape in two unsynced samples: summed
+"restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
+
 ## Incoming prefix-map flags
 
 A caller-supplied `-ffile-prefix-map` and vcache's own would both be on the

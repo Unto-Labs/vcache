@@ -237,6 +237,7 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
   }
   // Cache entries must survive a crash intact, so flush before the rename.
   // A cost file is a statistic: losing it costs an estimate, not a wrong object.
+  // A restored output is as durable as the compiler's own, which is not flushed.
   if (ok && durable && ::fsync(fd) != 0) {
     saved_errno = errno;
     ok = false;

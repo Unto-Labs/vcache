@@ -781,6 +781,109 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9h. Outputs are written without fsync; entries keep theirs"
+
+# Flushing an output before its rename was half the cost of restoring a large
+# one under parallel load, and buys nothing the compiler's own write has: rustc
+# and gcc do not fsync. A cache entry still must, since a torn entry is served.
+# A preload shim records the file behind every fsync.
+if [[ "$(uname)" != Linux ]]; then
+  skipped "the fsync shim reads /proc/self/fd"
+else
+  cat > "$WORK/fsync-log.c" <<'FSYNCEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static char log_path[4096];
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("FSYNC_LOG");
+  if (p != NULL) snprintf(log_path, sizeof log_path, "%s", p);
+  unsetenv("LD_PRELOAD");
+}
+static void note(int fd) {
+  char link[64], target[PATH_MAX];
+  snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+  ssize_t n = readlink(link, target, sizeof target - 1);
+  if (n <= 0 || log_path[0] == '\0') return;
+  target[n] = '\0';
+  FILE *f = fopen(log_path, "a");
+  if (f != NULL) { fprintf(f, "%s\n", target); fclose(f); }
+}
+int fsync(int fd) {
+  note(fd);
+  int (*real)(int) = dlsym(RTLD_NEXT, "fsync");
+  return real(fd);
+}
+int fdatasync(int fd) {
+  note(fd);
+  int (*real)(int) = dlsym(RTLD_NEXT, "fdatasync");
+  return real(fd);
+}
+FSYNCEOF
+  gcc -shared -fPIC "$WORK/fsync-log.c" -o "$WORK/fsync-log.so" -ldl
+  fsynced_under() {  # $1 = log, $2 = directory
+    grep -c -F -- "$2/" "$1" 2>/dev/null || true
+  }
+  restore_log="$WORK/fsync-restore.vlog"
+
+  if command -v rustc >/dev/null 2>&1; then
+    reset_cache
+    rm -f "$restore_log"
+    for tree in fsync-rs-a fsync-rs-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+      : > "$WORK/$tree.fsync"
+      ( cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off \
+          VCACHE_LOG="$restore_log" FSYNC_LOG="$WORK/$tree.fsync" \
+          LD_PRELOAD="$WORK/fsync-log.so" \
+          "$VCACHE" rustc --crate-name demo --crate-type lib \
+          --emit=dep-info,link --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>&1
+    done
+    check "the fsync-observed rust compiles miss then hit" "$(misses) $(hits)" "1 1"
+    check "a rust miss fsyncs its entry" \
+      "$([[ $(fsynced_under "$WORK/fsync-rs-a.fsync" "$VCACHE_DIR") -gt 0 ]] && echo yes)" "yes"
+    check "a rust miss places its outputs without fsync" \
+      "$(fsynced_under "$WORK/fsync-rs-a.fsync" "$WORK/fsync-rs-a/out")" "0"
+    check "a rust hit restores its outputs without fsync" \
+      "$(fsynced_under "$WORK/fsync-rs-b.fsync" "$WORK/fsync-rs-b/out")" "0"
+    check "a rust miss logs what it placed and how long it took" \
+      "$(grep -cE '\] rust: placed 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+    check "a rust hit logs what it restored and how long it took" \
+      "$(grep -cE '\] rust: restored 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+    check "and how long the hit took from lookup to placement" \
+      "$(grep -cE '\] rust: hit total [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+  else
+    skipped "rustc not installed"
+  fi
+
+  reset_cache
+  rm -f "$restore_log"
+  for tree in fsync-cc-a fsync-cc-b; do
+    make_project "$WORK/$tree"
+    mkdir -p "$WORK/$tree/out"
+    : > "$WORK/$tree.fsync"
+    ( cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=proj" VCACHE_DAEMON=off \
+        VCACHE_LOG="$restore_log" FSYNC_LOG="$WORK/$tree.fsync" \
+        LD_PRELOAD="$WORK/fsync-log.so" \
+        "$VCACHE" g++ -c -MD -MF out/lib.d -I include src/lib.cc -o out/lib.o ) >/dev/null 2>&1
+  done
+  check "the fsync-observed C++ compiles miss then hit" "$(misses) $(hits)" "1 1"
+  check "a C++ miss fsyncs its entry" \
+    "$([[ $(fsynced_under "$WORK/fsync-cc-a.fsync" "$VCACHE_DIR") -gt 0 ]] && echo yes)" "yes"
+  check "a C++ hit restores its object and .d without fsync" \
+    "$(fsynced_under "$WORK/fsync-cc-b.fsync" "$WORK/fsync-cc-b/out")" "0"
+  check "and both are restored" \
+    "$([[ -s $WORK/fsync-cc-b/out/lib.o && -s $WORK/fsync-cc-b/out/lib.d ]] && echo yes)" "yes"
+  check "a C++ hit logs what it restored and how long it took" \
+    "$(grep -cE '\] hit: restored 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+  check "and how long the hit took from lookup to placement" \
+    "$(grep -cE '\] hit total [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+fi
+
+# --------------------------------------------------------------------------
 section "9e. Rust: a rustc rebuilt in place is a new toolchain"
 
 # `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo

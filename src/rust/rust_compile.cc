@@ -3,6 +3,7 @@
 #include "rust/rust_compile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -401,7 +402,7 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
         bytes = &rewritten;
       }
     }
-    if (!util::WriteFileAtomic(target, *bytes)) {
+    if (!util::WriteFileAtomic(target, *bytes, /*durable=*/false)) {
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }
@@ -438,15 +439,28 @@ std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& 
   return std::nullopt;
 }
 
+// "<n> files, <m> bytes in <t> ms". Summed over a build's log, it is the time
+// spent writing outputs rather than compiling them.
+std::string PlacementSummary(const std::vector<storage::BlobFile>& files,
+                             std::chrono::steady_clock::time_point started) {
+  uint64_t bytes = 0;
+  for (const storage::BlobFile& file : files) bytes += file.contents.size();
+  return std::to_string(files.size()) + " files, " + std::to_string(bytes) + " bytes in " +
+         util::MillisecondsSince(started) + " ms";
+}
+
 // Restores a cached entry and replays its diagnostics. False if the entry is
-// unusable, in which case the caller recompiles.
+// unusable, in which case the caller recompiles. `lookup_started` is when the
+// entry was asked for: reading and checking it is most of a hit's cost.
 bool ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed,
-              const RootMap& roots, const std::vector<std::string>& path_env_vars) {
+              const RootMap& roots, const std::vector<std::string>& path_env_vars,
+              std::chrono::steady_clock::time_point lookup_started) {
   storage::Blob blob;
-  if (!storage::DeserializeBlob(got.value, &blob) || blob.files.empty() ||
-      !RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars)) {
-    return false;
-  }
+  if (!storage::DeserializeBlob(got.value, &blob) || blob.files.empty()) return false;
+  const auto restore_started = std::chrono::steady_clock::now();
+  if (!RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars)) return false;
+  VCACHE_LOG("rust: restored " + PlacementSummary(blob.files, restore_started));
+  VCACHE_LOG("rust: hit total " + util::MillisecondsSince(lookup_started) + " ms");
   if (!blob.stderr_text.empty()) {
     const std::string text = roots.LocalizeText(blob.stderr_text);
     ::fwrite(text.data(), 1, text.size(), stderr);
@@ -541,9 +555,11 @@ int RunRustCompile(const std::vector<std::string>& argv,
         VCACHE_LOG("rust manifest: " + which + " rejected: " + *mismatch);
         continue;
       }
+      const auto lookup_started = std::chrono::steady_clock::now();
       storage::GetResult got = cache->Get(states[i].key);
       media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
-      if (!got.hit || !ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
+      if (!got.hit ||
+          !ServeHit(got, parsed, roots, config.rust_path_env_vars, lookup_started)) {
         VCACHE_LOG("rust manifest: " + which + " matched but its entry is " +
                    (got.hit ? "unusable" : "gone"));
         continue;
@@ -591,10 +607,11 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   const auto try_entry_hit = [&]() {
     if (cache == nullptr) return false;
+    const auto lookup_started = std::chrono::steady_clock::now();
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
-      if (ServeHit(got, parsed, roots, config.rust_path_env_vars)) {
+      if (ServeHit(got, parsed, roots, config.rust_path_env_vars, lookup_started)) {
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
@@ -665,10 +682,12 @@ int RunRustCompile(const std::vector<std::string>& argv,
     core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
+  const auto place_started = std::chrono::steady_clock::now();
   if (!RestoreOutputs(files, parsed.out_dir, roots, config.rust_path_env_vars)) {
     core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
     return RunPassthrough(argv);
   }
+  VCACHE_LOG("rust: placed " + PlacementSummary(files, place_started));
 
   // Only now, with the artifacts in place. rustc announces each one on stderr
   // as a JSON "artifact" message, and cargo uses those to start a dependent

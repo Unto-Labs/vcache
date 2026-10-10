@@ -35,7 +35,9 @@ std::optional<std::string> ReadFile(const std::string& path);
 
 // Writes via a temporary file in the same directory followed by rename(2), so a
 // reader never observes a partially written cache entry. `durable` fsyncs
-// before the rename; cache entries need that, a replaceable statistic does not.
+// before the rename; cache entries need that. A replaceable statistic does not,
+// and neither does a restored build output, which the compiler would not have
+// fsynced either.
 bool WriteFileAtomic(const std::string& path, std::string_view contents,
                      bool durable = true);
 

@@ -5,6 +5,7 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -272,10 +273,15 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   return hasher.Hex();
 }
 
-// Writes the cached artifacts into the working tree.
+// Writes the cached artifacts into the working tree. `lookup_started` is when
+// the entry was asked for, so the log can show the whole hit, not only the writes.
 bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
-                    const RootMap& roots) {
-  if (!util::WriteFileAtomic(parsed.output, blob.object)) {
+                    const RootMap& roots,
+                    std::chrono::steady_clock::time_point lookup_started) {
+  const auto restore_started = std::chrono::steady_clock::now();
+  size_t restored_files = 1;
+  uint64_t restored_bytes = blob.object.size();
+  if (!util::WriteFileAtomic(parsed.output, blob.object, /*durable=*/false)) {
     VCACHE_LOG("hit: failed to write object " + parsed.output);
     return false;
   }
@@ -299,11 +305,18 @@ bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
       }
     }
 
-    if (!util::WriteFileAtomic(parsed.depfile, RenderDepFile(*dep))) {
+    const std::string depfile_text = RenderDepFile(*dep);
+    if (!util::WriteFileAtomic(parsed.depfile, depfile_text, /*durable=*/false)) {
       VCACHE_LOG("hit: failed to write dependency file " + parsed.depfile);
       return false;
     }
+    ++restored_files;
+    restored_bytes += depfile_text.size();
   }
+  VCACHE_LOG("hit: restored " + std::to_string(restored_files) + " files, " +
+             std::to_string(restored_bytes) + " bytes in " +
+             util::MillisecondsSince(restore_started) + " ms");
+  VCACHE_LOG("hit total " + util::MillisecondsSince(lookup_started) + " ms");
 
   if (!blob.stderr_text.empty()) {
     const std::string text = roots.LocalizeText(blob.stderr_text);
@@ -898,12 +911,13 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   const auto try_hit = [&]() {
     if (cache == nullptr) return false;
+    const auto lookup_started = std::chrono::steady_clock::now();
     storage::GetResult got = cache->Get(key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
       storage::Blob blob;
       if (storage::DeserializeBlob(got.value, &blob) &&
-          MaterializeHit(blob, parsed, roots)) {
+          MaterializeHit(blob, parsed, roots, lookup_started)) {
         VCACHE_LOG("hit on " + got.layer);
         RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
                                                    : Counter::kHitDisk);

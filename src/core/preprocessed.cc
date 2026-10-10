@@ -4,6 +4,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace vcache::core {
@@ -96,45 +97,100 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
   std::string pending;  // partial trailing line carried between reads
   bool ok = true;
 
-  auto flush_line = [&](const std::string& line, bool with_newline) {
-    // Only lines starting with '#' can be linemarkers; everything else is
-    // forwarded without inspection, which keeps this loop cheap.
-    if (!line.empty() && line[0] == '#') {
-      const std::string normalized = NormalizeLinemarker(line, roots);
-      hasher->Update(normalized);
-    } else {
-      hasher->Update(line);
-      // Only non-linemarker lines can carry it, and once one has, there is
-      // nothing left to learn, so the search stops for the rest of the file.
-      if (saw_incbin != nullptr && !*saw_incbin && ContainsIncbin(line)) {
-        *saw_incbin = true;
+  // BLAKE3 hashes several chunks at once with SIMD only when one update spans
+  // them; fed a run or a linemarker at a time (about 1 KiB apart in real
+  // output) it compresses block by block at a fraction of the speed. The
+  // digest of a stream does not depend on how it is sliced, so the normalised
+  // text is gathered here and handed over in large pieces.
+  constexpr size_t kHashBatchBytes = 256 << 10;
+  std::string hash_batch;
+  hash_batch.reserve(kHashBatchBytes);
+  auto emit = [&](std::string_view text) {
+    if (hash_batch.size() + text.size() > kHashBatchBytes) {
+      hasher->Update(hash_batch);
+      hash_batch.clear();
+      if (text.size() > kHashBatchBytes) {
+        hasher->Update(text);
+        return;
       }
     }
-    if (with_newline) hasher->Update("\n");
+    hash_batch.append(text);
+  };
+
+  // `text` is one or more whole lines, none of which starts with '#'.
+  auto feed_plain = [&](std::string_view text) {
+    emit(text);
+    // Only non-linemarker lines can carry it, and once one has, there is
+    // nothing left to learn, so the search stops for the rest of the file.
+    // ".incbin" holds no newline, so searching a run of lines finds exactly
+    // what searching them one by one would.
+    if (saw_incbin != nullptr && !*saw_incbin && ContainsIncbin(text)) {
+      *saw_incbin = true;
+    }
+  };
+  auto feed_line = [&](std::string_view line, bool with_newline) {
+    if (!line.empty() && line[0] == '#') {
+      emit(NormalizeLinemarker(std::string(line), roots));
+    } else {
+      feed_plain(line);
+    }
+    if (with_newline) emit("\n");
   };
 
   while (true) {
-    size_t n = ::fread(buf.data(), 1, buf.size(), f);
+    const size_t n = ::fread(buf.data(), 1, buf.size(), f);
     if (n == 0) {
       if (::ferror(f) != 0) ok = false;
       break;
     }
-    size_t start = 0;
-    for (size_t i = 0; i < n; ++i) {
-      if (buf[i] != '\n') continue;
-      if (pending.empty()) {
-        flush_line(std::string(buf.data() + start, i - start), true);
-      } else {
-        pending.append(buf.data() + start, i - start);
-        flush_line(pending, true);
-        pending.clear();
+    const char* data = buf.data();
+    size_t line_start = 0;
+    if (!pending.empty()) {
+      const auto* newline = static_cast<const char*>(std::memchr(data, '\n', n));
+      if (newline == nullptr) {
+        pending.append(data, n);
+        continue;
       }
-      start = i + 1;
+      pending.append(data, newline - data);
+      feed_line(pending, true);
+      pending.clear();
+      line_start = newline - data + 1;
     }
-    if (start < n) pending.append(buf.data() + start, n - start);
+
+    // Everything up to the last newline is whole lines; the rest waits for
+    // the next read. Within the whole lines only a '#' that starts a line
+    // needs attention, and '#' is rare outside linemarkers, so searching for
+    // it skips the per-line work for everything else.
+    const size_t last_newline = std::string_view(data, n).rfind('\n');
+    const size_t whole_lines_end =
+        last_newline == std::string_view::npos || last_newline < line_start ? line_start
+                                                                            : last_newline + 1;
+    size_t plain_run_start = line_start;
+    size_t scan = line_start;
+    while (scan < whole_lines_end) {
+      const auto* hash_sign =
+          static_cast<const char*>(std::memchr(data + scan, '#', whole_lines_end - scan));
+      if (hash_sign == nullptr) break;
+      const size_t hash_line_start = hash_sign - data;
+      scan = hash_line_start + 1;
+      if (hash_line_start != plain_run_start && data[hash_line_start - 1] != '\n') continue;
+      if (hash_line_start > plain_run_start) {
+        feed_plain(std::string_view(data + plain_run_start, hash_line_start - plain_run_start));
+      }
+      const auto* newline = static_cast<const char*>(
+          std::memchr(data + hash_line_start, '\n', whole_lines_end - hash_line_start));
+      const size_t hash_line_end = newline - data;
+      feed_line(std::string_view(data + hash_line_start, hash_line_end - hash_line_start), true);
+      plain_run_start = scan = hash_line_end + 1;
+    }
+    if (whole_lines_end > plain_run_start) {
+      feed_plain(std::string_view(data + plain_run_start, whole_lines_end - plain_run_start));
+    }
+    if (whole_lines_end < n) pending.assign(data + whole_lines_end, n - whole_lines_end);
   }
 
-  if (ok && !pending.empty()) flush_line(pending, false);
+  if (ok && !pending.empty()) feed_line(pending, false);
+  if (!hash_batch.empty()) hasher->Update(hash_batch);
   ::fclose(f);
   return ok;
 }

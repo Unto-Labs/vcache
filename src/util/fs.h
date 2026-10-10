@@ -35,12 +35,14 @@ std::optional<std::string> ReadFile(const std::string& path);
 
 // Writes via a temporary file in the same directory followed by rename(2), so a
 // reader never observes a partially written cache entry. `durable` fsyncs
-// before the rename; cache entries need that, a replaceable statistic does not.
+// before the rename; cache entries and memos need that, a build output or a
+// replaceable statistic does not.
 bool WriteFileAtomic(const std::string& path, std::string_view contents,
                      bool durable = true);
 
 // Hard-links `from` to `to`, falling back to a copy when the link fails (for
-// example across filesystems). Used to materialise cached objects cheaply.
+// example across filesystems). Used to place build outputs, so the copy is not
+// fsynced.
 bool LinkOrCopy(const std::string& from, const std::string& to);
 
 // Copies `from` to `to` without pulling the file through user space, and

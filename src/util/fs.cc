@@ -235,8 +235,12 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
     }
     written += static_cast<size_t>(n);
   }
-  // Cache entries must survive a crash intact, so flush before the rename.
-  // A cost file is a statistic: losing it costs an estimate, not a wrong object.
+  // Cache entries and memos must survive a crash intact, so flush before the
+  // rename: a torn entry would be served to every later build. A build output
+  // vcache writes into the tree is not worth the fsync, nor the slower rename
+  // that follows one: it can be restored from the cache again, and after a
+  // crash the build tool re-checks it like anything else it produced. A cost
+  // file is a statistic: losing it costs an estimate, not a wrong object.
   if (ok && durable && ::fsync(fd) != 0) {
     saved_errno = errno;
     ok = false;
@@ -266,7 +270,7 @@ bool LinkOrCopy(const std::string& from, const std::string& to) {
 
   auto data = ReadFile(from);
   if (!data) return false;
-  return WriteFileAtomic(to, *data);
+  return WriteFileAtomic(to, *data, /*durable=*/false);
 }
 
 bool CloneFile(const std::string& from, const std::string& to) {

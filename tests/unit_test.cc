@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -708,6 +709,128 @@ void TestPreprocessedNormalization() {
         "does not fire without the leading dot");
   Check(!core::ContainsIncbin("static void inc(void);"),
         "does not fire on ordinary code");
+}
+
+void TestPreprocessedHashSlicing() {
+  Section("core::preprocessed hash slicing");
+
+  auto scratch = util::MakeTempDir("vcache-preprocessed-hash-");
+  Check(scratch.has_value(), "preprocessed hash scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const core::RootMap roots = MakeRoots({"/home/u/proj=proj"});
+
+  // The per-line loop the hasher used to be fed by: the slicing may change,
+  // the byte stream and the .incbin verdict may not, or every cache key moves.
+  auto reference = [&](const std::string& text, bool* saw_incbin) {
+    hash::Hasher hasher;
+    *saw_incbin = false;
+    size_t start = 0;
+    while (start < text.size()) {
+      const size_t newline = text.find('\n', start);
+      const bool with_newline = newline != std::string::npos;
+      const std::string line =
+          text.substr(start, with_newline ? newline - start : std::string::npos);
+      if (!line.empty() && line[0] == '#') {
+        hasher.Update(core::NormalizeLinemarker(line, roots));
+      } else {
+        hasher.Update(line);
+        if (!*saw_incbin && core::ContainsIncbin(line)) *saw_incbin = true;
+      }
+      if (with_newline) hasher.Update("\n");
+      start = with_newline ? newline + 1 : text.size();
+    }
+    return hasher.Hex();
+  };
+
+  int case_number = 0;
+  auto check_case = [&](const std::string& text, const std::string& what) {
+    const std::string path = *scratch + "/case" + std::to_string(case_number++) + ".i";
+    // Not util::WriteFileAtomic: its first call fixes the process's file mode,
+    // which the written-file-permissions section needs to set up itself.
+    FILE* out = std::fopen(path.c_str(), "wb");
+    const bool written = out != nullptr &&
+                         std::fwrite(text.data(), 1, text.size(), out) == text.size();
+    if (out == nullptr || std::fclose(out) != 0 || !written) {
+      Check(false, what + ": scratch file written");
+      return;
+    }
+    bool expected_incbin = false;
+    const std::string expected = reference(text, &expected_incbin);
+    hash::Hasher hasher;
+    bool saw_incbin = !expected_incbin;
+    const bool read = core::HashNormalizedPreprocessedOutput(path, roots, &hasher, &saw_incbin);
+    Check(read, what + ": file read");
+    CheckEq(hasher.Hex(), expected, what + ": digest matches the per-line loop");
+    Check(saw_incbin == expected_incbin, what + ": .incbin verdict matches the per-line loop");
+  };
+
+  constexpr size_t kReadSize = 1 << 20;
+  const std::string marker = "# 1 \"/home/u/proj/src/a.cc\"";
+  const std::string system_marker = "# 3 \"/usr/include/stdio.h\" 2";
+
+  check_case("", "an empty file");
+  check_case(marker + "\nint a;\n\nint b;\n" + system_marker + "\n#pragma once\nint c;\n",
+             "linemarkers under a root among plain lines");
+  check_case("int a;\n" + marker, "a linemarker without a trailing newline");
+  check_case(marker + "\nint a;", "a plain line without a trailing newline");
+  check_case("\n\n#\n\n", "empty lines and a bare '#'");
+  check_case("int a; // # 1 \"/home/u/proj/a.cc\"\n  " + marker + "\nchar c = '#';\n",
+             "a '#' inside a plain line is not a linemarker");
+  check_case(marker + "\n" + std::string(kReadSize + kReadSize / 2, 'x') + "\n" + marker + "\n",
+             "a plain line longer than one read");
+  check_case(std::string(2 * kReadSize + 17, 'y'), "an unterminated line over two reads");
+  {
+    const std::string lead = std::string(kReadSize - 11, 'p') + "\n";
+    check_case(lead + "int straddling_the_read_boundary;\n" + marker + "\n",
+               "a plain line straddling the read boundary");
+    check_case(lead + marker + "\nint a;\n", "a linemarker straddling the read boundary");
+  }
+  check_case(std::string(kReadSize, 't') + marker + "\n" + marker + "\n",
+             "a '#' just after the read boundary in the middle of a line");
+  {
+    const std::string lead = std::string(kReadSize - 1, 'q') + "\n";
+    check_case(lead + marker + "\nint a;\n", "a linemarker starting exactly at the read boundary");
+    check_case(lead + "int a;\n" + marker + "\n",
+               "a plain line starting exactly at the read boundary");
+  }
+  check_case(marker + "\n" + "asm(\"\\t.incbin \\\"kernel/config_data.gz\\\"\");\nint a;\n",
+             "an .incbin in a plain line");
+  check_case("# 1 \"/home/u/proj/.incbin\"\n#pragma .incbin\nint a;\n",
+             "an .incbin only in '#' lines");
+  check_case(std::string(kReadSize - 3, 'r') + ".incbin\n",
+             "an .incbin straddling the read boundary");
+  check_case(std::string(kReadSize - 1, 's') + "\n.incbin\n",
+             "an .incbin starting exactly at the read boundary");
+
+  const std::vector<std::string> pieces = {
+      marker, system_marker, "# 42 \"/home/u/proj/inc/b.h\" 1 3 4", "#pragma once", "#", "",
+      "int x = 1;", "  return a.b->c;", "asm(\".incbin \\\"blob\\\"\");", "\t.incbin \"x\"",
+      "# 7 \"/home/u/proj/.incbin\"", "char c = '#';", "  " + marker, "#define X 1",
+  };
+  for (const unsigned seed : {1u, 2u, 3u, 4u, 5u}) {
+    std::mt19937 rng(seed);
+    std::string text;
+    const size_t target = 2 * kReadSize + rng() % kReadSize;
+    while (text.size() < target) {
+      const unsigned pick = rng() % 100;
+      if (pick < 2) {
+        text += std::string(rng() % (kReadSize / 2), 'z');
+      } else {
+        // .incbin pieces are rare so that most seeds also exercise its absence.
+        const size_t index = rng() % pieces.size();
+        if (pieces[index].find(".incbin") != std::string::npos && rng() % 50 != 0) continue;
+        text += pieces[index];
+      }
+      text += '\n';
+    }
+    if (seed % 2 == 0) text.pop_back();
+    check_case(text, "seeded mix " + std::to_string(seed));
+  }
 }
 
 void TestManifestMerge() {
@@ -5727,6 +5850,7 @@ int main(int argc, char** argv) {
   TestDepFile();
   TestDepFileEnvDeps();
   TestPreprocessedNormalization();
+  TestPreprocessedHashSlicing();
   TestBlob();
   TestCacheChain();
   TestCacheChainRemote();

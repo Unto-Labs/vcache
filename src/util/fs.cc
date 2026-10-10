@@ -9,6 +9,7 @@
 #endif
 #include <sys/ioctl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -367,6 +368,50 @@ std::optional<std::string> MakeTempDirUnder(const std::string& dir, const std::s
 
 std::string ScratchRoot(const std::string& cache_dir) { return cache_dir + "/tmp"; }
 
+// A dead owner's compiler can outlive it by a little when only vcache was killed.
+constexpr int64_t kDeadOwnerScratchGraceSeconds = 10 * 60;
+constexpr size_t kScratchTagLength = 8;
+constexpr size_t kScratchRandomLength = 6;
+
+// Names the pid namespace and the boot a pid belongs to. A sweep in another
+// container sharing the store, or after a reboot, cannot ask the kernel about an
+// owner pid from here, and a tag mismatch sends it back to the age rule.
+std::string ScratchOwnerTag() {
+  char pid_ns[64];
+  const ssize_t pid_ns_length = ::readlink("/proc/self/ns/pid", pid_ns, sizeof(pid_ns));
+  const auto boot_id = ReadFile("/proc/sys/kernel/random/boot_id");
+  if (pid_ns_length <= 0 || !boot_id || boot_id->empty()) return "";
+  uint32_t fnv1a = 2166136261u;
+  for (const char c : std::string(pid_ns, static_cast<size_t>(pid_ns_length)) + *boot_id) {
+    fnv1a = (fnv1a ^ static_cast<unsigned char>(c)) * 16777619u;
+  }
+  char tag[kScratchTagLength + 1];
+  std::snprintf(tag, sizeof(tag), "%08x", fnv1a);
+  return tag;
+}
+
+struct ScratchOwner {
+  pid_t pid;
+  std::string tag;
+};
+
+// Parses `<prefix><pid>.<tag>-XXXXXX`; an older `<prefix>XXXXXX` name yields nothing.
+std::optional<ScratchOwner> ParseScratchOwner(const std::string& name) {
+  if (name.size() < kScratchTagLength + kScratchRandomLength + 4) return std::nullopt;
+  const size_t tag_end = name.size() - kScratchRandomLength - 1;
+  const size_t tag_begin = tag_end - kScratchTagLength;
+  if (name[tag_end] != '-' || name[tag_begin - 1] != '.') return std::nullopt;
+  const size_t pid_end = tag_begin - 1;
+  size_t pid_begin = pid_end;
+  while (pid_begin > 0 && name[pid_begin - 1] >= '0' && name[pid_begin - 1] <= '9') --pid_begin;
+  if (pid_begin == pid_end || pid_end - pid_begin > 9) return std::nullopt;
+  const auto pid = static_cast<pid_t>(std::stol(name.substr(pid_begin, pid_end - pid_begin)));
+  if (pid <= 0) return std::nullopt;
+  return ScratchOwner{pid, name.substr(tag_begin, kScratchTagLength)};
+}
+
+bool ProcessAlive(pid_t pid) { return ::kill(pid, 0) == 0 || errno == EPERM; }
+
 }  // namespace
 
 std::optional<std::string> MakeTempDir(const std::string& prefix) {
@@ -375,10 +420,13 @@ std::optional<std::string> MakeTempDir(const std::string& prefix) {
 }
 
 std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix) {
+  const std::string tag = ScratchOwnerTag();
+  const std::string owned_prefix =
+      tag.empty() ? prefix : prefix + std::to_string(::getpid()) + "." + tag + "-";
   if (!cache_dir.empty() && MakeDirs(ScratchRoot(cache_dir))) {
-    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), prefix)) return dir;
+    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), owned_prefix)) return dir;
   }
-  return MakeTempDir(prefix);
+  return MakeTempDir(owned_prefix);
 }
 
 size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds) {
@@ -386,11 +434,18 @@ size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seco
   fs::directory_iterator it(ScratchRoot(cache_dir), ec);
   if (ec) return 0;
   const int64_t now = static_cast<int64_t>(::time(nullptr));
+  const std::string own_tag = ScratchOwnerTag();
   size_t removed = 0;
   for (const auto& entry : it) {
+    const auto owner = ParseScratchOwner(entry.path().filename().string());
+    const bool owner_visible = owner && !own_tag.empty() && owner->tag == own_tag;
+    // A running compile does not touch its directory's mtime while the compiler
+    // rewrites files in it, so age alone cannot tell a long compile from a dead one.
+    if (owner_visible && ProcessAlive(owner->pid)) continue;
     struct stat st{};
     if (::lstat(entry.path().c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-    if (now - static_cast<int64_t>(st.st_mtime) <= max_age_seconds) continue;
+    const int64_t limit_seconds = owner_visible ? kDeadOwnerScratchGraceSeconds : max_age_seconds;
+    if (now - static_cast<int64_t>(st.st_mtime) <= limit_seconds) continue;
     if (RemoveRecursive(entry.path().string())) ++removed;
   }
   return removed;

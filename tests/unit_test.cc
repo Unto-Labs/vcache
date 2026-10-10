@@ -862,21 +862,76 @@ void TestScratchDirs() {
         "a cache dir that cannot hold tmp/ falls back to the system temp dir");
   if (fallback) util::RemoveRecursive(*fallback);
 
-  const auto stale = util::MakeScratchDir(*cache, "vcache-");
-  const auto fresh = util::MakeScratchDir(*cache, "vcache-");
-  Check(stale.has_value() && fresh.has_value(), "two scratch directories created");
-  if (!stale || !fresh) return;
-  util::WriteFileAtomic(*stale + "/pp.i", "left by a killed compile");
-  const timeval seven_hours_ago[2] = {{::time(nullptr) - 7 * 3600, 0}, {::time(nullptr) - 7 * 3600, 0}};
-  ::utimes(stale->c_str(), seven_hours_ago);
+  // Directories named before the owner pid was recorded keep the age rule.
+  const std::string stale = *cache + "/tmp/vcache-Ab12Cd";
+  const std::string fresh = *cache + "/tmp/vcache-Ef34Gh";
+  util::MakeDirs(stale);
+  util::MakeDirs(fresh);
+  util::WriteFileAtomic(stale + "/pp.i", "left by a killed compile");
+  const auto set_age = [](const std::string& path, int64_t seconds) {
+    const timeval then[2] = {{::time(nullptr) - seconds, 0}, {::time(nullptr) - seconds, 0}};
+    ::utimes(path.c_str(), then);
+  };
+  set_age(stale, 7 * 3600);
   const std::string stale_file = *cache + "/tmp/stray-file";
   util::WriteFileAtomic(stale_file, "x");
-  ::utimes(stale_file.c_str(), seven_hours_ago);
+  set_age(stale_file, 7 * 3600);
 
-  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 1,
-        "the sweep removes exactly the one old directory");
-  Check(!util::IsDirectory(*stale), "a scratch directory older than the limit is removed");
-  Check(util::IsDirectory(*fresh), "a scratch directory in use is kept");
+  // The live owner is this process. A long compile rewrites files that already
+  // exist, which leaves its directory's mtime behind.
+  const auto running = util::MakeScratchDir(*cache, "vcache-rs-");
+  Check(running.has_value(), "a running compile's scratch directory is created");
+  if (!running) return;
+  util::WriteFileAtomic(*running + "/lib.rlib", "being written");
+  set_age(*running, 7 * 3600);
+
+  // A foreign owner: the live pid of this process, under another pid namespace
+  // or boot, where the sweep cannot ask the kernel about it.
+  const size_t tag_dot = running->rfind('.');
+  const std::string own_tag = tag_dot == std::string::npos ? "" : running->substr(tag_dot + 1, 8);
+  const std::string foreign_prefix = *cache + "/tmp/vcache-" + std::to_string(::getpid()) + "." +
+                                     (own_tag == "00000000" ? "11111111" : "00000000");
+  const std::string foreign_old = foreign_prefix + "-Ij56Kl";
+  const std::string foreign_new = foreign_prefix + "-Mn78Op";
+  util::MakeDirs(foreign_old);
+  util::MakeDirs(foreign_new);
+  set_age(foreign_old, 7 * 3600);
+  set_age(foreign_new, 3600);
+
+  // Dead owners: a child makes its scratch directories and exits without
+  // removing them, as a compile killed mid-run does.
+  const pid_t child = ::fork();
+  if (child == 0) {
+    util::MakeScratchDir(*cache, "vcache-dead-old-");
+    util::MakeScratchDir(*cache, "vcache-dead-new-");
+    _exit(0);
+  }
+  int status = 0;
+  Check(child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status),
+        "a child made its scratch directories and exited");
+  std::string dead_old, dead_new;
+  for (const auto& entry : fs::directory_iterator(*cache + "/tmp")) {
+    const std::string name = entry.path().filename().string();
+    if (util::StartsWith(name, "vcache-dead-old-")) dead_old = entry.path().string();
+    if (util::StartsWith(name, "vcache-dead-new-")) dead_new = entry.path().string();
+  }
+  Check(!dead_old.empty() && !dead_new.empty(), "the dead owner's directories are found");
+  set_age(dead_old, 3600);
+  set_age(dead_new, 60);
+
+  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 3,
+        "the sweep removes exactly the old unowned, foreign and dead-owner directories");
+  Check(!util::IsDirectory(stale), "an unowned scratch directory older than the limit is removed");
+  Check(util::IsDirectory(fresh), "an unowned scratch directory younger than the limit is kept");
+  Check(util::IsDirectory(*running),
+        "a scratch directory whose owner is alive is kept however old its mtime");
+  Check(!util::IsDirectory(foreign_old),
+        "a foreign owner's directory older than the limit is removed although the pid is live here");
+  Check(util::IsDirectory(foreign_new), "a foreign owner's directory younger than the limit is kept");
+  Check(!dead_old.empty() && !util::IsDirectory(dead_old),
+        "a dead owner's directory goes after the grace, long before the age limit");
+  Check(!dead_new.empty() && util::IsDirectory(dead_new),
+        "a dead owner's directory is kept within the grace");
   Check(util::FileExists(stale_file), "a plain file under tmp/ is left alone");
   Check(util::RemoveStaleScratchDirs(*cache + "/missing", 0) == 0,
         "a cache without tmp/ sweeps nothing");
@@ -3986,7 +4041,7 @@ void Age(const std::string& file, int64_t seconds) {
   times[0].tv_nsec = 0;
   times[1].tv_sec = mtime.tv_sec - seconds;
   times[1].tv_nsec = 0;
-  ::utimensat(0, file.c_str(), times, 0);
+  ::utimensat(AT_FDCWD, file.c_str(), times, 0);
 }
 
 // Keys are hex digests in production and the shard is just the first two
@@ -4170,6 +4225,38 @@ void TestDiskStorageEviction() {
     }
     Check(disk.Get(touched, &got),
           "a read protects an otherwise stale entry from the next eviction");
+  }
+
+  // ---- a hit refreshes the mtime under a relative cache dir --------------
+  // With stdin not a directory, a refresh resolved against fd 0 rather than
+  // the working directory fails and the entry ages as if never read.
+  {
+    TempCacheDir tmp;
+    const std::string cwd = util::CurrentDir();
+    const int saved_stdin = ::dup(0);
+    const int dev_null = ::open("/dev/null", O_RDONLY);
+    const bool arranged = !cwd.empty() && saved_stdin >= 0 && dev_null >= 0 &&
+                          ::chdir(tmp.path().c_str()) == 0 && ::dup2(dev_null, 0) == 0;
+    Check(arranged, "the relative cache dir and a /dev/null stdin are set up");
+    if (arranged) {
+      storage::DiskStorage disk("relative-cache", 1 << 20, /*read_only=*/false);
+      const std::string key = KeyIn("ab", "relative");
+      disk.Put(key, "payload");
+      const std::string entry = EntryPath("relative-cache", key);
+      Age(entry, 10000);
+      struct stat before {}, after {};
+      ::stat(entry.c_str(), &before);
+      Check(before.st_mtime < ::time(nullptr) - 5000, "the entry under the relative cache dir is aged");
+      std::string got;
+      const bool hit = disk.Get(key, &got);
+      ::stat(entry.c_str(), &after);
+      Check(hit && after.st_mtime > before.st_mtime,
+            "a hit refreshes the entry's mtime when the cache dir is relative");
+    }
+    if (saved_stdin >= 0) ::dup2(saved_stdin, 0);
+    if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) std::perror("chdir back");
+    if (saved_stdin >= 0) ::close(saved_stdin);
+    if (dev_null >= 0) ::close(dev_null);
   }
 
   // ---- explicit Trim ----------------------------------------------------

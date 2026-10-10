@@ -21,7 +21,8 @@ namespace vcache::storage {
 namespace {
 
 constexpr int kShardCount = 256;
-// No compile runs this long, so a scratch directory this old was left by a killed one.
+// No compile runs this long, so a scratch directory this old whose owner the sweep
+// cannot check was left by a killed one.
 constexpr int64_t kStaleScratchSeconds = 6 * 3600;
 
 // Evict down to this fraction of the budget so a shard that is exactly at the
@@ -66,7 +67,7 @@ bool DiskStorage::Get(const std::string& key, std::string* value) {
   *value = std::move(*data);
   // The mtime doubles as the LRU timestamp: relatime makes atime unreliable,
   // so refresh mtime explicitly on every hit.
-  ::utimensat(0, path.c_str(), nullptr, 0);
+  ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0);
   return true;
 }
 

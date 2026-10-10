@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "args/compiler_args.h"
@@ -44,6 +45,16 @@ CompilerId ResolveCompilerId(const std::string& compiler,
                              const std::string& check_mode,
                              const std::string& cache_dir,
                              const RootMap& roots);
+
+// Beside every PCH vcache builds or restores it writes `<output>` plus this
+// suffix: one line, the PCH's cache key in hex. A consumer's key can then name
+// the PCH it was compiled against without hashing tens of megabytes.
+inline constexpr std::string_view kPchKeyFileSuffix = ".vcache-key";
+
+// True for a clang PCH build without `-Xclang -fno-pch-timestamp`. That PCH
+// holds its headers' mtimes and clang refuses it once one of them changes, so
+// a restored copy would fail the next build that touched a header.
+bool PchCarriesTimestamps(const args::CompilerArgs& parsed, bool is_clang);
 
 // Builds the root mapping for this invocation from configuration, adding the
 // current directory when it would otherwise be left unmapped.

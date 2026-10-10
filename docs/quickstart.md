@@ -132,3 +132,4 @@ debugger at the real sources:
 - [preprocessor-problem.md](preprocessor-problem.md) — why this is needed, with
   measurements
 - [design.md](design.md) — how it is put together
+- [prompts/vcache-friendly-audit.md](prompts/vcache-friendly-audit.md) — an agent prompt to audit your build

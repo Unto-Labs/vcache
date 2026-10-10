@@ -49,6 +49,7 @@ is a hit at all when a ccache hit would not have been.
 | [docs/design.md](docs/design.md) | How it is put together |
 | [docs/daemon.md](docs/daemon.md) | The optional cache daemon: async S3 uploads, kept connections |
 | [docs/linux-kernel.md](docs/linux-kernel.md) | Recipe: caching Linux kernel builds |
+| [docs/prompts/vcache-friendly-audit.md](docs/prompts/vcache-friendly-audit.md) | A prompt for a coding agent that audits your build for vcache friendliness |
 
 ## Quick start
 

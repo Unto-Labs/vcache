@@ -401,7 +401,7 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
         bytes = &rewritten;
       }
     }
-    if (!util::WriteFileAtomic(target, *bytes)) {
+    if (!util::WriteFileAtomic(target, *bytes, /*durable=*/false)) {
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }

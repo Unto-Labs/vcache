@@ -275,7 +275,7 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
 // Writes the cached artifacts into the working tree.
 bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
                     const RootMap& roots) {
-  if (!util::WriteFileAtomic(parsed.output, blob.object)) {
+  if (!util::WriteFileAtomic(parsed.output, blob.object, /*durable=*/false)) {
     VCACHE_LOG("hit: failed to write object " + parsed.output);
     return false;
   }
@@ -299,7 +299,7 @@ bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
       }
     }
 
-    if (!util::WriteFileAtomic(parsed.depfile, RenderDepFile(*dep))) {
+    if (!util::WriteFileAtomic(parsed.depfile, RenderDepFile(*dep), /*durable=*/false)) {
       VCACHE_LOG("hit: failed to write dependency file " + parsed.depfile);
       return false;
     }
@@ -507,7 +507,7 @@ bool EmitDepOutput(const std::string& path, const std::string& text) {
     ::fflush(stdout);
     return true;
   }
-  return util::WriteFileAtomic(path, text);
+  return util::WriteFileAtomic(path, text, /*durable=*/false);
 }
 
 }  // namespace
@@ -969,7 +969,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     // No object is placed, exactly as the compiler leaves none.
     if (!tmp_depfile.empty()) {
       if (auto text = util::ReadFile(tmp_depfile)) {
-        util::WriteFileAtomic(parsed.depfile, *text);
+        util::WriteFileAtomic(parsed.depfile, *text, /*durable=*/false);
       }
     }
     VCACHE_LOG("compile failed with exit code " + std::to_string(compiled.exit_code));
@@ -987,7 +987,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (!tmp_depfile.empty()) {
     auto text = util::ReadFile(tmp_depfile);
     if (text) {
-      if (!util::WriteFileAtomic(parsed.depfile, *text)) {
+      if (!util::WriteFileAtomic(parsed.depfile, *text, /*durable=*/false)) {
         VCACHE_LOG("could not write dependency file " + parsed.depfile);
       }
       // Store it canonicalised so the entry is directory-independent; gcc does

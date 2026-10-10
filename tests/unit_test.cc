@@ -3986,7 +3986,7 @@ void Age(const std::string& file, int64_t seconds) {
   times[0].tv_nsec = 0;
   times[1].tv_sec = mtime.tv_sec - seconds;
   times[1].tv_nsec = 0;
-  ::utimensat(0, file.c_str(), times, 0);
+  ::utimensat(AT_FDCWD, file.c_str(), times, 0);
 }
 
 // Keys are hex digests in production and the shard is just the first two
@@ -4170,6 +4170,38 @@ void TestDiskStorageEviction() {
     }
     Check(disk.Get(touched, &got),
           "a read protects an otherwise stale entry from the next eviction");
+  }
+
+  // ---- a hit refreshes the mtime under a relative cache dir --------------
+  // With stdin not a directory, a refresh resolved against fd 0 rather than
+  // the working directory fails and the entry ages as if never read.
+  {
+    TempCacheDir tmp;
+    const std::string cwd = util::CurrentDir();
+    const int saved_stdin = ::dup(0);
+    const int dev_null = ::open("/dev/null", O_RDONLY);
+    const bool arranged = !cwd.empty() && saved_stdin >= 0 && dev_null >= 0 &&
+                          ::chdir(tmp.path().c_str()) == 0 && ::dup2(dev_null, 0) == 0;
+    Check(arranged, "the relative cache dir and a /dev/null stdin are set up");
+    if (arranged) {
+      storage::DiskStorage disk("relative-cache", 1 << 20, /*read_only=*/false);
+      const std::string key = KeyIn("ab", "relative");
+      disk.Put(key, "payload");
+      const std::string entry = EntryPath("relative-cache", key);
+      Age(entry, 10000);
+      struct stat before {}, after {};
+      ::stat(entry.c_str(), &before);
+      Check(before.st_mtime < ::time(nullptr) - 5000, "the entry under the relative cache dir is aged");
+      std::string got;
+      const bool hit = disk.Get(key, &got);
+      ::stat(entry.c_str(), &after);
+      Check(hit && after.st_mtime > before.st_mtime,
+            "a hit refreshes the entry's mtime when the cache dir is relative");
+    }
+    if (saved_stdin >= 0) ::dup2(saved_stdin, 0);
+    if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) std::perror("chdir back");
+    if (saved_stdin >= 0) ::close(saved_stdin);
+    if (dev_null >= 0) ::close(dev_null);
   }
 
   // ---- explicit Trim ----------------------------------------------------

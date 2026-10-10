@@ -42,7 +42,8 @@ Included:
 - a key-format version, so a change to this list invalidates old entries
 - compiler identity (see below)
 - the sorted set of **canonical** root targets
-- codegen-affecting flags, with any embedded paths canonicalised
+- codegen-affecting flags; an argument that is itself a path under a root is
+  canonicalised, a path inside a longer argument is kept verbatim
 - the preprocessed text, with linemarker paths canonicalised
 - explicitly configured environment variables
 - for Rust, each variable the dep-info reports the crate read through `env!` or
@@ -79,8 +80,9 @@ built from what is known before the scan runs:
 - its own key-format version
 - compiler identity and the resolved native target
 - the sorted set of canonical root targets
-- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim
-  and every path canonicalised
+- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim;
+  an argument that is itself a path under a root is canonicalised, a path joined
+  to its flag (`-I/abs/inc`) is not
 - the source's **canonical path** and its contents. The path matters because
   headers are found relative to the source: identical sources reached by
   different canonical paths read different files, and a state recorded for one
@@ -293,7 +295,8 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   already has its equivalent: a manifest of earlier `--emit=dep-info` runs,
   verified by re-hashing every recorded file, lets a hit skip that run (see
   `rust_dep_info` in `configuration.md`).
-- **Linking is not cached**, matching ccache and sccache.
+- **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
+  through `vcache-fstrace.so`); ccache and sccache do not cache it.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang

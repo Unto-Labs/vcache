@@ -261,7 +261,8 @@ and RHEL) gets a dynamically linked libstdc++ instead, which adds
 
 ## What is not cached
 
-Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
+Linking (unless the link cache is on, `VCACHE_LINK_CACHE=1`, Linux only),
+`-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
 text never mentions), and `rustc` without `--out-dir`/`--emit`. All of these
 fall through to the compiler unchanged, so a build always makes progress.

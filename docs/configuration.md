@@ -63,6 +63,7 @@ incoming_prefix_maps = "error"     # error | strip | keep
 read_only            = false
 hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
+cxx_manifest         = true        # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -90,6 +91,7 @@ timeout        = 30                # seconds
 | `vcache.incoming_prefix_maps` | `VCACHE_INCOMING_PREFIX_MAPS` | `--vcache-incoming-prefix-maps=`, `--vcache-allow-prefix-maps` | `error` |
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
+| `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `true` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -884,6 +886,109 @@ that this mode cannot see, which is the same trade ccache's direct mode makes.
 `-MG`, which lets a dependency name a file that does not exist yet, is not
 cached at all for the same reason.
 
+### `cxx_manifest`
+
+Every C or C++ lookup has to know the preprocessed text before it can compute
+the key, and producing it is most of what a hit costs. On `src/daemon/server.cc`
+(about 410 headers) a hit took 69 ms with clang++ and 88 ms with g++ through the
+preprocessor, and 6 ms and 9 ms through the manifest. With
+`cxx_manifest` on (the default), a lookup first asks a **manifest**, as
+[`dep_scan`](#dep_scan) and [`rust_dep_info`](#rust_dep_info) do. This is
+ccache's depend mode.
+
+The manifest key covers what is known before the preprocessor runs: the
+compiler and the resolved native target, the roots, the working directory, the
+source's canonical path and its spelling on the command line, the source's
+contents, the whole command line except the output and depfile paths (`-I`,
+`-D` and `-include` included; the paths in include-path flags are
+canonicalised, while `-D` values and `-B` are kept as written), the files named
+by keyed flags, `hash_env_vars`, `CPATH` and its siblings, and each precompiled
+header the command names (below). A state lists every file the depfile of an
+earlier compile named, with its digest, and the key that compile was stored
+under. A lookup re-hashes the files of each state and serves the first that
+matches in full; an unchanged file costs a `stat` and a read of its memo,
+because digests are memoised by device, inode, size, mtime and ctime.
+Nothing is trusted on mtime alone. A manifest keeps up to eight states.
+
+On a miss the compile records the state from its own depfile. A command with
+`-MD` already writes one; a command with no dependency flags gets
+`-MD -MF <scratch> -MT <output>` added, which changes no byte of the object and
+leaves no file in the tree. The result is stored under the ordinary
+preprocessor key, so a tree with `cxx_manifest` off hits entries a tree with it
+on stored, and the reverse. A hit logs
+`cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
+`--show-stats` counts it as a hit and again under `manifest hits`.
+
+| Setting | Meaning |
+| --- | --- |
+| `true` *(default)* | Look up and record manifest states. |
+| `false` | Preprocess on every lookup. Entries are shared with `true`. |
+
+```toml
+[vcache]
+cxx_manifest = false
+```
+```console
+$ export VCACHE_CXX_MANIFEST=0
+```
+
+Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
+says why:
+
+- `-MMD`, which leaves system headers out of the depfile. kbuild's
+  `-Wp,-MMD,<file>` is the common case.
+- `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` in the environment: gcc
+  writes that file from the preprocessor, which a manifest hit does not run.
+- `__DATE__`, `__TIME__` or `__TIMESTAMP__` on the command line, or in a file
+  the depfile names: the digest stays the same while the expansion does not.
+- A file that changed after the compile started, which may not be the version
+  the compile read.
+- Under gcc, a `.gch` in a directory an `#include` could have searched that
+  the command line does not name: gcc uses it without listing it or its header
+  in the depfile.
+- Under gcc, a file outside the compiler's own include directories that uses
+  `__has_include`. gcc's depfile does not name a header that was only probed,
+  so deleting it would go unseen; clang's does.
+
+Under gcc that last rule matters in practice. A translation unit whose headers
+use `__has_include` outside the compiler's own include directories records no
+state and stays on the preprocessor; Boost's config headers are one common
+source, as is any header on `CPATH` or `C_INCLUDE_PATH`, which vcache does not
+count as the compiler's own. The compiler's own directories come from
+`<compiler> -E -v`, run without the `CPATH` family and memoised under
+`<dir>/sysinc/`, which `--trim` prunes like `filehash/` and `--clear` empties.
+clang is unaffected: its depfile lists the files `__has_include` probed.
+
+**Precompiled headers.** Neither compiler's depfile names the PCH it loaded,
+so each PCH the command names (`-include-pch F`, `-Xclang -include-pch -Xclang
+F`, or `-include H` with `H.pch` or `H.gch` beside `H`) joins the manifest key,
+identified by the first of:
+
+1. `<pch>.sum`, when it is not older than the PCH: what a build writes for
+   ccache's `pch_external_checksum`, a digest of the PCH's inputs.
+2. `<pch>.vcache-key`, under the same rule.
+3. The PCH's bytes.
+
+A side file older than the PCH describes an earlier build of it and is
+ignored.
+
+**Commands the preprocessor cannot handle.** A PCH consumer whose command
+lacks an include path the PCH's header needs compiles, but fails under `-E`,
+since `-E` expands the header's text rather than loading the PCH. Without a
+manifest that is a *preprocess failed* run. With one, the compile runs, and its
+result is stored under a key derived from the manifest key and every recorded
+file's digest, as ccache's depend mode keys every result. Only a manifest
+lookup can find that entry.
+
+**The limitation worth knowing.** It is the one `dep_scan` has, and ccache's
+direct and depend modes have. A depfile names the files a compile read, not the
+paths it probed and did not find. Create a header that shadows one earlier on
+the include path, change nothing else, and a lookup can still hit with the old
+answer. The reverse, deleting a header that `__has_include` found but the
+compile did not read, is covered for clang by its depfile and for gcc by the
+rule above, except inside the compiler's own include directories. Set
+`cxx_manifest = false` to make these cases exact.
+
 ### `rust_dep_info`
 
 A Rust lookup has to know which files the crate reads before it can compute the
@@ -987,6 +1092,11 @@ machine would share.
 the number of observations and the median and maximum of `max_rss_kb` and
 `wall_ms`, then up to ten cost keys with the largest peak and their canonical
 source path.
+
+`--show-stats` lists *manifest hits* under the two hit rows: the hits a
+manifest answered, without running the preprocessor for C and C++ or the
+dep-info run for Rust. They are part of the hit counts above them, not added
+to them.
 
 `--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
 indented under each, plus a *passthrough* row for runs that fell back to the

@@ -356,6 +356,12 @@ std::optional<int64_t> FileMtime(const std::string& path) {
          static_cast<int64_t>(mtime.tv_nsec);
 }
 
+int64_t NowUnixNs() {
+  struct timespec now {};
+  ::clock_gettime(CLOCK_REALTIME, &now);
+  return static_cast<int64_t>(now.tv_sec) * 1000000000 + static_cast<int64_t>(now.tv_nsec);
+}
+
 std::optional<std::string> RealPath(const std::string& path) {
   char buf[PATH_MAX];
   if (::realpath(path.c_str(), buf) == nullptr) return std::nullopt;

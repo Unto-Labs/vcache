@@ -236,6 +236,7 @@ void ApplyTomlFile(const std::string& path, Config* config) {
                                    "' (expected manifest or uncacheable)");
       }
     }
+    if (auto v = TomlBool(*vc, "cxx_manifest")) config->cxx_manifest = *v;
     if (auto v = TomlString(*vc, "rust_dep_info")) {
       if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
         config->warnings.push_back("vcache.rust_dep_info: unknown policy '" + *v +
@@ -407,6 +408,8 @@ void ApplyEnvironment(Config* config) {
                                  "' (expected manifest or uncacheable)");
     }
   }
+
+  config->cxx_manifest = EnvBool("VCACHE_CXX_MANIFEST", config->cxx_manifest);
 
   if (auto v = Env("VCACHE_RUST_DEP_INFO")) {
     if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
@@ -588,6 +591,7 @@ std::string DescribeConfig(const Config& config) {
   out << "dependency scans: " << DepScanPolicyName(config.dep_scan_policy) << "\n";
   out << "rust dep-info:    " << RustDepInfoPolicyName(config.rust_dep_info_policy)
       << "\n";
+  out << "c/c++ manifest:   " << (config.cxx_manifest ? "on" : "off") << "\n";
   out << "read only:        " << (config.read_only ? "yes" : "no") << "\n";
   out << "error on media failure: "
       << (config.error_on_cache_media_failure ? "yes" : "no") << "\n";

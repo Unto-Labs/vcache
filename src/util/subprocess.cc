@@ -117,6 +117,7 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
     // single-threaded, so the child's heap cannot be observed mid-mutation by
     // another thread. The alternative, building an envp by hand, would have to
     // allocate here anyway.
+    for (const std::string& name : opts.unset_env) ::unsetenv(name.c_str());
     for (const auto& [name, value] : opts.env) {
       ::setenv(name.c_str(), value.c_str(), 1);
     }

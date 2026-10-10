@@ -262,12 +262,13 @@ and RHEL) gets a dynamically linked libstdc++ instead, which adds
 
 Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
-text never mentions), and `rustc` without `--out-dir`/`--emit`. All of these
-fall through to the compiler unchanged, so a build always makes progress.
+text never mentions), a clang precompiled header built without
+`-Xclang -fno-pch-timestamp`, and `rustc` without `--out-dir`/`--emit`. All of
+these fall through to the compiler unchanged, so a build always makes progress.
 `vcache --show-stats` counts them as *uncacheable*, broken down by the rule that
 declined each.
 
-Two things that look like they belong on that list but are cached:
+Three things that look like they belong on that list but are cached:
 
 - **`-march=native`.** The flag means something different on every machine, so
   vcache asks the compiler which target it resolved to and puts *that* in the
@@ -276,6 +277,11 @@ Two things that look like they belong on that list but are cached:
   more than the run being cached, so they are keyed on the command line and
   verified against a manifest of the files they read — see
   [`dep_scan`](docs/configuration.md#dep_scan).
+- **Precompiled header builds.** A PCH records the absolute path of every
+  header it read and loads nowhere else, so its key holds the directory and the
+  command line as typed: a rebuild of the same tree hits, another checkout does
+  not. vcache writes `<pch>.vcache-key` beside it — see
+  [the design notes](docs/design.md#known-limitations).
 
 ## How it works
 

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/cost.h"
+#include "hash/file_memo.h"
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -24,6 +25,7 @@ constexpr int kShardCount = 256;
 // No compile runs this long, so a scratch directory this old whose owner the sweep
 // cannot check was left by a killed one.
 constexpr int64_t kStaleScratchSeconds = 6 * 3600;
+constexpr int64_t kFileDigestMemoMaxAgeSeconds = 30 * 24 * 3600;
 
 // Evict down to this fraction of the budget so a shard that is exactly at the
 // limit does not trigger a scan on every single store.
@@ -190,9 +192,13 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
 
 void DiskStorage::Trim() {
   if (read_only_) return;
-  // Cost files are not cache entries. Put()'s TrimGlobal does not come here,
-  // so a store does not pay for walking costs/.
+  // Cost files and file digest memos are not cache entries. Put()'s TrimGlobal
+  // does not come here, so a store does not pay for walking costs/ or filehash/.
   core::PruneStaleCostFiles(dir_);
+  const size_t stale_memos = hash::PruneFileDigestMemos(dir_, kFileDigestMemoMaxAgeSeconds);
+  if (stale_memos > 0) {
+    VCACHE_LOG("disk: removed " + std::to_string(stale_memos) + " stale file digest memos");
+  }
   const size_t stale_scratch = util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
   if (stale_scratch > 0) {
     VCACHE_LOG("disk: removed " + std::to_string(stale_scratch) + " stale scratch directories");

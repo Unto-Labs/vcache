@@ -57,6 +57,7 @@
 #include "daemon/protocol.h"
 #include "daemon/client.h"
 #include "daemon/server.h"
+#include "hash/file_memo.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "rust/rust_compile.h"
@@ -5092,6 +5093,73 @@ void TestRustcFingerprint() {
           "two rustc files with one banner share a fingerprint");
 }
 
+void TestFileDigestMemo() {
+  Section("hash::file digest memo");
+
+  auto scratch = util::MakeTempDir("vcache-filehash-memo-");
+  Check(scratch.has_value(), "file digest memo scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string memo_dir = hash::FileDigestMemoDir(*scratch);
+  auto memo_files = [&memo_dir]() { return util::ListFilesRecursive(memo_dir); };
+  auto overwrite_memos = [&memo_files](const std::string& text) {
+    for (const util::FileEntry& memo : memo_files()) util::WriteFileAtomic(memo.path, text);
+  };
+  // Every file below was written moments ago; this clock treats it as settled.
+  auto settled_now_ns = []() {
+    struct timespec now {};
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    return (static_cast<int64_t>(now.tv_sec) + 60) * 1'000'000'000;
+  };
+
+  const std::string rlib = *scratch + "/libdep.rlib";
+  util::WriteFileAtomic(rlib, std::string(3 << 20, 'r') + "tail");
+  const std::string real_digest = hash::HashFile(rlib).value_or("");
+
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a memoised digest equals HashFile");
+  Check(memo_files().size() == 1, "a settled file gets one memo");
+
+  const std::string planted(hash::kDigestHexLen, 'a');
+  overwrite_memos(planted);
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""), planted,
+          "the second lookup answers from the memo");
+
+  Age(rlib, 100);
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a file with a new mtime is hashed again");
+
+  overwrite_memos("short");
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a memo of the wrong length is ignored");
+
+  const std::string fresh_memo_dir = *scratch + "/fresh-filehash";
+  CheckEq(hash::HashFileMemoized(rlib, fresh_memo_dir).value_or(""), real_digest,
+          "a file changed within the last 2 s still gets its real digest");
+  Check(util::ListFilesRecursive(fresh_memo_dir).empty(),
+        "a file changed within the last 2 s gets no memo");
+
+  Check(!hash::HashFileMemoized(*scratch + "/absent.rlib", memo_dir).has_value(),
+        "a missing file has no digest");
+
+  // Trim drops memos untouched for 30 days and keeps younger ones.
+  const std::string cache = *scratch + "/cache";
+  const std::string stale_memo = hash::FileDigestMemoDir(cache) + "/stale";
+  const std::string young_memo = hash::FileDigestMemoDir(cache) + "/young";
+  util::WriteFileAtomic(stale_memo, planted);
+  util::WriteFileAtomic(young_memo, planted);
+  Age(stale_memo, 31 * 24 * 3600);
+  Age(young_memo, 29 * 24 * 3600);
+  storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/false);
+  disk.Trim();
+  Check(!util::FileExists(stale_memo), "trim removes a memo older than 30 days");
+  Check(util::FileExists(young_memo), "trim keeps a memo younger than 30 days");
+}
+
 void TestRustOutputNames() {
   Section("rust::output names");
 
@@ -5902,6 +5970,7 @@ int main(int argc, char** argv) {
   TestCost();
   TestMemoryEstimates();
   TestRustcFingerprint();
+  TestFileDigestMemo();
   TestRustOutputNames();
   TestUploadGeneration();
   TestHeldHitLayer();

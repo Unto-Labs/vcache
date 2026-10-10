@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "core/cost.h"
+#include "hash/hasher.h"
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -86,6 +88,12 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
     return false;
   }
 
+  CheckShardGrowth(shard, value.size(), /*sweep_scratch=*/true);
+  return true;
+}
+
+void DiskStorage::CheckShardGrowth(const std::string& shard, uint64_t added_bytes,
+                                   bool sweep_scratch) {
   // Only this shard can have grown, and walking it is cheap.  What it has to
   // decide is when to pay for the global walk, which is not cheap: measured on
   // a 30k-entry cache with a warm dentry cache, one shard costs ~0.3ms and the
@@ -112,12 +120,84 @@ bool DiskStorage::Put(const std::string& key, const std::string& value) {
   // walk that was not due.  That costs time and never correctness, and a
   // rewrite means the same key hashed to the same content, which is rare.
   const uint64_t before =
-      shard_size >= value.size() ? shard_size - value.size() : 0;
+      shard_size >= added_bytes ? shard_size - added_bytes : 0;
   if (shard_size / shard_budget != before / shard_budget) {
-    util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
+    // PutFile runs before its compile has placed the outputs, while the stage
+    // dir holds the only copy, so it must not sweep. The entry's Put runs last.
+    if (sweep_scratch) util::RemoveStaleScratchDirs(dir_, kStaleScratchSeconds);
     TrimGlobal(max_size_, static_cast<uint64_t>(max_size_ * kTrimTargetFraction));
   }
-  return true;
+}
+
+std::string DiskStorage::PathForFile(const std::string& digest,
+                                     const std::string& suffix) const {
+  return ShardDir(digest) + "/" + digest + "." + suffix;
+}
+
+namespace {
+
+bool IsHexDigest(const std::string& digest) {
+  return digest.size() == hash::kDigestHexLen &&
+         std::all_of(digest.begin(), digest.end(), [](unsigned char c) {
+           return std::isdigit(c) != 0 || (c >= 'a' && c <= 'f');
+         });
+}
+
+}  // namespace
+
+DiskStorage::PutFileStatus DiskStorage::PutFile(const std::string& digest,
+                                                const std::string& suffix,
+                                                const std::string& source_path) {
+  ClearError();
+  if (read_only_) return PutFileStatus::kReadOnly;
+  if (!IsHexDigest(digest)) {
+    SetError("store file: '" + digest + "' is not a digest");
+    return PutFileStatus::kFailed;
+  }
+  struct stat source_st {};
+  if (::stat(source_path.c_str(), &source_st) != 0) {
+    if (errno == ENOENT) return PutFileStatus::kSourceMissing;
+    SetError("stat " + source_path + ": " + std::strerror(errno));
+    return PutFileStatus::kFailed;
+  }
+  const std::string shard = ShardDir(digest);
+  if (!util::MakeDirs(shard)) {
+    SetError("create shard directory " + shard + ": " + std::strerror(errno));
+    return PutFileStatus::kFailed;
+  }
+  const std::string path = PathForFile(digest, suffix);
+  const bool replacing = util::FileExists(path);
+  if (!util::CloneFile(source_path, path)) {
+    const int clone_errno = errno;
+    if (!util::FileExists(source_path)) return PutFileStatus::kSourceMissing;
+    SetError("clone " + source_path + " to " + path + ": " + std::strerror(clone_errno));
+    VCACHE_LOG("disk: " + last_error());
+    return PutFileStatus::kFailed;
+  }
+  // A rewrite did not grow the shard. Counting it would subtract the file's
+  // own size, and one at or above the shard budget would cross every time.
+  if (!replacing) {
+    CheckShardGrowth(shard, static_cast<uint64_t>(source_st.st_size), /*sweep_scratch=*/false);
+  }
+  return PutFileStatus::kStored;
+}
+
+std::optional<std::string> DiskStorage::GetFile(const std::string& digest,
+                                                const std::string& suffix) {
+  ClearError();
+  if (!IsHexDigest(digest)) return std::nullopt;
+  const std::string path = PathForFile(digest, suffix);
+  if (::utimensat(AT_FDCWD, path.c_str(), nullptr, 0) == 0) return path;
+  if (errno == ENOENT) return std::nullopt;
+  // A physically read-only store still serves; only the LRU hint is lost.
+  VCACHE_LOG("disk: could not refresh " + path + ": " + std::strerror(errno));
+  if (!util::FileExists(path)) return std::nullopt;
+  return path;
+}
+
+void DiskStorage::RemoveFile(const std::string& digest, const std::string& suffix) {
+  if (read_only_ || !IsHexDigest(digest)) return;
+  util::RemoveFile(PathForFile(digest, suffix));
 }
 
 // The walk is what costs -- ListFilesRecursive() stats every entry -- so the

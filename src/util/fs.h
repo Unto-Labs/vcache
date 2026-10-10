@@ -59,6 +59,12 @@ bool LinkOrCopy(const std::string& from, const std::string& to);
 // half-written file.
 bool CloneFile(const std::string& from, const std::string& to);
 
+// CloneFile without the rename: returns the exclusive temporary beside
+// `beside` that holds the copy, for a caller that must check it before
+// publishing it and then renames or removes it. nullopt, with errno set, if
+// the copy could not be made.
+std::optional<std::string> CloneToTempBeside(const std::string& from, const std::string& beside);
+
 std::optional<uint64_t> FileSize(const std::string& path);
 
 // Modification time in nanoseconds since the epoch, or nullopt if the file

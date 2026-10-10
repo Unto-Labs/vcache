@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "storage/storage.h"
@@ -44,9 +45,34 @@ class DiskStorage : public Storage {
   // True when the daemon's upload journal still names the entry at this path.
   bool IsPendingUpload(const std::string& entry_path) const;
 
+  // Content-addressed files beside the entries, for outputs too large to carry
+  // inside one: <dir>/<digest[0:2]>/<digest>.<suffix>. They live in the shards
+  // so that Trim, Clear and TotalSize count and evict them like entries, by
+  // their own mtime. They are not fsynced: a lost one fails its hit's hash.
+  enum class PutFileStatus { kStored, kReadOnly, kSourceMissing, kFailed };
+
+  // Clones `source_path` into the store under `digest`. An existing file is
+  // cloned over, which replaces one a crash tore. kFailed sets last_error().
+  PutFileStatus PutFile(const std::string& digest, const std::string& suffix,
+                        const std::string& source_path);
+
+  // The stored file's path, or nullopt when there is none. Its mtime is
+  // refreshed first, so a trim that starts while the caller hashes it sees a
+  // fresh file.
+  std::optional<std::string> GetFile(const std::string& digest, const std::string& suffix);
+
+  // Removes a stored file that failed verification, so failed hits cannot
+  // keep a torn file fresh until a store replaces it.
+  void RemoveFile(const std::string& digest, const std::string& suffix);
+
  private:
   std::string PathForKey(const std::string& key) const;
   std::string ShardDir(const std::string& key) const;
+  std::string PathForFile(const std::string& digest, const std::string& suffix) const;
+
+  // Runs the eviction check when `added_bytes` moved `shard` across a multiple
+  // of its share of the budget. See Put() for why it is an event.
+  void CheckShardGrowth(const std::string& shard, uint64_t added_bytes, bool sweep_scratch);
 
   // If the cache holds more than `high_water` bytes, evicts globally
   // least-recently-used entries until it is back under `target_bytes`.  One

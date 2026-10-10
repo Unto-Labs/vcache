@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "storage/chain.h"
 
+#include <algorithm>
+#include <cctype>
 #include <string_view>
 
 #include "hash/hasher.h"
@@ -63,6 +65,14 @@ std::string SerializeBlob(const Blob& blob) {
     payload.push_back(file.executable ? kFileFlagExecutable : 0);
     payload.append(file.contents);
     AppendSection(&body, SectionKind::kFile, payload);
+  }
+  for (const BlobSidecarFile& file : blob.sidecar_files) {
+    std::string payload;
+    AppendU64(&payload, file.name.size());
+    payload.append(file.name);
+    payload.push_back(file.executable ? kFileFlagExecutable : 0);
+    payload.append(file.digest);
+    AppendSection(&body, SectionKind::kSidecarFile, payload);
   }
 
   // A checksum over the body catches truncated uploads and bit rot; a corrupt
@@ -141,6 +151,24 @@ bool DeserializeBlob(const std::string& data, Blob* blob) {
         const size_t contents_at = fpos + static_cast<size_t>(name_len) + 1;
         file.contents.assign(payload.data() + contents_at, payload.size() - contents_at);
         blob->files.push_back(std::move(file));
+        break;
+      }
+      case SectionKind::kSidecarFile: {
+        size_t fpos = 0;
+        uint64_t name_len = 0;
+        if (!ReadU64(payload, &fpos, &name_len)) return false;
+        if (fpos + name_len + 1 + hash::kDigestHexLen != payload.size()) return false;
+        BlobSidecarFile file;
+        file.name.assign(payload.data() + fpos, static_cast<size_t>(name_len));
+        const auto flags = static_cast<unsigned char>(payload[fpos + name_len]);
+        file.executable = (flags & kFileFlagExecutable) != 0;
+        file.digest.assign(payload.substr(fpos + static_cast<size_t>(name_len) + 1));
+        if (!std::all_of(file.digest.begin(), file.digest.end(), [](unsigned char c) {
+              return std::isdigit(c) != 0 || (c >= 'a' && c <= 'f');
+            })) {
+          return false;
+        }
+        blob->sidecar_files.push_back(std::move(file));
         break;
       }
       default:

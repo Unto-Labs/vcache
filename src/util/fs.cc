@@ -270,18 +270,29 @@ bool LinkOrCopy(const std::string& from, const std::string& to) {
   return WriteFileAtomic(to, *data);
 }
 
-bool CloneFile(const std::string& from, const std::string& to) {
+std::optional<std::string> CloneToTempBeside(const std::string& from, const std::string& beside) {
   const int src = ::open(from.c_str(), O_RDONLY | O_CLOEXEC);
-  if (src < 0) return false;
+  if (src < 0) return std::nullopt;
 
   struct stat st;
-  if (::fstat(src, &st) != 0) { ::close(src); return false; }
+  if (::fstat(src, &st) != 0) {
+    const int saved_errno = errno;
+    ::close(src);
+    errno = saved_errno;
+    return std::nullopt;
+  }
 
   std::string tmp;
-  const int dst = CreateTempBeside(to, &tmp);
-  if (dst < 0) { ::close(src); return false; }
+  const int dst = CreateTempBeside(beside, &tmp);
+  if (dst < 0) {
+    const int saved_errno = errno;
+    ::close(src);
+    errno = saved_errno;
+    return std::nullopt;
+  }
 
   bool ok = false;
+  int saved_errno = 0;
 #ifdef FICLONE
   // Whole-file reflink. Instant and space-free where the filesystem supports
   // it, and the result is an independent inode. APFS has the same trick behind
@@ -318,22 +329,50 @@ bool CloneFile(const std::string& from, const std::string& to) {
       for (;;) {
         const ssize_t r = ::read(src, buf.data(), buf.size());
         if (r == 0) break;
-        if (r < 0) { if (errno == EINTR) continue; ok = false; break; }
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          saved_errno = errno;
+          ok = false;
+          break;
+        }
         ssize_t written = 0;
         while (written < r) {
           const ssize_t w = ::write(dst, buf.data() + written, r - written);
-          if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+          if (w < 0) {
+            if (errno == EINTR) continue;
+            saved_errno = errno;
+            ok = false;
+            break;
+          }
           written += w;
         }
         if (!ok) break;
       }
+    } else {
+      saved_errno = errno;
     }
   }
 
-  if (::close(dst) != 0) ok = false;
+  if (::close(dst) != 0 && ok) {
+    saved_errno = errno;
+    ok = false;
+  }
   ::close(src);
-  if (!ok || ::rename(tmp.c_str(), to.c_str()) != 0) {
+  if (!ok) {
     ::unlink(tmp.c_str());
+    errno = saved_errno;
+    return std::nullopt;
+  }
+  return tmp;
+}
+
+bool CloneFile(const std::string& from, const std::string& to) {
+  const auto tmp = CloneToTempBeside(from, to);
+  if (!tmp) return false;
+  if (::rename(tmp->c_str(), to.c_str()) != 0) {
+    const int saved_errno = errno;
+    ::unlink(tmp->c_str());
+    errno = saved_errno;
     return false;
   }
   return true;

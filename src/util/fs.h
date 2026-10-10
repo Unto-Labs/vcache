@@ -46,8 +46,9 @@ bool LinkOrCopy(const std::string& from, const std::string& to);
 // linker may later truncate in place, and sharing an inode would corrupt the
 // cached copy along with it.
 //
-// The write goes to a temporary beside `to` and is renamed into place, so a
-// reader never observes a half-written file.
+// The write goes to an exclusive temporary beside `to`, creating its directory
+// if needed, and is renamed into place, so a reader never observes a
+// half-written file.
 bool CloneFile(const std::string& from, const std::string& to);
 
 std::optional<uint64_t> FileSize(const std::string& path);

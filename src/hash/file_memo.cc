@@ -59,19 +59,13 @@ std::string MemoKey(const FileIdentity& id) {
   return key.Hex();
 }
 
-int64_t NowUnixNs() {
-  struct timespec now {};
-  ::clock_gettime(CLOCK_REALTIME, &now);
-  return ToNs(now);
-}
-
 }  // namespace
 
 std::string FileDigestMemoDir(const std::string& cache_dir) { return cache_dir + "/filehash"; }
 
 std::optional<std::string> HashFileMemoized(const std::string& path,
                                             const std::string& memo_dir) {
-  return HashFileMemoizedAt(path, memo_dir, NowUnixNs());
+  return HashFileMemoizedAt(path, memo_dir, util::NowUnixNs());
 }
 
 std::optional<std::string> HashFileMemoizedAt(const std::string& path,

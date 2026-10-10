@@ -897,15 +897,17 @@ preprocessor, and 6 ms and 9 ms through the manifest. With
 ccache's depend mode.
 
 The manifest key covers what is known before the preprocessor runs: the
-compiler and the resolved native target, the roots, the working directory and
-the source's canonical path, the source's contents, the whole command line
-except the output and depfile paths (`-I`, `-D` and `-include` included, all
-canonicalised), the files named by keyed flags, `hash_env_vars`, `CPATH` and
-its siblings, and each precompiled header the command names (below). A state
-lists every file the depfile of an earlier compile named, with its digest, and
-the key that compile was stored under. A lookup re-hashes the files of each
-state and serves the first that matches in full; an unchanged file costs one
-`stat`, because digests are memoised by device, inode, size, mtime and ctime.
+compiler and the resolved native target, the roots, the working directory, the
+source's canonical path and its spelling on the command line, the source's
+contents, the whole command line except the output and depfile paths (`-I`,
+`-D` and `-include` included; the paths in include-path flags are
+canonicalised, while `-D` values and `-B` are kept as written), the files named
+by keyed flags, `hash_env_vars`, `CPATH` and its siblings, and each precompiled
+header the command names (below). A state lists every file the depfile of an
+earlier compile named, with its digest, and the key that compile was stored
+under. A lookup re-hashes the files of each state and serves the first that
+matches in full; an unchanged file costs a `stat` and a read of its memo,
+because digests are memoised by device, inode, size, mtime and ctime.
 Nothing is trusted on mtime alone. A manifest keeps up to eight states.
 
 On a miss the compile records the state from its own depfile. A command with
@@ -935,13 +937,18 @@ says why:
 
 - `-MMD`, which leaves system headers out of the depfile. kbuild's
   `-Wp,-MMD,<file>` is the common case.
-- A file the depfile names that uses `__DATE__`, `__TIME__` or
-  `__TIMESTAMP__`: its digest stays the same while its expansion does not.
+- `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` in the environment: gcc
+  writes that file from the preprocessor, which a manifest hit does not run.
+- `__DATE__`, `__TIME__` or `__TIMESTAMP__` on the command line, or in a file
+  the depfile names: the digest stays the same while the expansion does not.
 - A file that changed after the compile started, which may not be the version
   the compile read.
 - Under gcc, a `.gch` in a directory an `#include` could have searched that
   the command line does not name: gcc uses it without listing it or its header
   in the depfile.
+- Under gcc, a file outside the compiler's own include directories that uses
+  `__has_include`. gcc's depfile does not name a header that was only probed,
+  so deleting it would go unseen; clang's does.
 
 **Precompiled headers.** Neither compiler's depfile names the PCH it loaded,
 so each PCH the command names (`-include-pch F`, `-Xclang -include-pch -Xclang
@@ -968,7 +975,10 @@ lookup can find that entry.
 direct and depend modes have. A depfile names the files a compile read, not the
 paths it probed and did not find. Create a header that shadows one earlier on
 the include path, change nothing else, and a lookup can still hit with the old
-answer. Set `cxx_manifest = false` to make that case exact.
+answer. The reverse, deleting a header that `__has_include` found but the
+compile did not read, is covered for clang by its depfile and for gcc by the
+rule above, except inside the compiler's own include directories. Set
+`cxx_manifest = false` to make these cases exact.
 
 ### `rust_dep_info`
 

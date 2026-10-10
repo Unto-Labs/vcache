@@ -101,17 +101,22 @@ runs the preprocessor, and that is most of what a hit costs. A compile first
 looks up a manifest instead (`cxx_manifest`, on by default). Its key is built
 from what is known before the preprocessor runs:
 
-- its own key-format version
+- its own key-format version, and the preprocessor key's, since states name
+  preprocessor keys and a bump of that version must not be bypassed through an
+  older manifest
 - compiler identity and the resolved native target
 - the sorted set of canonical root targets
 - the canonical working directory, since relative `-I` paths and relative
-  sources resolve against it, and the source's canonical path, since quoted
-  includes resolve beside it
+  sources resolve against it; the source's canonical absolute path, since
+  quoted includes resolve beside it; and the source as typed, canonicalised,
+  since `__FILE__` and the debug info name it as the command line spelled it
 - the source's contents
 - the command line minus the source, `-o` and the depfile path, with `-I`,
-  `-D`, `-include` and friends kept, and the paths in them (joined ones such as
-  `-I/abs/dir` too) canonicalised; `-c` and `-S` are told apart. A `-D` value
-  is kept as written, path or not: it reaches the object as written
+  `-D`, `-include` and friends kept, and the paths in include-path flags
+  (joined ones such as `-I/abs/dir` too) canonicalised; `-c` and `-S` are told
+  apart. A `-D` value is kept as written, path or not: it reaches the object as
+  written. So is `-B`: the `cc1`, `as` and specs it selects appear in no
+  depfile
 - the files named by keyed flags (sanitizer lists, profiles), by content
 - `hash_env_vars`, and `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
   `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`, which add include
@@ -121,7 +126,8 @@ from what is known before the preprocessor runs:
 A state lists every file the depfile of an earlier compile of that key named,
 with its digest, and the result key that compile stored under. A lookup takes
 the first state whose files all still hash the same, through the file-identity
-memo, so an unchanged header costs a `stat`. A state that matches but whose
+memo, so an unchanged header costs a `stat` and a read of its memo. A state
+that matches but whose
 entry is gone, or whose entry lacks the depfile this compile asked for, falls
 through to the preprocessor; the preprocessor usually computes the same key,
 which is then not asked for again.
@@ -132,7 +138,10 @@ flags gets `-MD -MF <scratch> -MT <output>` added; `-MD` writes the dependency
 list beside the object and changes nothing in it, which a test checks against
 the compiler run directly, and the scratch file is never stored, so the entry
 looks like one from an ordinary compile. `-MMD` omits system headers, so a
-command with it keeps to the preprocessor.
+command with it keeps to the preprocessor. So does a compile with
+`DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` set: gcc writes that dependency
+file from the preprocessor, which a manifest hit never runs, and ignores the
+variable once `-MD` is on the command line.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -151,7 +160,8 @@ still counted that way.
 `.pch`, and gcc's lists neither the `.gch` nor its header, so a PCH joins the
 manifest key from the command line: `-include-pch F`, `-Xclang -include-pch
 -Xclang F`, and `-include H` with `H.pch` or `H.gch` beside `H` in the working
-directory or any directory on the include path. It is identified, in order of
+directory or any directory on the include path (the `CPATH` family's
+included). It is identified, in order of
 preference, by `<pch>.sum` (what a build writes for ccache's
 `pch_external_checksum`: a digest of the PCH's inputs, stable where clang's
 PCH bytes are not), by `<pch>.vcache-key` (written by vcache beside a PCH it
@@ -163,13 +173,20 @@ state is not recorded while any directory an `#include` could search holds a
 
 **What declines a state.** A file the depfile names that cannot be read, that
 was modified or had its inode changed at or after the moment the compile
-started (it may not be the version the compile read), or whose bytes contain
+started (it may not be the version the compile read; each file is read before
+it is stat'ed, so an edit between the two still shows), or whose bytes contain
 `__DATE__`, `__TIME__` or `__TIMESTAMP__`: the digest stays the same while the
 expansion changes, which only the preprocessor key would see. A file that later
 gains such a token changes its digest, so the state is checked again when it is
-next written. For a derived key, `.incbin` declines it as well, since no
-preprocessed text was checked for it. A declined state leaves the entry stored
-under the preprocessor key as usual.
+next written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
+compile off the manifest altogether. A depfile that does not name the source
+declines the state, since a state with nothing to check would always match.
+Under gcc, a file outside the compiler's own include directories (as
+`<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`) whose bytes use
+`__has_include` declines it too: clang's depfile names a header that was only
+probed, gcc's does not. For a derived key, `.incbin` declines it as well, since
+no preprocessed text was checked for it. A declined state leaves the entry
+stored under the preprocessor key as usual.
 
 **The shadowing hole.** A depfile names the files a compile read, not the paths
 the preprocessor probed and did not find. A new header that would be found
@@ -178,6 +195,15 @@ so a lookup can still hit with the old answer until something recorded
 changes. ccache's direct and depend modes have the same hole and document it,
 as does `dep_scan` here. `vcache-fstrace.so` already records absent paths (`M`
 lines) for the link cache; recording them for compiles would close it.
+
+**The deleted-file case.** The other side of the same gap: a header that
+`__has_include` (or `__has_include_next`) found, but that the compile did not
+then include, decides an `#if` without being read. clang lists it in the
+depfile, so deleting it changes a recorded file and misses. gcc does not, so
+deleting it would still hit with the object built while it existed; the
+`__has_include` rule above declines such states under gcc. A system header
+that probes is exempt, on the assumption that the compiler's own include
+directories change only with the toolchain or the distribution.
 
 ## Compiler identity
 
@@ -390,8 +416,9 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   keyed like any compile, from the header preprocessed with `-dD`: the PCH
   hands its macro definitions to every compile that loads it, and plain `-E`
   drops them. Its key, and its manifest key, hold the working directory and
-  the command line exactly as typed, not canonicalised. A PCH records the absolute path of
-  every input, even one named relatively, and clang 22 refuses to load it once
+  the command line exactly as typed, not canonicalised. A PCH records the
+  absolute path of every input, even one named relatively, and clang 22 refuses
+  to load it once
   one is missing ("could not find file ... referenced by AST file"); with
   `-fno-pch-timestamp` it checks only their sizes. So a rebuild of the same
   tree hits, and so do containers that mount every worktree at one path, but

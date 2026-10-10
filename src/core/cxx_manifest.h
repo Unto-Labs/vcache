@@ -47,9 +47,23 @@ bool ParseCxxManifest(const std::string& text, std::vector<CxxManifestState>* st
 std::vector<std::string> CxxManifestKeyArgs(const args::CompilerArgs& parsed,
                                             const RootMap& roots, bool keep_link_args);
 
+// `path` made absolute against `cwd`, spelled otherwise as given: no `.` or
+// `..` is resolved, since that could cross a symlink the compiler followed.
+std::string CxxAbsolutePath(const std::string& cwd, const std::string& path);
+
 // Every directory the command line puts on the include path (-iquote, -I,
-// -isystem, -idirafter, separate or joined), absolute against `cwd`.
-std::vector<std::string> IncludeDirs(const args::CompilerArgs& parsed, const std::string& cwd);
+// -isystem, -idirafter, separate or joined), then those CPATH, C_INCLUDE_PATH,
+// CPLUS_INCLUDE_PATH, OBJC_INCLUDE_PATH and OBJCPLUS_INCLUDE_PATH add, absolute
+// against `cwd`.
+std::vector<std::string> CxxIncludeDirs(const args::CompilerArgs& parsed,
+                                        const std::string& cwd);
+
+// The environment variables the preprocessor reads extra include directories
+// from.
+inline constexpr const char* kIncludePathEnvVars[] = {
+    "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+    "OBJCPLUS_INCLUDE_PATH",
+};
 
 struct ConsumedPchs {
   // Absolute, in command-line order, without duplicates.
@@ -85,6 +99,9 @@ std::optional<std::string_view> FindTimeMacro(std::string_view text);
 
 struct RecordedInputs {
   std::vector<ManifestFile> files;
+  // Local paths of the files whose bytes use __has_include or
+  // __has_include_next, when the caller asked for them.
+  std::vector<std::string> probing_files;
   // Set when the state must not be recorded, saying why.
   std::string declined;
 };
@@ -93,9 +110,18 @@ struct RecordedInputs {
 // returns each one's canonical path and digest. Declines when a file cannot be
 // read, uses a time macro, was modified at or after `started_ns` (it may not be
 // the version the compile read), or, with `scan_incbin`, contains `.incbin`.
+// With `find_probes`, also lists the files that use __has_include.
 RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
                                    const RootMap& roots, int64_t started_ns,
-                                   bool scan_incbin);
+                                   bool scan_incbin, bool find_probes = false);
+
+// The directories a compiler searches for <...> includes with no -I given, as
+// `<compiler> -E -v` lists them, lexically normalised. Empty when the list
+// cannot be read.
+std::vector<std::string> ParseSystemIncludeDirs(const std::string& verbose_stderr);
+
+// True when `path`, lexically normalised, lies inside one of `dirs`.
+bool UnderAnyDir(const std::string& path, const std::vector<std::string>& dirs);
 
 // A .gch in any of `dirs` other than those in `keyed`, or nullopt. gcc uses a
 // .gch beside a header an #include names without listing either in the

@@ -3947,6 +3947,7 @@ mf_tree "$WORK/mf-a"
 l=$(mf_log 1); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
 check "the first compile misses" "$(misses)" "1"
 check "and records a manifest state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+rm -f "$WORK/mf-a/top.d"
 l=$(mf_log 2); mf_compile "$WORK/mf-a" "$l" -MD -MF top.d
 check "an unchanged compile hits" "$(hits)" "1"
 check "through the manifest" "$(manifest_hits)" "1"
@@ -4138,6 +4139,171 @@ if command -v python3 >/dev/null 2>&1; then
   check "and the daemon served its lookups" \
     "$("$VCACHE" --daemon-status 2>/dev/null | awk '/^lookups/ {print ($NF >= 5)}')" "1"
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+fi
+
+# The source as typed is in the key: a relative and an absolute spelling of
+# one file in one directory preprocess to different text, since __FILE__ and
+# the debug info name the source as the command line spelled it.
+reset_cache
+mkdir -p "$WORK/mf-spell/src"
+printf 'const char* where(void) { return __FILE__; }\n' > "$WORK/mf-spell/src/f.c"
+( cd "$WORK/mf-spell" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c src/f.c -o rel.o ) 2>/dev/null
+( cd "$WORK/mf-spell" && VCACHE_MAP_CWD=0 \
+    "$VCACHE" gcc -O2 -c "$WORK/mf-spell/src/f.c" -o abs.o ) 2>/dev/null
+check "an absolute spelling of a relative source is not a manifest hit" "$(manifest_hits)" "0"
+check "and its object names the source as typed" \
+  "$(strings "$WORK/mf-spell/abs.o" | grep -c "^$WORK/mf-spell/src/f.c$")" "1"
+
+# A time macro on the command line expands differently on every run while
+# nothing the manifest hashes changes.
+reset_cache
+printf 'const char* stamp(void) { return STAMP; }\n' > "$WORK/mf-time/cl.c"
+l=$(mf_log time-cl-1)
+( cd "$WORK/mf-time" && VCACHE_LOG="$l" \
+    "$VCACHE" gcc -O2 -DSTAMP=__TIME__ -c cl.c -o cl.o ) 2>/dev/null
+check "a time macro on the command line keeps to the preprocessor" \
+  "$(grep -c 'cxx manifest: the command line uses __TIME__' "$l")" "1"
+( cd "$WORK/mf-time" && "$VCACHE" gcc -O2 -DSTAMP=__TIME__ -c cl.c -o cl.o ) 2>/dev/null
+check "so the next compile is not a manifest hit" "$(manifest_hits)" "0"
+
+# A depfile names the files a compile read. gcc's leaves out a header that only
+# __has_include probed, so deleting it would not change any recorded digest.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  hp="$WORK/mf-hasinc"
+  mkdir -p "$hp"
+  printf '#pragma once\n' > "$hp/opt.h"
+  printf '#if __has_include("opt.h")\nint have_opt = 1;\n#else\nint have_opt = 0;\n#endif\n' \
+    > "$hp/main.c"
+  l=$(mf_log hasinc1)
+  ( cd "$hp" && VCACHE_MAP_CWD=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  check "gcc: a file probing with __has_include records no manifest state" \
+    "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
+  mv "$hp/opt.h" "$hp/opt.h.away"
+  ( cd "$hp" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  ( cd "$hp" && gcc -O2 -c main.c -o plain.o ) 2>/dev/null
+  check "gcc: so the object follows the probed header's removal" \
+    "$(cmp -s "$hp/m.o" "$hp/plain.o" && echo same)" "same"
+  # The compiler's own headers use it too (libstdc++'s <cstdint> does), and do
+  # not decline the state.
+  printf '#include <cstdint>\nstd::uint32_t width() { return 32; }\n' > "$hp/sys.cc"
+  ( cd "$hp" && "$VCACHE" g++ -O2 -c sys.cc -o sys.o ) 2>/dev/null
+  l=$(mf_log hasinc2)
+  ( cd "$hp" && VCACHE_LOG="$l" "$VCACHE" g++ -O2 -c sys.cc -o sys.o ) 2>/dev/null
+  check "gcc: a system header probing with __has_include still hits through the manifest" \
+    "$(grep -c 'preprocessor skipped' "$l")" "1"
+else
+  skipped "__has_include: gcc is not installed, or is clang"
+fi
+
+# gcc writes a dependency file named by DEPENDENCIES_OUTPUT during the -E run
+# and ignores the variable once -MD is on the command line.
+reset_cache
+mf_tree "$WORK/mf-depenv"
+rm -f "$WORK/mf-depenv/env.d"
+DEPENDENCIES_OUTPUT="$WORK/mf-depenv/env.d" mf_compile "$WORK/mf-depenv" "$(mf_log depenv1)"
+rm -f "$WORK/mf-depenv/env.d"
+l=$(mf_log depenv2)
+DEPENDENCIES_OUTPUT="$WORK/mf-depenv/env.d" mf_compile "$WORK/mf-depenv" "$l"
+check "DEPENDENCIES_OUTPUT keeps to the preprocessor" \
+  "$(grep -c 'cxx manifest: DEPENDENCIES_OUTPUT is set' "$l")" "1"
+check "and its dependency file is still written" \
+  "$([[ -s "$WORK/mf-depenv/env.d" ]] && echo written || echo missing)" "written"
+
+# Read-only: a hit is served from a manifest, and a miss writes none.
+reset_cache
+mf_tree "$WORK/mf-ro"
+l=$(mf_log ro1)
+VCACHE_READONLY=1 mf_compile "$WORK/mf-ro" "$l" -MD -MF top.d
+check "read-only: a miss stores no manifest" "$(disk_entries)" "0"
+mf_compile "$WORK/mf-ro" "$(mf_log ro2)" -MD -MF top.d
+l=$(mf_log ro3)
+VCACHE_READONLY=1 mf_compile "$WORK/mf-ro" "$l" -MD -MF top.d
+check "read-only: a hit is served through the manifest" \
+  "$(grep -c 'preprocessor skipped' "$l")" "1"
+
+# A manifest goes through the S3 layer like any entry: stored there, and served
+# from there once the local layer is gone.
+if command -v python3 >/dev/null 2>&1; then
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/mf-s3"
+  stop_s3
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  mf_s3() {  # $1 log
+    AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
+      VCACHE_S3_BUCKET=testbucket VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT" \
+      VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
+      mf_compile "$WORK/mf-a" "$1" -MD -MF top.d
+  }
+  reset_cache
+  mf_s3 "$(mf_log s3-1)"
+  check "S3: the miss uploads the entry and its manifest" \
+    "$(find "$S3DIR" -type f | wc -l | tr -d ' ')" "2"
+  reset_cache
+  l=$(mf_log s3-2); mf_s3 "$l"
+  check "S3: a manifest hit is served from the bucket" \
+    "$(grep -c 'cxx manifest hit on s3: .*preprocessor skipped' "$l")" "1"
+  stop_s3
+  check_mocks_gone
+else
+  skipped "manifest through S3: python3 not installed"
+fi
+
+# Two compiles that -E cannot handle, under single flight: one leases the
+# manifest key and compiles, the other waits and is served from the manifest.
+if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | grep -qi clang &&
+   command -v python3 >/dev/null 2>&1; then
+  sf="$WORK/mf-sf"
+  mkdir -p "$sf/inc" "$sf/bin"
+  printf '#pragma once\n#define BIG 5\n' > "$sf/inc/big.h"
+  printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$sf/h.h"
+  printf 'int f() { S s{BIG}; return s.x; }\n' > "$sf/main.cc"
+  ( cd "$sf" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch )
+  # Counts real compiles and holds each one long enough for the other to wait.
+  cat > "$sf/bin/slowg++" <<EOF
+#!/bin/sh
+case " \$* " in
+  *" -c "*) case " \$* " in *" -E "*) ;; *) echo compile >> "$sf/count"; sleep 2 ;; esac ;;
+esac
+exec g++ "\$@"
+EOF
+  chmod +x "$sf/bin/slowg++"
+  rm -f "$sf/count"
+  reset_cache
+  VCACHE_DAEMON_SINGLE_FLIGHT=1 "$VCACHE" --start-daemon >/dev/null
+  mf_sf() {  # $1 output, $2 log
+    ( cd "$sf" && VCACHE_DAEMON=on VCACHE_DAEMON_SINGLE_FLIGHT=1 VCACHE_LOG="$2" \
+        "$VCACHE" "$sf/bin/slowg++" -O2 -MD -MF "$1.d" -c -include h.h main.cc -o "$1" ) \
+      2>/dev/null
+  }
+  sfa=$(mf_log sf-a); sfb=$(mf_log sf-b)
+  mf_sf a.o "$sfa" &
+  sfpid=$!
+  for _ in $(seq 1 100); do
+    [[ -s "$sf/count" ]] && break
+    sleep 0.05
+  done
+  mf_sf b.o "$sfb"
+  wait "$sfpid" || true
+  check "single flight: two derived-key compiles run one compiler" \
+    "$(wc -l < "$sf/count" | tr -d ' ')" "1"
+  check "single flight: the waiter is served from the manifest" \
+    "$(cat "$sfa" "$sfb" | grep -c 'preprocessor skipped')" "1"
+  check "single flight: both objects are written and identical" \
+    "$(cmp -s "$sf/a.o" "$sf/b.o" && echo same)" "same"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+else
+  skipped "derived-key single flight: g++ or python3 is missing"
 fi
 
 # A PCH is in the manifest key, since the depfile does not name it: clang's

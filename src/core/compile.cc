@@ -5,8 +5,9 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
-#include <ctime>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -814,25 +815,12 @@ namespace {
 
 // New kinds of entry, so neither changes an existing key: the manifest itself,
 // and the result key of a compile that could not be preprocessed.
-constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v1";
+constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v2";
 constexpr std::string_view kCxxDerivedKeyVersion = "vcache-cxx-derived-v1";
 
-// The preprocessor reads these as extra include directories. The preprocessor
-// key sees their effect in the text; the manifest key has to hash them.
-constexpr const char* kIncludePathEnvVars[] = {
-    "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
-    "OBJCPLUS_INCLUDE_PATH",
-};
-
-int64_t NowUnixNs() {
-  struct timespec now {};
-  ::clock_gettime(CLOCK_REALTIME, &now);
-  return static_cast<int64_t>(now.tv_sec) * 1'000'000'000 + static_cast<int64_t>(now.tv_nsec);
-}
-
-std::string AbsoluteSource(const std::string& cwd, const std::string& source) {
-  return !source.empty() && source.front() == '/' ? source : cwd + "/" + source;
-}
+// gcc writes a dependency file named by one of these from the preprocessor.
+// A manifest hit runs none, and a compile with -MD added ignores them.
+constexpr const char* kDependencyEnvVars[] = {"DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES"};
 
 bool UsesDependencyFlag(const args::CompilerArgs& parsed, std::string_view flag) {
   for (const std::string& arg : parsed.dep_args) {
@@ -858,6 +846,21 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
     VCACHE_LOG("cxx manifest: -MMD omits system headers; using the preprocessor");
     return "";
   }
+  for (const char* name : kDependencyEnvVars) {
+    if (std::getenv(name) != nullptr) {
+      VCACHE_LOG(std::string("cxx manifest: ") + name + " is set; using the preprocessor");
+      return "";
+    }
+  }
+  // -DSTAMP=__TIME__ expands differently on every run, and nothing the manifest
+  // hashes would change.
+  for (const std::string& arg : parsed.argv) {
+    if (const auto macro = FindTimeMacro(arg)) {
+      VCACHE_LOG("cxx manifest: the command line uses " + std::string(*macro) +
+                 "; using the preprocessor");
+      return "";
+    }
+  }
   const ConsumedPchs pchs = FindConsumedPchs(parsed, cwd);
   if (!pchs.unsupported.empty()) {
     VCACHE_LOG("cxx manifest: " + pchs.unsupported + "; using the preprocessor");
@@ -882,11 +885,17 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
 
   hash::Hasher hasher;
   hasher.UpdateDelimited(kCxxManifestKeyVersion);
+  // States name result keys of this version, so a bump must not be bypassed by
+  // a manifest written before it.
+  hasher.UpdateDelimited(kCacheKeyVersion);
   hasher.UpdateDelimited(compiler_id.fingerprint);
   hasher.UpdateDelimited(native_target);
   hasher.UpdateDelimited(roots.Fingerprint());
   hasher.UpdateDelimited(roots.Canonicalize(cwd));
-  hasher.UpdateDelimited(roots.Canonicalize(AbsoluteSource(cwd, parsed.source)));
+  hasher.UpdateDelimited(roots.Canonicalize(CxxAbsolutePath(cwd, parsed.source)));
+  // And as typed: __FILE__ and the debug info name the source as the command
+  // line spelled it, so src/f.c and /abs/src/f.c in one directory differ.
+  hasher.UpdateDelimited(roots.Canonicalize(parsed.source));
   hasher.UpdateDelimited(*source_digest);
   // A PCH loads only at the paths that built it, so ComputeKey keys a PCH build
   // on the raw cwd and argv; a manifest state names that key, and must not
@@ -980,12 +989,54 @@ void StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
                         : std::string("cxx manifest: could not store"));
 }
 
+// The compiler's own <...> include directories, from `<compiler> -E -v` in the
+// compile's language with the flags that can move them. Memoised in the cache
+// directory, since the probe is a process; empty when it fails.
+std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
+                                           const CompilerId& compiler_id,
+                                           const std::string& cache_dir) {
+  std::vector<std::string> cmd{parsed.compiler};
+  for (size_t i = 0; i < parsed.key_args.size(); ++i) {
+    const std::string& arg = parsed.key_args[i];
+    if (util::StartsWith(arg, "--vcache-") || arg == "-MP") continue;
+    if (arg == "-MT" || arg == "-MQ") {
+      ++i;
+      continue;
+    }
+    if (util::StartsWith(arg, "-MT") || util::StartsWith(arg, "-MQ")) continue;
+    cmd.push_back(arg);
+  }
+  cmd.insert(cmd.end(), {"-x", NativeProbeLanguage(parsed.language), "-E", "-v", "/dev/null"});
+
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("system-include-dirs-memo-v1");
+  memo_key.UpdateDelimited(compiler_id.fingerprint);
+  for (const std::string& arg : cmd) memo_key.UpdateDelimited(arg);
+  const std::string memo_path = cache_dir + "/sysinc/" + memo_key.Hex();
+  if (auto cached = util::ReadFile(memo_path)) {
+    return util::Split(*cached, '\n', /*skip_empty=*/true);
+  }
+  util::ProcResult probe = util::Run(cmd, {.capture_stdout = true, .capture_stderr = true});
+  std::vector<std::string> dirs =
+      probe.exit_code == 0 ? ParseSystemIncludeDirs(probe.stderr_data) : std::vector<std::string>{};
+  if (dirs.empty()) {
+    VCACHE_LOG("cxx manifest: could not list the compiler's include directories");
+    return dirs;
+  }
+  util::WriteFileAtomic(memo_path, util::Join(dirs, "\n") + "\n");
+  return dirs;
+}
+
 // What the compile that just ran read, from the depfile it wrote. Declined, as
-// RecordDepfileInputs declines, and also under gcc when a .gch the key does not
-// cover sits where an #include could have picked it up.
+// RecordDepfileInputs declines; when the source is not among the files; and
+// under gcc when a .gch the key does not cover sits where an #include could
+// have picked it up, or when a file outside the compiler's own include
+// directories uses __has_include, since gcc's depfile does not name a header
+// that was only probed.
 RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
                                      const args::CompilerArgs& parsed, const RootMap& roots,
                                      const CompilerId& compiler_id, const std::string& cwd,
+                                     const std::string& cache_dir,
                                      const std::vector<std::string>& keyed_pchs,
                                      int64_t started_ns, bool scan_incbin) {
   RecordedInputs inputs;
@@ -996,11 +1047,40 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
     inputs.declined = "the compile wrote no readable dependency file";
     return inputs;
   }
-  inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin);
-  if (!inputs.declined.empty() || compiler_id.is_clang) return inputs;
+  inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin,
+                               /*find_probes=*/!compiler_id.is_clang);
+  if (!inputs.declined.empty()) return inputs;
+  // A state lists what it is checked against; one without the source would
+  // match whatever is on disk. Compared lexically normalised, since both
+  // compilers drop a leading ./ from the source they write.
+  const auto normal = [](const std::string& path) {
+    return std::filesystem::path(path).lexically_normal().string();
+  };
+  const std::string source = normal(CxxAbsolutePath(cwd, parsed.source));
+  if (std::none_of(inputs.files.begin(), inputs.files.end(), [&](const ManifestFile& file) {
+        return normal(roots.Localize(file.first)) == source;
+      })) {
+    inputs.files.clear();
+    inputs.declined = "the dependency file does not name the source";
+    return inputs;
+  }
+  if (compiler_id.is_clang) return inputs;
 
-  std::vector<std::string> dirs = {cwd, util::DirName(AbsoluteSource(cwd, parsed.source))};
-  for (std::string& dir : IncludeDirs(parsed, cwd)) dirs.push_back(std::move(dir));
+  if (!inputs.probing_files.empty()) {
+    const std::vector<std::string> system_dirs =
+        SystemIncludeDirs(parsed, compiler_id, cache_dir);
+    for (const std::string& path : inputs.probing_files) {
+      if (system_dirs.empty() || !UnderAnyDir(path, system_dirs)) {
+        inputs.files.clear();
+        inputs.declined = path + " uses __has_include, and gcc's depfile does not name " +
+                          "a header that was only probed";
+        return inputs;
+      }
+    }
+  }
+
+  std::vector<std::string> dirs = {cwd, util::DirName(CxxAbsolutePath(cwd, parsed.source))};
+  for (std::string& dir : CxxIncludeDirs(parsed, cwd)) dirs.push_back(std::move(dir));
   for (const ManifestFile& file : inputs.files) {
     dirs.push_back(util::DirName(roots.Localize(file.first)));
   }
@@ -1110,7 +1190,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   // Taken before anything reads the sources: a file changed after this may not
   // be the version the compile read, so it is not recorded in a manifest.
-  const int64_t started_ns = NowUnixNs();
+  const int64_t started_ns = util::NowUnixNs();
   const std::string cwd = util::CurrentDir();
   const std::string memo_dir = hash::FileDigestMemoDir(cache_dir);
 
@@ -1127,7 +1207,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     }
   };
 
-    // Serves `result_key` when its entry exists and fits this compile.
+  // Serves `result_key` when its entry exists and fits this compile.
   // `manifest_state` names the manifest state that chose the key; it is empty
   // when the preprocessed text did.
   const auto try_hit = [&](const std::string& result_key, const std::string& manifest_state) {
@@ -1382,7 +1462,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       manifest_inputs.declined = "the compile writes no -MD dependency file";
     } else {
       manifest_inputs =
-          ReadCxxManifestInputs(manifest_depfile, parsed, roots, compiler_id, cwd, keyed_pchs,
+          ReadCxxManifestInputs(manifest_depfile, parsed, roots, compiler_id, cwd, cache_dir,
+                                keyed_pchs,
                                 started_ns, /*scan_incbin=*/derive_key);
     }
     if (!manifest_inputs.declined.empty()) {

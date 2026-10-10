@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <set>
 
 #include "core/preprocessed.h"
@@ -19,11 +21,6 @@ namespace vcache::core {
 namespace {
 
 constexpr std::string_view kCxxManifestHeader = "vcache-cxxmanifest-1";
-
-std::string AbsoluteAgainst(const std::string& cwd, const std::string& path) {
-  if (!path.empty() && path.front() == '/') return path;
-  return cwd + "/" + path;
-}
 
 int64_t TimespecNs(const struct timespec& ts) {
   return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + static_cast<int64_t>(ts.tv_nsec);
@@ -46,10 +43,12 @@ std::optional<int64_t> LastChangeNs(const std::string& path) {
 // -I/home/a/proj/inc would otherwise stay apart from -I/home/b/proj/inc. Other
 // joined values, -D among them, are left as written: a path inside a macro
 // value reaches the object as spelled, so two checkouts must not share it.
+// -B is left as written too: the cc1, as and specs it selects are in no
+// depfile, so two trees must not share a state through it.
 std::string CanonicalizeArg(const std::string& arg, const RootMap& roots) {
   static constexpr std::string_view kPathPrefixes[] = {
       "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-isysroot",
-      "-iframework", "--sysroot=", "-I", "-F", "-B",
+      "-iframework", "--sysroot=", "-I", "-F",
   };
   for (std::string_view prefix : kPathPrefixes) {
     if (arg.size() > prefix.size() && util::StartsWith(arg, prefix)) {
@@ -118,20 +117,34 @@ std::vector<std::string> CxxManifestKeyArgs(const args::CompilerArgs& parsed,
   return out;
 }
 
-std::vector<std::string> IncludeDirs(const args::CompilerArgs& parsed, const std::string& cwd) {
+std::string CxxAbsolutePath(const std::string& cwd, const std::string& path) {
+  if (!path.empty() && path.front() == '/') return path;
+  return cwd + "/" + path;
+}
+
+std::vector<std::string> CxxIncludeDirs(const args::CompilerArgs& parsed,
+                                        const std::string& cwd) {
   static constexpr std::string_view kFlags[] = {"-iquote", "-I", "-isystem", "-idirafter"};
   std::vector<std::string> dirs;
   const std::vector<std::string>& argv = parsed.base_args;
   for (size_t i = 0; i < argv.size(); ++i) {
     for (std::string_view flag : kFlags) {
       if (argv[i] == flag && i + 1 < argv.size()) {
-        dirs.push_back(AbsoluteAgainst(cwd, argv[++i]));
+        dirs.push_back(CxxAbsolutePath(cwd, argv[++i]));
         break;
       }
       if (argv[i].size() > flag.size() && util::StartsWith(argv[i], flag)) {
-        dirs.push_back(AbsoluteAgainst(cwd, argv[i].substr(flag.size())));
+        dirs.push_back(CxxAbsolutePath(cwd, argv[i].substr(flag.size())));
         break;
       }
+    }
+  }
+  // An empty element names the working directory, as it does for gcc.
+  for (const char* name : kIncludePathEnvVars) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) continue;
+    for (const std::string& dir : util::Split(value, ':')) {
+      dirs.push_back(dir.empty() ? cwd : CxxAbsolutePath(cwd, dir));
     }
   }
   return dirs;
@@ -154,7 +167,7 @@ ConsumedPchs FindConsumedPchs(const args::CompilerArgs& parsed, const std::strin
       candidates.push_back(header);
     } else {
       candidates.push_back(cwd + "/" + header);
-      for (const std::string& dir : IncludeDirs(parsed, cwd)) {
+      for (const std::string& dir : CxxIncludeDirs(parsed, cwd)) {
         candidates.push_back(dir + "/" + header);
       }
     }
@@ -174,10 +187,10 @@ ConsumedPchs FindConsumedPchs(const args::CompilerArgs& parsed, const std::strin
   for (size_t i = 0; i < argv.size(); ++i) {
     const std::string& arg = argv[i];
     if (arg == "-include-pch" && i + 1 < argv.size()) {
-      add(AbsoluteAgainst(cwd, argv[++i]));
+      add(CxxAbsolutePath(cwd, argv[++i]));
     } else if (arg == "-Xclang" && i + 3 < argv.size() && argv[i + 1] == "-include-pch" &&
                argv[i + 2] == "-Xclang") {
-      add(AbsoluteAgainst(cwd, argv[i + 3]));
+      add(CxxAbsolutePath(cwd, argv[i + 3]));
       i += 3;
     } else if (arg == "-include" && i + 1 < argv.size()) {
       add_beside(argv[++i]);
@@ -219,15 +232,17 @@ std::optional<std::string_view> FindTimeMacro(std::string_view text) {
 
 RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
                                    const RootMap& roots, int64_t started_ns,
-                                   bool scan_incbin) {
+                                   bool scan_incbin, bool find_probes) {
   RecordedInputs recorded;
   std::set<std::string> seen;
   for (const DepRule& rule : dep.rules) {
     for (const std::string& prereq : rule.prerequisites) {
-      const std::string path = AbsoluteAgainst(cwd, prereq);
+      const std::string path = CxxAbsolutePath(cwd, prereq);
       if (!seen.insert(path).second) continue;
-      const std::optional<int64_t> changed = LastChangeNs(path);
+      // Read before the stat, so an edit that lands between the two moves the
+      // timestamps past started_ns rather than slipping in unseen.
       const std::optional<std::string> bytes = util::ReadFile(path);
+      const std::optional<int64_t> changed = LastChangeNs(path);
       if (!changed || !bytes) {
         recorded.declined = "cannot read " + path;
         return recorded;
@@ -244,10 +259,43 @@ RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
         recorded.declined = path + " contains .incbin";
         return recorded;
       }
+      if (find_probes && bytes->find("__has_include") != std::string::npos) {
+        recorded.probing_files.push_back(path);
+      }
       recorded.files.emplace_back(roots.Canonicalize(path), hash::HashString(*bytes));
     }
   }
   return recorded;
+}
+
+std::vector<std::string> ParseSystemIncludeDirs(const std::string& verbose_stderr) {
+  std::vector<std::string> dirs;
+  bool listing = false;
+  for (const std::string& line : util::Split(verbose_stderr, '\n')) {
+    if (util::StartsWith(line, "#include <...> search starts here:")) {
+      listing = true;
+      continue;
+    }
+    if (!listing) continue;
+    if (util::StartsWith(line, "End of search list.")) return dirs;
+    std::string dir = util::TrimWhitespace(line);
+    // macOS marks framework directories with a suffix.
+    const std::string_view kFramework = " (framework directory)";
+    if (util::EndsWith(dir, kFramework)) dir.resize(dir.size() - kFramework.size());
+    if (!dir.empty() && dir.front() == '/') {
+      dirs.push_back(std::filesystem::path(dir).lexically_normal().string());
+    }
+  }
+  return {};
+}
+
+bool UnderAnyDir(const std::string& path, const std::vector<std::string>& dirs) {
+  const std::string normal = std::filesystem::path(path).lexically_normal().string();
+  for (std::string dir : dirs) {
+    if (!dir.empty() && dir.back() != '/') dir.push_back('/');
+    if (util::StartsWith(normal, dir)) return true;
+  }
+  return false;
 }
 
 std::optional<std::string> FindUnkeyedGch(const std::vector<std::string>& dirs,

@@ -5294,6 +5294,11 @@ void TestCxxManifest() {
         "-c and -S are told apart");
   CheckEq(key_args({"g++", "-c", "a.cc", "-L/opt/lib"}), key_args({"g++", "-c", "a.cc"}),
           "a linker-only flag is dropped for gcc");
+  Check(util::Join(core::CxxManifestKeyArgs(args::Parse({"gcc", "-B/home/a/proj/bin", "-c", "a.c"}),
+                                            MakeRoots({"/home/a/proj=proj"}), false),
+                   " ")
+            .find("-B/vcache/proj/bin") == std::string::npos,
+        "a joined -B path is not canonicalised");
   CheckEq(util::Join(core::CxxManifestKeyArgs(
                          args::Parse({"g++", "-I/home/a/proj/inc", "-c", "a.cc"}),
                          MakeRoots({"/home/a/proj=proj"}), false),
@@ -5405,6 +5410,52 @@ void TestCxxManifest() {
         "unless the key already covers it");
   Check(!core::FindUnkeyedGch({dir + "/absent"}, {}).has_value(),
         "a directory that does not exist has none");
+
+  // gcc's depfile leaves out a header __has_include only probed.
+  util::WriteFileAtomic(dir + "/probe.h", "#if __has_include(\"opt.h\")\n#endif\n");
+  const core::RecordedInputs probes =
+      record("a.o: a.cc probe.h a.h\n", later_ns, false);
+  Check(probes.probing_files.empty(), "probes are not listed unless asked for");
+  const core::RecordedInputs listed = core::RecordDepfileInputs(
+      core::ParseDepFile("a.o: a.cc probe.h a.h\n").value_or(core::DepFile{}), dir, roots,
+      later_ns, false, /*find_probes=*/true);
+  CheckEq(util::Join(listed.probing_files, " "), dir + "/probe.h",
+          "a file using __has_include is listed when asked for");
+
+  const std::string verbose =
+      "ignoring nonexistent directory \"/x\"\n"
+      "#include \"...\" search starts here:\n"
+      " /quoted\n"
+      "#include <...> search starts here:\n"
+      " /usr/lib/gcc/x86_64-redhat-linux/16/../../../../include/c++/16\n"
+      " /usr/local/include\n"
+      " /usr/include\n"
+      "End of search list.\n";
+  const std::vector<std::string> system_dirs = core::ParseSystemIncludeDirs(verbose);
+  CheckEq(util::Join(system_dirs, " "), "/usr/include/c++/16 /usr/local/include /usr/include",
+          "the compiler's <...> directories are read from -E -v, normalised");
+  Check(core::ParseSystemIncludeDirs("#include <...> search starts here:\n /usr/include\n")
+            .empty(),
+        "a list with no end is not trusted");
+  Check(core::UnderAnyDir("/usr/lib/gcc/x86_64-redhat-linux/16/../../../../include/c++/16/cstdint",
+                          system_dirs),
+        "a header under one of them is recognised through ..");
+  Check(!core::UnderAnyDir("/usr/includes/x.h", system_dirs) &&
+            !core::UnderAnyDir(dir + "/probe.h", system_dirs),
+        "a sibling with a longer name and a project header are not");
+
+  // CPATH and friends add include directories, so a .gch can sit there too.
+  ::setenv("CPATH", (dir + "/inc::rel").c_str(), 1);
+  CheckEq(util::Join(core::CxxIncludeDirs(args::Parse({"g++", "-Ione", "-c", "a.cc"}), dir), " "),
+          dir + "/one " + dir + "/inc " + dir + " " + dir + "/rel",
+          "CPATH's directories follow the command line's, an empty one naming the cwd");
+  CheckEq(core::FindConsumedPchs(args::Parse({"g++", "-include", "g.h", "-c", "a.cc"}), dir)
+              .paths.empty()
+              ? std::string("none")
+              : core::FindConsumedPchs(args::Parse({"g++", "-include", "g.h", "-c", "a.cc"}), dir)
+                    .paths.front(),
+          dir + "/inc/g.h.gch", "-include finds a .gch in a CPATH directory");
+  ::unsetenv("CPATH");
 }
 
 void TestRustOutputNames() {

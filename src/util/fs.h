@@ -66,6 +66,9 @@ std::optional<uint64_t> FileSize(const std::string& path);
 // before when its size happens to be unchanged.
 std::optional<int64_t> FileMtime(const std::string& path);
 
+// The wall clock in the units FileMtime reports.
+int64_t NowUnixNs();
+
 // Returns the absolute, symlink-resolved path, or nullopt if it does not exist.
 std::optional<std::string> RealPath(const std::string& path);
 

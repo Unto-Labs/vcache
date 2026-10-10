@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/link.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -10,6 +11,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "args/link_args.h"
 #include "core/compile.h"
@@ -212,6 +214,62 @@ std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
   return out;
 }
 
+// Clones the stored output to a private name beside `output`, verifies the
+// clone and only then renames it into place. Verifying the source and cloning
+// it afterwards would let an eviction or a replacement in between publish bytes
+// that were never checked; a reflink shares the source's extents at the moment
+// of cloning, so hashing the clone checks exactly what is published.
+bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
+                        const std::string& output, bool executable) {
+  const std::string dir = util::DirName(output);
+  std::string tmpl = dir.empty() ? std::string(".vcache-tmp-XXXXXX")
+                                 : dir + "/.vcache-tmp-XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  const int fd = ::mkstemp(buf.data());
+  if (fd < 0) {
+    VCACHE_LOG("link hit: cannot create a temp file beside " + output + ": " +
+               std::strerror(errno));
+    return false;
+  }
+  ::close(fd);
+  const std::string tmp_path(buf.data());
+  const auto fail = [&]() {
+    util::RemoveFile(tmp_path);
+    return false;
+  };
+
+  if (!util::CloneFile(stored, tmp_path)) {
+    VCACHE_LOG("link hit: stored output is gone or unreadable: " + stored);
+    return fail();
+  }
+  const auto clone_digest = hash::HashFile(tmp_path);
+  if (!clone_digest || *clone_digest != digest) {
+    VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
+    return fail();
+  }
+  if (executable) {
+    // Add execute where the umask would have allowed it, not everywhere.
+    // CloneFile has already applied 0666 & ~umask, so under a strict umask the
+    // file is 0600; adding all three execute bits unconditionally would publish
+    // 0711 and let other users run a binary they cannot read.
+    struct stat st;
+    if (::stat(tmp_path.c_str(), &st) != 0) return fail();
+    const mode_t allowed = util::DefaultFileMode();
+    mode_t add = 0;
+    if (allowed & S_IRUSR) add |= S_IXUSR;
+    if (allowed & S_IRGRP) add |= S_IXGRP;
+    if (allowed & S_IROTH) add |= S_IXOTH;
+    if (::chmod(tmp_path.c_str(), st.st_mode | add) != 0) return fail();
+  }
+  if (::rename(tmp_path.c_str(), output.c_str()) != 0) {
+    VCACHE_LOG("link hit: cannot rename the verified output into place: " + output +
+               ": " + std::strerror(errno));
+    return fail();
+  }
+  return true;
+}
+
 bool MaterializeOutputs(const storage::Blob& blob,
                         const std::vector<std::string>& outputs,
                         const std::string& cache_dir) {
@@ -248,29 +306,16 @@ bool MaterializeOutputs(const storage::Blob& blob,
       return false;
     }
     const std::string stored = LinkOutputPath(cache_dir, f.contents);
-    const auto actual_digest = hash::HashFile(stored);
-    if (!actual_digest || *actual_digest != f.contents) {
-      VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
-      return false;
+    // The disk cache evicts oldest-mtime-first across every file in its shards,
+    // and DiskStorage::Get refreshes only the entry. Without this a hot output
+    // ages out before its entry, and every later hit fails verification and
+    // relinks. Refreshed before the hash so a trim that starts meanwhile sees a
+    // fresh file.
+    if (::utimensat(AT_FDCWD, stored.c_str(), nullptr, 0) != 0) {
+      VCACHE_LOG("link hit: could not refresh the stored output's mtime: " + stored +
+                 ": " + std::strerror(errno));
     }
-    if (!util::CloneFile(stored, f.name)) {
-      VCACHE_LOG("link hit: stored output is gone or unreadable: " + stored);
-      return false;
-    }
-    if (f.executable) {
-      // Add execute where the umask would have allowed it, not everywhere.
-      // WriteFileAtomic has already applied 0666 & ~umask, so under a strict
-      // umask the file is 0600; adding all three execute bits unconditionally
-      // would publish 0711 and let other users run a binary they cannot read.
-      struct stat st;
-      if (::stat(f.name.c_str(), &st) != 0) return false;
-      const mode_t allowed = util::DefaultFileMode();
-      mode_t add = 0;
-      if (allowed & S_IRUSR) add |= S_IXUSR;
-      if (allowed & S_IRGRP) add |= S_IXGRP;
-      if (allowed & S_IROTH) add |= S_IXOTH;
-      if (::chmod(f.name.c_str(), st.st_mode | add) != 0) return false;
-    }
+    if (!PlaceVerifiedClone(stored, f.contents, f.name, f.executable)) return false;
   }
   return true;
 }

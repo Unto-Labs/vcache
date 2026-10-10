@@ -3321,6 +3321,84 @@ reset_cache
 check "read-only link caching writes no sidecar" \
   "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l | tr -d " ")" "0"
 
+# DiskStorage::Get refreshes only the entry, and eviction is oldest-mtime-first
+# over every file in the shards. A hit that leaves the stored output's mtime
+# alone lets a hot binary age out before the entry that names it.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-fresh ) 2>/dev/null
+sidecar=$(find "$VCACHE_DIR" -type f -name '*.linkout' -print -quit)
+touch -d @946684800 "$sidecar"
+( cd "$WORK/link-one" && rm -f app-fresh && \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-fresh ) 2>/dev/null
+check "a link hit on an aged stored output" "$(hits)" "1"
+check "refreshes the stored output's mtime" \
+  "$([[ $(stat -c %Y "$sidecar") -gt 946684800 ]] && echo yes)" "yes"
+
+# The stored output can be evicted or replaced between being verified and
+# being published. A preload shim models a replacement right after vcache first
+# reads it: every later open of a .linkout gets another binary. The hit must
+# publish the bytes it verified, never the replacement.
+make_link_project "$WORK/link-swap" 9
+( cd "$WORK/link-swap" && gcc helper.o main.o -o replacement ) 2>/dev/null
+cat > "$WORK/linkout-swap.c" <<'SWAPEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char replacement[4096];
+static int linkout_opens;
+__attribute__((constructor)) static void init(void) {
+  const char *r = getenv("LINKOUT_REPLACEMENT");
+  if (r != NULL) snprintf(replacement, sizeof replacement, "%s", r);
+  /* RunLink declines a link under an inherited preload. */
+  unsetenv("LD_PRELOAD");
+}
+static const char *swap(const char *path) {
+  size_t n = strlen(path);
+  if (n < 8 || strcmp(path + n - 8, ".linkout") != 0) return path;
+  return linkout_opens++ == 0 ? path : replacement;
+}
+FILE *fopen(const char *path, const char *mode) {
+  FILE *(*real)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen");
+  return real(swap(path), mode);
+}
+FILE *fopen64(const char *path, const char *mode) {
+  FILE *(*real)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen64");
+  return real(swap(path), mode);
+}
+#define OPEN_SHIM(name)                                                 \
+  int name(const char *path, int flags, ...) {                          \
+    int mode = 0;                                                       \
+    if (flags & (O_CREAT | O_TMPFILE)) {                                \
+      va_list ap;                                                       \
+      va_start(ap, flags);                                              \
+      mode = va_arg(ap, int);                                           \
+      va_end(ap);                                                       \
+    }                                                                   \
+    int (*real)(const char *, int, ...) = dlsym(RTLD_NEXT, #name);      \
+    return real(swap(path), flags, mode);                               \
+  }
+OPEN_SHIM(open)
+OPEN_SHIM(open64)
+SWAPEOF
+gcc -shared -fPIC "$WORK/linkout-swap.c" -o "$WORK/linkout-swap.so" -ldl
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-swap ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-swap && \
+    LINKOUT_REPLACEMENT="$WORK/link-swap/replacement" \
+    LD_PRELOAD="$WORK/linkout-swap.so" \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-swap ) 2>/dev/null
+check "a stored output replaced after its first read is a hit" "$(hits)" "1"
+check "and publishes the verified binary, not the replacement" \
+  "$("$WORK/link-one/app-swap")" "7"
+check "and leaves no temp file beside the output" \
+  "$(find "$WORK/link-one" -name '.vcache-tmp-*' | wc -l | tr -d ' ')" "0"
+
 # The two guards that decide whether an entry is sound enough to store are
 # worth breaking on purpose. A guard that has never been seen to fire is
 # indistinguishable from one that cannot.

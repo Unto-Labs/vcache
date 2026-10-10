@@ -884,6 +884,99 @@ FSYNCEOF
 fi
 
 # --------------------------------------------------------------------------
+section "9i. Rust: a miss is placed by rename"
+
+# Reading rustc's output back and writing it again cost as much as the fsync
+# on a large rlib. A rename moves the file rustc wrote. The .d still goes
+# through memory, since it names the stage dir.
+if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
+  skipped "needs rustc and Linux"
+else
+  # --show-stats leaves out a reason that never happened.
+  unplaceable() { local n; n=$(stat_of "output unplaceable"); echo "${n:-0}"; }
+  rename_compile() {  # $1 = tree, $2 = rustc, then extra env assignments
+    local tree=$1 rustc=$2
+    shift 2
+    ( cd "$WORK/$tree" && env VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off "$@" \
+        "$VCACHE" "$rustc" --crate-name demo --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>&1
+  }
+  for tree in rename-a rename-b rename-xdev-a rename-xdev-b; do
+    mkdir -p "$WORK/$tree/src"
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+  done
+
+  reset_cache
+  write_altering_rustc "$WORK/rename-rustc/rustc" \
+    "stat -c %i libdemo.rlib > $(printf %q "$WORK/rename-staged-inode")"
+  rename_compile rename-a "$WORK/rename-rustc/rustc"
+  check "the renamed miss stores its entry" "$(misses) $(unplaceable)" "1 0"
+  check "the placed rlib is the file rustc wrote, not a copy" \
+    "$(stat -c %i "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
+  check "the .d names this output directory" \
+    "$(grep -c "^$WORK/rename-a/out/libdemo.rlib:" "$WORK/rename-a/out/demo.d")" "1"
+  check "the .d names neither the stage dir nor the placeholder" \
+    "$(grep -cE 'vcache-rs-|/vcache-outdir' "$WORK/rename-a/out/demo.d")" "0"
+  rename_compile rename-b rustc
+  check "the entry captured before the rename serves a hit" "$(hits)" "1"
+  check "and restores the same rlib" \
+    "$(cmp -s "$WORK/rename-a/out/libdemo.rlib" "$WORK/rename-b/out/libdemo.rlib" && echo same)" "same"
+
+  # The scratch dir falls back to $TMPDIR when the cache's cannot be made, and
+  # $TMPDIR is often tmpfs. A shim makes every rename from outside the output
+  # directory into it fail with EXDEV, as a rename across filesystems does.
+  cat > "$WORK/rename-xdev.c" <<'XDEVEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char into[4096];
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("XDEV_INTO");
+  if (p != NULL) snprintf(into, sizeof into, "%s/", p);
+  unsetenv("LD_PRELOAD");
+}
+int rename(const char *from, const char *to) {
+  size_t n = strlen(into);
+  if (n > 1 && strncmp(to, into, n) == 0 && strncmp(from, into, n) != 0) {
+    errno = EXDEV;
+    return -1;
+  }
+  int (*real)(const char *, const char *) = dlsym(RTLD_NEXT, "rename");
+  return real(from, to);
+}
+XDEVEOF
+  gcc -shared -fPIC "$WORK/rename-xdev.c" -o "$WORK/rename-xdev.so" -ldl
+  reset_cache
+  xdev_log="$WORK/rename-xdev.vlog"
+  rename_compile rename-xdev-a rustc XDEV_INTO="$WORK/rename-xdev-a/out" \
+    LD_PRELOAD="$WORK/rename-xdev.so" VCACHE_LOG="$xdev_log"
+  check "a miss whose rename fails with EXDEV still places and stores" \
+    "$(misses) $(unplaceable) $(grep -c '\] rust: placed 2 files' "$xdev_log")" "1 0 1"
+  rename_compile rename-xdev-b rustc
+  check "and its outputs match what a hit restores" \
+    "$(hits) $(cmp -s "$WORK/rename-xdev-a/out/libdemo.rlib" "$WORK/rename-xdev-b/out/libdemo.rlib" && echo same)" "1 same"
+  check "the copied .d is localised too" \
+    "$(grep -c "^$WORK/rename-xdev-a/out/libdemo.rlib:" "$WORK/rename-xdev-a/out/demo.d")" "1"
+
+  # The copy is created at the umask's default mode, so the execute bit has to
+  # be put back, and only where the umask lets the class read.
+  reset_cache
+  mkdir -p "$WORK/rename-xdev-bin/src"
+  echo 'fn main() {}' > "$WORK/rename-xdev-bin/src/main.rs"
+  ( umask 077 && cd "$WORK/rename-xdev-bin" && VCACHE_ROOTS="$WORK/rename-xdev-bin=bin" \
+      VCACHE_DAEMON=off XDEV_INTO="$WORK/rename-xdev-bin/out" LD_PRELOAD="$WORK/rename-xdev.so" \
+      "$VCACHE" rustc --crate-name xdevbin --crate-type bin \
+      --emit=dep-info,link --out-dir "$WORK/rename-xdev-bin/out" src/main.rs ) >/dev/null 2>&1
+  check "a binary copied after EXDEV under umask 077 is placed, not passed through" \
+    "$(misses) $(unplaceable)" "1 0"
+  check "and is 0700" "$(file_mode "$WORK/rename-xdev-bin/out/xdevbin")" "700"
+  check "and runs" "$("$WORK/rename-xdev-bin/out/xdevbin" >/dev/null 2>&1 && echo ran)" "ran"
+fi
+
+# --------------------------------------------------------------------------
 section "9e. Rust: a rustc rebuilt in place is a new toolchain"
 
 # `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo

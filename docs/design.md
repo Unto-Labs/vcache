@@ -172,6 +172,15 @@ and before the output reaches disk, the file can be empty or short while
 cargo's fingerprint, which checks mtimes and not contents, still counts it
 fresh. `cargo clean -p <crate>` recovers.
 
+A Rust miss moves rustc's outputs from the stage dir into the output directory
+with `rename(2)`, so the file in place is the one rustc wrote, with rustc's own
+mode bits. When the rename fails with `EXDEV`, because the scratch dir fell
+back to a `$TMPDIR` on another filesystem or the output directory is on one,
+the file is copied with `CloneFile` and given its execute bits under the
+umask. The `.d` is the exception: it names the stage dir, so it is written from
+the canonicalised copy captured for the entry and localised as a hit's is.
+Capture still reads every file once to build the entry.
+
 `VCACHE_LOG` gives each placement one line, so a build's log can be summed.
 "restored" and "placed" time the writes alone; "hit total" runs from asking the
 cache for the entry to the last output in place, so it adds reading the entry,
@@ -209,6 +218,11 @@ reverted. Without the fsync a warm build's restore cost is mostly reading and
 checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
 1,234 MiB restored) showed the same shape in two unsynced samples: summed
 "restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
+
+Placing a miss by rename, two synced fills each, interleaved: summed "placed"
+1,458 ms and 892 ms when rustc's outputs were read back and written again,
+48.6 ms and 47.4 ms by rename; fill wall 109.1 s and 103.5 s, then 102.8 s and
+100.4 s. Warm builds are unchanged, at 3.3 s and 4.2 s against 3.6 s and 4.2 s.
 
 ## Incoming prefix-map flags
 

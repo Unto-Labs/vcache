@@ -3,9 +3,11 @@
 #include "rust/rust_compile.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 
@@ -439,6 +441,53 @@ std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& 
   return std::nullopt;
 }
 
+// Moves a miss's staged outputs into the output directory. The rename keeps
+// the file rustc wrote, so a large rlib is not read back and written again.
+// The .d is the exception: it names the stage dir, so it is written from the
+// canonicalised copy in `files` and localised like a hit's.
+bool PlaceStagedOutputs(const std::string& stage_dir,
+                        const std::vector<storage::BlobFile>& files,
+                        const std::string& out_dir, const RootMap& roots,
+                        const std::vector<std::string>& path_env_vars) {
+  for (const storage::BlobFile& file : files) {
+    if (!IsSafeOutputName(file.name)) {
+      VCACHE_LOG("rust: refusing staged file name '" + file.name + "'");
+      return false;
+    }
+  }
+  std::vector<storage::BlobFile> dep_info;
+  for (const storage::BlobFile& file : files) {
+    if (util::EndsWith(file.name, ".d")) {
+      dep_info.push_back(file);
+      continue;
+    }
+    const std::string staged = stage_dir + "/" + file.name;
+    const std::string target = out_dir + "/" + file.name;
+    if (!util::MakeDirs(util::DirName(target))) {
+      VCACHE_LOG("rust: could not create the directory of " + target + ": " +
+                 std::strerror(errno));
+      return false;
+    }
+    if (::rename(staged.c_str(), target.c_str()) == 0) continue;
+    // The scratch dir fell back to $TMPDIR, or the output directory is on
+    // another filesystem. Tried rather than predicted from either path.
+    if (errno != EXDEV) {
+      VCACHE_LOG("rust: could not move " + staged + " to " + target + ": " +
+                 std::strerror(errno));
+      return false;
+    }
+    if (!util::CloneFile(staged, target)) {
+      VCACHE_LOG("rust: could not copy " + staged + " to " + target);
+      return false;
+    }
+    if (file.executable && !util::AddExecuteBitsUnderUmask(target)) {
+      VCACHE_LOG("rust: could not make " + target + " executable");
+      return false;
+    }
+  }
+  return RestoreOutputs(dep_info, out_dir, roots, path_env_vars);
+}
+
 // "<n> files, <m> bytes in <t> ms". Summed over a build's log, it is the time
 // spent writing outputs rather than compiling them.
 std::string PlacementSummary(const std::vector<storage::BlobFile>& files,
@@ -683,7 +732,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
     return RunPassthrough(argv);
   }
   const auto place_started = std::chrono::steady_clock::now();
-  if (!RestoreOutputs(files, parsed.out_dir, roots, config.rust_path_env_vars)) {
+  if (!PlaceStagedOutputs(stage_dir, files, parsed.out_dir, roots, config.rust_path_env_vars)) {
     core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
     return RunPassthrough(argv);
   }

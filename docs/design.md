@@ -44,7 +44,8 @@ Included:
 - a key-format version, so a change to this list invalidates old entries
 - compiler identity (see below)
 - the sorted set of **canonical** root targets
-- codegen-affecting flags, with any embedded paths canonicalised
+- codegen-affecting flags; an argument that is itself a path under a root is
+  canonicalised, a path inside a longer argument is kept verbatim
 - the preprocessed text, with linemarker paths canonicalised
 - explicitly configured environment variables
 - for Rust, each variable the dep-info reports the crate read through `env!` or
@@ -81,8 +82,9 @@ built from what is known before the scan runs:
 - its own key-format version
 - compiler identity and the resolved native target
 - the sorted set of canonical root targets
-- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim
-  and every path canonicalised
+- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim;
+  an argument that is itself a path under a root is canonicalised, a path joined
+  to its flag (`-I/abs/inc`) is not
 - the source's **canonical path** and its contents. The path matters because
   headers are found relative to the source: identical sources reached by
   different canonical paths read different files, and a state recorded for one
@@ -373,18 +375,41 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   PCH rebuilt with different bytes and no `.sum`, an entry another tree stored
   in preprocessor mode) is served by the preprocessor, and keeps being served
   that way until the next miss records a state.
-- **Linking is not cached**, matching ccache and sccache.
+- **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
+  through `vcache-fstrace.so`); ccache and sccache do not cache it.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang
   (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
-  Both hit across directories because `-E` expands the header text, so the
-  preprocessor key covers the header although the PCH bytes never enter it.
-  The manifest key does name the PCH (see above). gcc's `-fpch-preprocess`
-  swaps that text for a pragma naming the `.gch`, so it is declined.
-- **How a PCH was built is not in the key.** clang accepts a PCH that defines a
-  macro the compile does not, and gcc uses a `.gch` it never checks against an
-  edited header; in both cases the expanded text describes a different
+  Both hit across directories because `-E` expands the header text, so the key
+  covers the header although the PCH bytes never enter it. The manifest key
+  names the PCH too (see above). gcc's `-fpch-preprocess` swaps that text for a
+  pragma naming the `.gch`, so it is declined.
+- **A PCH build is cached only at the same paths.** A build with `-x c-header`,
+  `-x c++-header` or clang's `-Xclang -emit-pch` (CMake's form included) is
+  keyed like any compile, from the header preprocessed with `-dD`: the PCH
+  hands its macro definitions to every compile that loads it, and plain `-E`
+  drops them. Its key also holds the working directory and the command line
+  exactly as typed, not canonicalised. A PCH records the absolute path of
+  every input, even one named relatively, and clang 22 refuses to load it once
+  one is missing ("could not find file ... referenced by AST file"); with
+  `-fno-pch-timestamp` it checks only their sizes. So a rebuild of the same
+  tree hits, and so do containers that mount every worktree at one path, but
+  two trees at different host paths never share a PCH entry.
+  A clang PCH build needs `-Xclang -fno-pch-timestamp`. Without it the PCH
+  holds its headers' mtimes and clang rejects a restored copy once any of them
+  is touched, so the build is declined as `pch timestamps`. gcc does not check
+  header mtimes, and its `.gch` bytes differ between identical builds, which a
+  stored copy does not care about. A PCH build without `-o` is declined
+  (`no -o`), because gcc and clang name the default output differently.
+  After it places a PCH, on a miss or a hit, vcache writes `<output>.vcache-key`
+  beside it: one line, the PCH's cache key in hex, so a later key can name the
+  PCH without hashing tens of megabytes. It is written after the PCH, so no
+  reader pairs a new key with an old PCH, and every PCH build removes the old
+  key first, so a failed or uncached build leaves none.
+- **How a PCH was built is not in the key of a compile that uses it.** clang
+  accepts a PCH that defines a macro the compile does not, and gcc uses a
+  `.gch` it never checks against an edited header; in both cases the expanded text describes a different
   compilation from the one that ran. Build PCHs with the flags and headers of
   the compiles that use them, as build systems do. A stale `.gch` stores an
   object under the edited header's key. With an S3 tier that entry is shared

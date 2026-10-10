@@ -87,6 +87,11 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
     cmd.push_back(arg);
   }
   if (!compiler_id.is_clang) cmd.push_back("-fno-working-directory");
+  // A PCH carries the header's macro definitions to every compile that loads
+  // it, and plain -E drops them: a header that only changes `#define FOO 1` to
+  // `#define FOO 2` would preprocess identically, and clang's size check would
+  // accept the old PCH too. -dD keeps the definitions in the text.
+  if (parsed.produces_pch) cmd.push_back("-dD");
   cmd.push_back("-E");
   cmd.push_back(parsed.source);
   return cmd;
@@ -105,6 +110,10 @@ std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
   for (const std::string& arg : parsed.base_args) cmd.push_back(arg);
+  if (parsed.xclang_emit_pch) {
+    cmd.push_back("-Xclang");
+    cmd.push_back("-emit-pch");
+  }
   for (const std::string& arg : roots.PrefixMapArgs(PrefixMapStyle::kC)) {
     cmd.push_back(arg);
   }
@@ -136,7 +145,8 @@ std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
 // differs slightly between C and C++, so probe in the language being compiled.
 const char* NativeProbeLanguage(args::Language lang) {
   switch (lang) {
-    case args::Language::kCxx: return "c++";
+    case args::Language::kCxx:
+    case args::Language::kCxxHeader: return "c++";
     case args::Language::kObjC: return "objective-c";
     case args::Language::kObjCxx: return "objective-c++";
     default: return "c";
@@ -236,6 +246,18 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // -I-style differences between checkouts do not change the key.
   for (const std::string& arg : parsed.key_args) {
     hasher.UpdateDelimited(roots.Canonicalize(arg));
+  }
+
+  // A PCH records the absolute path of every input, even one named relatively,
+  // and clang refuses to load it once one of them is missing, so it is reusable
+  // only at the paths it was built at. The directory and the command line go in
+  // as typed, not canonicalised, so two trees at different paths never share a
+  // PCH entry; a rebuild of the same tree, or containers that mount every tree
+  // at one path, still hit.
+  if (parsed.produces_pch) {
+    hasher.UpdateDelimited("pch-built-at");
+    hasher.UpdateDelimited(util::CurrentDir());
+    for (const std::string& arg : parsed.argv) hasher.UpdateDelimited(arg);
   }
 
   // Linker-only flags change nothing about the object under -c, and gcc ignores
@@ -983,11 +1005,25 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
 
 }  // namespace
 
+bool PchCarriesTimestamps(const args::CompilerArgs& parsed, bool is_clang) {
+  return parsed.produces_pch && is_clang && !parsed.pch_timestamp_disabled;
+}
+
 int RunCompile(const std::vector<std::string>& argv, const Config& config,
                const RootMap& roots, storage::CacheChain* cache) {
   const std::string& cache_dir = config.disk.dir;
 
   args::CompilerArgs parsed = args::Parse(argv);
+
+  // Every path below, passthrough included, may replace the PCH, so the key
+  // that described the old one goes first. Only a run that knows the new PCH's
+  // key writes the file again.
+  const std::string pch_key_file =
+      parsed.produces_pch && !parsed.output.empty() && parsed.output != "-" &&
+              parsed.output != "/dev/null"
+          ? parsed.output + std::string(kPchKeyFileSuffix)
+          : "";
+  if (!pch_key_file.empty()) util::RemoveFile(pch_key_file);
 
   if (!parsed.cacheable()) {
     RecordDecision(cache_dir, *parsed.uncacheable);
@@ -1030,6 +1066,11 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const CompilerId compiler_id =
       ResolveCompilerId(parsed.compiler, check_mode, cache_dir, roots);
 
+  if (PchCarriesTimestamps(parsed, compiler_id.is_clang)) {
+    RecordDecision(cache_dir, {Reason::kPchWithTimestamps, parsed.output});
+    return RunPassthrough(argv);
+  }
+
   // -march=native and friends: resolve them to a concrete target fingerprint,
   // or decline to cache if the caller asked for that or the probe failed.
   std::string native_target;
@@ -1069,7 +1110,16 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // invocation. A hit does not clear it: the media still failed.
   bool media_failed = false;
 
-  // Serves `result_key` when its entry exists and fits this compile.
+  // Written after the PCH itself, so no reader pairs this key with the PCH it
+  // replaced.
+  const auto write_pch_key_file = [&](const std::string& pch_key) {
+    if (pch_key_file.empty()) return;
+    if (!util::WriteFileAtomic(pch_key_file, pch_key + "\n", /*durable=*/false)) {
+      VCACHE_LOG("could not write " + pch_key_file);
+    }
+  };
+
+    // Serves `result_key` when its entry exists and fits this compile.
   // `manifest_state` names the manifest state that chose the key; it is empty
   // when the preprocessed text did.
   const auto try_hit = [&](const std::string& result_key, const std::string& manifest_state) {
@@ -1089,6 +1139,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         return false;
       }
       if (blob_decoded && MaterializeHit(blob, parsed, roots)) {
+        write_pch_key_file(result_key);
         const Counter layer = got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
         if (manifest_state.empty()) {
           VCACHE_LOG("hit on " + got.layer);
@@ -1339,6 +1390,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     key = DeriveCxxResultKey(manifest_key, manifest_inputs.files);
     VCACHE_LOG("derived key " + key + " for " + parsed.source + " -> " + parsed.output);
   }
+  write_pch_key_file(key);
 
   // ---- store --------------------------------------------------------------
 

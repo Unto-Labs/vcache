@@ -352,8 +352,8 @@ an entry would return a correct object while that companion silently never
 appeared. The build looks successful; the breakage shows up later and somewhere
 else, when gcov finds no data or a debugger cannot resolve any DWARF.
 
-vcache therefore declines to cache them, reporting `flag writes a second output
-file` as the uncacheable reason:
+vcache therefore declines to cache them, reporting `second output file` as the
+uncacheable reason:
 
 | Flag | Companion file |
 | --- | --- |
@@ -1123,7 +1123,8 @@ an `.incbin` directive anywhere in the preprocessed text (see below);
 `-save-temps`, `-fsyntax-only`, `-fpch-preprocess`,
 `-specs=`, `-frepo`, `-fmodules`, PGO flags (`-fprofile-generate`,
 `-fprofile-use`, `-fprofile-instr-use`, `-fauto-profile`),
-`-fsanitize-blacklist=`; malformed or deeply nested `@response-files`.
+`-fno-validate-pch`, `-fmodule-file=`, `-fmodule-map-file=`, `-fprebuilt-module-path=`;
+malformed or deeply nested `@response-files`.
 
 `.incbin` is the one on that list that is not a flag. It tells the *assembler*
 to splice a file in verbatim, so neither the file's name nor its contents reach

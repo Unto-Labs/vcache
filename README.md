@@ -49,6 +49,7 @@ is a hit at all when a ccache hit would not have been.
 | [docs/design.md](docs/design.md) | How it is put together |
 | [docs/daemon.md](docs/daemon.md) | The optional cache daemon: async S3 uploads, kept connections |
 | [docs/linux-kernel.md](docs/linux-kernel.md) | Recipe: caching Linux kernel builds |
+| [docs/prompts/vcache-friendly-audit.md](docs/prompts/vcache-friendly-audit.md) | A prompt for a coding agent that audits your build for vcache friendliness |
 
 ## Quick start
 
@@ -260,14 +261,16 @@ and RHEL) gets a dynamically linked libstdc++ instead, which adds
 
 ## What is not cached
 
-Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
+Linking (unless the link cache is on, `VCACHE_LINK_CACHE=1`, Linux only),
+`-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
-text never mentions), and `rustc` without `--out-dir`/`--emit`. All of these
-fall through to the compiler unchanged, so a build always makes progress.
+text never mentions), a clang precompiled header built without
+`-Xclang -fno-pch-timestamp`, and `rustc` without `--out-dir`/`--emit`. All of
+these fall through to the compiler unchanged, so a build always makes progress.
 `vcache --show-stats` counts them as *uncacheable*, broken down by the rule that
 declined each.
 
-Two things that look like they belong on that list but are cached:
+Three things that look like they belong on that list but are cached:
 
 - **`-march=native`.** The flag means something different on every machine, so
   vcache asks the compiler which target it resolved to and puts *that* in the
@@ -276,6 +279,11 @@ Two things that look like they belong on that list but are cached:
   more than the run being cached, so they are keyed on the command line and
   verified against a manifest of the files they read — see
   [`dep_scan`](docs/configuration.md#dep_scan).
+- **Precompiled header builds.** A PCH records the absolute path of every
+  header it read and loads nowhere else, so its key holds the directory and the
+  command line as typed: a rebuild of the same tree hits, another checkout does
+  not. vcache writes `<pch>.vcache-key` beside it — see
+  [the design notes](docs/design.md#known-limitations).
 
 ## How it works
 

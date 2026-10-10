@@ -33,6 +33,8 @@ enum class Language {
   kObjCxx,
   kAssemblerWithCpp,  // .S -- preprocessed, so cacheable
   kAssembler,         // .s -- not preprocessed
+  kCHeader,           // -x c-header: the output is a precompiled header
+  kCxxHeader,         // -x c++-header: likewise
 };
 
 std::string LanguageName(Language lang);
@@ -51,6 +53,21 @@ struct CompilerArgs {
   bool preprocess_only = false;   // -E
   bool assemble_only = false;     // -S
   bool generates_debug_info = false;
+
+  // The output is a precompiled header: a header language, or clang's
+  // `-Xclang -emit-pch` on any input. core/compile.cc keys these on the paths
+  // as typed as well, because a PCH loads only where its inputs still are.
+  bool produces_pch = false;
+
+  // `-Xclang -emit-pch` is held out of base_args and re-added for the real
+  // compile only: clang lets it override -E, which would make the preprocessing
+  // run write the PCH instead of the text the key is built from.
+  bool xclang_emit_pch = false;
+
+  // `-Xclang -fno-pch-timestamp`. Without it a clang PCH records the mtime of
+  // every header it read and is refused once any of them changes, so a
+  // restored copy would fail after the next checkout or touch.
+  bool pch_timestamp_disabled = false;
 
   // -M or -MM with no -c: the invocation produces a dependency list and nothing
   // else. It is cached by a different route from a compile -- see RunDepScan in

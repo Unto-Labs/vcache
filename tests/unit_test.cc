@@ -4672,6 +4672,76 @@ void TestCloneFile() {
         "the clone gets the umask's default mode, not mkstemp's 0600");
 }
 
+void TestPchArgs() {
+  Section("args::CompilerArgs (precompiled headers)");
+  using core::Reason;
+
+  // gcc's spelling: a header language under -c.
+  auto gch = args::Parse({"g++", "-O2", "-x", "c++-header", "-c", "h.h", "-o", "h.h.gch"});
+  Check(gch.cacheable(), "a gcc .gch build is cacheable");
+  Check(gch.language == args::Language::kCxxHeader, "-x c++-header is the C++ header language");
+  Check(gch.produces_pch, "and produces a PCH");
+  CheckEq(gch.output, "h.h.gch", "the .gch is the output");
+  Check(args::Parse({"gcc", "-x", "c-header", "-c", "h.h", "-o", "h.h.gch"}).language ==
+            args::Language::kCHeader,
+        "-x c-header is the C header language");
+  Check(gch.key_args !=
+            args::Parse({"g++", "-O2", "-x", "c++", "-c", "h.h", "-o", "h.o"}).key_args,
+        "the header language is part of the key");
+
+  // CMake's clang spelling: -emit-pch passed to cc1, the header pulled in by a
+  // cc1 -include, and a .cxx stub as the input.
+  auto cmake = args::Parse({"clang++", "-O2", "-Xclang", "-fno-pch-timestamp", "-Xclang",
+                            "-emit-pch", "-Xclang", "-include", "-Xclang", "cmake_pch.hxx",
+                            "-x", "c++-header", "-o", "cmake_pch.hxx.pch", "-c",
+                            "cmake_pch.hxx.cxx"});
+  Check(cmake.cacheable(), "CMake's clang PCH build is cacheable");
+  CheckEq(cmake.source, "cmake_pch.hxx.cxx", "the -Xclang -include value is not a source");
+  CheckEq(cmake.output, "cmake_pch.hxx.pch", "the .pch is the output");
+  Check(cmake.produces_pch && cmake.xclang_emit_pch && cmake.pch_timestamp_disabled,
+        "-emit-pch and -fno-pch-timestamp are recognised through -Xclang");
+  Check(std::find(cmake.base_args.begin(), cmake.base_args.end(), "-emit-pch") ==
+            cmake.base_args.end(),
+        "-emit-pch is held out of the flags the preprocessor sees");
+  Check(std::find(cmake.key_args.begin(), cmake.key_args.end(), "-emit-pch") !=
+            cmake.key_args.end(),
+        "but stays in the key");
+
+  // -emit-pch on a source language still writes a PCH, not an object.
+  Check(args::Parse({"clang++", "-Xclang", "-emit-pch", "-c", "a.cc", "-o", "a.pch"})
+            .produces_pch,
+        "-Xclang -emit-pch makes any compile a PCH build");
+  Check(!args::Parse({"clang++", "-c", "a.cc", "-o", "a.o"}).produces_pch,
+        "an ordinary compile is not a PCH build");
+
+  auto no_output = args::Parse({"g++", "-x", "c++-header", "-c", "h.h"});
+  Check(!no_output.cacheable() && no_output.uncacheable->reason == Reason::kNoOutputFlag,
+        "a PCH build without -o is declined as no -o");
+  Check(!args::Parse({"g++", "-x", "c++-header", "-S", "h.h", "-o", "h.s"}).cacheable(),
+        "a header under -S is declined");
+  Check(!args::Parse({"clang++", "-x", "c++-header", "-c", "h.h", "-o", "h.pch", "-Xclang",
+                      "-fno-validate-pch"})
+             .cacheable(),
+        "-fno-validate-pch stays declined on a PCH build");
+  Check(!args::Parse({"g++", "-x", "c++-header", "-c", "h.h", "-o", "h.h.gch",
+                      "-fpch-preprocess"})
+             .cacheable(),
+        "-fpch-preprocess stays declined on a PCH build");
+
+  // Only clang's PCH holds header mtimes, and only without -fno-pch-timestamp.
+  Check(core::PchCarriesTimestamps(gch, /*is_clang=*/true) &&
+            !core::PchCarriesTimestamps(gch, /*is_clang=*/false),
+        "a clang PCH build without -fno-pch-timestamp carries timestamps; gcc's does not");
+  Check(!core::PchCarriesTimestamps(cmake, /*is_clang=*/true),
+        "-Xclang -fno-pch-timestamp removes them");
+  Check(!core::PchCarriesTimestamps(args::Parse({"clang++", "-c", "a.cc", "-o", "a.o"}),
+                                    /*is_clang=*/true),
+        "an ordinary clang compile is not affected");
+  CheckEq(core::Decision(Reason::kPchWithTimestamps, "h.pch").Describe(),
+          std::string("pch timestamps: h.pch"),
+          "the reason is logged and counted as pch timestamps");
+}
+
 void TestStats() {
   Section("core::Stats reasons");
   using core::Counter;
@@ -4788,7 +4858,7 @@ void TestStats() {
         "a link through the compile path is declined as link");
   Check(args::ParseRustc({"rustc", "--emit=link", "a.rs"}).uncacheable->reason == Reason::kNoOutDir,
         "rustc without --out-dir is declined as no --out-dir");
-  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoLinkOutput,
+  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoOutputFlag,
         "a link without -o is declined as no -o");
 }
 
@@ -6115,6 +6185,7 @@ int main(int argc, char** argv) {
   TestLinkArgs();
   TestCompilerArgs();
   TestClangArgs();
+  TestPchArgs();
   TestDepScanKeyArgs();
   TestRustcArgs();
   TestSigV4();

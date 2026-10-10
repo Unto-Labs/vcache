@@ -3714,10 +3714,11 @@ fi
 # --------------------------------------------------------------------------
 section "precompiled headers"
 
-# A precompiled header records the absolute paths and mtimes of its inputs, so
-# generating one is declined; a stored copy would be wrong in another directory.
-# Using one is cacheable only while the preprocessed text still expands the
-# header, which is what each compiler block below pins down.
+# A precompiled header records the absolute path of every input and refuses to
+# load where one is missing, so building one is cached only at the same paths:
+# a rebuild of the same tree hits, another tree does not. Using one is cacheable
+# while the preprocessed text still expands the header, which each compiler
+# block below pins down.
 make_pch_tree() {
   mkdir -p "$1"
   printf '#define FOO 1\nstruct S { int x; };\n' > "$1/h.h"
@@ -3725,27 +3726,98 @@ make_pch_tree() {
 }
 
 if command -v clang++ >/dev/null 2>&1; then
+  # clang rejects a PCH built at another -O level, so both steps pass -O2.
+  clang_pch_build() {
+    local dir="$1"
+    shift
+    ( cd "$dir" && VCACHE_ROOTS="$dir=proj" "$VCACHE" clang++ -O2 -x c++-header -c h.h \
+        -Xclang -emit-pch -Xclang -fno-pch-timestamp "$@" -o h.pch ) 2>/dev/null
+  }
+  # Compiled without vcache, so the object can only come from loading the PCH.
+  clang_pch_consumer() {
+    ( cd "$1" && clang++ -O2 -Werror=invalid-pch -c -Xclang -include-pch -Xclang h.pch \
+        main.cc -o "$2" ) 2>/dev/null
+  }
+
   reset_cache
   make_pch_tree "$WORK/pch-clang-a"
   make_pch_tree "$WORK/pch-clang-b"
-  # clang rejects a PCH built at another -O level, so both steps pass -O2.
-  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
-    ( cd "$d" && VCACHE_ROOTS="$d=proj" \
-        "$VCACHE" clang++ -O2 -x c++-header -c h.h -Xclang -emit-pch -o h.pch ) 2>/dev/null
-  done
-  check "clang PCH generation is declined" "$(uncacheable)" "2"
-  check "and the PCH is still written" \
-    "$([[ -s "$WORK/pch-clang-a/h.pch" && -s "$WORK/pch-clang-b/h.pch" ]] && echo yes)" "yes"
+  pa="$WORK/pch-clang-a"
+  pb="$WORK/pch-clang-b"
+  clang_pch_build "$pa"
+  check "clang PCH generation is cached" "$(misses)/$(uncacheable)" "1/0"
+  check "and the PCH is written" "$([[ -s "$pa/h.pch" ]] && echo yes)" "yes"
+  check ".vcache-key holds the PCH's key" \
+    "$(grep -cxE '[0-9a-f]{64}' "$pa/h.pch.vcache-key" 2>/dev/null)" "1"
+  pch_key_built="$(cat "$pa/h.pch.vcache-key" 2>/dev/null)"
+  clang_pch_consumer "$pa" fresh.o
+  mv "$pa/h.pch" "$pa/built.pch"
 
+  clang_pch_build "$pa"
+  check "a rebuild in the same directory hits" "$(hits)/$(misses)" "1/1"
+  if clang_pch_consumer "$pa" restored.o; then
+    ok "clang accepts the restored PCH under -Werror=invalid-pch"
+  else
+    bad "clang accepts the restored PCH under -Werror=invalid-pch"
+  fi
+  if [[ -s "$pa/fresh.o" ]] && cmp -s "$pa/fresh.o" "$pa/restored.o"; then
+    ok "and the consumer's object equals the one built with the fresh PCH"
+  else
+    bad "and the consumer's object equals the one built with the fresh PCH"
+  fi
+  check ".vcache-key is the same after the hit" \
+    "$(cat "$pa/h.pch.vcache-key" 2>/dev/null)" "$pch_key_built"
+
+  # The PCH from tree A names A's headers; clang would refuse it in B.
+  clang_pch_build "$pb"
+  check "a PCH built in another directory is not served to it" "$(misses)/$(hits)" "2/1"
+  check "and B's .vcache-key is its own" \
+    "$([[ -s "$pb/h.pch.vcache-key" && "$(cat "$pb/h.pch.vcache-key")" != "$pch_key_built" ]] \
+       && echo yes)" "yes"
+  pch_key_b="$(cat "$pb/h.pch.vcache-key" 2>/dev/null)"
+  clang_pch_build "$pb" -DEXTRA=1
+  check ".vcache-key changes when the -D set changes" \
+    "$([[ -s "$pb/h.pch.vcache-key" && "$(cat "$pb/h.pch.vcache-key")" != "$pch_key_b" ]] \
+       && echo yes)" "yes"
+
+  # The PCH carries the header's macros to its consumers. An edit to a #define
+  # that keeps the file's size passes clang's check on the old PCH, so only the
+  # key can tell the two apart.
+  misses_before=$(misses)
+  printf '#define FOO 2\nstruct S { int x; };\n' > "$pb/h.h"
+  clang_pch_build "$pb"
+  check "a header that only changes a macro is a new PCH key" \
+    "$(misses)" "$((misses_before + 1))"
+  printf '#define FOO 1\nstruct S { int x; };\n' > "$pb/h.h"
+  clang_pch_build "$pb"
+
+  # Without -fno-pch-timestamp the PCH holds the headers' mtimes, and clang
+  # refuses a restored copy once one of them has been touched.
+  ( cd "$pb" && VCACHE_ROOTS="$pb=proj" \
+      "$VCACHE" clang++ -O2 -x c++-header -c h.h -Xclang -emit-pch -o ts.pch ) 2>/dev/null
+  check "a clang PCH with timestamps is declined" "$(stat_of 'pch timestamps')" "1"
+  check "and is still written, without a .vcache-key" \
+    "$([[ -s "$pb/ts.pch" && ! -e "$pb/ts.pch.vcache-key" ]] && echo yes)" "yes"
+
+  # A failed build leaves the old PCH in place; its key must not outlive it.
+  cp "$pb/h.pch" "$pb/ok.pch"
+  cp "$pb/h.pch.vcache-key" "$pb/ok.pch.vcache-key"
+  printf 'struct {\n' > "$pb/bad.h"
+  ( cd "$pb" && VCACHE_ROOTS="$pb=proj" "$VCACHE" clang++ -O2 -x c++-header -c bad.h \
+      -Xclang -emit-pch -Xclang -fno-pch-timestamp -o ok.pch ) 2>/dev/null
+  check "a failed PCH build leaves no .vcache-key" \
+    "$([[ -s "$pb/ok.pch" && ! -e "$pb/ok.pch.vcache-key" ]] && echo yes)" "yes"
+
+  reset_cache
   # clang -E re-emits the PCH's header text, so the key covers the header even
   # though the .pch bytes never reach it.
-  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
+  for d in "$pa" "$pb"; do
     ( cd "$d" && VCACHE_ROOTS="$d=proj" "$VCACHE" clang++ -O2 -c \
         -Xclang -include-pch -Xclang "$d/h.pch" main.cc -o main.o ) 2>/dev/null
   done
   check "a compile using the PCH is cached" "$(misses)" "1"
   check "and hits from another directory" "$(hits)" "1"
-  if cmp -s "$WORK/pch-clang-a/main.o" "$WORK/pch-clang-b/main.o"; then
+  if cmp -s "$pa/main.o" "$pb/main.o"; then
     ok "PCH objects are byte-identical across directories"
   else
     bad "PCH objects are byte-identical across directories"
@@ -3753,16 +3825,15 @@ if command -v clang++ >/dev/null 2>&1; then
 
   # The driver spelling takes its value as a separate argument, which must not
   # be read as a second input file.
-  for d in "$WORK/pch-clang-a" "$WORK/pch-clang-b"; do
+  for d in "$pa" "$pb"; do
     ( cd "$d" && VCACHE_ROOTS="$d=proj" "$VCACHE" clang++ -O2 -c \
         -include-pch "$d/h.pch" main.cc -o driver.o ) 2>/dev/null
   done
-  check "the driver's -include-pch spelling is cached too" "$(uncacheable)" "2"
+  check "the driver's -include-pch spelling is cached too" "$(uncacheable)" "0"
   check "and hits from another directory" "$(hits)" "2"
 
   # An edited header leaves the PCH stale: clang refuses it, so vcache must not
   # answer from an entry either.
-  pa="$WORK/pch-clang-a"
   hits_before=$(hits)
   printf '#define FOO 1\nstruct S { int x; int y; };\n' > "$pa/h.h"
   if ( cd "$pa" && VCACHE_ROOTS="$pa=proj" "$VCACHE" clang++ -O2 -c \
@@ -3772,8 +3843,10 @@ if command -v clang++ >/dev/null 2>&1; then
     ok "a stale PCH still fails the compile"
   fi
   check "and is not answered from the cache" "$(hits)" "$hits_before"
-  ( cd "$pa" && VCACHE_ROOTS="$pa=proj" \
-      "$VCACHE" clang++ -O2 -x c++-header -c h.h -Xclang -emit-pch -o h.pch ) 2>/dev/null
+  clang_pch_build "$pa"
+  check ".vcache-key changes when a header the PCH includes changes" \
+    "$([[ -s "$pa/h.pch.vcache-key" && "$(cat "$pa/h.pch.vcache-key")" != "$pch_key_built" ]] \
+       && echo yes)" "yes"
   misses_before=$(misses)
   ( cd "$pa" && VCACHE_ROOTS="$pa=proj" "$VCACHE" clang++ -O2 -c \
       -Xclang -include-pch -Xclang "$pa/h.pch" main.cc -o main.o ) 2>/dev/null
@@ -3784,19 +3857,45 @@ else
 fi
 
 if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | grep -qi clang; then
+  gcc_pch_build() {
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" \
+        "$VCACHE" g++ -O2 -x c++-header -c h.h -o h.h.gch ) 2>/dev/null
+  }
+  gcc_picks_up_gch() {
+    (cd "$1" && g++ -O2 -H -c -include h.h main.cc -o /dev/null 2>&1 | grep -c '^! .*h\.h\.gch')
+  }
+
   reset_cache
   make_pch_tree "$WORK/pch-gcc-a"
   make_pch_tree "$WORK/pch-gcc-b"
-  for d in "$WORK/pch-gcc-a" "$WORK/pch-gcc-b"; do
-    ( cd "$d" && VCACHE_ROOTS="$d=proj" \
-        "$VCACHE" g++ -O2 -x c++-header -c h.h -o h.h.gch ) 2>/dev/null
-  done
-  check "gcc .gch generation is declined" "$(uncacheable)" "2"
+  pg="$WORK/pch-gcc-a"
+  gcc_pch_build "$pg"
+  check "gcc .gch generation is cached" "$(misses)/$(uncacheable)" "1/0"
+  check "and .vcache-key holds its key" \
+    "$(grep -cxE '[0-9a-f]{64}' "$pg/h.h.gch.vcache-key" 2>/dev/null)" "1"
   # Without this the checks below would pass on a textual include alone.
-  check "and gcc picks the .gch up" \
-    "$(cd "$WORK/pch-gcc-a" && g++ -O2 -H -c -include h.h main.cc -o /dev/null 2>&1 \
-         | grep -c '^! .*h\.h\.gch')" "1"
+  check "and gcc picks the .gch up" "$(gcc_picks_up_gch "$pg")" "1"
 
+  mv "$pg/h.h.gch" "$pg/built.gch"
+  gcc_pch_build "$pg"
+  check "a rebuild in the same directory hits" "$(hits)/$(misses)" "1/1"
+  check "gcc picks the restored .gch up" "$(gcc_picks_up_gch "$pg")" "1"
+  if ( cd "$pg" && g++ -O2 -c -include h.h main.cc -o restored.o ) 2>/dev/null \
+       && [[ -s "$pg/restored.o" ]]; then
+    ok "and the consumer compiles"
+  else
+    bad "and the consumer compiles"
+  fi
+  gcc_pch_build "$WORK/pch-gcc-b"
+  check "a .gch built in another directory is not served to it" "$(misses)/$(hits)" "2/1"
+  # gcc never checks a .gch against its header, so a macro edit must change the key.
+  printf '#define FOO 2\nstruct S { int x; };\n' > "$WORK/pch-gcc-b/h.h"
+  gcc_pch_build "$WORK/pch-gcc-b"
+  check "a header that only changes a macro is a new .gch key" "$(misses)" "3"
+  printf '#define FOO 1\nstruct S { int x; };\n' > "$WORK/pch-gcc-b/h.h"
+  gcc_pch_build "$WORK/pch-gcc-b"
+
+  reset_cache
   # gcc -E expands the header textually even when a valid .gch sits beside it.
   for d in "$WORK/pch-gcc-a" "$WORK/pch-gcc-b"; do
     ( cd "$d" && VCACHE_ROOTS="$d=proj" \
@@ -3812,14 +3911,13 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
 
   # -fpch-preprocess leaves only a pragma naming the .gch, so two different
   # .gch files would preprocess identically.
-  pg="$WORK/pch-gcc-a"
   if ( cd "$pg" && VCACHE_ROOTS="$pg=proj" "$VCACHE" g++ -O2 -c -fpch-preprocess \
          -include h.h main.cc -o pp.o ) 2>/dev/null && [[ -s "$pg/pp.o" ]]; then
     ok "-fpch-preprocess still compiles"
   else
     bad "-fpch-preprocess still compiles"
   fi
-  check "and is declined" "$(uncacheable)" "3"
+  check "and is declined" "$(uncacheable)" "1"
 else
   skipped "g++ is not installed, or is clang"
 fi

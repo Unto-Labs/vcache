@@ -531,6 +531,13 @@ it.
 `vcache --trim` sweeps every shard on demand; `vcache --clear` empties the cache
 and resets counters.
 
+Link outputs, and Rust outputs of 8 MiB or more, are stored beside the entries
+as `<digest>.linkout` and `<digest>.rustout` files in the same shards, and a
+hit clones them (a reflink where the filesystem supports one) and hashes the
+clone before publishing it. They count against `size` like entries. Rust keeps
+them only when S3 is off; with S3 configured every Rust output stays inside its
+entry.
+
 Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
 per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
 versions read only the leading counters, and drop the reason lines when they

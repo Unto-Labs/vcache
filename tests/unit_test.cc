@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <filesystem>
 #include <memory>
@@ -5209,9 +5210,12 @@ void TestRustOutputNames() {
   util::WriteFileAtomic(*scratch + "/outside-target", "out");
   Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
         "a symlink out of the capture directory can be planted");
+  constexpr uint64_t kNoSidecars = std::numeric_limits<uint64_t>::max();
   std::vector<storage::BlobFile> captured;
+  std::vector<storage::BlobSidecarFile> sidecars;
   std::string unparsed_dep_info;
-  Check(!rust::CaptureOutputs(cap, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(cap, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a name that escapes the output directory fails");
 
   const std::string inner = *scratch + "/inner";
@@ -5220,8 +5224,75 @@ void TestRustOutputNames() {
   Check(::symlink("lib.rlib", (inner + "/alias.rlib").c_str()) == 0,
         "a symlink inside the capture directory can be planted");
   captured.clear();
-  Check(!rust::CaptureOutputs(inner, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(inner, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a symlink that stays inside the directory fails too");
+
+  // A large output is left where rustc wrote it, by name; the .d is read and
+  // rewritten whatever its size.
+  const std::string sized = *scratch + "/sized";
+  util::MakeDirs(sized);
+  util::WriteFileAtomic(sized + "/libbig.rlib", std::string(64, 'r'));
+  util::WriteFileAtomic(sized + "/small.rmeta", std::string(8, 'm'));
+  util::WriteFileAtomic(sized + "/big.d", "big.d: " + std::string(80, 'x') + ".rs\n");
+  ::chmod((sized + "/libbig.rlib").c_str(), 0755);
+  captured.clear();
+  sidecars.clear();
+  Check(rust::CaptureOutputs(sized, roots, {}, 64, &captured, &sidecars, &unparsed_dep_info),
+        "a capture with a sidecar threshold succeeds");
+  Check(sidecars.size() == 1 && sidecars[0].name == "libbig.rlib" && sidecars[0].digest.empty() &&
+            sidecars[0].executable,
+        "a file at the threshold is a sidecar, with its execute bit and no digest yet");
+  std::vector<std::string> inline_names;
+  for (const storage::BlobFile& file : captured) inline_names.push_back(file.name);
+  std::sort(inline_names.begin(), inline_names.end());
+  Check(inline_names == std::vector<std::string>{"big.d", "small.rmeta"},
+        "a smaller file and a .d above the threshold stay inline");
+}
+
+// Large outputs are hashed and searched for leaked local paths in one read.
+// A path that straddles two reads must still be found, or a leaked OUT_DIR
+// lands in another checkout's build.
+void TestHashAndScanFile() {
+  Section("rust::HashAndScanFile");
+  auto scratch = util::MakeTempDir("vcache-rust-scan-");
+  Check(scratch.has_value(), "scan scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string local = "/home/someone/target/debug/build/x-1/out";
+  std::string bytes(4096, '\0');
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(i * 7);
+  const std::string clean = *scratch + "/clean.rlib";
+  util::WriteFileAtomic(clean, bytes);
+  // 16-byte reads: the path starts 5 bytes before a read boundary.
+  std::string leaky = bytes;
+  leaky.replace(16 * 100 - 5, local.size(), local);
+  const std::string straddling = *scratch + "/straddling.rlib";
+  util::WriteFileAtomic(straddling, leaky);
+
+  const auto scanned = rust::HashAndScanFile(clean, {"/elsewhere", local}, 16);
+  Check(scanned.has_value() && !scanned->found_pattern, "a clean file has no pattern");
+  Check(scanned && scanned->digest == hash::HashFile(clean) && scanned->size == bytes.size(),
+        "and hashes as HashFile does");
+  const auto found = rust::HashAndScanFile(straddling, {"/elsewhere", local}, 16);
+  Check(found && found->found_pattern == std::optional<size_t>(1),
+        "a path split across two reads is found");
+  const auto found_large_reads = rust::HashAndScanFile(straddling, {local});
+  Check(found_large_reads && found_large_reads->found_pattern == std::optional<size_t>(0),
+        "and found with the default read size");
+  Check(found && found->digest == hash::HashFile(straddling),
+        "a file with a pattern is still hashed whole");
+  Check(!rust::HashAndScanFile(*scratch + "/absent", {local}, 16), "a missing file fails");
+#if defined(__linux__)
+  // procfs reports size 0 for a file with bytes: a read that does not match the
+  // size it started from fails closed.
+  Check(!rust::HashAndScanFile("/proc/self/status", {local}, 16),
+        "a file whose size differs from what it held fails closed");
+#endif
 }
 
 void TestUploadGeneration() {
@@ -5976,6 +6047,7 @@ int main(int argc, char** argv) {
   TestMemoryEstimates();
   TestRustcFingerprint();
   TestRustOutputNames();
+  TestHashAndScanFile();
   TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();

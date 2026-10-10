@@ -977,6 +977,228 @@ XDEVEOF
 fi
 
 # --------------------------------------------------------------------------
+section "9j. Rust: large outputs are sidecars, restored by clone"
+
+# An output of 8 MiB or more is kept beside the entry as <digest>.rustout and
+# cloned on a hit, so its bytes never pass through the entry or memory. The
+# entry's checksum then covers only the digest, so every hit hashes the clone.
+if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
+  skipped "needs rustc and Linux"
+else
+  sidecar_files() {
+    find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*.rustout" \
+      2>/dev/null | wc -l | tr -d ' '
+  }
+  largest_entry_bytes() {
+    find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
+      ! -name '*.rustout' -printf '%s\n' 2>/dev/null | sort -n | tail -1
+  }
+  reason_count() { local n; n=$(stat_of "$1"); echo "${n:-0}"; }
+  # 9 MiB of non-zero static data, so the rlib crosses the threshold; the
+  # unused function makes rustc warn, which a hit replays.
+  big_crate() {  # $1 = tree
+    mkdir -p "$WORK/$1/src"
+    printf '%s\n' 'pub static BIG: [u8; 9 << 20] = [7; 9 << 20];' \
+      'pub fn value(i: usize) -> u8 { BIG[i] }' 'fn unused() {}' > "$WORK/$1/src/lib.rs"
+  }
+  sidecar_log="$WORK/sidecar.vlog"
+  # sidecar_compile TREE RUSTC EMIT [env assignments...]
+  sidecar_compile() {
+    local tree=$1 rustc=$2 emit=$3
+    shift 3
+    ( cd "$WORK/$tree" && env VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off \
+        VCACHE_LOG="$sidecar_log" "$@" \
+        "$VCACHE" "$rustc" --crate-name big --crate-type lib --emit="$emit" \
+        --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>"$WORK/$tree.stderr"
+  }
+  warnings_in() { grep -c 'function `unused` is never used' "$WORK/$1.stderr"; }
+  for tree in side-a side-b side-c side-gone side-bad side-link-a side-link-b side-ro \
+              side-s3 side-part-a side-part-b; do
+    big_crate "$tree"
+  done
+
+  reset_cache
+  rm -f "$sidecar_log"
+  sidecar_compile side-a rustc dep-info,link
+  check "a large rlib is stored as one sidecar" "$(misses) $(sidecar_files)" "1 1"
+  check "and the entry does not carry its bytes" \
+    "$([[ $(largest_entry_bytes) -lt 1048576 ]] && echo small)" "small"
+  stored=$(find "$VCACHE_DIR" -type f -name '*.rustout' -print -quit)
+  check "the sidecar is named by the rlib's digest and holds its bytes" \
+    "$(cmp -s "$stored" "$WORK/side-a/out/libbig.rlib" && echo same)" "same"
+  sidecar_compile side-b rustc dep-info,link
+  check "another checkout hits" "$(hits)" "1"
+  check "and restores the same rlib" \
+    "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-b/out/libbig.rlib" && echo same)" "same"
+  check "as a file of its own, not a link to the sidecar" \
+    "$([[ $(stat -c %i "$WORK/side-b/out/libbig.rlib") != $(stat -c %i "$stored") ]] && echo own)" "own"
+  check "the hit replays the warning once" "$(warnings_in side-b)" "1"
+  check "the hit's .d is localised" \
+    "$(grep -c "^$WORK/side-b/out/libbig.rlib:" "$WORK/side-b/out/big.d")" "1"
+  check "the hit leaves no temp in the output directory" \
+    "$(find "$WORK/side-b/out" -name '.vcache-tmp-*' | wc -l | tr -d ' ')" "0"
+
+  # Eviction is oldest-mtime-first over every file in the shards, and a hit
+  # refreshes only what it reads: the sidecar must be refreshed by the hit.
+  touch -d @946684800 "$stored"
+  sidecar_compile side-c rustc dep-info,link
+  check "a hit on an aged sidecar" "$(hits)" "2"
+  check "refreshes the sidecar's mtime" \
+    "$([[ $(stat -c %Y "$stored") -gt 946684800 ]] && echo yes)" "yes"
+
+  # A sidecar evicted on its own: the hit fails before anything reaches cargo,
+  # and the compile replays its own diagnostics only.
+  rm -f "$stored"
+  sidecar_compile side-gone rustc dep-info,link
+  check "a hit whose sidecar is gone recompiles" "$(hits) $(misses)" "2 2"
+  check "and forwards the warning once, from the compile" "$(warnings_in side-gone)" "1"
+  check "and logs why" "$(grep -c 'rust: sidecar .* is gone' "$sidecar_log")" "2"
+  check "the recompile stores the sidecar again" "$(sidecar_files)" "1"
+
+  # A torn sidecar fails its hash. It is removed, or failed hits would keep it
+  # the freshest file in the store. The compile here fails, so nothing
+  # replaces it.
+  stored=$(find "$VCACHE_DIR" -type f -name '*.rustout' -print -quit)
+  printf 'torn' | dd of="$stored" bs=1 seek=4096 conv=notrunc status=none
+  write_altering_rustc "$WORK/side-rustc/failing/rustc" "exit 3"
+  sidecar_compile side-bad "$WORK/side-rustc/failing/rustc" dep-info,link
+  check "a sidecar that fails verification is not served" "$(hits)" "2"
+  check "and is removed from the store" "$(sidecar_files)" "0"
+  check "the failed verification is logged" \
+    "$(grep -c 'failed digest verification' "$sidecar_log")" "1"
+
+  # --emit=link alone leaves no .d, so the entry has no inline file at all.
+  reset_cache
+  sidecar_compile side-link-a rustc link
+  sidecar_compile side-link-b rustc link
+  check "an entry whose only output is a sidecar hits" "$(misses) $(hits)" "1 1"
+  check "and restores it" \
+    "$(cmp -s "$WORK/side-link-a/out/libbig.rlib" "$WORK/side-link-b/out/libbig.rlib" && echo same)" \
+    "same"
+
+  reset_cache
+  sidecar_compile side-ro rustc dep-info,link VCACHE_READONLY=1
+  check "a read-only miss places its large rlib" \
+    "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-ro/out/libbig.rlib" && echo same)" "same"
+  check "and stores no sidecar" "$(sidecar_files)" "0"
+
+  # An entry that can reach S3 must be whole on another host.
+  reset_cache
+  sidecar_compile side-s3 rustc dep-info,link VCACHE_S3_BUCKET=nobucket \
+    VCACHE_S3_ENDPOINT=http://127.0.0.1:9 VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
+    VCACHE_S3_NO_CREDENTIALS=1
+  check "with S3 configured the large rlib stays inline" \
+    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 9437184 ]] && echo inline)" "0 inline"
+
+  # A cargo-made OUT_DIR baked into a large output, split across the scan's
+  # 1 MiB reads, must keep the entry out of the store. The build still gets
+  # its outputs and diagnostics.
+  reset_cache
+  mkdir -p "$WORK/side-leak/src" "$WORK/side-leak/target/out"
+  echo 'pub fn answer() -> u32 { 42 }' > "$WORK/side-leak/target/out/gen.rs"
+  echo 'include!(concat!(env!("OUT_DIR"), "/gen.rs")); fn unused() {}' \
+    > "$WORK/side-leak/src/lib.rs"
+  { head -c $((1048576 - 8)) /dev/zero | tr '\0' 'z'
+    printf '%s' "$WORK/side-leak/target/out"
+    head -c $((9 * 1048576)) /dev/zero | tr '\0' 'z'; } > "$WORK/side-leak.bin"
+  write_altering_rustc "$WORK/side-rustc/leaky/rustc" "cp $(printf %q "$WORK/side-leak.bin") extra.bin"
+  ( cd "$WORK/side-leak" && env OUT_DIR="$WORK/side-leak/target/out" VCACHE_DAEMON=off \
+      VCACHE_ROOTS="$WORK/side-leak=crate:$WORK/side-leak/target=target" \
+      VCACHE_RUST_PATH_ENV_VARS=OUT_DIR \
+      "$VCACHE" "$WORK/side-rustc/leaky/rustc" --crate-name big --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/side-leak/out" src/lib.rs ) \
+      >/dev/null 2>"$WORK/side-leak.stderr"
+  check "a local OUT_DIR across a read boundary of a large output is refused" \
+    "$(reason_count "env path in output")" "1"
+  check "and stores no sidecar and no entry" "$(sidecar_files) $(disk_entries)" "0 0"
+  check "the refused compile still places its outputs" \
+    "$(cmp -s "$WORK/side-leak.bin" "$WORK/side-leak/out/extra.bin" && [[ -f "$WORK/side-leak/out/libbig.rlib" ]] && echo placed)" \
+    "placed"
+  check "and forwards its diagnostics" "$(warnings_in side-leak)" "1"
+
+  # A rename that fails after another sidecar was already placed leaves a
+  # partial set: no other manifest state or entry may be tried, only a compile
+  # repairs every name. A shim fails the second rename into the output dir.
+  cat > "$WORK/rename-second.c" <<'SECONDEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char into[4096];
+static int renames_into;
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("FAIL_SECOND_RENAME_INTO");
+  if (p != NULL) snprintf(into, sizeof into, "%s/", p);
+  unsetenv("LD_PRELOAD");
+}
+int rename(const char *from, const char *to) {
+  size_t n = strlen(into);
+  if (n > 1 && strncmp(to, into, n) == 0 && ++renames_into == 2) {
+    errno = EIO;
+    return -1;
+  }
+  int (*real)(const char *, const char *) = dlsym(RTLD_NEXT, "rename");
+  return real(from, to);
+}
+SECONDEOF
+  gcc -shared -fPIC "$WORK/rename-second.c" -o "$WORK/rename-second.so" -ldl
+  head -c $((9 * 1048576)) /dev/zero | tr '\0' 'q' > "$WORK/side-second.bin"
+  write_altering_rustc "$WORK/side-rustc/two/rustc" "cp $(printf %q "$WORK/side-second.bin") second.bin"
+  reset_cache
+  rm -f "$sidecar_log"
+  sidecar_compile side-part-a "$WORK/side-rustc/two/rustc" dep-info,link
+  check "a compile with two large outputs stores two sidecars" "$(sidecar_files)" "2"
+  sidecar_compile side-part-b "$WORK/side-rustc/two/rustc" dep-info,link \
+    FAIL_SECOND_RENAME_INTO="$WORK/side-part-b/out" LD_PRELOAD="$WORK/rename-second.so"
+  check "a hit that placed part of its set recompiles" "$(hits) $(misses)" "0 2"
+  check "without trying the direct key" \
+    "$(grep -c 'placed part of its set; recompiling' "$sidecar_log") $(grep -c 'unusable cache entry' "$sidecar_log")" \
+    "1 0"
+  check "and leaves the whole set as compiled" \
+    "$(cmp -s "$WORK/side-part-a/out/libbig.rlib" "$WORK/side-part-b/out/libbig.rlib" && cmp -s "$WORK/side-second.bin" "$WORK/side-part-b/out/second.bin" && echo whole)" \
+    "whole"
+  check "with the warning forwarded once" "$(warnings_in side-part-b)" "1"
+
+  # Under umask 077 the restored binary must be 0700, as the linker made it.
+  reset_cache
+  for tree in side-bin-a side-bin-b; do
+    mkdir -p "$WORK/$tree/src"
+    printf '%s\n' 'static BIG: [u8; 9 << 20] = [7; 9 << 20];' \
+      'fn main() { std::process::exit(i32::from(BIG[std::env::args().count()]) - 7); }' \
+      > "$WORK/$tree/src/main.rs"
+    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" VCACHE_DAEMON=off \
+        "$VCACHE" rustc --crate-name sidebin --crate-type bin \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
+  done
+  check "a large binary crate is a sidecar and hits" "$(sidecar_files) $(hits)" "1 1"
+  check "and is restored 0700 under umask 077" "$(file_mode "$WORK/side-bin-b/out/sidebin")" "700"
+  check "and runs" "$("$WORK/side-bin-b/out/sidebin" && echo ran)" "ran"
+
+  # An older vcache sharing the store must not reach these entries: it reads
+  # a v1 manifest and v3 keys. Set VCACHE_PREVIOUS to its binary to check.
+  if [[ -n "${VCACHE_PREVIOUS:-}" && -x "${VCACHE_PREVIOUS:-}" ]]; then
+    reset_cache
+    big_crate side-prev-a
+    big_crate side-prev-b
+    sidecar_compile side-prev-a rustc dep-info,link
+    printf 'stale rlib from an earlier build' > "$WORK/side-prev-b/stale.rlib"
+    mkdir -p "$WORK/side-prev-b/out"
+    cp "$WORK/side-prev-b/stale.rlib" "$WORK/side-prev-b/out/libbig.rlib"
+    ( cd "$WORK/side-prev-b" && VCACHE_ROOTS="$WORK/side-prev-b=crate" VCACHE_DAEMON=off \
+        "$VCACHE_PREVIOUS" rustc --crate-name big --crate-type lib --emit=dep-info,link \
+        --out-dir "$WORK/side-prev-b/out" src/lib.rs ) >/dev/null 2>&1
+    check "the previous vcache gets no hit from a store this one filled" "$(hits)" "0"
+    check "and compiles the rlib itself" \
+      "$(cmp -s "$WORK/side-prev-a/out/libbig.rlib" "$WORK/side-prev-b/out/libbig.rlib" && echo same)" \
+      "same"
+  else
+    skipped "VCACHE_PREVIOUS not set: the older-reader check needs an older vcache binary"
+  fi
+fi
+
+# --------------------------------------------------------------------------
 section "9e. Rust: a rustc rebuilt in place is a new toolchain"
 
 # `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo

@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rust/rust_compile.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -9,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <optional>
 
 #include "args/rustc_args.h"
@@ -19,6 +24,7 @@
 #include "daemon/client.h"
 #include "hash/hasher.h"
 #include "rust/rust_manifest.h"
+#include "storage/disk_storage.h"
 #include "storage/storage.h"
 #include "util/fs.h"
 #include "util/log.h"
@@ -64,8 +70,25 @@ using core::MapDirection;
 using core::Reason;
 using core::RootMap;
 
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v3";
-constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v1";
+// Both bump together. A hit usually follows a manifest state to its entry key
+// without recomputing it, so an entry key bump alone would still lead an older
+// vcache from a v1 manifest into an entry whose sidecar section it skips.
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v4";
+constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v2";
+
+// Provisional. On a measured store, outputs of 8 MiB or more were 9% of the
+// files and 66% of the bytes; every sidecar is one more file for the trimmer
+// to stat on each walk.
+constexpr uint64_t kSidecarMinBytes = 8ull << 20;
+const std::string kSidecarSuffix = "rustout";
+
+// Sidecars live only in the disk cache, so an entry that can reach S3 keeps
+// every output inline and stays whole on another host. Decided from the config
+// rather than the chain: with a daemon the chain holds no S3 layer, yet the
+// daemon uploads what it stores.
+bool SidecarsApply(const core::Config& config) {
+  return config.disk.enabled && !config.s3.enabled;
+}
 
 int RunPassthrough(const std::vector<std::string>& argv) {
   VCACHE_LOG("rust passthrough: " + util::Join(argv, " "));
@@ -224,6 +247,11 @@ std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
   }
 
   HashExtraEnv(config, &hasher);
+
+  // An inline entry and a sidecar entry never share a key, so a disk-only
+  // recache cannot overwrite an inline entry still queued for upload with one
+  // whose bytes are not inside it.
+  hasher.UpdateDelimited(SidecarsApply(config) ? "sidecars" : "inline");
   return hasher.Hex();
 }
 
@@ -331,7 +359,8 @@ bool IsSafeOutputName(std::string_view name) {
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
                     const std::vector<std::string>& path_env_vars,
-                    std::vector<storage::BlobFile>* files,
+                    uint64_t sidecar_min_bytes, std::vector<storage::BlobFile>* files,
+                    std::vector<storage::BlobSidecarFile>* sidecar_files,
                     std::string* unparsed_dep_info) {
   std::error_code ec;
   for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
@@ -346,9 +375,6 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
       return false;
     }
     const std::string path = entry.path().string();
-    auto contents = util::ReadFile(path);
-    if (!contents) return false;
-
     storage::BlobFile file;
     file.name = fs::relative(entry.path(), fs::path(dir), ec).string();
     if (ec) return false;
@@ -358,6 +384,21 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     // directory, so an entry that restores the bytes but not the execute bit
     // fails the build with EACCES.
     file.executable = (status.permissions() & fs::perms::owner_exec) != fs::perms::none;
+
+    // Left where rustc wrote it: hashed, stored and placed from the stage
+    // dir, never read into memory. The .d is excluded by name, whatever its
+    // size, because it has to be rewritten.
+    if (!util::EndsWith(file.name, ".d")) {
+      const uintmax_t size = entry.file_size(ec);
+      if (ec) return false;
+      if (size >= sidecar_min_bytes) {
+        sidecar_files->push_back({std::move(file.name), "", file.executable});
+        continue;
+      }
+    }
+
+    auto contents = util::ReadFile(path);
+    if (!contents) return false;
 
     // rustc does not apply --remap-path-prefix to dep-info output, exactly as
     // gcc does not to .d files, so it has to be rewritten explicitly.
@@ -377,13 +418,13 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     }
     files->push_back(std::move(file));
   }
-  return !files->empty();
+  return !files->empty() || !sidecar_files->empty();
 }
 
 // Writes a captured file set into the real output directory.
 bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
                     const std::string& out_dir, const RootMap& roots,
-                    const std::vector<std::string>& path_env_vars) {
+                    const std::vector<std::string>& path_env_vars, size_t* placed) {
   for (const storage::BlobFile& file : files) {
     if (!IsSafeOutputName(file.name)) {
       VCACHE_LOG("rust: refusing stored file name '" + file.name + "'");
@@ -408,6 +449,7 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }
+    if (placed != nullptr) ++*placed;
     if (file.executable) {
       if (!util::AddExecuteBitsUnderUmask(target)) {
         VCACHE_LOG("rust: could not make " + target + " executable");
@@ -418,13 +460,67 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   return true;
 }
 
+std::optional<ScannedOutput> HashAndScanFile(const std::string& path,
+                                             const std::vector<std::string>& patterns,
+                                             size_t chunk_bytes) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return std::nullopt;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    ::close(fd);
+    return std::nullopt;
+  }
+  // A pattern can straddle two reads, so each read is searched together with
+  // the tail of the one before it: one byte short of the longest pattern.
+  size_t carried_bytes = 0;
+  for (const std::string& pattern : patterns) {
+    if (!pattern.empty()) carried_bytes = std::max(carried_bytes, pattern.size() - 1);
+  }
+  hash::Hasher hasher;
+  ScannedOutput scanned;
+  std::string window;
+  std::vector<char> buf(std::max<size_t>(chunk_bytes, 1));
+  bool read_ok = true;
+  while (true) {
+    const ssize_t n = ::read(fd, buf.data(), buf.size());
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      read_ok = false;
+      break;
+    }
+    if (n == 0) break;
+    hasher.Update(buf.data(), static_cast<size_t>(n));
+    scanned.size += static_cast<uint64_t>(n);
+    if (scanned.found_pattern) continue;
+    window.append(buf.data(), static_cast<size_t>(n));
+    for (size_t i = 0; i < patterns.size(); ++i) {
+      if (!patterns[i].empty() && window.find(patterns[i]) != std::string::npos) {
+        scanned.found_pattern = i;
+        break;
+      }
+    }
+    if (window.size() > carried_bytes) window.erase(0, window.size() - carried_bytes);
+  }
+  ::close(fd);
+  // A file that changed size under the read was not scanned whole.
+  if (!read_ok || scanned.size != static_cast<uint64_t>(st.st_size)) return std::nullopt;
+  scanned.digest = hasher.Hex();
+  return scanned;
+}
+
 namespace {
 
-// Names the first path-valued env dep whose local value, which the key left out,
-// still appears in the entry: another checkout must not be served this path.
-std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& env_deps,
-                                               const std::vector<std::string>& path_env_vars,
-                                               const RootMap& roots, const storage::Blob& blob) {
+// The local value of each path-valued env dep the key canonicalised. The key
+// left it out, so an entry that still holds it must not be served elsewhere.
+struct LocalEnvPath {
+  std::string name;
+  std::string value;
+};
+
+std::vector<LocalEnvPath> LocalEnvPaths(const std::vector<core::DepEnv>& env_deps,
+                                        const std::vector<std::string>& path_env_vars,
+                                        const RootMap& roots) {
+  std::vector<LocalEnvPath> paths;
   for (const core::DepEnv& env : env_deps) {
     if (!env.value || std::find(path_env_vars.begin(), path_env_vars.end(), env.name) ==
                           path_env_vars.end()) {
@@ -432,10 +528,21 @@ std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& 
     }
     const char* raw = std::getenv(env.name.c_str());
     if (raw == nullptr || *raw == '\0' || roots.Canonicalize(raw) == raw) continue;
-    const std::string_view local(raw);
-    if (blob.stderr_text.find(local) != std::string::npos) return env.name;
-    for (const storage::BlobFile& file : blob.files) {
-      if (file.contents.find(local) != std::string::npos) return env.name + " in " + file.name;
+    paths.push_back({env.name, raw});
+  }
+  return paths;
+}
+
+// Names the first local env path found in the diagnostics or an inline file.
+std::optional<std::string> FindEnvPathInOutput(const std::vector<LocalEnvPath>& local_paths,
+                                               const std::string& stderr_text,
+                                               const std::vector<storage::BlobFile>& files) {
+  for (const LocalEnvPath& local : local_paths) {
+    if (stderr_text.find(local.value) != std::string::npos) return local.name;
+    for (const storage::BlobFile& file : files) {
+      if (file.contents.find(local.value) != std::string::npos) {
+        return local.name + " in " + file.name;
+      }
     }
   }
   return std::nullopt;
@@ -447,20 +554,32 @@ std::optional<std::string> FindEnvPathInOutput(const std::vector<core::DepEnv>& 
 // canonicalised copy in `files` and localised like a hit's.
 bool PlaceStagedOutputs(const std::string& stage_dir,
                         const std::vector<storage::BlobFile>& files,
+                        const std::vector<storage::BlobSidecarFile>& sidecar_files,
                         const std::string& out_dir, const RootMap& roots,
                         const std::vector<std::string>& path_env_vars) {
+  struct Staged {
+    const std::string& name;
+    bool executable;
+  };
+  std::vector<Staged> staged_files;
+  std::vector<storage::BlobFile> dep_info;
   for (const storage::BlobFile& file : files) {
+    if (util::EndsWith(file.name, ".d")) {
+      dep_info.push_back(file);
+    } else {
+      staged_files.push_back({file.name, file.executable});
+    }
+  }
+  for (const storage::BlobSidecarFile& file : sidecar_files) {
+    staged_files.push_back({file.name, file.executable});
+  }
+  for (const Staged& file : staged_files) {
     if (!IsSafeOutputName(file.name)) {
       VCACHE_LOG("rust: refusing staged file name '" + file.name + "'");
       return false;
     }
   }
-  std::vector<storage::BlobFile> dep_info;
-  for (const storage::BlobFile& file : files) {
-    if (util::EndsWith(file.name, ".d")) {
-      dep_info.push_back(file);
-      continue;
-    }
+  for (const Staged& file : staged_files) {
     const std::string staged = stage_dir + "/" + file.name;
     const std::string target = out_dir + "/" + file.name;
     if (!util::MakeDirs(util::DirName(target))) {
@@ -488,33 +607,183 @@ bool PlaceStagedOutputs(const std::string& stage_dir,
   return RestoreOutputs(dep_info, out_dir, roots, path_env_vars);
 }
 
-// "<n> files, <m> bytes in <t> ms". Summed over a build's log, it is the time
-// spent writing outputs rather than compiling them.
-std::string PlacementSummary(const std::vector<storage::BlobFile>& files,
-                             std::chrono::steady_clock::time_point started) {
+uint64_t InlineBytes(const std::vector<storage::BlobFile>& files) {
   uint64_t bytes = 0;
   for (const storage::BlobFile& file : files) bytes += file.contents.size();
-  return std::to_string(files.size()) + " files, " + std::to_string(bytes) + " bytes in " +
+  return bytes;
+}
+
+// "<n> files, <m> bytes in <t> ms". Summed over a build's log, it is the time
+// spent writing outputs rather than compiling them.
+std::string PlacementSummary(size_t file_count, uint64_t bytes,
+                             std::chrono::steady_clock::time_point started) {
+  return std::to_string(file_count) + " files, " + std::to_string(bytes) + " bytes in " +
          util::MillisecondsSince(started) + " ms";
 }
 
-// Restores a cached entry and replays its diagnostics. False if the entry is
-// unusable, in which case the caller recompiles. `lookup_started` is when the
-// entry was asked for: reading and checking it is most of a hit's cost.
-bool ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed,
-              const RootMap& roots, const std::vector<std::string>& path_env_vars,
-              std::chrono::steady_clock::time_point lookup_started) {
+enum class HitOutcome {
+  kServed,
+  // Nothing was placed; another entry may still serve.
+  kUnusable,
+  // Some files were placed before a failure. Another entry might not write
+  // every name this one already placed, so only a compile can repair the set.
+  kPartiallyPlaced,
+};
+
+// Restores a cached entry and replays its diagnostics. Every sidecar is cloned
+// and verified before anything is placed, and nothing reaches cargo until the
+// whole set is in place. `lookup_started` is when the entry was asked for.
+HitOutcome ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed,
+                    const RootMap& roots, const std::vector<std::string>& path_env_vars,
+                    storage::DiskStorage* sidecar_store,
+                    std::chrono::steady_clock::time_point lookup_started) {
   storage::Blob blob;
-  if (!storage::DeserializeBlob(got.value, &blob) || blob.files.empty()) return false;
+  // An entry whose outputs are all sidecars has no inline file: --emit=link
+  // without dep-info is legal.
+  if (!storage::DeserializeBlob(got.value, &blob) ||
+      (blob.files.empty() && blob.sidecar_files.empty())) {
+    return HitOutcome::kUnusable;
+  }
   const auto restore_started = std::chrono::steady_clock::now();
-  if (!RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars)) return false;
-  VCACHE_LOG("rust: restored " + PlacementSummary(blob.files, restore_started));
+  std::vector<std::string_view> names;
+  for (const storage::BlobFile& file : blob.files) names.push_back(file.name);
+  for (const storage::BlobSidecarFile& file : blob.sidecar_files) names.push_back(file.name);
+  for (const std::string_view name : names) {
+    if (!IsSafeOutputName(name)) {
+      VCACHE_LOG("rust: refusing stored file name '" + std::string(name) + "'");
+      return HitOutcome::kUnusable;
+    }
+  }
+
+  struct VerifiedClone {
+    std::string temp;
+    std::string target;
+  };
+  std::vector<VerifiedClone> clones;
+  const auto discard_from = [&](size_t first) {
+    for (size_t i = first; i < clones.size(); ++i) util::RemoveFile(clones[i].temp);
+  };
+  uint64_t sidecar_bytes = 0;
+  for (const storage::BlobSidecarFile& file : blob.sidecar_files) {
+    // A missing sidecar was evicted on its own mtime, independently of the
+    // entry; an S3 or disk-less run never has one. Either way, a miss.
+    const auto stored =
+        sidecar_store != nullptr ? sidecar_store->GetFile(file.digest, kSidecarSuffix)
+                                 : std::nullopt;
+    if (!stored) {
+      VCACHE_LOG("rust: sidecar " + file.digest + " for " + file.name + " is gone");
+      discard_from(0);
+      return HitOutcome::kUnusable;
+    }
+    const std::string target = parsed.out_dir + "/" + file.name;
+    const auto temp = util::CloneToTempBeside(*stored, target);
+    if (!temp) {
+      VCACHE_LOG("rust: could not clone " + *stored + " beside " + target + ": " +
+                 std::strerror(errno));
+      discard_from(0);
+      return HitOutcome::kUnusable;
+    }
+    clones.push_back({*temp, target});
+    // The clone, not the stored file: a reflink shares the source's extents
+    // as they were when it was taken, so this checks exactly what is published.
+    const auto digest = hash::HashFile(*temp);
+    if (!digest || *digest != file.digest) {
+      VCACHE_LOG("rust: sidecar " + *stored + " failed digest verification");
+      sidecar_store->RemoveFile(file.digest, kSidecarSuffix);
+      discard_from(0);
+      return HitOutcome::kUnusable;
+    }
+    if (file.executable && !util::AddExecuteBitsUnderUmask(*temp)) {
+      discard_from(0);
+      return HitOutcome::kUnusable;
+    }
+    sidecar_bytes += util::FileSize(*temp).value_or(0);
+  }
+
+  for (size_t i = 0; i < clones.size(); ++i) {
+    if (::rename(clones[i].temp.c_str(), clones[i].target.c_str()) != 0) {
+      VCACHE_LOG("rust: could not rename a verified sidecar into place: " + clones[i].target +
+                 ": " + std::strerror(errno));
+      discard_from(i);
+      return i > 0 ? HitOutcome::kPartiallyPlaced : HitOutcome::kUnusable;
+    }
+  }
+  size_t inline_placed = 0;
+  if (!RestoreOutputs(blob.files, parsed.out_dir, roots, path_env_vars, &inline_placed)) {
+    return clones.size() + inline_placed > 0 ? HitOutcome::kPartiallyPlaced
+                                             : HitOutcome::kUnusable;
+  }
+  VCACHE_LOG("rust: restored " +
+             PlacementSummary(blob.files.size() + blob.sidecar_files.size(),
+                              InlineBytes(blob.files) + sidecar_bytes, restore_started));
   VCACHE_LOG("rust: hit total " + util::MillisecondsSince(lookup_started) + " ms");
   if (!blob.stderr_text.empty()) {
     const std::string text = roots.LocalizeText(blob.stderr_text);
     ::fwrite(text.data(), 1, text.size(), stderr);
   }
-  return true;
+  return HitOutcome::kServed;
+}
+
+enum class StorePrepared {
+  kReady,
+  // A decision was recorded: the entry must not be stored.
+  kRefused,
+  // A sidecar could not be read or stored; counted as a failed store.
+  kFailed,
+};
+
+// Settles, before anything is placed, whether this compile's entry can be
+// stored, and publishes its sidecars: a sidecar is cloned from the staged
+// file, which placing renames away. The env-path check covers every byte the
+// entry will hold or name, and finishes before the first sidecar is stored.
+// Whatever it returns, the outputs are still placed.
+StorePrepared PrepareSidecarStore(const std::string& stage_dir, const std::vector<storage::BlobFile>& files,
+                         const std::string& canonical_stderr,
+                         const std::vector<LocalEnvPath>& local_paths,
+                         std::vector<storage::BlobSidecarFile>* sidecar_files,
+                         storage::DiskStorage* sidecar_store, const std::string& cache_dir,
+                         bool* media_failed) {
+  if (auto leaked = FindEnvPathInOutput(local_paths, canonical_stderr, files)) {
+    core::RecordDecision(cache_dir, {Reason::kEnvPathInOutput, *leaked});
+    return StorePrepared::kRefused;
+  }
+  std::vector<std::string> patterns;
+  for (const LocalEnvPath& local : local_paths) patterns.push_back(local.value);
+  for (storage::BlobSidecarFile& file : *sidecar_files) {
+    const auto scanned = HashAndScanFile(stage_dir + "/" + file.name, patterns);
+    if (!scanned) {
+      VCACHE_LOG("rust: could not read " + file.name + " whole; not storing");
+      core::RecordCounter(cache_dir, Counter::kStoreFailed);
+      return StorePrepared::kFailed;
+    }
+    if (scanned->found_pattern) {
+      core::RecordDecision(cache_dir, {Reason::kEnvPathInOutput,
+                                       local_paths[*scanned->found_pattern].name + " in " +
+                                           file.name});
+      return StorePrepared::kRefused;
+    }
+    file.digest = scanned->digest;
+  }
+  if (sidecar_files->empty()) return StorePrepared::kReady;
+  if (sidecar_store == nullptr) return StorePrepared::kFailed;
+  for (const storage::BlobSidecarFile& file : *sidecar_files) {
+    const std::string staged = stage_dir + "/" + file.name;
+    switch (sidecar_store->PutFile(file.digest, kSidecarSuffix, staged)) {
+      case storage::DiskStorage::PutFileStatus::kStored:
+        continue;
+      case storage::DiskStorage::PutFileStatus::kFailed:
+        *media_failed |=
+            core::ReportCacheMediaErrors({"disk: " + sidecar_store->last_error()}, cache_dir);
+        break;
+      case storage::DiskStorage::PutFileStatus::kSourceMissing:
+      case storage::DiskStorage::PutFileStatus::kReadOnly:
+        VCACHE_LOG("rust: could not store the sidecar for " + file.name);
+        break;
+    }
+    core::RecordCounter(cache_dir, Counter::kStoreFailed);
+    return StorePrepared::kFailed;
+  }
+  return StorePrepared::kReady;
 }
 
 Counter HitCounter(const storage::GetResult& got) {
@@ -581,6 +850,18 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // Tracks whether any layer was broken, as opposed to cold, for this run.
   bool media_failed = false;
 
+  // Sidecars are read and written in the disk cache directly, with or without
+  // a daemon: the entry crosses the socket, its large outputs never do.
+  std::optional<storage::DiskStorage> disk_for_sidecars;
+  if (config.disk.enabled) {
+    disk_for_sidecars.emplace(config.disk.dir, config.disk.max_size, config.read_only);
+  }
+  storage::DiskStorage* const sidecar_store =
+      disk_for_sidecars ? &*disk_for_sidecars : nullptr;
+  // Set when a hit failed after placing part of its set. Only a compile
+  // overwrites the whole set, so no other entry is tried.
+  bool partially_placed = false;
+
   // ---- manifest: answer from a remembered dep-info run --------------------
 
   std::string manifest_key;
@@ -607,8 +888,15 @@ int RunRustCompile(const std::vector<std::string>& argv,
       const auto lookup_started = std::chrono::steady_clock::now();
       storage::GetResult got = cache->Get(states[i].key);
       media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
-      if (!got.hit ||
-          !ServeHit(got, parsed, roots, config.rust_path_env_vars, lookup_started)) {
+      const HitOutcome outcome = got.hit ? ServeHit(got, parsed, roots, config.rust_path_env_vars,
+                                                    sidecar_store, lookup_started)
+                                         : HitOutcome::kUnusable;
+      if (outcome == HitOutcome::kPartiallyPlaced) {
+        VCACHE_LOG("rust manifest: " + which + " placed part of its set; recompiling");
+        partially_placed = true;
+        break;
+      }
+      if (outcome != HitOutcome::kServed) {
         VCACHE_LOG("rust manifest: " + which + " matched but its entry is " +
                    (got.hit ? "unusable" : "gone"));
         continue;
@@ -655,17 +943,20 @@ int RunRustCompile(const std::vector<std::string>& argv,
   };
 
   const auto try_entry_hit = [&]() {
-    if (cache == nullptr) return false;
+    if (cache == nullptr || partially_placed) return false;
     const auto lookup_started = std::chrono::steady_clock::now();
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
-      if (ServeHit(got, parsed, roots, config.rust_path_env_vars, lookup_started)) {
+      const HitOutcome outcome = ServeHit(got, parsed, roots, config.rust_path_env_vars,
+                                          sidecar_store, lookup_started);
+      if (outcome == HitOutcome::kServed) {
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
         return true;
       }
+      partially_placed = outcome == HitOutcome::kPartiallyPlaced;
       VCACHE_LOG("rust: unusable cache entry; recompiling");
     }
     return false;
@@ -725,18 +1016,41 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   std::vector<storage::BlobFile> files;
+  std::vector<storage::BlobSidecarFile> sidecar_files;
   std::string unparsed_dep_info;
-  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars, &files,
-                      &unparsed_dep_info)) {
+  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars,
+                      SidecarsApply(config) ? kSidecarMinBytes
+                                            : std::numeric_limits<uint64_t>::max(),
+                      &files, &sidecar_files, &unparsed_dep_info)) {
     core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
+
+  const bool storing = !config.read_only && cache != nullptr;
+  const std::string canonical_stderr = roots.CanonicalizeText(compiled.stderr_data);
+  StorePrepared prepared = StorePrepared::kRefused;
+  if (storing && !unparsed_dep_info.empty()) {
+    core::RecordDecision(cache_dir, {Reason::kUnparsedDepInfo, unparsed_dep_info});
+  } else if (storing) {
+    prepared = PrepareSidecarStore(
+        stage_dir, files, canonical_stderr,
+        LocalEnvPaths(inputs.env_deps, config.rust_path_env_vars, roots), &sidecar_files,
+        sidecar_store, cache_dir, &media_failed);
+  }
+
   const auto place_started = std::chrono::steady_clock::now();
-  if (!PlaceStagedOutputs(stage_dir, files, parsed.out_dir, roots, config.rust_path_env_vars)) {
+  uint64_t sidecar_bytes = 0;
+  for (const storage::BlobSidecarFile& file : sidecar_files) {
+    sidecar_bytes += util::FileSize(stage_dir + "/" + file.name).value_or(0);
+  }
+  if (!PlaceStagedOutputs(stage_dir, files, sidecar_files, parsed.out_dir, roots,
+                          config.rust_path_env_vars)) {
     core::RecordDecision(cache_dir, {Reason::kOutputUnplaceable, parsed.out_dir});
     return RunPassthrough(argv);
   }
-  VCACHE_LOG("rust: placed " + PlacementSummary(files, place_started));
+  VCACHE_LOG("rust: placed " + PlacementSummary(files.size() + sidecar_files.size(),
+                                                InlineBytes(files) + sidecar_bytes,
+                                                place_started));
 
   // Only now, with the artifacts in place. rustc announces each one on stderr
   // as a JSON "artifact" message, and cargo uses those to start a dependent
@@ -748,28 +1062,21 @@ int RunRustCompile(const std::vector<std::string>& argv,
     ::fflush(stderr);
   }
 
-  if (config.read_only || cache == nullptr) {
+  if (!storing || prepared == StorePrepared::kFailed) {
     if (media_failed && config.error_on_cache_media_failure &&
         compiled.exit_code == 0) {
       return core::kCacheMediaFailureExit;
     }
     return compiled.exit_code;
   }
+  if (prepared == StorePrepared::kRefused) return compiled.exit_code;
 
-  if (!unparsed_dep_info.empty()) {
-    core::RecordDecision(cache_dir, {Reason::kUnparsedDepInfo, unparsed_dep_info});
-    return compiled.exit_code;
-  }
-
+  // Every sidecar is in the store before the entry that names it: the daemon
+  // completes a single-flight lease as soon as this Put succeeds.
   storage::Blob blob;
   blob.files = std::move(files);
-  blob.stderr_text = roots.CanonicalizeText(compiled.stderr_data);
-
-  if (auto leaked = FindEnvPathInOutput(inputs.env_deps, config.rust_path_env_vars, roots,
-                                        blob)) {
-    core::RecordDecision(cache_dir, {Reason::kEnvPathInOutput, *leaked});
-    return compiled.exit_code;
-  }
+  blob.sidecar_files = std::move(sidecar_files);
+  blob.stderr_text = canonical_stderr;
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
   core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);

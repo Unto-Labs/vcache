@@ -139,8 +139,13 @@ the build. `vcache --show-costs` summarises the records.
 Each compile, dependency scan and link works in a scratch directory under
 `<cache>/tmp/` (the system temp dir only when that cannot be created). It is
 removed when vcache exits; a vcache that is killed mid-compile cannot, so
-`--trim`, and a store that triggers an eviction check, remove any scratch
-directory not modified for six hours.
+`--trim`, and a store that triggers an eviction check, sweep them. The name
+carries the owner's pid and a tag for its pid namespace and boot,
+`<prefix><pid>.<tag>-XXXXXX`. A directory whose owner is still running is kept
+however old its mtime, since a long compile rewriting existing files does not
+change it; one whose owner has exited goes after ten minutes. A directory the
+sweep cannot check (another container, an earlier boot, an older vcache) goes
+once it has not been modified for six hours.
 
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,

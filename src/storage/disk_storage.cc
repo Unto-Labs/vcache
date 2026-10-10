@@ -21,7 +21,8 @@ namespace vcache::storage {
 namespace {
 
 constexpr int kShardCount = 256;
-// No compile runs this long, so a scratch directory this old was left by a killed one.
+// No compile runs this long, so a scratch directory this old whose owner the sweep
+// cannot check was left by a killed one.
 constexpr int64_t kStaleScratchSeconds = 6 * 3600;
 
 // Evict down to this fraction of the budget so a shard that is exactly at the

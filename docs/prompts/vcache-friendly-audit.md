@@ -145,24 +145,29 @@ hosts with different CPUs share one cache directory and one host name, use `unca
 
 ### Precompiled headers
 
-vcache does not cache the PCH build itself (`-x c++-header` counts as "unknown language"), so
-each tree builds its own PCH. vcache caches the consumers, because `-E` expands the header text
-in place of the PCH, which puts the header in the key. Thus:
+vcache caches the consumers of a PCH, because `-E` expands the header text in place of the
+PCH, which puts the header in the key. It also caches the PCH build itself (`-x c++-header`,
+`-x c-header`, clang's `-Xclang -emit-pch`), keyed on the header preprocessed with `-dD` plus
+the working directory and the command line exactly as typed: a PCH records the absolute path
+of every input and clang refuses to load it elsewhere, so a rebuild of the same tree hits, and
+so do containers that mount every checkout at one path, but two checkouts at different paths
+never share a PCH entry. Thus:
 
 - A consumer's command line must have every include directory that the PCH producer had. gcc
   and clang can compile a consumer without them, but `-E` then fails and the compile counts as
-  "preprocessor error". Compare producer and consumer flags.
+  "preprocessor error". Compare producer and consumer flags (CMake's `REUSE_FROM` does not
+  carry the producer's include paths to the consumer).
+- clang: build PCHs with `-Xclang -fno-pch-timestamp`. Without it the PCH holds its headers'
+  mtimes, clang rejects a restored copy after any touch, and vcache declines the build as
+  "pch timestamps". gcc `.gch` builds need nothing extra.
+- A PCH build must name its output with `-o`, or it is declined ("no -o").
 - No `-fpch-preprocess` and no `-fno-validate-pch` (see above).
-- The key does not record how the PCH was built. Build it with the same flags and headers as
-  its consumers. A stale `.gch` stores an object under the key of the edited header.
-- clang: build PCHs with `-Xclang -fno-pch-timestamp`. The PCH then holds no header mtimes, and
-  clang accepts a copy restored into another tree. Any cache that restores PCHs needs this, and
-  the PCH caching proposed for vcache requires it. Do not add build steps that depend on header
-  mtimes.
-- A `<pch>.sum` digest of the PCH inputs (compiler identity, flags, preprocessed header) is what
-  ccache's `pch_external_checksum` reads. vcache's proposed manifest mode would read it, or a
-  `<pch>.vcache-key` that vcache writes. Neither changes the hit rate today. Mention one only as
-  preparation.
+- The consumer's key does not record how the PCH was built. Build it with the same flags and
+  headers as its consumers. A stale `.gch` stores an object under the key of the edited header.
+- After every PCH build vcache writes `<output>.vcache-key` beside the PCH: one line, the
+  PCH's cache key. A build that also writes a `<pch>.sum` digest for ccache's
+  `pch_external_checksum` can keep doing so; neither file changes the hit rate of the
+  consumers today.
 
 ### Rust
 

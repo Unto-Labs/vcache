@@ -328,11 +328,20 @@ bool IsSafeOutputName(std::string_view name) {
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
                     const std::vector<std::string>& path_env_vars,
-                    std::vector<storage::BlobFile>* files) {
+                    std::vector<storage::BlobFile>* files,
+                    std::string* unparsed_dep_info) {
   std::error_code ec;
   for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
     if (ec) return false;
-    if (!entry.is_regular_file()) continue;
+    // Not is_regular_file(), which follows a symlink: the entry would hold the
+    // target's bytes and never recreate the link.
+    const fs::file_status status = entry.symlink_status(ec);
+    if (ec) return false;
+    if (fs::is_directory(status)) continue;
+    if (!fs::is_regular_file(status)) {
+      VCACHE_LOG("rust: output " + entry.path().string() + " is not a regular file");
+      return false;
+    }
     const std::string path = entry.path().string();
     auto contents = util::ReadFile(path);
     if (!contents) return false;
@@ -345,8 +354,7 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     // cargo runs build scripts and binary crates directly out of the output
     // directory, so an entry that restores the bytes but not the execute bit
     // fails the build with EACCES.
-    file.executable =
-        (entry.status().permissions() & fs::perms::owner_exec) != fs::perms::none;
+    file.executable = (status.permissions() & fs::perms::owner_exec) != fs::perms::none;
 
     // rustc does not apply --remap-path-prefix to dep-info output, exactly as
     // gcc does not to .d files, so it has to be rewritten explicitly.
@@ -356,6 +364,9 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
         SubstituteDir(&*dep, dir, std::string(kOutDirPlaceholder));
         file.contents = core::RenderDepFile(*dep);
       } else {
+        // Still placed, since the build reads it, but it names the stage dir,
+        // and a hit in another checkout would write that path as its target.
+        if (unparsed_dep_info->empty()) *unparsed_dep_info = file.name;
         file.contents = std::move(*contents);
       }
     } else {
@@ -395,12 +406,7 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
       return false;
     }
     if (file.executable) {
-      std::error_code perm_ec;
-      fs::permissions(target,
-                      fs::perms::owner_exec | fs::perms::group_exec |
-                          fs::perms::others_exec,
-                      fs::perm_options::add, perm_ec);
-      if (perm_ec) {
+      if (!util::AddExecuteBitsUnderUmask(target)) {
         VCACHE_LOG("rust: could not make " + target + " executable");
         return false;
       }
@@ -653,7 +659,9 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   std::vector<storage::BlobFile> files;
-  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars, &files)) {
+  std::string unparsed_dep_info;
+  if (!CaptureOutputs(stage_dir, roots, config.rust_path_env_vars, &files,
+                      &unparsed_dep_info)) {
     core::RecordDecision(cache_dir, Reason::kCaptureFailed);
     return RunPassthrough(argv);
   }
@@ -677,6 +685,11 @@ int RunRustCompile(const std::vector<std::string>& argv,
         compiled.exit_code == 0) {
       return core::kCacheMediaFailureExit;
     }
+    return compiled.exit_code;
+  }
+
+  if (!unparsed_dep_info.empty()) {
+    core::RecordDecision(cache_dir, {Reason::kUnparsedDepInfo, unparsed_dep_info});
     return compiled.exit_code;
   }
 

@@ -4928,8 +4928,18 @@ void TestRustOutputNames() {
   Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
         "a symlink out of the capture directory can be planted");
   std::vector<storage::BlobFile> captured;
-  Check(!rust::CaptureOutputs(cap, roots, {}, &captured),
+  std::string unparsed_dep_info;
+  Check(!rust::CaptureOutputs(cap, roots, {}, &captured, &unparsed_dep_info),
         "capturing a name that escapes the output directory fails");
+
+  const std::string inner = *scratch + "/inner";
+  util::MakeDirs(inner);
+  util::WriteFileAtomic(inner + "/lib.rlib", "ok");
+  Check(::symlink("lib.rlib", (inner + "/alias.rlib").c_str()) == 0,
+        "a symlink inside the capture directory can be planted");
+  captured.clear();
+  Check(!rust::CaptureOutputs(inner, roots, {}, &captured, &unparsed_dep_info),
+        "capturing a symlink that stays inside the directory fails too");
 }
 
 void TestUploadGeneration() {

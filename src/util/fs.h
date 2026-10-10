@@ -25,6 +25,12 @@ bool MakeDirs(const std::string& path);
 // rather than publishing more than the user asked for.
 mode_t DefaultFileMode();
 
+// Marks `path` executable the way a linker would have created it: execute for
+// each of owner, group and other that DefaultFileMode() lets read. Adding all
+// three regardless would publish 0711 under umask 077, a binary other users can
+// run but not read.
+bool AddExecuteBitsUnderUmask(const std::string& path);
+
 std::optional<std::string> ReadFile(const std::string& path);
 
 // Writes via a temporary file in the same directory followed by rename(2), so a

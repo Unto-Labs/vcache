@@ -63,6 +63,17 @@ mode_t DefaultFileMode() {
   return kMode;
 }
 
+bool AddExecuteBitsUnderUmask(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  const mode_t allowed = DefaultFileMode();
+  mode_t add = 0;
+  if (allowed & S_IRUSR) add |= S_IXUSR;
+  if (allowed & S_IRGRP) add |= S_IXGRP;
+  if (allowed & S_IROTH) add |= S_IXOTH;
+  return ::chmod(path.c_str(), (st.st_mode & 07777) | add) == 0;
+}
+
 namespace {
 
 // std::filesystem throws on many operations; every call here goes through a

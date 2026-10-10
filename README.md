@@ -49,6 +49,7 @@ is a hit at all when a ccache hit would not have been.
 | [docs/design.md](docs/design.md) | How it is put together |
 | [docs/daemon.md](docs/daemon.md) | The optional cache daemon: async S3 uploads, kept connections |
 | [docs/linux-kernel.md](docs/linux-kernel.md) | Recipe: caching Linux kernel builds |
+| [docs/prompts/vcache-friendly-audit.md](docs/prompts/vcache-friendly-audit.md) | A prompt for a coding agent that audits your build for vcache friendliness |
 
 ## Quick start
 
@@ -260,7 +261,8 @@ and RHEL) gets a dynamically linked libstdc++ instead, which adds
 
 ## What is not cached
 
-Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
+Linking (unless the link cache is on, `VCACHE_LINK_CACHE=1`, Linux only),
+`-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
 text never mentions), a clang precompiled header built without
 `-Xclang -fno-pch-timestamp`, and `rustc` without `--out-dir`/`--emit`. All of

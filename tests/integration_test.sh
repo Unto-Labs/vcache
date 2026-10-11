@@ -4834,18 +4834,34 @@ check "a tracer that is not a shared object is not preloaded" \
 check "and neither the miss nor the hit prints a loader message" \
   "$(cat "$tl/notelf-miss.err" "$tl/notelf-hit.err" | grep -c 'cannot be preloaded' || true)" "0"
 
-# A compile in which ld.so ignored a preload anyway is not stored.
+# A compile in which ld.so refused a preload in some process is cached as
+# usual, from the depfile, without the refusal: it is the tracer's doing, and
+# a hit must not replay it. A PCH built that way still gets its .vcache-key.
 if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   mkdir -p "$tl/badwrap"
   printf '#!/bin/sh\nLD_PRELOAD="$LD_PRELOAD %s/no-such-lib.so" exec %s "$@"\n' \
     "$tl" "$(gcc -print-prog-name=cc1)" > "$tl/badwrap/cc1"
   chmod +x "$tl/badwrap/cc1"
-  ( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -B "$tl/badwrap/" -O2 -c main.c -o m.o ) \
-    2> "$tl/badwrap.err"
-  check "a compile whose stderr has ld.so ignoring a preload says so" \
-    "$(grep -c 'cannot be preloaded' "$tl/badwrap.err")" "1"
-  check "and stores nothing to replay it from" "$(disk_entries)" "0"
+  mf_badwrap() {  # $1 log, $2 stderr file
+    ( cd "$tl" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" gcc -B "$tl/badwrap/" -O2 -c main.c -o m.o ) 2> "$2"
+  }
+  l=$(mf_log badwrap1); mf_badwrap "$l" "$tl/badwrap1.err"
+  check "a refused preload records the state from the depfile" \
+    "$(grep -c 'ld.so refused the tracer in a process of the compile; recording from' "$l")" "1"
+  check "and stores it" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  check "and is counted once, as a miss" "$(misses)/$(uncacheable)" "1/0"
+  l=$(mf_log badwrap2); mf_badwrap "$l" "$tl/badwrap2.err"
+  check "the next compile hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
+  check "and neither prints the loader's refusal" \
+    "$(cat "$tl/badwrap1.err" "$tl/badwrap2.err" | grep -c 'cannot be preloaded' || true)" "0"
+  printf '#define P 1\n' > "$tl/p.h"
+  rm -f "$tl/p.h.gch" "$tl/p.h.gch.vcache-key"
+  ( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -B "$tl/badwrap/" -O2 -x c-header -c p.h \
+      -o p.h.gch ) 2>/dev/null
+  check "a PCH built through it still gets its .vcache-key" \
+    "$([[ -s "$tl/p.h.gch.vcache-key" ]] && echo written)" "written"
 fi
 
 # A compiler process that did not load the tracer records nothing, so the

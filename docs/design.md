@@ -199,9 +199,10 @@ ELF shared object of vcache's own class and machine, a host other than Linux),
 when `LD_PRELOAD` is already set, when no process loaded the tracer, when the
 trace is marked incomplete, does not parse or names no process, when the
 compiler's include directories cannot be listed, and when the trace does not
-show a file the depfile names being read. A compile whose stderr carries
-ld.so's "cannot be preloaded" message is not stored at all: the entry would
-replay it on every hit.
+show a file the depfile names being read, and when ld.so refused a preload in
+some process of the compile. ld.so's "cannot be preloaded" lines are then taken
+out of the compile's stderr: they come from preloading the tracer, and an entry
+would replay them on every hit. The entry is stored as usual.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off

@@ -303,6 +303,18 @@ void TestLinkTraceClassification() {
     Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
   }
 
+  // ld.so's refusals are taken out of a traced compile's stderr, line by line.
+  bool refused = false;
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:1: warning: x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS64): ignored.\nlast",
+              &refused),
+          "a.c:1: warning: x\nlast", "a refusal line goes, the compiler's lines stay");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals("a.c:1: warning: x\n", &refused), "a.c:1: warning: x\n",
+          "stderr without one is untouched");
+  Check(!refused, "and reports none");
+
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
   util::WriteFileAtomic(log, "P\t/usr/bin/ld\ngarbage line\n");

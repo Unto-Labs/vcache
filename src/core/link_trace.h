@@ -56,6 +56,11 @@ bool TracerLoadsHere(const std::string& tracer);
 // The message ld.so writes to stderr when it ignores an LD_PRELOAD entry.
 inline constexpr std::string_view kPreloadIgnoredMessage = "from LD_PRELOAD cannot be preloaded";
 
+// `stderr_text` without the lines carrying kPreloadIgnoredMessage. Sets
+// `removed` when there was one: some process of the traced tree did not load
+// the tracer, and a cached entry must not replay what preloading it caused.
+std::string WithoutPreloadRefusals(const std::string& stderr_text, bool* removed);
+
 // Parses a tracer log. `outputs` are the files this link writes; they are
 // excluded from every set, since an output is not an input to itself.
 // `cwd` resolves relative paths as the tracer recorded them.

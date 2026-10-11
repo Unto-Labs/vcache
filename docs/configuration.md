@@ -933,7 +933,8 @@ compiler's executables, the shared objects they load and its own trees
 (`lib*/gcc`, `libexec/gcc`, `lib/clang`) outside every include directory are
 left out: the compiler fingerprint stands for them. On `src/daemon/server.cc` a
 state holds 1091 absent paths under g++ and 902 under clang++, and a hit takes
-5.9 ms and 6.1 ms, against 5.0 ms and 5.7 ms with none. The result is stored under the ordinary
+5.9 ms and 6.1 ms (min of 30; median 7.4 and 7.5), against 5.8 ms and 5.5 ms
+(median 6.7 and 6.7) before the trace. The result is stored under the ordinary
 preprocessor key, so a tree with `cxx_manifest` off hits entries a tree with it
 on stored, and the reverse. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
@@ -968,7 +969,11 @@ other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
 (a statically linked compiler), a trace the tracer marked incomplete or that
 does not parse, or a trace that does not show every file the depfile names
 being read: a compiler process that did not load the tracer (another ELF class,
-a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed.
+a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. When
+ld.so refuses a preload in some process of the compile, its "cannot be
+preloaded" lines are taken out of the compile's stderr, so neither the miss nor
+a later hit prints them, and the state comes from the depfile; the entry is
+stored as usual.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:
@@ -983,8 +988,6 @@ says why:
   the compile read.
 - A file the compiler read, by the trace, that is gone by the time the state
   is recorded, other than an intermediate it also wrote.
-- ld.so's "cannot be preloaded" message on the compile's stderr: nothing is
-  stored, since an entry would replay it.
 - From the depfile alone under gcc, a `.gch` in a directory an `#include` could
   have searched that the command line does not name: gcc uses it without
   listing it or its header in the depfile. The trace sees it.
@@ -999,7 +1002,7 @@ directories records no state and stays on the preprocessor; Boost's config
 headers are one common source, as is any header on `CPATH` or
 `C_INCLUDE_PATH`, which vcache does not count as the compiler's own. With the
 trace such a unit records a state: `src/core/depfile.cc`, which includes Boost,
-hits in 9.1 ms where the preprocessor took 250 ms. The compiler's own
+hits in 10.1 ms where the preprocessor took 292 ms. The compiler's own
 directories come from `<compiler> -E -v`, run without the `CPATH` family and
 memoised under `<dir>/sysinc/`, which `--trim` prunes like `filehash/` and
 `--clear` empties. clang is unaffected: its depfile lists the files

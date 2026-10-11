@@ -117,6 +117,25 @@ bool TracerLoadsHere(const std::string& tracer) {
          ours->compare(18, 2, *theirs, 18, 2) == 0 && type == kSharedObjectType;
 }
 
+std::string WithoutPreloadRefusals(const std::string& stderr_text, bool* removed) {
+  *removed = false;
+  std::string kept;
+  kept.reserve(stderr_text.size());
+  size_t begin = 0;
+  while (begin < stderr_text.size()) {
+    size_t end = stderr_text.find('\n', begin);
+    end = end == std::string::npos ? stderr_text.size() : end + 1;
+    const std::string_view line(stderr_text.data() + begin, end - begin);
+    if (line.find(kPreloadIgnoredMessage) != std::string_view::npos) {
+      *removed = true;
+    } else {
+      kept.append(line);
+    }
+    begin = end;
+  }
+  return kept;
+}
+
 bool ParseTraceLog(const std::string& log_path,
                    const std::vector<std::string>& outputs,
                    const std::string& cwd, LinkTrace* out) {

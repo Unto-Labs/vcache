@@ -1593,6 +1593,13 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   RecordCompileCost(cache_dir, "compile", parsed.source,
                     args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
 
+  // ld.so's refusal to preload the tracer into some process of the compile is
+  // the tracer's doing, not the compiler's: neither printed nor stored, and
+  // the trace is not used, since that process recorded nothing.
+  bool preload_refused = false;
+  if (!trace_log.empty()) {
+    compiled.stderr_data = WithoutPreloadRefusals(compiled.stderr_data, &preload_refused);
+  }
   if (!compiled.stderr_data.empty()) {
     ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);
   }
@@ -1642,14 +1649,6 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     }
   }
 
-  // ld.so ignored the tracer in some process and said so on stderr, which an
-  // entry would replay on every hit.
-  if (!trace_log.empty() &&
-      compiled.stderr_data.find(kPreloadIgnoredMessage) != std::string::npos) {
-    RecordDecision(cache_dir, {Reason::kNoTracer, manifest_tracer});
-    return compiled.exit_code;
-  }
-
   // ---- what the compile read, for the manifest ----------------------------
 
   RecordedInputs manifest_inputs;
@@ -1657,8 +1656,12 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     if (manifest_depfile.empty()) {
       manifest_inputs.declined = "the compile writes no -MD dependency file";
     } else {
+      if (preload_refused) {
+        VCACHE_LOG("cxx manifest: ld.so refused the tracer in a process of the compile; "
+                   "recording from the depfile");
+      }
       const std::optional<CxxTraceInputs> traced =
-          trace_log.empty()
+          trace_log.empty() || preload_refused
               ? std::nullopt
               : ReadCxxManifestTrace(trace_log, manifest_tracer, *temp_dir, keyed_pchs, parsed,
                                      compiler_id, roots, cwd, cache_dir);

@@ -71,4 +71,13 @@ void LogKV(const std::string& key, const std::string& value) {
   LogLine(key + ": " + value);
 }
 
+std::string MillisecondsSince(std::chrono::steady_clock::time_point started) {
+  const double elapsed_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+          .count();
+  char text[32];
+  std::snprintf(text, sizeof(text), "%.3f", elapsed_ms);
+  return text;
+}
+
 }  // namespace vcache::util

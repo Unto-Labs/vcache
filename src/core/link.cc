@@ -20,6 +20,7 @@
 #include "core/stats.h"
 #include "daemon/client.h"
 #include "hash/hasher.h"
+#include "storage/disk_storage.h"
 #include "storage/storage.h"
 #include "util/fs.h"
 #include "util/log.h"
@@ -195,19 +196,11 @@ std::string TracerPath() {
   return util::DirName(*self) + "/vcache-fstrace.so";
 }
 
-// Every output the link is expected to write.
-// Where a link output is kept, content-addressed by its digest.
-//
-// Deliberately inside the disk cache's own shard layout: Trim, Clear and
-// TotalSize all walk those shards, so these files are evicted, cleared and
-// counted like any other entry without a second accounting path. The coupling
-// to that layout is the price; the alternative is a parallel store that the
-// budget does not know about.
-std::string LinkOutputPath(const std::string& cache_dir,
-                           const std::string& digest) {
-  return cache_dir + "/" + digest.substr(0, 2) + "/" + digest + ".linkout";
-}
+// Link outputs are kept as DiskStorage files under this suffix, content-
+// addressed by their digest.
+const std::string kLinkOutputSuffix = "linkout";
 
+// Every output the link is expected to write.
 std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
   std::vector<std::string> out{parsed.output};
   out.insert(out.end(), parsed.extra_outputs.begin(), parsed.extra_outputs.end());
@@ -221,28 +214,18 @@ std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
 // of cloning, so hashing the clone checks exactly what is published.
 bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
                         const std::string& output, bool executable) {
-  const std::string dir = util::DirName(output);
-  std::string tmpl = dir.empty() ? std::string(".vcache-tmp-XXXXXX")
-                                 : dir + "/.vcache-tmp-XXXXXX";
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-  const int fd = ::mkstemp(buf.data());
-  if (fd < 0) {
-    VCACHE_LOG("link hit: cannot create a temp file beside " + output + ": " +
+  const auto temp = util::CloneToTempBeside(stored, output);
+  if (!temp) {
+    VCACHE_LOG("link hit: cannot clone " + stored + " beside " + output + ": " +
                std::strerror(errno));
     return false;
   }
-  ::close(fd);
-  const std::string tmp_path(buf.data());
+  const std::string tmp_path = *temp;
   const auto fail = [&]() {
     util::RemoveFile(tmp_path);
     return false;
   };
 
-  if (!util::CloneFile(stored, tmp_path)) {
-    VCACHE_LOG("link hit: stored output is gone or unreadable: " + stored);
-    return fail();
-  }
   const auto clone_digest = hash::HashFile(tmp_path);
   if (!clone_digest || *clone_digest != digest) {
     VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
@@ -259,7 +242,7 @@ bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
 
 bool MaterializeOutputs(const storage::Blob& blob,
                         const std::vector<std::string>& outputs,
-                        const std::string& cache_dir) {
+                        storage::DiskStorage* disk) {
   std::vector<std::string> expected = outputs;
   std::vector<std::string> stored_names;
   stored_names.reserve(blob.files.size());
@@ -292,17 +275,16 @@ bool MaterializeOutputs(const storage::Blob& blob,
       VCACHE_LOG("link hit: cached output has an invalid content digest");
       return false;
     }
-    const std::string stored = LinkOutputPath(cache_dir, f.contents);
     // The disk cache evicts oldest-mtime-first across every file in its shards,
-    // and DiskStorage::Get refreshes only the entry. Without this a hot output
-    // ages out before its entry, and every later hit fails verification and
-    // relinks. Refreshed before the hash so a trim that starts meanwhile sees a
-    // fresh file.
-    if (::utimensat(AT_FDCWD, stored.c_str(), nullptr, 0) != 0) {
-      VCACHE_LOG("link hit: could not refresh the stored output's mtime: " + stored +
-                 ": " + std::strerror(errno));
+    // and DiskStorage::Get refreshes only the entry. GetFile refreshes the
+    // output too, or a hot output ages out before its entry and every later
+    // hit fails verification and relinks.
+    const auto stored = disk->GetFile(f.contents, kLinkOutputSuffix);
+    if (!stored) {
+      VCACHE_LOG("link hit: stored output is gone: " + f.contents);
+      return false;
     }
-    if (!PlaceVerifiedClone(stored, f.contents, f.name, f.executable)) return false;
+    if (!PlaceVerifiedClone(*stored, f.contents, f.name, f.executable)) return false;
   }
   return true;
 }
@@ -336,6 +318,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     RecordDecision(cache_dir, Reason::kLinkWithoutDisk);
     return RunPassthrough(argv);
   }
+  storage::DiskStorage disk(config.disk.dir, config.disk.max_size, config.read_only);
   const char* inherited_preload = std::getenv("LD_PRELOAD");
   if (inherited_preload != nullptr && *inherited_preload != '\0') {
     // A preloaded library can change linker behaviour, and it is loaded before
@@ -380,7 +363,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("link: manifest entry matched but its result is gone");
         continue;
       }
-      if (!MaterializeOutputs(blob, outputs, cache_dir)) break;
+      if (!MaterializeOutputs(blob, outputs, &disk)) break;
       if (!blob.stderr_text.empty()) {
         ::fputs(roots.LocalizeText(blob.stderr_text).c_str(), stderr);
       }
@@ -535,12 +518,11 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       VCACHE_LOG("link: expected output was not produced: " + path);
       return 0;
     }
-    const std::string stored = LinkOutputPath(cache_dir, *digest);
-    if (!util::MakeDirs(util::DirName(stored))) return 0;
     // Content-addressed, so an output identical to one already stored costs
     // nothing to store again -- and the clone is a reflink where possible, so
     // it costs nothing in space either.
-    if (!util::CloneFile(path, stored)) {
+    if (disk.PutFile(*digest, kLinkOutputSuffix, path) !=
+        storage::DiskStorage::PutFileStatus::kStored) {
       VCACHE_LOG("link: could not stage output into the cache: " + path);
       return 0;
     }

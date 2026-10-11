@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <filesystem>
 #include <memory>
@@ -1161,6 +1162,73 @@ void TestBlob() {
     Check(!storage::DeserializeBlob(flipped, &ignored),
           "flipping one body byte is rejected");
   }
+}
+
+// Builds an entry by hand, so a test can carry a section kind this build does
+// not know, under a valid checksum.
+std::string EncodeBlobBody(const std::string& body) {
+  std::string out = "VCACHE02" + hash::HashString(body);
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>(body.size() >> (8 * i)));
+  return out + body;
+}
+
+std::string EncodeSection(uint8_t kind, const std::string& payload) {
+  std::string out(1, static_cast<char>(kind));
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>(payload.size() >> (8 * i)));
+  return out + payload;
+}
+
+void TestBlobSidecars() {
+  Section("storage::Blob sidecar files");
+
+  const std::string digest(hash::kDigestHexLen, 'a');
+  storage::Blob blob;
+  blob.files.push_back(storage::BlobFile{"demo.d", "demo.d: lib.rs\n"});
+  blob.sidecar_files.push_back(storage::BlobSidecarFile{"libdemo.rlib", digest, false});
+  blob.sidecar_files.push_back(storage::BlobSidecarFile{"demo", hash::HashString("x"), true});
+  storage::Blob decoded;
+  Check(storage::DeserializeBlob(storage::SerializeBlob(blob), &decoded),
+        "an entry with sidecar files round-trips");
+  Check(decoded.files.size() == 1 && decoded.sidecar_files.size() == 2,
+        "inline and sidecar files stay apart");
+  Check(decoded.sidecar_files.size() == 2 && decoded.sidecar_files[0].name == "libdemo.rlib" &&
+            decoded.sidecar_files[0].digest == digest && !decoded.sidecar_files[0].executable &&
+            decoded.sidecar_files[1].name == "demo" &&
+            decoded.sidecar_files[1].digest == hash::HashString("x") &&
+            decoded.sidecar_files[1].executable,
+        "a sidecar keeps its name, digest and execute bit");
+
+  // The reader fails closed on its own format: a digest it cannot use would
+  // otherwise name a file that can never verify.
+  std::string short_digest_payload;
+  for (int i = 0; i < 8; ++i) short_digest_payload.push_back(i == 0 ? 1 : 0);
+  short_digest_payload += "x";
+  short_digest_payload.push_back(0);
+  short_digest_payload += "abc";
+  storage::Blob rejected;
+  Check(!storage::DeserializeBlob(EncodeBlobBody(EncodeSection(7, short_digest_payload)),
+                                  &rejected),
+        "a sidecar section with a short digest is rejected");
+  std::string upper_digest_payload = short_digest_payload.substr(0, 10) +
+                                     std::string(hash::kDigestHexLen, 'A');
+  Check(!storage::DeserializeBlob(EncodeBlobBody(EncodeSection(7, upper_digest_payload)),
+                                  &rejected),
+        "a sidecar section whose digest is not lowercase hex is rejected");
+
+  // Kinds a reader does not know are still skipped, which is what older
+  // entries rely on and what kept older readers from failing on this one.
+  std::string file_payload;
+  for (int i = 0; i < 8; ++i) file_payload.push_back(i == 0 ? 6 : 0);
+  file_payload += "a.rlib";
+  file_payload.push_back(0);
+  file_payload += "rlib bytes";
+  const std::string with_unknown = EncodeBlobBody(EncodeSection(99, "from a newer vcache") +
+                                                  EncodeSection(5, file_payload));
+  storage::Blob skipped;
+  Check(storage::DeserializeBlob(with_unknown, &skipped), "an unknown section kind is skipped");
+  Check(skipped.files.size() == 1 && skipped.files[0].name == "a.rlib" &&
+            skipped.files[0].contents == "rlib bytes" && skipped.sidecar_files.empty(),
+        "and the sections around it still read");
 }
 
 // An in-memory layer, so the chain's fan-out and backfill rules can be checked
@@ -4245,6 +4313,122 @@ void TestDiskTrimPins() {
   }
 }
 
+// Sidecar files sit in the shards beside entries and are evicted with them,
+// so storing one has to run the same growth check an entry does. It must not
+// sweep scratch dirs: a sidecar is stored before its compile has placed the
+// outputs, while the stage dir holds the only copy.
+void TestDiskStorageFiles() {
+  Section("storage::DiskStorage files");
+
+  const std::string payload(40 * 1024, 's');
+  const std::string digest = hash::HashString(payload);
+  const std::string shard = digest.substr(0, 2);
+  const std::string other_shard = shard == "00" ? "01" : "00";
+
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    storage::DiskStorage disk(tmp.path() + "/cache", 1 << 20, false);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "PutFile stores a file");
+    const std::string stored = tmp.path() + "/cache/" + shard + "/" + digest + ".rustout";
+    Check(util::ReadFile(stored) == std::optional<std::string>(payload),
+          "at <dir>/<digest[0:2]>/<digest>.<suffix>, byte for byte");
+    Check(util::FileExists(source), "and leaves the source in place");
+
+    Age(stored, 3600);
+    const auto aged = util::FileMtime(stored);
+    const auto got = disk.GetFile(digest, "rustout");
+    Check(got == std::optional<std::string>(stored), "GetFile names the stored file");
+    Check(aged && util::FileMtime(stored) && *util::FileMtime(stored) > *aged,
+          "and refreshes its mtime");
+    Check(!disk.GetFile(hash::HashString("absent"), "rustout"), "GetFile of an absent file is nullopt");
+    Check(!disk.failed(), "and an absent file is not an error");
+    Check(!disk.GetFile(digest, "linkout"), "the suffix is part of the name");
+    Check(!disk.GetFile("../../etc/passwd", "rustout"), "GetFile refuses a non-digest");
+
+    util::WriteFileAtomic(stored, std::string(payload.size(), 't'));
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "PutFile over an existing file succeeds");
+    Check(util::ReadFile(stored) == std::optional<std::string>(payload),
+          "and replaces a torn copy with the source bytes");
+
+    Check(disk.PutFile(hash::HashString("gone"), "rustout", tmp.path() + "/no-such-file") ==
+              storage::DiskStorage::PutFileStatus::kSourceMissing,
+          "a missing source is reported as such");
+    Check(!disk.failed(), "and is not a storage error");
+    Check(disk.PutFile("not-a-digest", "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kFailed,
+          "PutFile refuses a non-digest");
+
+    disk.RemoveFile(digest, "rustout");
+    Check(!util::FileExists(stored), "RemoveFile removes the stored file");
+  }
+
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    const std::string cache = tmp.path() + "/cache";
+    util::MakeDirs(cache + "/" + shard);
+    util::WriteFileAtomic(cache + "/" + shard + "/" + digest + ".rustout", "earlier");
+    storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/true);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kReadOnly,
+          "a read-only store refuses PutFile");
+    Check(util::ReadFile(cache + "/" + shard + "/" + digest + ".rustout") ==
+              std::optional<std::string>("earlier"),
+          "and writes nothing");
+    Check(disk.GetFile(digest, "rustout").has_value(), "a read-only store still serves a file");
+    disk.RemoveFile(digest, "rustout");
+    Check(util::FileExists(cache + "/" + shard + "/" + digest + ".rustout"),
+          "and never removes one");
+  }
+
+  // 64 KiB budget, so a 40 KiB file crosses its shard's quarter-KiB share.
+  // An older 40 KiB entry in another shard puts the store over the limit.
+  const auto make_crossing_store = [&](const std::string& cache) {
+    const std::string old_key = KeyIn(other_shard, "0ld");
+    util::MakeDirs(cache + "/" + other_shard);
+    util::WriteFileAtomic(EntryPath(cache, old_key), payload);
+    Age(EntryPath(cache, old_key), 3600);
+    util::MakeDirs(cache + "/tmp/vcache-rs-orphan");
+    Age(cache + "/tmp/vcache-rs-orphan", 7 * 3600);
+    return EntryPath(cache, old_key);
+  };
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    const std::string cache = tmp.path() + "/cache";
+    const std::string old_entry = make_crossing_store(cache);
+    storage::DiskStorage disk(cache, 64 * 1024, false);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "a sidecar that crosses its shard's budget is stored");
+    Check(!util::FileExists(old_entry), "and runs the eviction check, which evicts the older entry");
+    Check(util::IsDirectory(cache + "/tmp/vcache-rs-orphan"), "but sweeps no scratch dir");
+
+    const std::string second_old = make_crossing_store(cache);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "storing the same sidecar again succeeds");
+    Check(util::FileExists(second_old), "and, since the shard did not grow, evicts nothing");
+  }
+  {
+    TempCacheDir tmp;
+    const std::string cache = tmp.path() + "/cache";
+    const std::string old_entry = make_crossing_store(cache);
+    storage::DiskStorage disk(cache, 64 * 1024, false);
+    Check(disk.Put(digest, payload), "the control: an entry that crosses is stored");
+    Check(!util::FileExists(old_entry), "evicts the older entry");
+    Check(!util::IsDirectory(cache + "/tmp/vcache-rs-orphan"), "and sweeps the scratch dir");
+  }
+}
+
 void TestDiskStorageEviction() {
   Section("disk storage: global eviction");
 
@@ -4670,6 +4854,18 @@ void TestCloneFile() {
   Check(::stat(nested.c_str(), &st) == 0 &&
             (st.st_mode & 07777) == vcache::util::DefaultFileMode(),
         "the clone gets the umask's default mode, not mkstemp's 0600");
+
+  const std::string beside = *dir + "/held/artifact";
+  const auto temp = vcache::util::CloneToTempBeside(from, beside);
+  Check(temp.has_value() && vcache::util::DirName(*temp) == *dir + "/held" &&
+            vcache::util::BaseName(*temp).starts_with(".vcache-tmp-"),
+        "CloneToTempBeside returns a private temp beside the destination");
+  Check(temp && vcache::util::ReadFile(*temp) == std::optional<std::string>("cached output"),
+        "holding the source bytes");
+  Check(!vcache::util::FileExists(beside), "and does not publish the destination");
+  errno = 0;
+  Check(!vcache::util::CloneToTempBeside(*dir + "/absent", beside) && errno == ENOENT,
+        "a missing source fails with ENOENT");
 }
 
 void TestPchArgs() {
@@ -5517,9 +5713,12 @@ void TestRustOutputNames() {
   util::WriteFileAtomic(*scratch + "/outside-target", "out");
   Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
         "a symlink out of the capture directory can be planted");
+  constexpr uint64_t kNoSidecars = std::numeric_limits<uint64_t>::max();
   std::vector<storage::BlobFile> captured;
+  std::vector<storage::BlobSidecarFile> sidecars;
   std::string unparsed_dep_info;
-  Check(!rust::CaptureOutputs(cap, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(cap, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a name that escapes the output directory fails");
 
   const std::string inner = *scratch + "/inner";
@@ -5528,8 +5727,75 @@ void TestRustOutputNames() {
   Check(::symlink("lib.rlib", (inner + "/alias.rlib").c_str()) == 0,
         "a symlink inside the capture directory can be planted");
   captured.clear();
-  Check(!rust::CaptureOutputs(inner, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(inner, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a symlink that stays inside the directory fails too");
+
+  // A large output is left where rustc wrote it, by name; the .d is read and
+  // rewritten whatever its size.
+  const std::string sized = *scratch + "/sized";
+  util::MakeDirs(sized);
+  util::WriteFileAtomic(sized + "/libbig.rlib", std::string(64, 'r'));
+  util::WriteFileAtomic(sized + "/small.rmeta", std::string(8, 'm'));
+  util::WriteFileAtomic(sized + "/big.d", "big.d: " + std::string(80, 'x') + ".rs\n");
+  ::chmod((sized + "/libbig.rlib").c_str(), 0755);
+  captured.clear();
+  sidecars.clear();
+  Check(rust::CaptureOutputs(sized, roots, {}, 64, &captured, &sidecars, &unparsed_dep_info),
+        "a capture with a sidecar threshold succeeds");
+  Check(sidecars.size() == 1 && sidecars[0].name == "libbig.rlib" && sidecars[0].digest.empty() &&
+            sidecars[0].executable,
+        "a file at the threshold is a sidecar, with its execute bit and no digest yet");
+  std::vector<std::string> inline_names;
+  for (const storage::BlobFile& file : captured) inline_names.push_back(file.name);
+  std::sort(inline_names.begin(), inline_names.end());
+  Check(inline_names == std::vector<std::string>{"big.d", "small.rmeta"},
+        "a smaller file and a .d above the threshold stay inline");
+}
+
+// Large outputs are hashed and searched for leaked local paths in one read.
+// A path that straddles two reads must still be found, or a leaked OUT_DIR
+// lands in another checkout's build.
+void TestHashAndScanFile() {
+  Section("rust::HashAndScanFile");
+  auto scratch = util::MakeTempDir("vcache-rust-scan-");
+  Check(scratch.has_value(), "scan scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string local = "/home/someone/target/debug/build/x-1/out";
+  std::string bytes(4096, '\0');
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(i * 7);
+  const std::string clean = *scratch + "/clean.rlib";
+  util::WriteFileAtomic(clean, bytes);
+  // 16-byte reads: the path starts 5 bytes before a read boundary.
+  std::string leaky = bytes;
+  leaky.replace(16 * 100 - 5, local.size(), local);
+  const std::string straddling = *scratch + "/straddling.rlib";
+  util::WriteFileAtomic(straddling, leaky);
+
+  const auto scanned = rust::HashAndScanFile(clean, {"/elsewhere", local}, 16);
+  Check(scanned.has_value() && !scanned->found_pattern, "a clean file has no pattern");
+  Check(scanned && scanned->digest == hash::HashFile(clean) && scanned->size == bytes.size(),
+        "and hashes as HashFile does");
+  const auto found = rust::HashAndScanFile(straddling, {"/elsewhere", local}, 16);
+  Check(found && found->found_pattern == std::optional<size_t>(1),
+        "a path split across two reads is found");
+  const auto found_large_reads = rust::HashAndScanFile(straddling, {local});
+  Check(found_large_reads && found_large_reads->found_pattern == std::optional<size_t>(0),
+        "and found with the default read size");
+  Check(found && found->digest == hash::HashFile(straddling),
+        "a file with a pattern is still hashed whole");
+  Check(!rust::HashAndScanFile(*scratch + "/absent", {local}, 16), "a missing file fails");
+#if defined(__linux__)
+  // procfs reports size 0 for a file with bytes: a read that does not match the
+  // size it started from fails closed.
+  Check(!rust::HashAndScanFile("/proc/self/status", {local}, 16),
+        "a file whose size differs from what it held fails closed");
+#endif
 }
 
 void TestUploadGeneration() {
@@ -6232,6 +6498,7 @@ int main(int argc, char** argv) {
   TestPreprocessedNormalization();
   TestPreprocessedHashSlicing();
   TestBlob();
+  TestBlobSidecars();
   TestCacheChain();
   TestCacheChainRemote();
   TestDaemonProtocol();
@@ -6266,6 +6533,7 @@ int main(int argc, char** argv) {
   // disk cache does on every Put -- primes the cache in the parent, the child
   // inherits it, and the strict-umask assertion fails.
   TestDiskStorageEviction();
+  TestDiskStorageFiles();
   TestDiskTrimPins();
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
@@ -6286,6 +6554,7 @@ int main(int argc, char** argv) {
   TestFileDigestMemo();
   TestCxxManifest();
   TestRustOutputNames();
+  TestHashAndScanFile();
   TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();

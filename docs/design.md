@@ -234,6 +234,31 @@ The checksum is not paranoia: a silently corrupt object linked into a binary is
 far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
 
+**Sidecar files.** Some outputs are too large to carry inside an entry. A link
+output, and a Rust output of 8 MiB or more other than its `.d`, is kept in the
+disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
+(`linkout`, `rustout`), and the entry names it by digest (a `kFile` section for
+link, a `kSidecarFile` section for Rust). Both go through `DiskStorage::PutFile`
+and `GetFile`. A sidecar is created by `CloneFile`, a reflink where the
+filesystem has one, and restored the same way into an exclusive temporary
+beside the output. The hit hashes that clone, not the stored file, and renames
+it into place only if it matches; a Rust hit verifies every sidecar before it
+places anything or forwards diagnostics. The checksum covers only the digest,
+so the hash is what proves the bytes. A Rust sidecar that fails it is removed,
+so failed hits cannot keep a torn file the freshest in the store.
+
+Sidecars sit in the shards, so `--trim`, `--clear` and the size budget count
+and evict them like entries, by their own mtime; `GetFile` refreshes it on
+every hit. Eviction is per file: an entry whose sidecar has gone is a failed
+hit and a recompile, never a wrong output. Storing a new sidecar runs the
+shard's eviction check, without the scratch sweep, since a sidecar is stored
+before its compile has placed the outputs. They are not fsynced; a lost one
+fails its hash. Rust sidecars are used only with a disk cache and no S3, so
+every entry that can reach another host is whole; the entry key records which
+of the two forms it has. A Rust miss stores each large output as a sidecar
+straight from the stage dir, before placing it by rename, so it is never read
+into memory.
+
 The metadata section is not part of any cache key. A stored compile or link
 appends `max_rss_kb` and `wall_ms`, taken from `wait4` on that process. For a
 gcc or clang driver the figure is the peak of the largest process the driver
@@ -276,6 +301,87 @@ buckets without `ListBucket` permission return it for a missing key.
 
 **Chain.** First hit wins; the hit is written back into every faster layer it
 passed through. Any backend error is reported as a miss.
+
+## Restoring outputs
+
+A hit writes each output to a temporary file beside it and renames it into
+place, so a reader never sees a partial file. Outputs are not fsynced; cache
+entries are. A torn entry would be served to every later build. A torn output
+is what a crash during an uncached build leaves too, because rustc and gcc do
+not fsync what they write either. If the machine crashes after vcache returns
+and before the output reaches disk, the file can be empty or short while
+cargo's fingerprint, which checks mtimes and not contents, still counts it
+fresh. `cargo clean -p <crate>` recovers.
+
+A Rust miss moves rustc's outputs from the stage dir into the output directory
+with `rename(2)`, so the file in place is the one rustc wrote, with rustc's own
+mode bits. When the rename fails with `EXDEV`, because the scratch dir fell
+back to a `$TMPDIR` on another filesystem or the output directory is on one,
+the file is copied with `CloneFile` and given its execute bits under the
+umask. The `.d` is the exception: it names the stage dir, so it is written from
+the canonicalised copy captured for the entry and localised as a hit's is.
+Capture still reads every file once to build the entry.
+
+`VCACHE_LOG` gives each placement one line, so a build's log can be summed.
+"restored" and "placed" time the writes alone; "hit total" runs from asking the
+cache for the entry to the last output in place, so it adds reading the entry,
+checking its checksum and unpacking it. Without the fsync that is most of a
+Rust hit (below).
+
+```
+rust: restored 3 files, 41630234 bytes in 28.512 ms    a Rust hit
+rust: hit total 61.077 ms
+rust: placed 3 files, 41630234 bytes in 9.204 ms       a Rust miss
+hit: restored 2 files, 182311 bytes in 0.207 ms        a C or C++ hit
+hit total 0.391 ms
+```
+
+### Measurements
+
+A clean `cargo build` (dev profile) of sunbird's root workspace on a 128-core
+host, through `build-limited` (30 CPUs): 344 rustc runs, of which a warm build
+serves 341 from the cache, restoring 4,801 MiB. Store and target directory on
+one XFS filesystem, entries in the page cache, daemon off, `sync` before each
+build. Hit builds are four interleaved samples per binary, median and range;
+the fill is one sample. A summed time adds up every process's line, so with
+builds running in parallel it exceeds the wall time.
+
+| | origin/fbg | fsync kept | no fsync |
+|---|---|---|---|
+| warm build, wall | 6.6 s (6.3–7.5) | 6.4 s (5.6–8.7) | 3.6 s (3.3–3.9) |
+| warm build, summed "hit total" | not logged | 42.6 s (36.0–73.0) | 5.7 s (5.1–6.0) |
+| warm build, summed "restored" | not logged | 37.2 s (30.5–68.2) | 1.2 s (0.7–1.6) |
+| fill, wall | 129.8 s | 131.7 s | 118.1 s |
+| fill, summed "placed" | not logged | 21.6 s | 2.3 s |
+
+"fsync kept" is this change with only its `durable = false` arguments
+reverted. Without the fsync a warm build's restore cost is mostly reading and
+checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
+1,234 MiB restored) showed the same shape in two unsynced samples: summed
+"restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
+
+Placing a miss by rename, two synced fills each, interleaved: summed "placed"
+1,458 ms and 892 ms when rustc's outputs were read back and written again,
+48.6 ms and 47.4 ms by rename; fill wall 109.1 s and 103.5 s, then 102.8 s and
+100.4 s. Warm builds are unchanged, at 3.3 s and 4.2 s against 3.6 s and 4.2 s.
+
+Sidecars for outputs of 8 MiB or more, four interleaved warm builds against the
+same build with every output inline (median, range; the host was busier than in
+the runs above, so compare within the table only):
+
+| | inline | sidecars |
+|---|---|---|
+| warm build, wall | 4.8 s (3.4–5.6) | 3.0 s (2.3–3.1) |
+| warm build, summed "hit total" | 12.6 s (5.5–17.3) | 6.4 s (3.5–8.9) |
+| warm build, summed "restored" | 6.2 s (1.1–8.3) | 5.1 s (3.0–6.7) |
+| fill, wall (two runs) | 106.0 s, 102.6 s | 98.3 s, 100.7 s |
+| store after one fill | 682 entries, 5,035 MB | 682 entries, 728 MB, and 53 sidecars, 4,307 MB |
+
+With sidecars, "restored" includes cloning 4.3 GB and hashing every clone; the
+entries a warm build reads shrink from 5.0 GB to 0.7 GB, which is where "hit
+total" falls. The sidecars ran from 8.1 MiB to 1,056 MiB, median 13.4 MiB.
+`HashFile` on the largest took 0.13–0.15 s from the page cache and 0.36–0.38 s
+with its pages dropped first (NVMe), three runs each.
 
 ## Incoming prefix-map flags
 

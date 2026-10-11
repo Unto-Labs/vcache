@@ -62,6 +62,7 @@ enum class SectionKind : uint8_t {
   kMeta = 4,     // "key: value\n" lines describing how the entry was produced
   kFile = 5,     // one named output file; repeated once per file
   kDepManifest = 6,  // the file set a cached -M run depended on, with hashes
+  kSidecarFile = 7,  // one named output kept beside the entry, by digest
 };
 
 // One output file identified by its path relative to the output directory.
@@ -74,6 +75,16 @@ struct BlobFile {
   // rustc links cargo's build scripts and any binary crate into the output
   // directory, and cargo executes them straight away. Contents alone are not
   // enough to replay that, so the execute bit travels with the entry.
+  bool executable = false;
+};
+
+// An output too large to carry inside the entry. The disk cache keeps its
+// bytes in a content-addressed file of their own (DiskStorage::PutFile), which
+// a hit can reflink instead of reading through memory. The entry's checksum
+// covers only the digest, so a hit must hash what it restores.
+struct BlobSidecarFile {
+  std::string name;
+  std::string digest;
   bool executable = false;
 };
 
@@ -91,6 +102,7 @@ struct Blob {
   bool has_dep_manifest = false;
 
   std::vector<BlobFile> files;
+  std::vector<BlobSidecarFile> sidecar_files;
 };
 
 std::string SerializeBlob(const Blob& blob);

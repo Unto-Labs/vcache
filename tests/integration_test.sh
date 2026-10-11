@@ -807,6 +807,424 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9h. Outputs are written without fsync; entries keep theirs"
+
+# Flushing an output before its rename was half the cost of restoring a large
+# one under parallel load, and buys nothing the compiler's own write has: rustc
+# and gcc do not fsync. A cache entry still must, since a torn entry is served.
+# A preload shim records the file behind every fsync.
+if [[ "$(uname)" != Linux ]]; then
+  skipped "the fsync shim reads /proc/self/fd"
+else
+  cat > "$WORK/fsync-log.c" <<'FSYNCEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static char log_path[4096];
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("FSYNC_LOG");
+  if (p != NULL) snprintf(log_path, sizeof log_path, "%s", p);
+  unsetenv("LD_PRELOAD");
+}
+static void note(int fd) {
+  char link[64], target[PATH_MAX];
+  snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+  ssize_t n = readlink(link, target, sizeof target - 1);
+  if (n <= 0 || log_path[0] == '\0') return;
+  target[n] = '\0';
+  FILE *f = fopen(log_path, "a");
+  if (f != NULL) { fprintf(f, "%s\n", target); fclose(f); }
+}
+int fsync(int fd) {
+  note(fd);
+  int (*real)(int) = dlsym(RTLD_NEXT, "fsync");
+  return real(fd);
+}
+int fdatasync(int fd) {
+  note(fd);
+  int (*real)(int) = dlsym(RTLD_NEXT, "fdatasync");
+  return real(fd);
+}
+FSYNCEOF
+  gcc -shared -fPIC "$WORK/fsync-log.c" -o "$WORK/fsync-log.so" -ldl
+  fsynced_under() {  # $1 = log, $2 = directory
+    grep -c -F -- "$2/" "$1" 2>/dev/null || true
+  }
+  restore_log="$WORK/fsync-restore.vlog"
+
+  if command -v rustc >/dev/null 2>&1; then
+    reset_cache
+    rm -f "$restore_log"
+    for tree in fsync-rs-a fsync-rs-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+      : > "$WORK/$tree.fsync"
+      ( cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off \
+          VCACHE_LOG="$restore_log" FSYNC_LOG="$WORK/$tree.fsync" \
+          LD_PRELOAD="$WORK/fsync-log.so" \
+          "$VCACHE" rustc --crate-name demo --crate-type lib \
+          --emit=dep-info,link --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>&1
+    done
+    check "the fsync-observed rust compiles miss then hit" "$(misses) $(hits)" "1 1"
+    check "a rust miss fsyncs its entry" \
+      "$([[ $(fsynced_under "$WORK/fsync-rs-a.fsync" "$VCACHE_DIR") -gt 0 ]] && echo yes)" "yes"
+    check "a rust miss places its outputs without fsync" \
+      "$(fsynced_under "$WORK/fsync-rs-a.fsync" "$WORK/fsync-rs-a/out")" "0"
+    check "a rust hit restores its outputs without fsync" \
+      "$(fsynced_under "$WORK/fsync-rs-b.fsync" "$WORK/fsync-rs-b/out")" "0"
+    check "a rust miss logs what it placed and how long it took" \
+      "$(grep -cE '\] rust: placed 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+    check "a rust hit logs what it restored and how long it took" \
+      "$(grep -cE '\] rust: restored 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+    check "and how long the hit took from lookup to placement" \
+      "$(grep -cE '\] rust: hit total [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+  else
+    skipped "rustc not installed"
+  fi
+
+  reset_cache
+  rm -f "$restore_log"
+  for tree in fsync-cc-a fsync-cc-b; do
+    make_project "$WORK/$tree"
+    mkdir -p "$WORK/$tree/out"
+    : > "$WORK/$tree.fsync"
+    ( cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=proj" VCACHE_DAEMON=off \
+        VCACHE_LOG="$restore_log" FSYNC_LOG="$WORK/$tree.fsync" \
+        LD_PRELOAD="$WORK/fsync-log.so" \
+        "$VCACHE" g++ -c -MD -MF out/lib.d -I include src/lib.cc -o out/lib.o ) >/dev/null 2>&1
+  done
+  check "the fsync-observed C++ compiles miss then hit" "$(misses) $(hits)" "1 1"
+  check "a C++ miss fsyncs its entry" \
+    "$([[ $(fsynced_under "$WORK/fsync-cc-a.fsync" "$VCACHE_DIR") -gt 0 ]] && echo yes)" "yes"
+  check "a C++ hit restores its object and .d without fsync" \
+    "$(fsynced_under "$WORK/fsync-cc-b.fsync" "$WORK/fsync-cc-b/out")" "0"
+  check "and both are restored" \
+    "$([[ -s $WORK/fsync-cc-b/out/lib.o && -s $WORK/fsync-cc-b/out/lib.d ]] && echo yes)" "yes"
+  check "a C++ hit logs what it restored and how long it took" \
+    "$(grep -cE '\] hit: restored 2 files, [0-9]+ bytes in [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+  check "and how long the hit took from lookup to placement" \
+    "$(grep -cE '\] hit total [0-9]+\.[0-9]{3} ms$' "$restore_log")" "1"
+fi
+
+# --------------------------------------------------------------------------
+section "9i. Rust: a miss is placed by rename"
+
+# Reading rustc's output back and writing it again cost as much as the fsync
+# on a large rlib. A rename moves the file rustc wrote. The .d still goes
+# through memory, since it names the stage dir.
+if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
+  skipped "needs rustc and Linux"
+else
+  # --show-stats leaves out a reason that never happened.
+  unplaceable() { local n; n=$(stat_of "output unplaceable"); echo "${n:-0}"; }
+  rename_compile() {  # $1 = tree, $2 = rustc, then extra env assignments
+    local tree=$1 rustc=$2
+    shift 2
+    ( cd "$WORK/$tree" && env VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off "$@" \
+        "$VCACHE" "$rustc" --crate-name demo --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>&1
+  }
+  for tree in rename-a rename-b rename-xdev-a rename-xdev-b; do
+    mkdir -p "$WORK/$tree/src"
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+  done
+
+  reset_cache
+  write_altering_rustc "$WORK/rename-rustc/rustc" \
+    "stat -c %i libdemo.rlib > $(printf %q "$WORK/rename-staged-inode")"
+  rename_compile rename-a "$WORK/rename-rustc/rustc"
+  check "the renamed miss stores its entry" "$(misses) $(unplaceable)" "1 0"
+  check "the placed rlib is the file rustc wrote, not a copy" \
+    "$(stat -c %i "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
+  check "the .d names this output directory" \
+    "$(grep -c "^$WORK/rename-a/out/libdemo.rlib:" "$WORK/rename-a/out/demo.d")" "1"
+  check "the .d names neither the stage dir nor the placeholder" \
+    "$(grep -cE 'vcache-rs-|/vcache-outdir' "$WORK/rename-a/out/demo.d")" "0"
+  rename_compile rename-b rustc
+  check "the entry captured before the rename serves a hit" "$(hits)" "1"
+  check "and restores the same rlib" \
+    "$(cmp -s "$WORK/rename-a/out/libdemo.rlib" "$WORK/rename-b/out/libdemo.rlib" && echo same)" "same"
+
+  # The scratch dir falls back to $TMPDIR when the cache's cannot be made, and
+  # $TMPDIR is often tmpfs. A shim makes every rename from outside the output
+  # directory into it fail with EXDEV, as a rename across filesystems does.
+  cat > "$WORK/rename-xdev.c" <<'XDEVEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char into[4096];
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("XDEV_INTO");
+  if (p != NULL) snprintf(into, sizeof into, "%s/", p);
+  unsetenv("LD_PRELOAD");
+}
+int rename(const char *from, const char *to) {
+  size_t n = strlen(into);
+  if (n > 1 && strncmp(to, into, n) == 0 && strncmp(from, into, n) != 0) {
+    errno = EXDEV;
+    return -1;
+  }
+  int (*real)(const char *, const char *) = dlsym(RTLD_NEXT, "rename");
+  return real(from, to);
+}
+XDEVEOF
+  gcc -shared -fPIC "$WORK/rename-xdev.c" -o "$WORK/rename-xdev.so" -ldl
+  reset_cache
+  xdev_log="$WORK/rename-xdev.vlog"
+  rename_compile rename-xdev-a rustc XDEV_INTO="$WORK/rename-xdev-a/out" \
+    LD_PRELOAD="$WORK/rename-xdev.so" VCACHE_LOG="$xdev_log"
+  check "a miss whose rename fails with EXDEV still places and stores" \
+    "$(misses) $(unplaceable) $(grep -c '\] rust: placed 2 files' "$xdev_log")" "1 0 1"
+  rename_compile rename-xdev-b rustc
+  check "and its outputs match what a hit restores" \
+    "$(hits) $(cmp -s "$WORK/rename-xdev-a/out/libdemo.rlib" "$WORK/rename-xdev-b/out/libdemo.rlib" && echo same)" "1 same"
+  check "the copied .d is localised too" \
+    "$(grep -c "^$WORK/rename-xdev-a/out/libdemo.rlib:" "$WORK/rename-xdev-a/out/demo.d")" "1"
+
+  # The copy is created at the umask's default mode, so the execute bit has to
+  # be put back, and only where the umask lets the class read.
+  reset_cache
+  mkdir -p "$WORK/rename-xdev-bin/src"
+  echo 'fn main() {}' > "$WORK/rename-xdev-bin/src/main.rs"
+  ( umask 077 && cd "$WORK/rename-xdev-bin" && VCACHE_ROOTS="$WORK/rename-xdev-bin=bin" \
+      VCACHE_DAEMON=off XDEV_INTO="$WORK/rename-xdev-bin/out" LD_PRELOAD="$WORK/rename-xdev.so" \
+      "$VCACHE" rustc --crate-name xdevbin --crate-type bin \
+      --emit=dep-info,link --out-dir "$WORK/rename-xdev-bin/out" src/main.rs ) >/dev/null 2>&1
+  check "a binary copied after EXDEV under umask 077 is placed, not passed through" \
+    "$(misses) $(unplaceable)" "1 0"
+  check "and is 0700" "$(file_mode "$WORK/rename-xdev-bin/out/xdevbin")" "700"
+  check "and runs" "$("$WORK/rename-xdev-bin/out/xdevbin" >/dev/null 2>&1 && echo ran)" "ran"
+fi
+
+# --------------------------------------------------------------------------
+section "9j. Rust: large outputs are sidecars, restored by clone"
+
+# An output of 8 MiB or more is kept beside the entry as <digest>.rustout and
+# cloned on a hit, so its bytes never pass through the entry or memory. The
+# entry's checksum then covers only the digest, so every hit hashes the clone.
+if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
+  skipped "needs rustc and Linux"
+else
+  sidecar_files() {
+    find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*.rustout" \
+      2>/dev/null | wc -l | tr -d ' '
+  }
+  largest_entry_bytes() {
+    find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
+      ! -name '*.rustout' -printf '%s\n' 2>/dev/null | sort -n | tail -1
+  }
+  reason_count() { local n; n=$(stat_of "$1"); echo "${n:-0}"; }
+  # 9 MiB of non-zero static data, so the rlib crosses the threshold; the
+  # unused function makes rustc warn, which a hit replays.
+  big_crate() {  # $1 = tree
+    mkdir -p "$WORK/$1/src"
+    printf '%s\n' 'pub static BIG: [u8; 9 << 20] = [7; 9 << 20];' \
+      'pub fn value(i: usize) -> u8 { BIG[i] }' 'fn unused() {}' > "$WORK/$1/src/lib.rs"
+  }
+  sidecar_log="$WORK/sidecar.vlog"
+  # sidecar_compile TREE RUSTC EMIT [env assignments...]
+  sidecar_compile() {
+    local tree=$1 rustc=$2 emit=$3
+    shift 3
+    ( cd "$WORK/$tree" && env VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_DAEMON=off \
+        VCACHE_LOG="$sidecar_log" "$@" \
+        "$VCACHE" "$rustc" --crate-name big --crate-type lib --emit="$emit" \
+        --out-dir "$WORK/$tree/out" src/lib.rs ) >/dev/null 2>"$WORK/$tree.stderr"
+  }
+  warnings_in() { grep -c 'function `unused` is never used' "$WORK/$1.stderr"; }
+  for tree in side-a side-b side-c side-gone side-bad side-link-a side-link-b side-ro \
+              side-s3 side-part-a side-part-b; do
+    big_crate "$tree"
+  done
+
+  reset_cache
+  rm -f "$sidecar_log"
+  sidecar_compile side-a rustc dep-info,link
+  check "a large rlib is stored as one sidecar" "$(misses) $(sidecar_files)" "1 1"
+  check "and the entry does not carry its bytes" \
+    "$([[ $(largest_entry_bytes) -lt 1048576 ]] && echo small)" "small"
+  stored=$(find "$VCACHE_DIR" -type f -name '*.rustout' -print -quit)
+  check "the sidecar is named by the rlib's digest and holds its bytes" \
+    "$(cmp -s "$stored" "$WORK/side-a/out/libbig.rlib" && echo same)" "same"
+  sidecar_compile side-b rustc dep-info,link
+  check "another checkout hits" "$(hits)" "1"
+  check "and restores the same rlib" \
+    "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-b/out/libbig.rlib" && echo same)" "same"
+  check "as a file of its own, not a link to the sidecar" \
+    "$([[ $(stat -c %i "$WORK/side-b/out/libbig.rlib") != $(stat -c %i "$stored") ]] && echo own)" "own"
+  check "the hit replays the warning once" "$(warnings_in side-b)" "1"
+  check "the hit's .d is localised" \
+    "$(grep -c "^$WORK/side-b/out/libbig.rlib:" "$WORK/side-b/out/big.d")" "1"
+  check "the hit leaves no temp in the output directory" \
+    "$(find "$WORK/side-b/out" -name '.vcache-tmp-*' | wc -l | tr -d ' ')" "0"
+
+  # Eviction is oldest-mtime-first over every file in the shards, and a hit
+  # refreshes only what it reads: the sidecar must be refreshed by the hit.
+  touch -d @946684800 "$stored"
+  sidecar_compile side-c rustc dep-info,link
+  check "a hit on an aged sidecar" "$(hits)" "2"
+  check "refreshes the sidecar's mtime" \
+    "$([[ $(stat -c %Y "$stored") -gt 946684800 ]] && echo yes)" "yes"
+
+  # A sidecar evicted on its own: the hit fails before anything reaches cargo,
+  # and the compile replays its own diagnostics only.
+  rm -f "$stored"
+  sidecar_compile side-gone rustc dep-info,link
+  check "a hit whose sidecar is gone recompiles" "$(hits) $(misses)" "2 2"
+  check "and forwards the warning once, from the compile" "$(warnings_in side-gone)" "1"
+  check "and logs why" "$(grep -c 'rust: sidecar .* is gone' "$sidecar_log")" "2"
+  check "the recompile stores the sidecar again" "$(sidecar_files)" "1"
+
+  # A torn sidecar fails its hash. It is removed, or failed hits would keep it
+  # the freshest file in the store. The compile here fails, so nothing
+  # replaces it.
+  stored=$(find "$VCACHE_DIR" -type f -name '*.rustout' -print -quit)
+  printf 'torn' | dd of="$stored" bs=1 seek=4096 conv=notrunc status=none
+  write_altering_rustc "$WORK/side-rustc/failing/rustc" "exit 3"
+  sidecar_compile side-bad "$WORK/side-rustc/failing/rustc" dep-info,link
+  check "a sidecar that fails verification is not served" "$(hits)" "2"
+  check "and is removed from the store" "$(sidecar_files)" "0"
+  check "the failed verification is logged" \
+    "$(grep -c 'failed digest verification' "$sidecar_log")" "1"
+
+  # --emit=link alone leaves no .d, so the entry has no inline file at all.
+  reset_cache
+  sidecar_compile side-link-a rustc link
+  sidecar_compile side-link-b rustc link
+  check "an entry whose only output is a sidecar hits" "$(misses) $(hits)" "1 1"
+  check "and restores it" \
+    "$(cmp -s "$WORK/side-link-a/out/libbig.rlib" "$WORK/side-link-b/out/libbig.rlib" && echo same)" \
+    "same"
+
+  reset_cache
+  sidecar_compile side-ro rustc dep-info,link VCACHE_READONLY=1
+  check "a read-only miss places its large rlib" \
+    "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-ro/out/libbig.rlib" && echo same)" "same"
+  check "and stores no sidecar" "$(sidecar_files)" "0"
+
+  # An entry that can reach S3 must be whole on another host.
+  reset_cache
+  sidecar_compile side-s3 rustc dep-info,link VCACHE_S3_BUCKET=nobucket \
+    VCACHE_S3_ENDPOINT=http://127.0.0.1:9 VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
+    VCACHE_S3_NO_CREDENTIALS=1
+  check "with S3 configured the large rlib stays inline" \
+    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 9437184 ]] && echo inline)" "0 inline"
+
+  # A cargo-made OUT_DIR baked into a large output, split across the scan's
+  # 1 MiB reads, must keep the entry out of the store. The build still gets
+  # its outputs and diagnostics.
+  reset_cache
+  mkdir -p "$WORK/side-leak/src" "$WORK/side-leak/target/out"
+  echo 'pub fn answer() -> u32 { 42 }' > "$WORK/side-leak/target/out/gen.rs"
+  echo 'include!(concat!(env!("OUT_DIR"), "/gen.rs")); fn unused() {}' \
+    > "$WORK/side-leak/src/lib.rs"
+  { head -c $((1048576 - 8)) /dev/zero | tr '\0' 'z'
+    printf '%s' "$WORK/side-leak/target/out"
+    head -c $((9 * 1048576)) /dev/zero | tr '\0' 'z'; } > "$WORK/side-leak.bin"
+  write_altering_rustc "$WORK/side-rustc/leaky/rustc" "cp $(printf %q "$WORK/side-leak.bin") extra.bin"
+  ( cd "$WORK/side-leak" && env OUT_DIR="$WORK/side-leak/target/out" VCACHE_DAEMON=off \
+      VCACHE_ROOTS="$WORK/side-leak=crate:$WORK/side-leak/target=target" \
+      VCACHE_RUST_PATH_ENV_VARS=OUT_DIR \
+      "$VCACHE" "$WORK/side-rustc/leaky/rustc" --crate-name big --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/side-leak/out" src/lib.rs ) \
+      >/dev/null 2>"$WORK/side-leak.stderr"
+  check "a local OUT_DIR across a read boundary of a large output is refused" \
+    "$(reason_count "env path in output")" "1"
+  check "and stores no sidecar and no entry" "$(sidecar_files) $(disk_entries)" "0 0"
+  check "the refused compile still places its outputs" \
+    "$(cmp -s "$WORK/side-leak.bin" "$WORK/side-leak/out/extra.bin" && [[ -f "$WORK/side-leak/out/libbig.rlib" ]] && echo placed)" \
+    "placed"
+  check "and forwards its diagnostics" "$(warnings_in side-leak)" "1"
+
+  # A rename that fails after another sidecar was already placed leaves a
+  # partial set: no other manifest state or entry may be tried, only a compile
+  # repairs every name. A shim fails the second rename into the output dir.
+  cat > "$WORK/rename-second.c" <<'SECONDEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char into[4096];
+static int renames_into;
+__attribute__((constructor)) static void init(void) {
+  const char *p = getenv("FAIL_SECOND_RENAME_INTO");
+  if (p != NULL) snprintf(into, sizeof into, "%s/", p);
+  unsetenv("LD_PRELOAD");
+}
+int rename(const char *from, const char *to) {
+  size_t n = strlen(into);
+  if (n > 1 && strncmp(to, into, n) == 0 && ++renames_into == 2) {
+    errno = EIO;
+    return -1;
+  }
+  int (*real)(const char *, const char *) = dlsym(RTLD_NEXT, "rename");
+  return real(from, to);
+}
+SECONDEOF
+  gcc -shared -fPIC "$WORK/rename-second.c" -o "$WORK/rename-second.so" -ldl
+  head -c $((9 * 1048576)) /dev/zero | tr '\0' 'q' > "$WORK/side-second.bin"
+  write_altering_rustc "$WORK/side-rustc/two/rustc" "cp $(printf %q "$WORK/side-second.bin") second.bin"
+  reset_cache
+  rm -f "$sidecar_log"
+  sidecar_compile side-part-a "$WORK/side-rustc/two/rustc" dep-info,link
+  check "a compile with two large outputs stores two sidecars" "$(sidecar_files)" "2"
+  sidecar_compile side-part-b "$WORK/side-rustc/two/rustc" dep-info,link \
+    FAIL_SECOND_RENAME_INTO="$WORK/side-part-b/out" LD_PRELOAD="$WORK/rename-second.so"
+  check "a hit that placed part of its set recompiles" "$(hits) $(misses)" "0 2"
+  check "without trying the direct key" \
+    "$(grep -c 'placed part of its set; recompiling' "$sidecar_log") $(grep -c 'unusable cache entry' "$sidecar_log")" \
+    "1 0"
+  check "and leaves the whole set as compiled" \
+    "$(cmp -s "$WORK/side-part-a/out/libbig.rlib" "$WORK/side-part-b/out/libbig.rlib" && cmp -s "$WORK/side-second.bin" "$WORK/side-part-b/out/second.bin" && echo whole)" \
+    "whole"
+  check "with the warning forwarded once" "$(warnings_in side-part-b)" "1"
+
+  # Under umask 077 the restored binary must be 0700, as the linker made it.
+  reset_cache
+  for tree in side-bin-a side-bin-b; do
+    mkdir -p "$WORK/$tree/src"
+    printf '%s\n' 'static BIG: [u8; 9 << 20] = [7; 9 << 20];' \
+      'fn main() { std::process::exit(i32::from(BIG[std::env::args().count()]) - 7); }' \
+      > "$WORK/$tree/src/main.rs"
+    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" VCACHE_DAEMON=off \
+        "$VCACHE" rustc --crate-name sidebin --crate-type bin \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
+  done
+  check "a large binary crate is a sidecar and hits" "$(sidecar_files) $(hits)" "1 1"
+  check "and is restored 0700 under umask 077" "$(file_mode "$WORK/side-bin-b/out/sidebin")" "700"
+  check "and runs" "$("$WORK/side-bin-b/out/sidebin" && echo ran)" "ran"
+
+  # An older vcache sharing the store must not reach these entries: it reads
+  # a v1 manifest and v3 keys. Set VCACHE_PREVIOUS to its binary to check.
+  if [[ -n "${VCACHE_PREVIOUS:-}" && -x "${VCACHE_PREVIOUS:-}" ]]; then
+    reset_cache
+    big_crate side-prev-a
+    big_crate side-prev-b
+    sidecar_compile side-prev-a rustc dep-info,link
+    printf 'stale rlib from an earlier build' > "$WORK/side-prev-b/stale.rlib"
+    mkdir -p "$WORK/side-prev-b/out"
+    cp "$WORK/side-prev-b/stale.rlib" "$WORK/side-prev-b/out/libbig.rlib"
+    ( cd "$WORK/side-prev-b" && VCACHE_ROOTS="$WORK/side-prev-b=crate" VCACHE_DAEMON=off \
+        "$VCACHE_PREVIOUS" rustc --crate-name big --crate-type lib --emit=dep-info,link \
+        --out-dir "$WORK/side-prev-b/out" src/lib.rs ) >/dev/null 2>&1
+    check "the previous vcache gets no hit from a store this one filled" "$(hits)" "0"
+    check "and compiles the rlib itself" \
+      "$(cmp -s "$WORK/side-prev-a/out/libbig.rlib" "$WORK/side-prev-b/out/libbig.rlib" && echo same)" \
+      "same"
+  else
+    skipped "VCACHE_PREVIOUS not set: the older-reader check needs an older vcache binary"
+  fi
+fi
+
+# --------------------------------------------------------------------------
 section "9e. Rust: a rustc rebuilt in place is a new toolchain"
 
 # `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo

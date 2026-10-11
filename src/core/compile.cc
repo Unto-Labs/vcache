@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -335,9 +336,14 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   return hasher.Hex();
 }
 
-// Writes the cached artifacts into the working tree.
+// Writes the cached artifacts into the working tree. `lookup_started` is when
+// the entry was asked for, so the log can show the whole hit, not only the writes.
 bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
-                    const RootMap& roots) {
+                    const RootMap& roots,
+                    std::chrono::steady_clock::time_point lookup_started) {
+  const auto restore_started = std::chrono::steady_clock::now();
+  size_t restored_files = 1;
+  uint64_t restored_bytes = blob.object.size();
   if (!util::WriteFileAtomic(parsed.output, blob.object, /*durable=*/false)) {
     VCACHE_LOG("hit: failed to write object " + parsed.output);
     return false;
@@ -362,11 +368,18 @@ bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
       }
     }
 
-    if (!util::WriteFileAtomic(parsed.depfile, RenderDepFile(*dep), /*durable=*/false)) {
+    const std::string depfile_text = RenderDepFile(*dep);
+    if (!util::WriteFileAtomic(parsed.depfile, depfile_text, /*durable=*/false)) {
       VCACHE_LOG("hit: failed to write dependency file " + parsed.depfile);
       return false;
     }
+    ++restored_files;
+    restored_bytes += depfile_text.size();
   }
+  VCACHE_LOG("hit: restored " + std::to_string(restored_files) + " files, " +
+             std::to_string(restored_bytes) + " bytes in " +
+             util::MillisecondsSince(restore_started) + " ms");
+  VCACHE_LOG("hit total " + util::MillisecondsSince(lookup_started) + " ms");
 
   if (!blob.stderr_text.empty()) {
     const std::string text = roots.LocalizeText(blob.stderr_text);
@@ -1258,6 +1271,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // when the preprocessed text did.
   const auto try_hit = [&](const std::string& result_key, const std::string& manifest_state) {
     if (cache == nullptr) return false;
+    const auto lookup_started = std::chrono::steady_clock::now();
     storage::GetResult got = cache->Get(result_key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
@@ -1272,7 +1286,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                    "; recompiling");
         return false;
       }
-      if (blob_decoded && MaterializeHit(blob, parsed, roots)) {
+      if (blob_decoded && MaterializeHit(blob, parsed, roots, lookup_started)) {
         write_pch_key_file(PchIdentityFromMeta(blob.meta));
         const Counter layer = got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
         if (manifest_state.empty()) {

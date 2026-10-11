@@ -4834,27 +4834,34 @@ check "a tracer that is not a shared object is not preloaded" \
 check "and neither the miss nor the hit prints a loader message" \
   "$(cat "$tl/notelf-miss.err" "$tl/notelf-hit.err" | grep -c 'cannot be preloaded' || true)" "0"
 
-# A compile in which ld.so refused a preload in some process is cached as
-# usual, from the depfile, without the refusal: it is the tracer's doing, and
-# a hit must not replay it. A PCH built that way still gets its .vcache-key.
+# A compile in which ld.so refused to preload the tracer in some process is
+# cached as usual, from the depfile, without the refusal: it is the tracer's
+# doing, and a hit must not replay it. A PCH built that way still gets its
+# .vcache-key. No cc1 of another ELF class is at hand, so the wrapper prints
+# ld.so's exact refusal line naming the tracer it was given, then runs cc1.
 if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   mkdir -p "$tl/badwrap"
-  printf '#!/bin/sh\nLD_PRELOAD="$LD_PRELOAD %s/no-such-lib.so" exec %s "$@"\n' \
-    "$tl" "$(gcc -print-prog-name=cc1)" > "$tl/badwrap/cc1"
+  cat > "$tl/badwrap/cc1" <<EOF
+#!/bin/sh
+for object in \$LD_PRELOAD; do
+  echo "ERROR: ld.so: object '\$object' from LD_PRELOAD cannot be preloaded (wrong ELF class: ELFCLASS32): ignored." >&2
+done
+exec $(gcc -print-prog-name=cc1) "\$@"
+EOF
   chmod +x "$tl/badwrap/cc1"
   mf_badwrap() {  # $1 log, $2 stderr file
     ( cd "$tl" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
         "$VCACHE" gcc -B "$tl/badwrap/" -O2 -c main.c -o m.o ) 2> "$2"
   }
   l=$(mf_log badwrap1); mf_badwrap "$l" "$tl/badwrap1.err"
-  check "a refused preload records the state from the depfile" \
+  check "a refused tracer records the state from the depfile" \
     "$(grep -c 'ld.so refused the tracer in a process of the compile; recording from' "$l")" "1"
   check "and stores it" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   check "and is counted once, as a miss" "$(misses)/$(uncacheable)" "1/0"
   l=$(mf_log badwrap2); mf_badwrap "$l" "$tl/badwrap2.err"
   check "the next compile hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
-  check "and neither prints the loader's refusal" \
+  check "and neither prints the loader's refusal of the tracer" \
     "$(cat "$tl/badwrap1.err" "$tl/badwrap2.err" | grep -c 'cannot be preloaded' || true)" "0"
   printf '#define P 1\n' > "$tl/p.h"
   rm -f "$tl/p.h.gch" "$tl/p.h.gch.vcache-key"
@@ -4862,6 +4869,28 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
       -o p.h.gch ) 2>/dev/null
   check "a PCH built through it still gets its .vcache-key" \
     "$([[ -s "$tl/p.h.gch.vcache-key" ]] && echo written)" "written"
+
+  # A refusal of the build's own preload is the compiler's output: kept on the
+  # miss and replayed by the hit, as without vcache. The tracer loaded
+  # everywhere, so the trace is used.
+  reset_cache
+  mkdir -p "$tl/ownwrap"
+  printf '#!/bin/sh\nLD_PRELOAD="$LD_PRELOAD %s/no-such-lib.so" exec %s "$@"\n' \
+    "$tl" "$(gcc -print-prog-name=cc1)" > "$tl/ownwrap/cc1"
+  chmod +x "$tl/ownwrap/cc1"
+  mf_ownwrap() {  # $1 log, $2 stderr file
+    ( cd "$tl" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" gcc -B "$tl/ownwrap/" -O2 -c main.c -o m.o ) 2> "$2"
+  }
+  l=$(mf_log ownwrap1); mf_ownwrap "$l" "$tl/ownwrap1.err"
+  check "a refusal of another object is kept on the miss" \
+    "$(grep -c "object '$tl/no-such-lib.so' from LD_PRELOAD cannot be preloaded" \
+      "$tl/ownwrap1.err")" "1"
+  check "and the state comes from the trace" \
+    "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
+  l=$(mf_log ownwrap2); mf_ownwrap "$l" "$tl/ownwrap2.err"
+  check "and replayed by the hit" \
+    "$(grep -c 'preprocessor skipped' "$l")/$(grep -c "no-such-lib.so" "$tl/ownwrap2.err")" "1/1"
 fi
 
 # A compiler process that did not load the tracer records nothing, so the

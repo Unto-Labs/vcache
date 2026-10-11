@@ -1598,7 +1598,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // the trace is not used, since that process recorded nothing.
   bool preload_refused = false;
   if (!trace_log.empty()) {
-    compiled.stderr_data = WithoutPreloadRefusals(compiled.stderr_data, &preload_refused);
+    compiled.stderr_data =
+        WithoutPreloadRefusals(compiled.stderr_data, manifest_tracer, &preload_refused);
   }
   if (!compiled.stderr_data.empty()) {
     ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);

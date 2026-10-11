@@ -117,7 +117,11 @@ bool TracerLoadsHere(const std::string& tracer) {
          ours->compare(18, 2, *theirs, 18, 2) == 0 && type == kSharedObjectType;
 }
 
-std::string WithoutPreloadRefusals(const std::string& stderr_text, bool* removed) {
+std::string WithoutPreloadRefusals(const std::string& stderr_text, const std::string& tracer,
+                                   bool* removed) {
+  // ld.so: "ERROR: ld.so: object '<path>' from LD_PRELOAD cannot be preloaded
+  // (<why>): ignored."
+  const std::string refusal = "'" + tracer + "' " + std::string(kPreloadIgnoredMessage);
   *removed = false;
   std::string kept;
   kept.reserve(stderr_text.size());
@@ -126,7 +130,7 @@ std::string WithoutPreloadRefusals(const std::string& stderr_text, bool* removed
     size_t end = stderr_text.find('\n', begin);
     end = end == std::string::npos ? stderr_text.size() : end + 1;
     const std::string_view line(stderr_text.data() + begin, end - begin);
-    if (line.find(kPreloadIgnoredMessage) != std::string_view::npos) {
+    if (line.find(refusal) != std::string_view::npos) {
       *removed = true;
     } else {
       kept.append(line);

@@ -970,10 +970,11 @@ other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
 does not parse, or a trace that does not show every file the depfile names
 being read: a compiler process that did not load the tracer (another ELF class,
 a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. When
-ld.so refuses a preload in some process of the compile, its "cannot be
-preloaded" lines are taken out of the compile's stderr, so neither the miss nor
-a later hit prints them, and the state comes from the depfile; the entry is
-stored as usual.
+ld.so refuses to preload the tracer in some process of the compile, its "cannot
+be preloaded" lines naming the tracer are taken out of the compile's stderr, so
+neither the miss nor a later hit prints them, and the state comes from the
+depfile; the entry is stored as usual. A refusal of any other object is the
+build's own and is kept.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:

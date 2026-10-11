@@ -305,14 +305,21 @@ void TestLinkTraceClassification() {
 
   // ld.so's refusals are taken out of a traced compile's stderr, line by line.
   bool refused = false;
+  const std::string other_refusal =
+      "ERROR: ld.so: object '/b/wrap.so' from LD_PRELOAD cannot be preloaded "
+      "(cannot open shared object file): ignored.\n";
   CheckEq(core::WithoutPreloadRefusals(
               "a.c:1: warning: x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
-              "cannot be preloaded (wrong ELF class: ELFCLASS64): ignored.\nlast",
-              &refused),
-          "a.c:1: warning: x\nlast", "a refusal line goes, the compiler's lines stay");
+              "cannot be preloaded (wrong ELF class: ELFCLASS64): ignored.\n" + other_refusal +
+                  "last",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal + "last",
+          "a refusal of the tracer goes; another object's and the compiler's lines stay");
   Check(refused, "and is reported");
-  CheckEq(core::WithoutPreloadRefusals("a.c:1: warning: x\n", &refused), "a.c:1: warning: x\n",
-          "stderr without one is untouched");
+  CheckEq(core::WithoutPreloadRefusals("a.c:1: warning: x\n" + other_refusal,
+                                       "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal,
+          "stderr with no refusal of the tracer is untouched");
   Check(!refused, "and reports none");
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),

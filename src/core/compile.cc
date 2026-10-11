@@ -57,6 +57,30 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
 }
 
+std::string BannerWithoutAbsentDepsMark(std::string_view banner,
+                                        int* absent_deps_version) {
+  static constexpr std::string_view kMark = "absent-deps-";
+  std::string text(banner);
+  *absent_deps_version = 0;
+  size_t at = 0;
+  while ((at = text.find(kMark, at)) != std::string::npos) {
+    const size_t digits = at + kMark.size();
+    size_t end = digits;
+    while (end < text.size() && std::isdigit(static_cast<unsigned char>(text[end]))) ++end;
+    const bool bounded = (at == 0 || std::isspace(static_cast<unsigned char>(text[at - 1]))) &&
+                         (end == text.size() || std::isspace(static_cast<unsigned char>(text[end])));
+    if (end == digits || !bounded) {
+      at = digits;
+      continue;
+    }
+    *absent_deps_version = std::atoi(text.c_str() + digits);
+    const size_t from = at > 0 ? at - 1 : at;
+    text.erase(from, end - from);
+    at = from;
+  }
+  return text;
+}
+
 namespace {
 
 // Which driver this is. The version banner settles it whenever there is one;
@@ -452,7 +476,8 @@ CompilerId ResolveCompilerId(const std::string& compiler,
     // The memo is keyed by the local path, so it holds the banner as printed.
     // Canonicalise on use rather than on store, so the same memo stays correct
     // if the root mapping changes.
-    id.fingerprint = hash::HashString(roots.CanonicalizeText(*cached));
+    id.fingerprint = hash::HashString(roots.CanonicalizeText(
+        BannerWithoutAbsentDepsMark(*cached, &id.absent_deps_version)));
     id.description = util::Split(*cached, '\n', /*skip_empty=*/true).empty()
                          ? real
                          : util::Split(*cached, '\n', true).back();
@@ -478,7 +503,8 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   util::WriteFileAtomic(memo_path, banner);
   id.is_clang = LooksLikeClang(banner, real);
-  id.fingerprint = hash::HashString(roots.CanonicalizeText(banner));
+  id.fingerprint = hash::HashString(roots.CanonicalizeText(
+      BannerWithoutAbsentDepsMark(banner, &id.absent_deps_version)));
   const auto lines = util::Split(banner, '\n', /*skip_empty=*/true);
   id.description = lines.empty() ? real : lines.back();
   return id;

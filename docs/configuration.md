@@ -1108,7 +1108,9 @@ How the toolchain is identified:
 | `mtime` | Path, size and mtime only -- no probe, no banner. Fastest, least safe. |
 
 `version` is the default precisely because a shared remote cache is a first-class
-use case and mtimes never agree across machines.
+use case and mtimes never agree across machines. An `absent-deps-<n>` token in
+the banner is left out of the hash: a compiler built with that local patch
+produces the stock compiler's objects, so both share entries.
 
 ## Logging and diagnostics
 

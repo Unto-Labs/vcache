@@ -1650,6 +1650,9 @@ void TestCompileSessionStalledSend() {
   daemon::Writer header;
   header.U64(request.data().size());
   for (int i = 0; i < 4096; ++i) flood.append(header.data() + request.data());
+  // MSG_DONTWAIT alone is not enough on macOS, where a send to a full AF_UNIX
+  // peer can still block; a non-blocking descriptor is honoured everywhere.
+  ::fcntl(held_fd, F_SETFL, ::fcntl(held_fd, F_GETFL) | O_NONBLOCK);
   size_t flood_offset = 0;
   bool queued_requests = false;
   const bool stalled = PollUntil([&] {

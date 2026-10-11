@@ -25,6 +25,12 @@ bool MakeDirs(const std::string& path);
 // rather than publishing more than the user asked for.
 mode_t DefaultFileMode();
 
+// Marks `path` executable the way a linker would have created it: execute for
+// each of owner, group and other that DefaultFileMode() lets read. Adding all
+// three regardless would publish 0711 under umask 077, a binary other users can
+// run but not read.
+bool AddExecuteBitsUnderUmask(const std::string& path);
+
 std::optional<std::string> ReadFile(const std::string& path);
 
 // Writes via a temporary file in the same directory followed by rename(2), so a
@@ -46,8 +52,9 @@ bool LinkOrCopy(const std::string& from, const std::string& to);
 // linker may later truncate in place, and sharing an inode would corrupt the
 // cached copy along with it.
 //
-// The write goes to a temporary beside `to` and is renamed into place, so a
-// reader never observes a half-written file.
+// The write goes to an exclusive temporary beside `to`, creating its directory
+// if needed, and is renamed into place, so a reader never observes a
+// half-written file.
 bool CloneFile(const std::string& from, const std::string& to);
 
 std::optional<uint64_t> FileSize(const std::string& path);
@@ -80,6 +87,18 @@ std::string CurrentDir();
 
 // Creates a uniquely named directory under the system temp dir and returns it.
 std::optional<std::string> MakeTempDir(const std::string& prefix);
+
+// A compile's scratch directory, under `<cache_dir>/tmp`, or the system temp dir
+// when that cannot be created. A compile killed mid-run cannot remove it; inside
+// the cache, RemoveStaleScratchDirs does.
+std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix);
+
+// Removes the scratch directories under `<cache_dir>/tmp` whose compile is over and
+// returns how many it removed. MakeScratchDir names the owner pid, and a directory
+// whose owner this process can see is kept while the owner lives and for a short
+// grace after it dies. One whose owner it cannot see (another pid namespace, an
+// earlier boot, an older vcache) goes once unmodified for `max_age_seconds`.
+size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds);
 
 bool RemoveRecursive(const std::string& path);
 bool RemoveFile(const std::string& path);

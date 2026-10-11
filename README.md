@@ -192,7 +192,7 @@ new S3 connection each; see [docs/daemon.md](docs/daemon.md).
 | `vcache --show-stats` | hit/miss counters, why runs were not cached, and cache size |
 | `vcache --zero-stats` | reset counters |
 | `vcache --clear` | delete all entries |
-| `vcache --trim` | evict until under the size limit |
+| `vcache --trim` | evict until under the size limit, and remove scratch directories killed compiles left |
 | `vcache --show-config` | effective configuration |
 | `vcache --show-roots` | resolved root mapping for this directory |
 | `vcache --start-daemon` | start the cache daemon in the background |

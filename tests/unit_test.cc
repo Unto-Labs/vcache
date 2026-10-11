@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
@@ -12,11 +13,13 @@
 #include <sys/un.h>
 
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -836,6 +839,104 @@ void TestManifestPause() {
   Check(elapsed_ms >= 400 && elapsed_ms < 2000,
         "a fifo with no writer returns at the test bound (took " + std::to_string(elapsed_ms) +
             "ms)");
+}
+
+void TestScratchDirs() {
+  Section("util::MakeScratchDir");
+
+  auto cache = util::MakeTempDir("vcache-scratch-test-");
+  Check(cache.has_value(), "scratch test cache exists");
+  if (!cache) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*cache};
+
+  const auto scratch = util::MakeScratchDir(*cache, "vcache-");
+  Check(scratch.has_value() && util::StartsWith(*scratch, *cache + "/tmp/vcache-") &&
+            util::IsDirectory(*scratch),
+        "a compile's scratch directory is created under <cache>/tmp");
+
+  const std::string not_a_dir = *cache + "/plain-file";
+  util::WriteFileAtomic(not_a_dir, "x");
+  const auto fallback = util::MakeScratchDir(not_a_dir, "vcache-");
+  Check(fallback.has_value() && !util::StartsWith(*fallback, not_a_dir) && util::IsDirectory(*fallback),
+        "a cache dir that cannot hold tmp/ falls back to the system temp dir");
+  if (fallback) util::RemoveRecursive(*fallback);
+
+  // Directories named before the owner pid was recorded keep the age rule.
+  const std::string stale = *cache + "/tmp/vcache-Ab12Cd";
+  const std::string fresh = *cache + "/tmp/vcache-Ef34Gh";
+  util::MakeDirs(stale);
+  util::MakeDirs(fresh);
+  util::WriteFileAtomic(stale + "/pp.i", "left by a killed compile");
+  const auto set_age = [](const std::string& path, int64_t seconds) {
+    const timeval then[2] = {{::time(nullptr) - seconds, 0}, {::time(nullptr) - seconds, 0}};
+    ::utimes(path.c_str(), then);
+  };
+  set_age(stale, 7 * 3600);
+  const std::string stale_file = *cache + "/tmp/stray-file";
+  util::WriteFileAtomic(stale_file, "x");
+  set_age(stale_file, 7 * 3600);
+
+  // The live owner is this process. A long compile rewrites files that already
+  // exist, which leaves its directory's mtime behind.
+  const auto running = util::MakeScratchDir(*cache, "vcache-rs-");
+  Check(running.has_value(), "a running compile's scratch directory is created");
+  if (!running) return;
+  util::WriteFileAtomic(*running + "/lib.rlib", "being written");
+  set_age(*running, 7 * 3600);
+
+  // A foreign owner: the live pid of this process, under another pid namespace
+  // or boot, where the sweep cannot ask the kernel about it.
+  const size_t tag_dot = running->rfind('.');
+  const std::string own_tag = tag_dot == std::string::npos ? "" : running->substr(tag_dot + 1, 8);
+  const std::string foreign_prefix = *cache + "/tmp/vcache-" + std::to_string(::getpid()) + "." +
+                                     (own_tag == "00000000" ? "11111111" : "00000000");
+  const std::string foreign_old = foreign_prefix + "-Ij56Kl";
+  const std::string foreign_new = foreign_prefix + "-Mn78Op";
+  util::MakeDirs(foreign_old);
+  util::MakeDirs(foreign_new);
+  set_age(foreign_old, 7 * 3600);
+  set_age(foreign_new, 3600);
+
+  // Dead owners: a child makes its scratch directories and exits without
+  // removing them, as a compile killed mid-run does.
+  const pid_t child = ::fork();
+  if (child == 0) {
+    util::MakeScratchDir(*cache, "vcache-dead-old-");
+    util::MakeScratchDir(*cache, "vcache-dead-new-");
+    _exit(0);
+  }
+  int status = 0;
+  Check(child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status),
+        "a child made its scratch directories and exited");
+  std::string dead_old, dead_new;
+  for (const auto& entry : fs::directory_iterator(*cache + "/tmp")) {
+    const std::string name = entry.path().filename().string();
+    if (util::StartsWith(name, "vcache-dead-old-")) dead_old = entry.path().string();
+    if (util::StartsWith(name, "vcache-dead-new-")) dead_new = entry.path().string();
+  }
+  Check(!dead_old.empty() && !dead_new.empty(), "the dead owner's directories are found");
+  set_age(dead_old, 3600);
+  set_age(dead_new, 60);
+
+  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 3,
+        "the sweep removes exactly the old unowned, foreign and dead-owner directories");
+  Check(!util::IsDirectory(stale), "an unowned scratch directory older than the limit is removed");
+  Check(util::IsDirectory(fresh), "an unowned scratch directory younger than the limit is kept");
+  Check(util::IsDirectory(*running),
+        "a scratch directory whose owner is alive is kept however old its mtime");
+  Check(!util::IsDirectory(foreign_old),
+        "a foreign owner's directory older than the limit is removed although the pid is live here");
+  Check(util::IsDirectory(foreign_new), "a foreign owner's directory younger than the limit is kept");
+  Check(!dead_old.empty() && !util::IsDirectory(dead_old),
+        "a dead owner's directory goes after the grace, long before the age limit");
+  Check(!dead_new.empty() && util::IsDirectory(dead_new),
+        "a dead owner's directory is kept within the grace");
+  Check(util::FileExists(stale_file), "a plain file under tmp/ is left alone");
+  Check(util::RemoveStaleScratchDirs(*cache + "/missing", 0) == 0,
+        "a cache without tmp/ sweeps nothing");
 }
 
 void TestReadFile() {
@@ -3945,7 +4046,7 @@ void Age(const std::string& file, int64_t seconds) {
   times[0].tv_nsec = 0;
   times[1].tv_sec = mtime.tv_sec - seconds;
   times[1].tv_nsec = 0;
-  ::utimensat(0, file.c_str(), times, 0);
+  ::utimensat(AT_FDCWD, file.c_str(), times, 0);
 }
 
 // Keys are hex digests in production and the shard is just the first two
@@ -4129,6 +4230,38 @@ void TestDiskStorageEviction() {
     }
     Check(disk.Get(touched, &got),
           "a read protects an otherwise stale entry from the next eviction");
+  }
+
+  // ---- a hit refreshes the mtime under a relative cache dir --------------
+  // With stdin not a directory, a refresh resolved against fd 0 rather than
+  // the working directory fails and the entry ages as if never read.
+  {
+    TempCacheDir tmp;
+    const std::string cwd = util::CurrentDir();
+    const int saved_stdin = ::dup(0);
+    const int dev_null = ::open("/dev/null", O_RDONLY);
+    const bool arranged = !cwd.empty() && saved_stdin >= 0 && dev_null >= 0 &&
+                          ::chdir(tmp.path().c_str()) == 0 && ::dup2(dev_null, 0) == 0;
+    Check(arranged, "the relative cache dir and a /dev/null stdin are set up");
+    if (arranged) {
+      storage::DiskStorage disk("relative-cache", 1 << 20, /*read_only=*/false);
+      const std::string key = KeyIn("ab", "relative");
+      disk.Put(key, "payload");
+      const std::string entry = EntryPath("relative-cache", key);
+      Age(entry, 10000);
+      struct stat before {}, after {};
+      ::stat(entry.c_str(), &before);
+      Check(before.st_mtime < ::time(nullptr) - 5000, "the entry under the relative cache dir is aged");
+      std::string got;
+      const bool hit = disk.Get(key, &got);
+      ::stat(entry.c_str(), &after);
+      Check(hit && after.st_mtime > before.st_mtime,
+            "a hit refreshes the entry's mtime when the cache dir is relative");
+    }
+    if (saved_stdin >= 0) ::dup2(saved_stdin, 0);
+    if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) std::perror("chdir back");
+    if (saved_stdin >= 0) ::close(saved_stdin);
+    if (dev_null >= 0) ::close(dev_null);
   }
 
   // ---- explicit Trim ----------------------------------------------------
@@ -4319,6 +4452,102 @@ void TestWriteErrnoIsPreserved() {
 
   ::chmod(locked.c_str(), 0755);
   fs::remove_all(dir);
+}
+
+#if defined(__linux__)
+// Armed by TestWriteCloseFailure: the next close(2) of a vcache temp file
+// really closes it and then fails with EIO, which is how NFS or an exhausted
+// quota reports a write the kernel accepted and could not complete. Every other
+// close goes straight to the system call.
+static std::atomic<bool> g_fail_next_temp_close{false};
+
+extern "C" int close(int fd) {
+  if (g_fail_next_temp_close.load()) {
+    char link[64];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    char target[PATH_MAX];
+    const ssize_t n = ::readlink(link, target, sizeof(target) - 1);
+    if (n > 0) {
+      target[n] = '\0';
+      if (std::strstr(target, "/.vcache-tmp-") != nullptr &&
+          g_fail_next_temp_close.exchange(false)) {
+        ::syscall(SYS_close, fd);
+        errno = EIO;
+        return -1;
+      }
+    }
+  }
+  return static_cast<int>(::syscall(SYS_close, fd));
+}
+#endif
+
+// Without an fsync, close() is the only call that can report a write the
+// kernel accepted and then failed to complete. Renaming after that error
+// published a short file as a complete cache entry.
+void TestWriteCloseFailure() {
+  Section("WriteFileAtomic checks close");
+#if defined(__linux__)
+  auto dir = vcache::util::MakeTempDir("vcache-close-test-");
+  Check(dir.has_value(), "close test scratch exists");
+  if (!dir) return;
+  struct CloseGuard {
+    std::string path;
+    ~CloseGuard() { vcache::util::RemoveRecursive(path); }
+  } guard{*dir};
+
+  const std::string path = *dir + "/entry";
+  g_fail_next_temp_close = true;
+  errno = 0;
+  const bool wrote = vcache::util::WriteFileAtomic(path, "bytes never written back", false);
+  const int wrote_errno = errno;
+  const bool fault_reached = !g_fail_next_temp_close.exchange(false);
+  Check(fault_reached, "the injected close failure was reached");
+  Check(!wrote, "WriteFileAtomic fails when close reports a delayed write error");
+  Check(wrote_errno == EIO, "and reports close's EIO");
+  Check(!vcache::util::FileExists(path), "nothing is published under the destination");
+  Check(fs::is_empty(*dir), "the temp file is removed");
+#endif
+}
+
+// CloneFile places link outputs and must not disturb another writer's temp:
+// a stale one, or one in flight from a process in another PID namespace that
+// shares the store and happens to have the same pid.
+void TestCloneFile() {
+  Section("util::CloneFile");
+  auto dir = vcache::util::MakeTempDir("vcache-clone-test-");
+  Check(dir.has_value(), "clone test scratch exists");
+  if (!dir) return;
+  struct CloneGuard {
+    std::string path;
+    ~CloneGuard() { vcache::util::RemoveRecursive(path); }
+  } guard{*dir};
+
+  const std::string from = *dir + "/stored";
+  vcache::util::WriteFileAtomic(from, "cached output");
+  const std::string to = *dir + "/out/artifact";
+  const std::string pid_named_temp = to + ".tmp." + std::to_string(::getpid());
+  vcache::util::WriteFileAtomic(pid_named_temp, "another writer's bytes");
+
+  Check(vcache::util::CloneFile(from, to), "CloneFile succeeds beside another writer's temp");
+  Check(vcache::util::ReadFile(to) == std::optional<std::string>("cached output"),
+        "the destination holds the source bytes");
+  Check(vcache::util::ReadFile(pid_named_temp) ==
+            std::optional<std::string>("another writer's bytes"),
+        "the other writer's temp is neither truncated nor renamed away");
+  size_t leftover_temps = 0;
+  for (const auto& entry : fs::directory_iterator(*dir + "/out")) {
+    if (entry.path().filename().string().starts_with(".vcache-tmp-")) ++leftover_temps;
+  }
+  Check(leftover_temps == 0, "CloneFile leaves no temp of its own behind");
+
+  const std::string nested = *dir + "/new/sub/artifact";
+  Check(vcache::util::CloneFile(from, nested), "CloneFile creates the destination's directory");
+  Check(vcache::util::ReadFile(nested) == std::optional<std::string>("cached output"),
+        "and the clone holds the source bytes");
+  struct ::stat st {};
+  Check(::stat(nested.c_str(), &st) == 0 &&
+            (st.st_mode & 07777) == vcache::util::DefaultFileMode(),
+        "the clone gets the umask's default mode, not mkstemp's 0600");
 }
 
 void TestStats() {
@@ -4789,8 +5018,18 @@ void TestRustOutputNames() {
   Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
         "a symlink out of the capture directory can be planted");
   std::vector<storage::BlobFile> captured;
-  Check(!rust::CaptureOutputs(cap, roots, {}, &captured),
+  std::string unparsed_dep_info;
+  Check(!rust::CaptureOutputs(cap, roots, {}, &captured, &unparsed_dep_info),
         "capturing a name that escapes the output directory fails");
+
+  const std::string inner = *scratch + "/inner";
+  util::MakeDirs(inner);
+  util::WriteFileAtomic(inner + "/lib.rlib", "ok");
+  Check(::symlink("lib.rlib", (inner + "/alias.rlib").c_str()) == 0,
+        "a symlink inside the capture directory can be planted");
+  captured.clear();
+  Check(!rust::CaptureOutputs(inner, roots, {}, &captured, &unparsed_dep_info),
+        "capturing a symlink that stays inside the directory fails too");
 }
 
 void TestUploadGeneration() {
@@ -5516,6 +5755,8 @@ int main(int argc, char** argv) {
   TestS3ResponseParsing();
   TestWrittenFileMode();
   TestWriteErrnoIsPreserved();
+  TestWriteCloseFailure();
+  TestCloneFile();
   // Must run after TestWrittenFileMode. util::DefaultFileMode() caches the
   // umask in a function-local static on first use, so that test forks before
   // this process has written anything, to get a child that initialises its own
@@ -5535,6 +5776,7 @@ int main(int argc, char** argv) {
   TestRunRusage();
   // After the rusage check. ReadFile's 64 MiB fixture stays in the allocator,
   // and a forked child is charged that high-water mark until exec replaces it.
+  TestScratchDirs();
   TestReadFile();
   TestCost();
   TestMemoryEstimates();

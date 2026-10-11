@@ -33,9 +33,13 @@ std::string ResolveRustcFingerprint(const std::string& rustc,
 // empty, a NUL, absolute, or any `..` component. A `.` component is allowed.
 bool IsSafeOutputName(std::string_view name);
 
+// False when the stage dir holds a symlink or any other non-regular file.
+// `unparsed_dep_info` names a .d left as rustc wrote it because it did not
+// parse; such a set may be placed but never stored.
 bool CaptureOutputs(const std::string& dir, const core::RootMap& roots,
                     const std::vector<std::string>& path_env_vars,
-                    std::vector<storage::BlobFile>* files);
+                    std::vector<storage::BlobFile>* files,
+                    std::string* unparsed_dep_info);
 
 bool RestoreOutputs(const std::vector<storage::BlobFile>& files, const std::string& out_dir,
                     const core::RootMap& roots,

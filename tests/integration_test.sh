@@ -24,6 +24,9 @@ PATH=$(tr ':' '\n' <<<"$PATH" | grep -vE '/s?ccache(/|$)' | paste -sd: -)
 TMPBASE="${TMPDIR:-/tmp}"
 while [[ "$TMPBASE" == */ && "$TMPBASE" != "/" ]]; do TMPBASE="${TMPBASE%/}"; done
 WORK="$(mktemp -d "$TMPBASE/vcache-it-XXXXXX")"
+# Anything a killed process leaves in a temp dir then goes when the work dir does.
+export TMPDIR="$WORK/tmp"
+mkdir -p "$TMPDIR"
 # A slow PUT dies on SIGTERM when the disposition is the default. The flight
 # mock is not stopped by its own case: the next start is what signals it, and
 # only if that pid is still the one the shell holds. A parent that ignores
@@ -263,6 +266,18 @@ if debug_info "$WORK/a.o" | grep -q "checkout-a"; then
 else
   ok "debug info does not leak the local path"
 fi
+
+check "a finished compile leaves no scratch directory in the cache" \
+  "$(find "$VCACHE_DIR/tmp" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "a finished compile leaves nothing in TMPDIR" \
+  "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'vcache-*' | wc -l | tr -d ' ')" "0"
+mkdir -p "$VCACHE_DIR/tmp/vcache-killed" "$VCACHE_DIR/tmp/vcache-running"
+touch -d '7 hours ago' "$VCACHE_DIR/tmp/vcache-killed"
+"$VCACHE" --trim >/dev/null 2>&1
+check "--trim removes a scratch directory a killed compile left" \
+  "$([[ -d $VCACHE_DIR/tmp/vcache-killed ]] && echo kept || echo removed)" "removed"
+check "--trim keeps a recent scratch directory" \
+  "$([[ -d $VCACHE_DIR/tmp/vcache-running ]] && echo kept || echo removed)" "kept"
 
 # --------------------------------------------------------------------------
 section "2. out-of-tree builds (cwd differs, source tree does not)"
@@ -685,6 +700,84 @@ EOF
   fi
 else
   printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
+section "9g. Rust: outputs are placed as rustc left them, or not stored"
+
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  real_rustc=$(command -v rustc)
+  file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+  # A rustc that runs the real one and then runs $2 in the --out-dir of the
+  # compile that emits link. The dep-info pass is left alone. vcache knows
+  # rustc by its name, so each one is `rustc` in its own directory.
+  write_altering_rustc() {  # $1 = dest, $2 = shell command
+    mkdir -p "$(dirname "$1")"
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf '%q "$@" || exit $?\n' "$real_rustc"
+      printf '%s\n' 'case " $* " in *" --emit=dep-info,link "*) ;; *) exit 0 ;; esac'
+      printf '%s\n' 'out=; prev='
+      printf '%s\n' 'for arg in "$@"; do [ "$prev" = --out-dir ] && out=$arg; prev=$arg; done'
+      printf 'cd "$out" && %s\n' "$2"
+    } > "$1"
+    chmod +x "$1"
+  }
+  place_compile() {  # $1 = tree, $2 = rustc
+    ( cd "$WORK/$1" && VCACHE_ROOTS="$WORK/$1=crate" \
+        "$VCACHE" "$2" --crate-name demo --crate-type lib \
+        --emit=dep-info,link --out-dir "$WORK/$1/out" src/lib.rs ) >/dev/null 2>&1
+  }
+  # cargo creates the out dir; a passthrough rustc needs it to exist.
+  for tree in place-link place-dep-a place-dep-b; do
+    mkdir -p "$WORK/$tree/src" "$WORK/$tree/out"
+    echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+  done
+
+  # Captured through the link, the entry held the target's bytes under the
+  # target's name, so the link itself was never placed.
+  reset_cache
+  write_altering_rustc "$WORK/place-rustc/symlink/rustc" "ln -sf libdemo.rlib alias.rlib"
+  place_compile place-link "$WORK/place-rustc/symlink/rustc"
+  check "a compile that leaves a symlink succeeds" "$?" "0"
+  check "a symlink in the stage dir fails the capture" "$(stat_of "capture failed")" "1"
+  check "a symlink in the stage dir stores nothing" "$(disk_entries)" "0"
+  check "the symlink is placed as rustc made it" \
+    "$([[ -L "$WORK/place-link/out/alias.rlib" ]] && echo link)" "link"
+  check "the crate is still placed" \
+    "$([[ -f "$WORK/place-link/out/libdemo.rlib" ]] && echo yes)" "yes"
+
+  # A .d that does not parse keeps the stage dir's path; a hit in another
+  # checkout would write that path as its rule target.
+  reset_cache
+  write_altering_rustc "$WORK/place-rustc/bad-dep/rustc" "printf 'not a make rule\\n' >> demo.d"
+  place_compile place-dep-a "$WORK/place-rustc/bad-dep/rustc"
+  check "a compile with an unparsable .d succeeds" "$?" "0"
+  check "its crate is placed" \
+    "$([[ -f "$WORK/place-dep-a/out/libdemo.rlib" ]] && echo yes)" "yes"
+  check "an unparsable .d is counted" "$(stat_of "unparsed dep-info")" "1"
+  check "an unparsable .d is not stored" "$(disk_entries)" "0"
+  place_compile place-dep-b "$WORK/place-rustc/bad-dep/rustc"
+  check "another checkout is not served the raw .d" "$(hits)" "0"
+  check "and compiles for itself" "$(misses)" "2"
+
+  # Under umask 077 the linker makes a binary 0700. Adding all three execute
+  # bits makes it 0711: runnable by other users who cannot read it.
+  reset_cache
+  for tree in place-umask-a place-umask-b; do
+    mkdir -p "$WORK/$tree/src"
+    echo 'fn main() {}' > "$WORK/$tree/src/main.rs"
+    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" \
+        "$VCACHE" rustc --crate-name umaskbin --crate-type bin \
+        --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
+  done
+  check "the umask 077 binary crate hit" "$(hits)" "1"
+  check "a binary placed after a miss under umask 077 is 0700" \
+    "$(file_mode "$WORK/place-umask-a/out/umaskbin")" "700"
+  check "a binary restored from a hit under umask 077 is 0700" \
+    "$(file_mode "$WORK/place-umask-b/out/umaskbin")" "700"
 fi
 
 # --------------------------------------------------------------------------
@@ -3309,6 +3402,84 @@ reset_cache
     "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-readonly ) 2>/dev/null
 check "read-only link caching writes no sidecar" \
   "$(find "$VCACHE_DIR" -type f -name '*.linkout' 2>/dev/null | wc -l | tr -d " ")" "0"
+
+# DiskStorage::Get refreshes only the entry, and eviction is oldest-mtime-first
+# over every file in the shards. A hit that leaves the stored output's mtime
+# alone lets a hot binary age out before the entry that names it.
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-fresh ) 2>/dev/null
+sidecar=$(find "$VCACHE_DIR" -type f -name '*.linkout' -print -quit)
+touch -d @946684800 "$sidecar"
+( cd "$WORK/link-one" && rm -f app-fresh && \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-fresh ) 2>/dev/null
+check "a link hit on an aged stored output" "$(hits)" "1"
+check "refreshes the stored output's mtime" \
+  "$([[ $(stat -c %Y "$sidecar") -gt 946684800 ]] && echo yes)" "yes"
+
+# The stored output can be evicted or replaced between being verified and
+# being published. A preload shim models a replacement right after vcache first
+# reads it: every later open of a .linkout gets another binary. The hit must
+# publish the bytes it verified, never the replacement.
+make_link_project "$WORK/link-swap" 9
+( cd "$WORK/link-swap" && gcc helper.o main.o -o replacement ) 2>/dev/null
+cat > "$WORK/linkout-swap.c" <<'SWAPEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static char replacement[4096];
+static int linkout_opens;
+__attribute__((constructor)) static void init(void) {
+  const char *r = getenv("LINKOUT_REPLACEMENT");
+  if (r != NULL) snprintf(replacement, sizeof replacement, "%s", r);
+  /* RunLink declines a link under an inherited preload. */
+  unsetenv("LD_PRELOAD");
+}
+static const char *swap(const char *path) {
+  size_t n = strlen(path);
+  if (n < 8 || strcmp(path + n - 8, ".linkout") != 0) return path;
+  return linkout_opens++ == 0 ? path : replacement;
+}
+FILE *fopen(const char *path, const char *mode) {
+  FILE *(*real)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen");
+  return real(swap(path), mode);
+}
+FILE *fopen64(const char *path, const char *mode) {
+  FILE *(*real)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen64");
+  return real(swap(path), mode);
+}
+#define OPEN_SHIM(name)                                                 \
+  int name(const char *path, int flags, ...) {                          \
+    int mode = 0;                                                       \
+    if (flags & (O_CREAT | O_TMPFILE)) {                                \
+      va_list ap;                                                       \
+      va_start(ap, flags);                                              \
+      mode = va_arg(ap, int);                                           \
+      va_end(ap);                                                       \
+    }                                                                   \
+    int (*real)(const char *, int, ...) = dlsym(RTLD_NEXT, #name);      \
+    return real(swap(path), flags, mode);                               \
+  }
+OPEN_SHIM(open)
+OPEN_SHIM(open64)
+SWAPEOF
+gcc -shared -fPIC "$WORK/linkout-swap.c" -o "$WORK/linkout-swap.so" -ldl
+reset_cache
+( cd "$WORK/link-one" && "$VCACHE" --vcache-root="$PWD=proj" \
+    gcc helper.o main.o -o app-swap ) 2>/dev/null
+( cd "$WORK/link-one" && rm -f app-swap && \
+    LINKOUT_REPLACEMENT="$WORK/link-swap/replacement" \
+    LD_PRELOAD="$WORK/linkout-swap.so" \
+    "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-swap ) 2>/dev/null
+check "a stored output replaced after its first read is a hit" "$(hits)" "1"
+check "and publishes the verified binary, not the replacement" \
+  "$("$WORK/link-one/app-swap")" "7"
+check "and leaves no temp file beside the output" \
+  "$(find "$WORK/link-one" -name '.vcache-tmp-*' | wc -l | tr -d ' ')" "0"
 
 # The two guards that decide whether an entry is sound enough to store are
 # worth breaking on purpose. A guard that has never been seen to fire is

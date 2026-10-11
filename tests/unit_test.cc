@@ -4,6 +4,7 @@
 // build to plain make, as the plan asks.
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <poll.h>
@@ -3962,6 +3963,20 @@ size_t CountFiles(const std::string& dir) {
   return util::ListFilesRecursive(dir).size();
 }
 
+// Stands in for a running daemon: holds <cache>/daemon/lock the way it does.
+struct HeldDaemonLock {
+  int fd = -1;
+  explicit HeldDaemonLock(const std::string& cache) {
+    util::MakeDirs(cache + "/daemon");
+    fd = ::open((cache + "/daemon/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+  ~HeldDaemonLock() { if (fd >= 0) ::close(fd); }
+};
+
 void TestDiskTrimPins() {
   Section("storage::disk trim");
 
@@ -3978,10 +3993,44 @@ void TestDiskTrimPins() {
     Age(EntryPath(tmp.path(), k2), 50);
     util::MakeDirs(tmp.path() + "/daemon/pending");
     util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(daemon.fd >= 0, "the test holds the daemon lock");
     Check(disk.Put(k3, payload), "the store that crosses the budget succeeds");
     Check(util::FileExists(EntryPath(tmp.path(), k1)), "a pending upload is not evicted");
     Check(!util::FileExists(EntryPath(tmp.path(), k2)), "an unpinned older entry is evicted");
     Check(util::FileExists(EntryPath(tmp.path(), k3)), "the new entry stays");
+  }
+  {
+    // A daemon that was killed leaves its journal and its lock file, but no
+    // lock. Its pins must not outlive it, or they keep their entries past the
+    // budget and every newer entry is evicted instead.
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "the dead-daemon case stores two entries");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k2, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/lock", "");
+    Check(disk.Put(k3, payload), "the store over a dead daemon's journal succeeds");
+    Check(!util::FileExists(EntryPath(tmp.path(), k1)),
+          "a dead daemon's journal does not pin the oldest entry");
+    Check(util::FileExists(EntryPath(tmp.path(), k3)), "and the new entry stays");
+    Check(disk.Clear(), "--clear succeeds with a dead daemon's journal");
+    Check(!util::IsDirectory(tmp.path() + "/daemon/pending"),
+          "--clear drops a dead daemon's journal");
+  }
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload), "the live-daemon clear stores an entry");
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(disk.Clear(), "--clear succeeds under a live daemon");
+    Check(util::FileExists(tmp.path() + "/daemon/pending/" + k1),
+          "--clear leaves a live daemon's journal to the daemon");
   }
   {
     TempCacheDir tmp;
@@ -4003,6 +4052,7 @@ void TestDiskTrimPins() {
       util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + key, "");
     }
     storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    HeldDaemonLock daemon(tmp.path());
     const pid_t pid = ::fork();
     Check(pid >= 0, "the all-pinned trim can be watched");
     if (pid == 0) {

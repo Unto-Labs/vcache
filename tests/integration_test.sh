@@ -3747,7 +3747,7 @@ if command -v clang++ >/dev/null 2>&1; then
   clang_pch_build "$pa"
   check "clang PCH generation is cached" "$(misses)/$(uncacheable)" "1/0"
   check "and the PCH is written" "$([[ -s "$pa/h.pch" ]] && echo yes)" "yes"
-  check ".vcache-key holds the PCH's key" \
+  check ".vcache-key holds the PCH's identity" \
     "$(grep -cxE '[0-9a-f]{64}' "$pa/h.pch.vcache-key" 2>/dev/null)" "1"
   pch_key_built="$(cat "$pa/h.pch.vcache-key" 2>/dev/null)"
   clang_pch_consumer "$pa" fresh.o
@@ -3771,8 +3771,10 @@ if command -v clang++ >/dev/null 2>&1; then
   # The PCH from tree A names A's headers; clang would refuse it in B.
   clang_pch_build "$pb"
   check "a PCH built in another directory is not served to it" "$(misses)/$(hits)" "2/1"
-  check "and B's .vcache-key is its own" \
-    "$([[ -s "$pb/h.pch.vcache-key" && "$(cat "$pb/h.pch.vcache-key")" != "$pch_key_built" ]] \
+  # The entry is B's own, but the identity carries no paths, so B's consumers
+  # share A's manifest states.
+  check "and B's .vcache-key equals A's" \
+    "$([[ -s "$pb/h.pch.vcache-key" && "$(cat "$pb/h.pch.vcache-key")" == "$pch_key_built" ]] \
        && echo yes)" "yes"
   pch_key_b="$(cat "$pb/h.pch.vcache-key" 2>/dev/null)"
   clang_pch_build "$pb" -DEXTRA=1
@@ -3871,7 +3873,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   pg="$WORK/pch-gcc-a"
   gcc_pch_build "$pg"
   check "gcc .gch generation is cached" "$(misses)/$(uncacheable)" "1/0"
-  check "and .vcache-key holds its key" \
+  check "and .vcache-key holds its identity" \
     "$(grep -cxE '[0-9a-f]{64}' "$pg/h.h.gch.vcache-key" 2>/dev/null)" "1"
   # Without this the checks below would pass on a textual include alone.
   check "and gcc picks the .gch up" "$(gcc_picks_up_gch "$pg")" "1"
@@ -4388,6 +4390,33 @@ if command -v clang++ >/dev/null 2>&1; then
   check "clang: and derives a new key" "$(grep -c '\] derived key ' "$l")" "1"
   mf_use_pch "$(mf_log dk4)"
   check "clang: which the next compile hits" "$(manifest_hits)" "2"
+
+  # The identity in .vcache-key carries no paths, so a consumer in another
+  # worktree, whose PCH entry is its own, hits the manifest state this tree
+  # recorded, with no .sum written by the build.
+  reset_cache
+  pcb="$WORK/mf-pch-b"
+  mkdir -p "$pcb/inc"
+  cp "$pc/inc/big.h" "$pcb/inc/"
+  cp "$pc/h.h" "$pc/main.cc" "$pcb/"
+  mf_vcache_pch() {  # $1 tree
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" "$VCACHE" clang++ -O2 -I inc -x c++-header -c h.h \
+        -Xclang -emit-pch -Xclang -fno-pch-timestamp -o h.pch ) 2>/dev/null
+  }
+  mf_use_pch_in() {  # $1 tree, $2 log
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" "$VCACHE" clang++ -O2 -I inc \
+        -MD -MF main.d -c -include-pch h.pch main.cc -o main.o ) 2>/dev/null
+  }
+  mf_vcache_pch "$pc"
+  mf_use_pch_in "$pc" "$(mf_log x1)"
+  mf_vcache_pch "$pcb"
+  check "clang: another tree builds its own PCH" "$(misses)" "3"
+  check "clang: with the same .vcache-key" \
+    "$(cmp -s "$pc/h.pch.vcache-key" "$pcb/h.pch.vcache-key" && echo same)" "same"
+  l=$(mf_log x2); mf_use_pch_in "$pcb" "$l"
+  check "clang: so its consumer hits the manifest the first tree recorded" \
+    "$(manifest_hits)" "1"
+  check "clang: keyed on the .vcache-key" "$(grep -c 'PCH .*h\.pch is vcache-key' "$l")" "1"
 else
   skipped "clang++ is not installed"
 fi

@@ -966,7 +966,9 @@ identified by the first of:
 
 1. `<pch>.sum`, when it is not older than the PCH: what a build writes for
    ccache's `pch_external_checksum`, a digest of the PCH's inputs.
-2. `<pch>.vcache-key`, under the same rule.
+2. `<pch>.vcache-key`, under the same rule: a digest of the PCH's inputs with
+   paths canonicalised, which vcache writes beside every PCH it builds or
+   restores, so consumers in different checkouts share one identity.
 3. The PCH's bytes.
 
 A side file older than the PCH describes an earlier build of it and is

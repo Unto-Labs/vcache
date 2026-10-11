@@ -34,6 +34,7 @@ namespace {
 // Bumped whenever the key derivation or blob layout changes, so old entries are
 // ignored rather than misinterpreted.
 constexpr std::string_view kCacheKeyVersion = "vcache-key-v2";
+constexpr std::string_view kPchIdentityVersion = "vcache-pch-identity-v1";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
 // everything vcache cannot or should not cache.
@@ -222,14 +223,43 @@ std::string ResolveNativeTarget(const args::CompilerArgs& parsed,
   return digest;
 }
 
+// The meta line that carries a PCH build's identity, so a hit can write the
+// key file without the preprocessed text.
+constexpr std::string_view kPchIdentityMetaKey = "pch-identity: ";
+
+std::string PchIdentityFromMeta(const std::string& meta) {
+  size_t pos = 0;
+  while (pos < meta.size()) {
+    const size_t end = meta.find('\n', pos);
+    const std::string_view line(meta.data() + pos, (end == std::string::npos ? meta.size() : end) - pos);
+    if (util::StartsWith(line, kPchIdentityMetaKey)) {
+      return std::string(line.substr(kPchIdentityMetaKey.size()));
+    }
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return "";
+}
+
 std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
                        const CompilerId& compiler_id, const Config& config,
                        const std::string& native_target,
-                       const std::string& preprocessed_path, bool* saw_incbin) {
+                       const std::string& preprocessed_path, bool* saw_incbin,
+                       std::string* pch_identity) {
   hash::Hasher hasher;
-  hasher.UpdateDelimited(kCacheKeyVersion);
-  hasher.UpdateDelimited(compiler_id.fingerprint);
-  hasher.UpdateDelimited(native_target);
+  // A PCH build's identity takes every input of its key except the paths as
+  // typed, so it is the same in every worktree; consumers' manifests name the
+  // PCH by it where the build writes no .sum (see PchIdentity).
+  hash::Hasher identity;
+  const bool want_identity = parsed.produces_pch && pch_identity != nullptr;
+  if (want_identity) identity.UpdateDelimited(kPchIdentityVersion);
+  const auto feed = [&](std::string_view text) {
+    hasher.UpdateDelimited(text);
+    if (want_identity) identity.UpdateDelimited(text);
+  };
+  feed(kCacheKeyVersion);
+  feed(compiler_id.fingerprint);
+  feed(native_target);
 
   // The two key inputs that are neither the source nor the flags, logged
   // because a miss caused by either is otherwise invisible: the command line
@@ -241,12 +271,12 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
 
   // Root mapping participates in the key: the same source canonicalised under
   // a different mapping produces a different object.
-  hasher.UpdateDelimited(roots.Fingerprint());
+  feed(roots.Fingerprint());
 
   // Only codegen-affecting flags, with any embedded paths canonicalised so that
   // -I-style differences between checkouts do not change the key.
   for (const std::string& arg : parsed.key_args) {
-    hasher.UpdateDelimited(roots.Canonicalize(arg));
+    feed(roots.Canonicalize(arg));
   }
 
   // A PCH records the absolute path of every input, even one named relatively,
@@ -269,7 +299,7 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // would report a flag the caller never passed.
   if (compiler_id.is_clang) {
     for (const std::string& arg : parsed.link_args) {
-      hasher.UpdateDelimited(roots.Canonicalize(arg));
+      feed(roots.Canonicalize(arg));
     }
   }
 
@@ -284,23 +314,24 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
       VCACHE_LOG("cannot hash keyed input file " + path);
       return "";
     }
-    hasher.UpdateDelimited(*digest);
+    feed(*digest);
   }
 
   for (const std::string& name : config.extra_env_vars) {
     const char* value = std::getenv(name.c_str());
-    hasher.UpdateDelimited(name);
-    hasher.UpdateDelimited(value != nullptr ? value : "");
+    feed(name);
+    feed(value != nullptr ? value : "");
   }
 
   // The preprocessed text carries the full effect of every -I/-D/-include flag
   // and of the source itself. Its linemarkers still hold raw absolute paths --
   // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
   // on the way into the hash.
-  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher,
-                                        saw_incbin)) {
+  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher, saw_incbin,
+                                        want_identity ? &identity : nullptr)) {
     return "";
   }
+  if (want_identity) *pch_identity = identity.Hex();
   return hasher.Hex();
 }
 
@@ -1211,9 +1242,13 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   // Written after the PCH itself, so no reader pairs this key with the PCH it
   // replaced.
-  const auto write_pch_key_file = [&](const std::string& pch_key) {
+  const auto write_pch_key_file = [&](const std::string& identity) {
     if (pch_key_file.empty()) return;
-    if (!util::WriteFileAtomic(pch_key_file, pch_key + "\n", /*durable=*/false)) {
+    if (identity.empty()) {
+      VCACHE_LOG("no identity for " + pch_key_file);
+      return;
+    }
+    if (!util::WriteFileAtomic(pch_key_file, identity + "\n", /*durable=*/false)) {
       VCACHE_LOG("could not write " + pch_key_file);
     }
   };
@@ -1238,7 +1273,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         return false;
       }
       if (blob_decoded && MaterializeHit(blob, parsed, roots)) {
-        write_pch_key_file(result_key);
+        write_pch_key_file(PchIdentityFromMeta(blob.meta));
         const Counter layer = got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
         if (manifest_state.empty()) {
           VCACHE_LOG("hit on " + got.layer);
@@ -1317,6 +1352,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
           ? "exit code " + std::to_string(pp.exit_code) + ": " + pp.stderr_data.substr(0, 512)
           : "";
   std::string key;
+  std::string pch_identity;
   if (pp.exit_code != 0 && !derive_key) {
     // The compilation itself will fail too; let the compiler produce the real
     // diagnostics rather than reporting a vcache-shaped error.
@@ -1329,7 +1365,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   } else {
     bool saw_incbin = false;
     key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
-                     &saw_incbin);
+                     &saw_incbin, &pch_identity);
     if (key.empty()) {
       RecordDecision(cache_dir, Reason::kNoCacheKey);
       return RunPassthrough(argv);
@@ -1490,7 +1526,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     key = DeriveCxxResultKey(manifest_key, manifest_inputs.files);
     VCACHE_LOG("derived key " + key + " for " + parsed.source + " -> " + parsed.output);
   }
-  write_pch_key_file(key);
+  write_pch_key_file(pch_identity);
 
   // ---- store --------------------------------------------------------------
 
@@ -1523,6 +1559,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   blob.meta = "compiler: " + compiler_id.description + "\n" +
               "language: " + args::LanguageName(parsed.language) + "\n" +
               "roots:\n" + roots.DebugString();
+  if (!pch_identity.empty()) {
+    blob.meta += std::string(kPchIdentityMetaKey) + pch_identity + "\n";
+  }
   AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));

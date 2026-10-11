@@ -282,7 +282,8 @@ Three things that look like they belong on that list but are cached:
 - **Precompiled header builds.** A PCH records the absolute path of every
   header it read and loads nowhere else, so its key holds the directory and the
   command line as typed: a rebuild of the same tree hits, another checkout does
-  not. vcache writes `<pch>.vcache-key` beside it — see
+  not. vcache writes `<pch>.vcache-key` beside it, a path-independent digest
+  of its inputs that consumers' manifests share across checkouts — see
   [the design notes](docs/design.md#known-limitations).
 
 ## How it works

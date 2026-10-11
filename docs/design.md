@@ -165,7 +165,8 @@ included). It is identified, in order of
 preference, by `<pch>.sum` (what a build writes for ccache's
 `pch_external_checksum`: a digest of the PCH's inputs, stable where clang's
 PCH bytes are not), by `<pch>.vcache-key` (written by vcache beside a PCH it
-caches), or by the PCH's bytes. A side file older than the PCH is ignored: it
+builds or restores: a digest of the PCH's inputs with paths canonicalised, the
+same in every worktree), or by the PCH's bytes. A side file older than the PCH is ignored: it
 describes an earlier build. A directory of `.gch` files is declined. gcc also
 uses `H.gch` for a plain `#include "H"`, again listing neither, so under gcc a
 state is not recorded while any directory an `#include` could search holds a
@@ -430,10 +431,14 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   stored copy does not care about. A PCH build without `-o` is declined
   (`no -o`), because gcc and clang name the default output differently.
   After it places a PCH, on a miss or a hit, vcache writes `<output>.vcache-key`
-  beside it: one line, the PCH's cache key in hex, so a later key can name the
-  PCH without hashing tens of megabytes. It is written after the PCH, so no
-  reader pairs a new key with an old PCH, and every PCH build removes the old
-  key first, so a failed or uncached build leaves none.
+  beside it: one line, a digest of the PCH's inputs with paths canonicalised
+  (compiler, flags, `-dD` header text), so a consumer's manifest can name the
+  PCH without hashing tens of megabytes. Unlike the entry's key it carries no
+  paths, so consumers in two worktrees name the PCH the same way and share
+  manifest states although each worktree builds its own PCH. The identity
+  travels in the entry's meta, so a hit writes it too. It is written after the
+  PCH, so no reader pairs a new identity with an old PCH, and every PCH build
+  removes the old file first, so a failed or uncached build leaves none.
 - **How a PCH was built is not in the key of a compile that uses it.** clang
   accepts a PCH that defines a macro the compile does not, and gcc uses a
   `.gch` it never checks against an edited header; in both cases the expanded text describes a different

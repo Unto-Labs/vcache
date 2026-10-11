@@ -1,14 +1,19 @@
 /* SPDX-FileCopyrightText: 2026 Unto Labs
  * SPDX-License-Identifier: Apache-2.0
  *
- * LD_PRELOAD file-access tracer for link steps.
+ * LD_PRELOAD file-access tracer for link steps, and for the C/C++ compiles a
+ * manifest state is recorded from.
  *
  * A link has no -E equivalent, so the only way to learn its true input set is
- * to watch it. This records both halves of the dependency question:
+ * to watch it. A compile has a depfile, which names what it read but not what
+ * the preprocessor looked for and did not find. This records both halves of
+ * the dependency question:
  *
  *   R  a path that was opened or stat'd successfully -- its CONTENT is an input
  *   M  a path probed and not found (ENOENT)         -- its ABSENCE is an input
  *   P  an executable that ran                       -- part of the toolchain
+ *   L  a shared object a process that ran loaded    -- part of the toolchain
+ *   W  a path opened for writing only               -- an output, not an input
  *   D  a directory that was listed
  *
  * The second is the half a "record what was read" manifest cannot express, and
@@ -123,6 +128,18 @@ static void emit_result(const char *path, int failed, int saved_errno) {
   if (saved_errno == ENOENT) emit('M', path);
 }
 
+/* An open that cannot read says nothing about the file's content as an input.
+   Read-write opens stay R: the process may read what it finds. */
+static void emit_open_result(const char *path, int failed, int saved_errno,
+                             int written_only) {
+  if (!failed && written_only) { emit('W', path); return; }
+  emit_result(path, failed, saved_errno);
+}
+
+static int fopen_mode_written_only(const char *mode) {
+  return mode != NULL && (mode[0] == 'w' || mode[0] == 'a') && strchr(mode, '+') == NULL;
+}
+
 /* Resolve a relative openat path against its directory descriptor. Treating it
    as cwd-relative records a different file and can omit the real input. */
 static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) {
@@ -147,11 +164,11 @@ static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) 
 }
 
 static void emit_at_result(int dirfd, const char *path, int failed,
-                           int saved_errno) {
+                           int saved_errno, int written_only) {
   if (failed && saved_errno != ENOENT) return;
   char resolved[VCACHE_RECORD_MAX];
   if (resolve_at_path(dirfd, path, resolved, sizeof resolved)) {
-    emit_result(resolved, failed, saved_errno);
+    emit_open_result(resolved, failed, saved_errno, written_only);
   } else {
     mark_incomplete();
   }
@@ -195,8 +212,10 @@ static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
   /* Dependencies are loaded before interposition is active. Include every
      other already-loaded DSO: for the common linkers the implementation is a
      shared library -- ld.bfd's logic lives in libbfd, lld's in libLLVM -- and
-     libz/libzstd emit output bytes directly for compressed debug sections. */
-  emit('R', info->dlpi_name);
+     libz/libzstd emit output bytes directly for compressed debug sections.
+     Its own kind, so a reader that keys the toolchain another way can tell
+     these apart from the files the process opened. */
+  emit('L', info->dlpi_name);
   return 0;
 }
 
@@ -212,7 +231,7 @@ int open(const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open)(path, flags, m);
   int saved = errno;
-  emit_result(path, r < 0, saved);
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -222,7 +241,7 @@ int open64(const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open64)(path, flags, m);
   int saved = errno;
-  emit_result(path, r < 0, saved);
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -232,7 +251,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(openat)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved);
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -242,7 +261,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(openat64)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved);
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -250,7 +269,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 FILE *fopen(const char *path, const char *mode) {
   FILE *r = NEXT(fopen)(path, mode);
   int saved = errno;
-  emit_result(path, r == NULL, saved);
+  emit_open_result(path, r == NULL, saved, fopen_mode_written_only(mode));
   errno = saved;
   return r;
 }
@@ -258,7 +277,7 @@ FILE *fopen(const char *path, const char *mode) {
 FILE *fopen64(const char *path, const char *mode) {
   FILE *r = NEXT(fopen64)(path, mode);
   int saved = errno;
-  emit_result(path, r == NULL, saved);
+  emit_open_result(path, r == NULL, saved, fopen_mode_written_only(mode));
   errno = saved;
   return r;
 }
@@ -290,7 +309,7 @@ int access(const char *path, int mode) {
 int faccessat(int dirfd, const char *path, int mode, int flags) {
   int r = NEXT(faccessat)(dirfd, path, mode, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved);
+  emit_at_result(dirfd, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }
@@ -298,7 +317,7 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
   int r = NEXT(fstatat)(dirfd, path, st, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved);
+  emit_at_result(dirfd, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }

@@ -4481,7 +4481,8 @@ for f in src hdr; do
 done
 
 # gcc uses a .gch beside a header an #include names and lists neither in the
-# depfile, so a state recorded beside one would not see it rebuilt.
+# depfile. The trace sees it open the .gch, and probe for one that is not there
+# yet; a state recorded from the depfile alone is not recorded beside one.
 if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   sp="$WORK/mf-stray"
@@ -4489,16 +4490,38 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   printf '#define V 1\n' > "$sp/pch.h"
   printf '#include "pch.h"\nint v = V;\n' > "$sp/main.c"
   ( cd "$sp" && gcc -O2 -x c-header -c pch.h -o pch.h.gch )
-  l=$(mf_log stray1)
-  ( cd "$sp" && VCACHE_MAP_CWD=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
-  check "a .gch an #include can reach records no manifest state" \
+  mf_stray() {  # $1 log, then variables
+    local log=$1; shift
+    ( cd "$sp" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
+        "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  }
+  l=$(mf_log stray0); mf_stray "$l" VCACHE_CXX_MANIFEST_TRACE=0
+  check "without the trace, a .gch an #include can reach records no manifest state" \
     "$(grep -c 'not recording: gcc could have used .*pch\.h\.gch' "$l")" "1"
+  reset_cache
+  l=$(mf_log stray1); mf_stray "$l"
+  check "with the trace, a compile that uses a .gch records a manifest state" \
+    "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   printf '#define V 2\n' > "$sp/pch.h"
   ( cd "$sp" && gcc -O2 -x c-header -c pch.h -o pch.h.gch )
-  ( cd "$sp" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  mf_stray "$(mf_log stray2)"
   ( cd "$sp" && gcc -O2 -c main.c -o plain.o ) 2>/dev/null
   check "so the object follows the rebuilt .gch" \
     "$(cmp -s "$sp/m.o" "$sp/plain.o" && echo same)" "same"
+
+  # A .gch that appears after the state was recorded is one gcc probed for.
+  # The object is not compared: the -E run reads the header, not the .gch, so
+  # the preprocessor key cannot tell the two apart either.
+  reset_cache
+  rm -f "$sp/pch.h.gch"
+  mf_stray "$(mf_log stray3)"
+  mf_stray "$(mf_log stray4)"
+  check "without a .gch the compile hits through the manifest" "$(manifest_hits)" "1"
+  ( cd "$sp" && gcc -O2 -x c-header -c pch.h -o pch.h.gch )
+  l=$(mf_log stray5); mf_stray "$l"
+  check "a .gch that appears beside the header misses the manifest" \
+    "$(grep -c 'rejected: .*/pch\.h\.gch exists now' "$l")" "1"
+  check "and runs the preprocessor" "$(grep -c '\] preprocess: ' "$l")" "1"
 else
   skipped "stray .gch: gcc is not installed, or is clang"
 fi
@@ -4587,23 +4610,47 @@ check "a time macro on the command line keeps to the preprocessor" \
 check "so the next compile is not a manifest hit" "$(manifest_hits)" "0"
 
 # A depfile names the files a compile read. gcc's leaves out a header that only
-# __has_include probed, so deleting it would not change any recorded digest.
+# __has_include probed; the trace sees the probe and what it found.
 if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   hp="$WORK/mf-hasinc"
-  mkdir -p "$hp"
-  printf '#pragma once\n' > "$hp/opt.h"
+  mkdir -p "$hp/first" "$hp/second"
+  printf '#pragma once\n' > "$hp/second/opt.h"
   printf '#if __has_include("opt.h")\nint have_opt = 1;\n#else\nint have_opt = 0;\n#endif\n' \
     > "$hp/main.c"
-  l=$(mf_log hasinc1)
-  ( cd "$hp" && VCACHE_MAP_CWD=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
-  check "gcc: a file probing with __has_include records no manifest state" \
-    "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
-  mv "$hp/opt.h" "$hp/opt.h.away"
-  ( cd "$hp" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
-  ( cd "$hp" && gcc -O2 -c main.c -o plain.o ) 2>/dev/null
-  check "gcc: so the object follows the probed header's removal" \
+  mf_hasinc() {  # $1 log, then variables
+    local log=$1; shift
+    ( cd "$hp" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
+        "$VCACHE" gcc -O2 -I first -I second -c main.c -o m.o ) 2>/dev/null
+  }
+  hasinc_plain() { ( cd "$hp" && gcc -O2 -I first -I second -c main.c -o plain.o ) 2>/dev/null; }
+  l=$(mf_log hasinc1); mf_hasinc "$l"
+  check "gcc: a file probing with __has_include records a manifest state" \
+    "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  mv "$hp/second/opt.h" "$hp/opt.h.away"
+  l=$(mf_log hasinc2); mf_hasinc "$l"; hasinc_plain
+  check "gcc: removing the probed header misses" \
+    "$(grep -c 'rejected: .*second/opt\.h is gone' "$l")" "1"
+  check "gcc: and the object follows its removal" \
     "$(cmp -s "$hp/m.o" "$hp/plain.o" && echo same)" "same"
+  mv "$hp/opt.h.away" "$hp/second/opt.h"
+  l=$(mf_log hasinc3); mf_hasinc "$l"
+  check "gcc: putting it back hits the state recorded with it" \
+    "$(grep -c 'state 2 of 2; preprocessor skipped' "$l")" "1"
+  printf '#pragma once\n' > "$hp/first/opt.h"
+  l=$(mf_log hasinc4); mf_hasinc "$l"
+  check "gcc: an opt.h earlier on the include path misses both states" \
+    "$(grep -c 'rejected: .*first/opt\.h exists now' "$l")" "2"
+  check "gcc: with no manifest hit" "$(grep -c 'preprocessor skipped' "$l" || true)" "0"
+  rm -f "$hp/first/opt.h"
+  reset_cache
+  l=$(mf_log hasinc5); mf_hasinc "$l" VCACHE_CXX_MANIFEST_TRACE=0
+  check "gcc: VCACHE_CXX_MANIFEST_TRACE=0 records from the depfile" \
+    "$(grep -c 'tracing is off; recording from the depfile' "$l")" "1"
+  check "gcc: where a file probing with __has_include still declines the state" \
+    "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
+  check "VCACHE_CXX_MANIFEST_TRACE=0 shows in --show-config" \
+    "$(VCACHE_CXX_MANIFEST_TRACE=0 "$VCACHE" --show-config | grep -c 'c/c++ manifest trace: off')" "1"
   # The compiler's own headers use it too (libstdc++'s <cstdint> does), and do
   # not decline the state.
   printf '#include <cstdint>\nstd::uint32_t width() { return 32; }\n' > "$hp/sys.cc"
@@ -4613,7 +4660,8 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   check "gcc: a system header probing with __has_include still hits through the manifest" \
     "$(grep -c 'preprocessor skipped' "$l")" "1"
   # gcc lists CPATH directories among its <...> search directories, so a
-  # project header there must not pass for one of the compiler's own.
+  # project header there must not pass for one of the compiler's own when the
+  # state comes from the depfile alone.
   reset_cache
   cpd="$WORK/mf-cpath"
   mkdir -p "$cpd/inc"
@@ -4622,18 +4670,120 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
     > "$cpd/inc/probe.h"
   printf '#include <probe.h>\nint have_opt = HAVE_OPT;\n' > "$cpd/main.c"
   l=$(mf_log cpath1)
-  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
-      "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
-  check "gcc: a CPATH header probing with __has_include records no manifest state" \
+  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_MAP_CWD=0 \
+      VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  check "gcc: without the trace, a CPATH header probing with __has_include records no state" \
     "$(grep -c 'not recording: .*inc/probe\.h uses __has_include' "$l")" "1"
   mv "$cpd/inc/opt.h" "$cpd/opt.h.away"
-  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+  ( cd "$cpd" && CPATH="$cpd/inc" VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_MAP_CWD=0 \
+      "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
   ( cd "$cpd" && CPATH="$cpd/inc" gcc -O2 -c main.c -o plain.o ) 2>/dev/null
   check "gcc: so the object follows the removal of what it probed" \
     "$(cmp -s "$cpd/m.o" "$cpd/plain.o" && echo same)" "same"
 else
   skipped "__has_include: gcc is not installed, or is clang"
 fi
+
+# The shadowing hole: a header created earlier on the include path than the
+# one a state recorded. A depfile names only what was read; the trace records
+# the paths probed and not found, and a lookup checks each is still absent.
+for cc in gcc clang; do
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    skipped "$cc: not installed"
+    continue
+  fi
+  reset_cache
+  sh="$WORK/mf-shadow-$cc"
+  mkdir -p "$sh/first" "$sh/second"
+  printf '#define V 2\n' > "$sh/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$sh/main.c"
+  mf_shadow() {  # $1 log
+    ( cd "$sh" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" "$cc" -O2 -I first -I second -c main.c -o m.o ) 2>/dev/null
+  }
+  l=$(mf_log "shadow-$cc-1"); mf_shadow "$l"
+  check "$cc: the state is recorded from the trace" \
+    "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
+  mf_shadow "$(mf_log "shadow-$cc-2")"
+  check "$cc: the second compile hits through the manifest" "$(manifest_hits)" "1"
+  printf '#define V 1\n' > "$sh/first/h.h"
+  l=$(mf_log "shadow-$cc-3"); mf_shadow "$l"
+  ( cd "$sh" && "$cc" -O2 -I first -I second -c main.c -o plain.o ) 2>/dev/null
+  check "$cc: a header created earlier on the include path misses" \
+    "$(grep -c 'rejected: .*first/h\.h exists now' "$l")" "1"
+  check "$cc: and the object uses the new header" \
+    "$(cmp -s "$sh/m.o" "$sh/plain.o" && echo same)" "same"
+done
+
+# Absent paths are canonicalised through the roots as files are, so a tree at
+# another path hits a state another recorded, and checks its own include path.
+reset_cache
+for t in a b; do
+  mkdir -p "$WORK/mf-shx-$t/first" "$WORK/mf-shx-$t/second"
+  printf '#define V 2\n' > "$WORK/mf-shx-$t/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$WORK/mf-shx-$t/main.c"
+done
+mf_shx() {  # $1 tree, $2 log
+  ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+      "$VCACHE" gcc -O2 -I first -I second -c main.c -o m.o ) 2>/dev/null
+}
+mf_shx "$WORK/mf-shx-a" "$(mf_log shx-a1)"
+l=$(mf_log shx-b1); mf_shx "$WORK/mf-shx-b" "$l"
+check "another tree hits the state the first recorded" "$(manifest_hits)" "1"
+printf '#define V 1\n' > "$WORK/mf-shx-b/first/h.h"
+l=$(mf_log shx-b2); mf_shx "$WORK/mf-shx-b" "$l"
+( cd "$WORK/mf-shx-b" && gcc -O2 -I first -I second -c main.c -o plain.o ) 2>/dev/null
+check "a header created on that tree's include path misses there" \
+  "$(grep -c "rejected: $WORK/mf-shx-b/first/h\.h exists now" "$l")" "1"
+check "and its object uses the new header" \
+  "$(cmp -s "$WORK/mf-shx-b/m.o" "$WORK/mf-shx-b/plain.o" && echo same)" "same"
+l=$(mf_log shx-a2); mf_shx "$WORK/mf-shx-a" "$l"
+check "while the first tree still hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
+
+# The trace is written to the compile's scratch directory, and goes with it.
+reset_cache
+tl="$WORK/mf-tracelog"
+mkdir -p "$tl"
+printf '#define V 4\n' > "$tl/h.h"
+printf '#include "h.h"\nint v = V;\n' > "$tl/main.c"
+mf_traced() {  # $1 log, then variables
+  local log=$1; shift
+  ( cd "$tl" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
+      "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+}
+l=$(mf_log trace1); mf_traced "$l"
+check "a miss records from a trace" "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
+check "and leaves no trace behind" \
+  "$(find "$VCACHE_DIR" "$tl" -name 'trace*' | wc -l | tr -d ' ')" "0"
+l=$(mf_log trace2); mf_traced "$l"
+check "a hit is traced by nothing" "$(grep -c 'preprocessor skipped' "$l")" "1"
+check "and leaves no scratch behind" \
+  "$(find "$VCACHE_DIR/tmp" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+# A trace that cannot be trusted to be whole is not used; the state comes from
+# the depfile, as it does where there is no tracer.
+if [[ -f "$WORK/stub-tracer.so" ]]; then
+  reset_cache
+  l=$(mf_log trace-inc)
+  mf_traced "$l" STUB_MODE=incomplete VCACHE_TRACER="$WORK/stub-tracer.so"
+  check "an incomplete trace falls back to the depfile" \
+    "$(grep -c 'the trace is incomplete; recording from the depfile' "$l")" "1"
+  check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  check "and the trace is left out of it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+  reset_cache
+  l=$(mf_log trace-np)
+  mf_traced "$l" STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so"
+  check "a trace naming no process falls back to the depfile" \
+    "$(grep -c 'the trace names no process; recording from the depfile' "$l")" "1"
+  check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+else
+  skipped "incomplete compile trace: the stub tracer was not built"
+fi
+reset_cache
+l=$(mf_log trace-none); mf_traced "$l" VCACHE_TRACER="$WORK/no-such-tracer.so"
+check "without a tracer the state comes from the depfile" \
+  "$(grep -c "no tracer at '$WORK/no-such-tracer.so'; recording from the depfile" "$l")" "1"
+check "and is still recorded" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
 
 # gcc writes a dependency file named by DEPENDENCIES_OUTPUT during the -E run
 # and ignores the variable once -MD is on the command line.

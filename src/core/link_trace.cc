@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/link_trace.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <cstdlib>
 
 #include "util/fs.h"
 #include "util/str.h"
@@ -49,11 +52,47 @@ bool IsIgnoredPath(const std::string& path) {
   return false;
 }
 
+bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out) {
+  auto text = util::ReadFile(log_path);
+  if (!text) return false;
+  for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
+    // A malformed line is a missing dependency record. Partial traces cannot
+    // be trusted: skipping one can turn a required input into a false hit.
+    if (line.size() < 3 || line[1] != '\t') return false;
+    const char kind = line[0];
+    std::string path = line.substr(2);
+    if (path[0] != '/') path = cwd + "/" + path;
+    switch (kind) {
+      case 'R': out->reads.push_back(std::move(path)); break;
+      case 'M': out->absent.push_back(std::move(path)); break;
+      case 'P': out->tools.push_back(std::move(path)); break;
+      case 'L': out->loaded.push_back(std::move(path)); break;
+      case 'W': out->written.push_back(std::move(path)); break;
+      case 'D': break;  // listings are covered by the paths probed within them
+      default: return false;
+    }
+  }
+  return true;
+}
+
+bool TraceMarkedIncomplete(const std::string& log_path) {
+  struct stat st;
+  return ::stat((log_path + ".incomplete").c_str(), &st) == 0;
+}
+
+std::string TracerPath() {
+  const char* override_path = std::getenv("VCACHE_TRACER");
+  if (override_path != nullptr && *override_path != '\0') return override_path;
+  auto self = util::SelfPath();
+  if (!self) return "";
+  return util::DirName(*self) + "/vcache-fstrace.so";
+}
+
 bool ParseTraceLog(const std::string& log_path,
                    const std::vector<std::string>& outputs,
                    const std::string& cwd, LinkTrace* out) {
-  auto text = util::ReadFile(log_path);
-  if (!text) return false;
+  TraceRecords records;
+  if (!ReadTraceRecords(log_path, cwd, &records)) return false;
 
   std::vector<std::string> abs_outputs;
   abs_outputs.reserve(outputs.size());
@@ -66,26 +105,23 @@ bool ParseTraceLog(const std::string& log_path,
            abs_outputs.end();
   };
 
+  // A linker's own implementation is a shared library -- ld.bfd's logic lives
+  // in libbfd, lld's in libLLVM -- so what the processes loaded is an input.
+  // A file written is kept as one too, as it was before the tracer told the
+  // two apart: an intermediate is gone by the time it would be hashed.
   std::vector<std::string> reads, absent, tools;
-  for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
-    // A malformed line is a missing dependency record. Partial traces cannot
-    // be trusted: skipping one can turn a required input into a false hit.
-    if (line.size() < 3 || line[1] != '\t') return false;
-    const char kind = line[0];
-    std::string path = line.substr(2);
-    if (path.empty()) continue;
-    path = util::AbsoluteLexical(path[0] == '/' ? path : cwd + "/" + path);
-    if (IsIgnoredPath(path)) continue;
-    if (is_output(path)) continue;
-
-    switch (kind) {
-      case 'R': reads.push_back(std::move(path)); break;
-      case 'M': absent.push_back(std::move(path)); break;
-      case 'P': tools.push_back(std::move(path)); break;
-      case 'D': break;  // listings are covered by the paths probed within them
-      default: return false;
+  const auto keep = [&](const std::vector<std::string>& from, std::vector<std::string>* to) {
+    for (const std::string& raw : from) {
+      std::string path = util::AbsoluteLexical(raw);
+      if (IsIgnoredPath(path) || is_output(path)) continue;
+      to->push_back(std::move(path));
     }
-  }
+  };
+  keep(records.reads, &reads);
+  keep(records.loaded, &reads);
+  keep(records.written, &reads);
+  keep(records.absent, &absent);
+  keep(records.tools, &tools);
 
   const auto sort_unique = [](std::vector<std::string>* v) {
     std::sort(v->begin(), v->end());

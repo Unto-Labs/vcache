@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <set>
 
 #include "core/preprocessed.h"
@@ -21,7 +22,8 @@
 namespace vcache::core {
 namespace {
 
-constexpr std::string_view kCxxManifestHeader = "vcache-cxxmanifest-1";
+constexpr std::string_view kCxxManifestHeader = "vcache-cxxmanifest-2";
+constexpr std::string_view kAbsentLinePrefix = "absent ";
 
 int64_t TimespecNs(const struct timespec& ts) {
   return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + static_cast<int64_t>(ts.tv_nsec);
@@ -62,7 +64,8 @@ std::string CanonicalizeArg(const std::string& arg, const RootMap& roots) {
 }  // namespace
 
 // A header line, then per state a "state <result key>" line followed by one
-// RenderManifestFile line per file.
+// RenderManifestFile line per file and one "absent <path>" line per absent
+// path. A file line starts with a digest, so the two cannot be confused.
 std::string RenderCxxManifest(const std::vector<CxxManifestState>& states) {
   std::string out(kCxxManifestHeader);
   out.push_back('\n');
@@ -70,6 +73,11 @@ std::string RenderCxxManifest(const std::vector<CxxManifestState>& states) {
     out += "state " + state.result_key + "\n";
     for (const ManifestFile& file : state.files) {
       out += RenderManifestFile(file);
+      out.push_back('\n');
+    }
+    for (const std::string& path : state.absent) {
+      out += kAbsentLinePrefix;
+      out += path;
       out.push_back('\n');
     }
   }
@@ -89,6 +97,12 @@ bool ParseCxxManifest(const std::string& text, std::vector<CxxManifestState>* st
       continue;
     }
     if (states->empty()) return false;
+    if (util::StartsWith(line, kAbsentLinePrefix)) {
+      std::string path = line.substr(kAbsentLinePrefix.size());
+      if (path.empty() || path.front() != '/') return false;
+      states->back().absent.push_back(std::move(path));
+      continue;
+    }
     ManifestFile file;
     if (!ParseManifestFile(line, &file)) return false;
     states->back().files.push_back(std::move(file));
@@ -334,6 +348,283 @@ std::optional<std::string> FindUnkeyedGch(const std::vector<std::string>& dirs,
     if (found) return found;
   }
   return std::nullopt;
+}
+
+namespace {
+
+// std::filesystem's lexically_normal for an absolute path, without a trailing
+// slash, at a fraction of the cost: a trace has thousands of paths to classify.
+// A relative path goes through std::filesystem.
+std::string LexicalNormal(const std::string& path) {
+  if (path.empty() || path.front() != '/') {
+    std::string normal = std::filesystem::path(path).lexically_normal().string();
+    if (normal.size() > 1 && normal.back() == '/') normal.pop_back();
+    return normal;
+  }
+  std::vector<std::string_view> segments;
+  const std::string_view view = path;
+  size_t begin = 0;
+  while (begin < view.size()) {
+    size_t end = view.find('/', begin);
+    if (end == std::string_view::npos) end = view.size();
+    const std::string_view segment = view.substr(begin, end - begin);
+    if (segment == "..") {
+      if (!segments.empty()) segments.pop_back();
+    } else if (!segment.empty() && segment != ".") {
+      segments.push_back(segment);
+    }
+    begin = end + 1;
+  }
+  std::string normal;
+  normal.reserve(path.size());
+  for (std::string_view segment : segments) {
+    normal.push_back('/');
+    normal.append(segment);
+  }
+  return normal.empty() ? "/" : normal;
+}
+
+// `normal` is `dir` or lies inside it; both lexically normal.
+bool InNormalDir(const std::string& normal, const std::string& dir) {
+  if (dir == "/") return true;
+  return util::StartsWith(normal, dir) &&
+         (normal.size() == dir.size() || normal[dir.size()] == '/');
+}
+
+bool InAnyNormalDir(const std::string& normal, const std::vector<std::string>& dirs) {
+  for (const std::string& dir : dirs) {
+    if (InNormalDir(normal, dir)) return true;
+  }
+  return false;
+}
+
+// The filter with every path in it lexically normal, so that classifying a
+// trace normalises each traced path once.
+CxxTraceFilter NormalFilter(const CxxTraceFilter& filter) {
+  CxxTraceFilter normal;
+  if (!filter.scratch_dir.empty()) normal.scratch_dir = LexicalNormal(filter.scratch_dir);
+  if (!filter.tracer.empty()) normal.tracer = LexicalNormal(filter.tracer);
+  for (const std::string& pch : filter.keyed_pchs) normal.keyed_pchs.push_back(LexicalNormal(pch));
+  for (const std::string& dir : filter.compiler_dirs) {
+    normal.compiler_dirs.push_back(LexicalNormal(dir));
+  }
+  for (const std::string& dir : filter.search_path_dirs) {
+    normal.search_path_dirs.push_back(LexicalNormal(dir));
+  }
+  return normal;
+}
+
+bool IsNoiseUnderNormalFilter(const std::string& path, const std::string& normal,
+                              const CxxTraceFilter& filter) {
+  if (IsIgnoredPath(path) || IsIgnoredPath(normal)) return true;
+  if (normal == filter.tracer) return true;
+  if (std::find(filter.keyed_pchs.begin(), filter.keyed_pchs.end(), normal) !=
+      filter.keyed_pchs.end()) {
+    return true;
+  }
+  if (!filter.scratch_dir.empty() && InNormalDir(normal, filter.scratch_dir)) return true;
+  return InAnyNormalDir(normal, filter.compiler_dirs);
+}
+
+// Drops "." segments and doubled separators, which never change what a path
+// names. ".." stays: resolving it could cross a symlink the compiler followed.
+std::string WithoutDotSegments(const std::string& path) {
+  std::string out;
+  out.reserve(path.size());
+  size_t i = 0;
+  while (i < path.size()) {
+    if (path[i] != '/') {
+      out.push_back(path[i++]);
+      continue;
+    }
+    while (i < path.size() && path[i] == '/') ++i;
+    if (i + 1 <= path.size() && path.compare(i, 1, ".") == 0 &&
+        (i + 1 == path.size() || path[i + 1] == '/')) {
+      ++i;
+      continue;
+    }
+    out.push_back('/');
+  }
+  if (out.size() > 1 && out.back() == '/') out.pop_back();
+  return out.empty() ? "/" : out;
+}
+
+// A prefix `dir` names, and each spelling a symlink in / gives it: on a merged
+// /usr, /lib64 is /usr/lib64, and the loader and clang's driver both use the
+// short form.
+void AddWithTopLevelAliases(const std::string& dir, std::vector<std::string>* dirs) {
+  dirs->push_back(dir);
+  DIR* top = ::opendir("/");
+  if (top == nullptr) return;
+  while (const dirent* entry = ::readdir(top)) {
+    const std::string alias = std::string("/") + entry->d_name;
+    struct stat st;
+    if (::lstat(alias.c_str(), &st) != 0 || !S_ISLNK(st.st_mode)) continue;
+    const std::optional<std::string> target = util::RealPath(alias);
+    if (!target || *target == "/") continue;
+    if (dir == *target || util::StartsWith(dir, *target + "/")) {
+      dirs->push_back(alias + dir.substr(target->size()));
+    } else if (util::StartsWith(*target, dir + "/")) {
+      dirs->push_back(alias);
+    }
+  }
+  ::closedir(top);
+}
+
+// Where gcc writes the intermediates of one compile, the assembly file among
+// them: the first of TMPDIR, TMP and TEMP, else /tmp or /var/tmp.
+bool InTempDir(const std::string& path) {
+  const std::string parent = util::DirName(LexicalNormal(path));
+  for (const char* name : {"TMPDIR", "TMP", "TEMP"}) {
+    const char* value = std::getenv(name);
+    if (value != nullptr && *value != '\0' && LexicalNormal(value) == parent) return true;
+  }
+  return parent == "/tmp" || parent == "/var/tmp";
+}
+
+}  // namespace
+
+std::vector<std::string> CompilerInstallDirs(const std::vector<std::string>& executables,
+                                             const std::vector<std::string>& project_dirs) {
+  std::set<std::string> prefixes;
+  for (const std::string& executable : executables) {
+    const std::string normal = LexicalNormal(executable);
+    const size_t libexec = normal.find("/libexec/");
+    if (libexec != std::string::npos) {
+      prefixes.insert(libexec == 0 ? "/" : normal.substr(0, libexec));
+      continue;
+    }
+    const std::string dir = util::DirName(normal);
+    prefixes.insert(util::BaseName(dir) == "bin" ? util::DirName(dir) : dir);
+  }
+  std::vector<std::string> dirs;
+  for (const std::string& prefix : prefixes) {
+    const bool hides_project =
+        prefix == "/" || std::any_of(project_dirs.begin(), project_dirs.end(),
+                                     [&](const std::string& dir) {
+                                       const std::string normal = LexicalNormal(dir);
+                                       return normal == prefix ||
+                                              util::StartsWith(normal, prefix + "/");
+                                     });
+    const std::string base = prefix == "/" ? "" : prefix;
+    if (!hides_project) {
+      AddWithTopLevelAliases(prefix, &dirs);
+      continue;
+    }
+    for (const char* tree : {"/lib/gcc", "/lib64/gcc", "/lib32/gcc", "/libx32/gcc",
+                             "/libexec/gcc", "/lib/clang"}) {
+      AddWithTopLevelAliases(base + tree, &dirs);
+    }
+  }
+  std::sort(dirs.begin(), dirs.end());
+  dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+  return dirs;
+}
+
+std::vector<std::string> SearchPathDirs(const std::string& search_path,
+                                        const std::vector<std::string>& project_dirs) {
+  std::set<std::string> project;
+  for (const std::string& dir : project_dirs) project.insert(LexicalNormal(dir));
+  std::vector<std::string> dirs;
+  for (const std::string& entry : util::Split(search_path, ':')) {
+    if (entry.empty() || entry.front() != '/') continue;
+    const std::string dir = LexicalNormal(entry);
+    if (project.count(dir) == 0) dirs.push_back(dir);
+  }
+  return dirs;
+}
+
+bool IsCxxTraceNoise(const std::string& path, const CxxTraceFilter& filter) {
+  return IsNoiseUnderNormalFilter(path, LexicalNormal(path), NormalFilter(filter));
+}
+
+CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceFilter& filter) {
+  const CxxTraceFilter normal_filter = NormalFilter(filter);
+  // Each kept path with its normal form, sorted and unique by the former.
+  const auto select = [&](const std::vector<std::string>& from) {
+    std::vector<std::pair<std::string, std::string>> kept;
+    for (const std::string& path : from) {
+      std::string normal = LexicalNormal(path);
+      if (IsNoiseUnderNormalFilter(path, normal, normal_filter)) continue;
+      kept.emplace_back(WithoutDotSegments(path), std::move(normal));
+    }
+    std::sort(kept.begin(), kept.end());
+    kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+    return kept;
+  };
+  CxxTraceInputs selected;
+  std::set<std::string> read_normal;
+  for (auto& [path, normal] : select(records.reads)) {
+    selected.reads.push_back(std::move(path));
+    read_normal.insert(std::move(normal));
+  }
+  // Probed and then found is a read: gcc probes the name of its own
+  // intermediate before creating it, and a header can be created mid-compile.
+  for (auto& [path, normal] : select(records.absent)) {
+    if (read_normal.count(normal) != 0) continue;
+    if (std::find(normal_filter.search_path_dirs.begin(), normal_filter.search_path_dirs.end(),
+                  util::DirName(normal)) != normal_filter.search_path_dirs.end()) {
+      continue;
+    }
+    selected.absent.push_back(std::move(path));
+  }
+  return selected;
+}
+
+void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, int64_t started_ns,
+                       const std::string& memo_dir, RecordedInputs* recorded) {
+  std::set<std::string> listed;
+  for (const ManifestFile& file : recorded->files) {
+    listed.insert(LexicalNormal(roots.Localize(file.first)));
+  }
+  const auto decline = [&](std::string why) {
+    recorded->files.clear();
+    recorded->absent.clear();
+    recorded->declined = std::move(why);
+  };
+  for (const std::string& path : trace.reads) {
+    if (!listed.insert(LexicalNormal(path)).second) continue;
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+      if (InTempDir(path)) continue;
+      return decline(path + " was read by the compile and is gone");
+    }
+    if (S_ISDIR(st.st_mode)) continue;
+    if (!S_ISREG(st.st_mode)) return decline(path + " is not a regular file");
+    const std::optional<std::string> digest = hash::HashFileMemoized(path, memo_dir);
+    const std::optional<int64_t> changed = LastChangeNs(path);
+    if (!digest || !changed) return decline("cannot read " + path);
+    if (*changed >= started_ns) return decline(path + " changed while it was being compiled");
+    recorded->files.emplace_back(roots.Canonicalize(path), *digest);
+  }
+  // Below a directory that does not exist, one stat of the directory stands
+  // for every probe inside it: nothing can appear there without it. gcc probes
+  // each header in each -I directory, so this cuts its list to what clang,
+  // which skips a missing directory, records anyway. The walk stops at "..",
+  // which would cross a symlink lexically.
+  std::map<std::string, bool> exists;
+  const auto present = [&](const std::string& dir) {
+    auto [it, inserted] = exists.try_emplace(dir, false);
+    if (inserted) {
+      struct stat st;
+      it->second = ::lstat(dir.c_str(), &st) == 0;
+    }
+    return it->second;
+  };
+  for (const std::string& path : trace.absent) {
+    std::string highest = path;
+    if (highest.find("/../") == std::string::npos) {
+      for (std::string parent = util::DirName(highest);
+           parent.size() > 1 && parent != highest && !present(parent);
+           parent = util::DirName(parent)) {
+        highest = parent;
+      }
+    }
+    recorded->absent.push_back(roots.Canonicalize(highest));
+  }
+  std::sort(recorded->absent.begin(), recorded->absent.end());
+  recorded->absent.erase(std::unique(recorded->absent.begin(), recorded->absent.end()),
+                         recorded->absent.end());
 }
 
 }  // namespace vcache::core

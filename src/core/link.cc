@@ -17,6 +17,7 @@
 #include "core/compile.h"
 #include "core/cost.h"
 #include "core/link_trace.h"
+#include "core/manifest.h"
 #include "core/stats.h"
 #include "daemon/client.h"
 #include "hash/hasher.h"
@@ -120,21 +121,11 @@ bool LinkManifestStillHolds(const LinkManifestEntry& e, const RootMap& roots) {
       return false;
     }
   }
-  for (const std::string& canonical : e.absent) {
-    const std::string local = roots.Localize(canonical);
-    struct stat st;
-    if (::lstat(local.c_str(), &st) == 0) {
-      // Something now exists where the recorded link found nothing. The search
-      // that produced this entry would resolve differently today.
-      VCACHE_LOG("link manifest: a path that was absent now exists: " + local);
-      return false;
-    }
-    if (errno != ENOENT) {
-      // EACCES, EIO and friends do not prove absence. The original trace only
-      // records ENOENT, so require that same answer when validating a hit.
-      VCACHE_LOG("link manifest: cannot prove path is still absent: " + local);
-      return false;
-    }
+  // Something now exists where the recorded link found nothing, and the
+  // search that produced this entry would resolve differently today.
+  if (auto appeared = FindAppearedPath(e.absent, roots)) {
+    VCACHE_LOG("link manifest: an absent path " + *appeared);
+    return false;
   }
   return true;
 }
@@ -186,14 +177,6 @@ std::string ComputePreKey(const args::LinkArgs& parsed, const RootMap& roots,
                " inputs=" + hi.Hex().substr(0, 16));
   }
   return h.Hex();
-}
-
-std::string TracerPath() {
-  const char* override_path = std::getenv("VCACHE_TRACER");
-  if (override_path != nullptr && *override_path != '\0') return override_path;
-  auto self = util::SelfPath();
-  if (!self) return "";
-  return util::DirName(*self) + "/vcache-fstrace.so";
 }
 
 // Link outputs are kept as DiskStorage files under this suffix, content-
@@ -436,8 +419,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   // input set is missing an entry, and an entry with a missing input is one
   // that can hit when it should not. Storing it would be worse than not
   // caching this link at all.
-  struct stat incomplete_st;
-  if (::stat((trace_log + ".incomplete").c_str(), &incomplete_st) == 0) {
+  if (TraceMarkedIncomplete(trace_log)) {
     RecordDecision(cache_dir, Reason::kIncompleteTrace);
     return 0;
   }

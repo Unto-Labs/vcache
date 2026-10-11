@@ -30,6 +30,18 @@ std::optional<std::string> FindStaleManifestFile(const std::vector<ManifestFile>
   return std::nullopt;
 }
 
+std::optional<std::string> FindAppearedPath(const std::vector<std::string>& absent_paths,
+                                            const RootMap& roots) {
+  for (const std::string& canonical_path : absent_paths) {
+    const std::string local = roots.Localize(canonical_path);
+    struct stat st;
+    if (::lstat(local.c_str(), &st) == 0) return local + " exists now";
+    // EACCES, EIO and friends do not prove absence.
+    if (errno != ENOENT) return local + " cannot be shown absent";
+  }
+  return std::nullopt;
+}
+
 std::string RenderManifestFile(const ManifestFile& file) {
   std::string out = file.second;
   out.push_back(' ');

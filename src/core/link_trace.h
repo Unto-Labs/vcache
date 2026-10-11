@@ -26,6 +26,27 @@ struct LinkTrace {
   std::vector<std::string> tools;
 };
 
+// The records of a tracer log by kind, each path made absolute against `cwd`
+// and otherwise spelled as the traced process passed it.
+struct TraceRecords {
+  std::vector<std::string> reads;   // R
+  std::vector<std::string> absent;  // M
+  std::vector<std::string> tools;   // P
+  std::vector<std::string> loaded;   // L: shared objects the processes loaded
+  std::vector<std::string> written;  // W: opened for writing only
+};
+
+// False when the log cannot be read or any record is malformed, for the reason
+// ParseTraceLog gives.
+bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out);
+
+// True when the tracer could not record something and said so beside the log.
+bool TraceMarkedIncomplete(const std::string& log_path);
+
+// VCACHE_TRACER when set, else vcache-fstrace.so beside this binary; empty
+// when this binary cannot locate itself.
+std::string TracerPath();
+
 // Parses a tracer log. `outputs` are the files this link writes; they are
 // excluded from every set, since an output is not an input to itself.
 // `cwd` resolves relative paths as the tracer recorded them.

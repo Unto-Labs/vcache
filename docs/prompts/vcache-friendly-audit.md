@@ -164,10 +164,11 @@ never share a PCH entry. Thus:
 - No `-fpch-preprocess` and no `-fno-validate-pch` (see above).
 - The consumer's key does not record how the PCH was built. Build it with the same flags and
   headers as its consumers. A stale `.gch` stores an object under the key of the edited header.
-- After every PCH build vcache writes `<output>.vcache-key` beside the PCH: one line, the
-  PCH's cache key. A build that also writes a `<pch>.sum` digest for ccache's
-  `pch_external_checksum` can keep doing so; neither file changes the hit rate of the
-  consumers today.
+- After every PCH build vcache writes `<output>.vcache-key` beside the PCH: one line, a
+  digest of the PCH's inputs with paths canonicalised, the same in every checkout. A
+  consumer's manifest names the PCH by `<pch>.sum` when the build writes one for ccache's
+  `pch_external_checksum`, else by this file, so a build without such a launcher still
+  gets manifest hits across checkouts.
 
 ### Rust
 

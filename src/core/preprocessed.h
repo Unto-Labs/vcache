@@ -35,10 +35,13 @@ namespace vcache::core {
 // assembler directive. That directive names a file the *assembler* opens, long
 // after preprocessing, so its contents never reach this text -- see
 // ContainsIncbin.
+// `also`, when non-null, is fed the same normalised text as `hasher`, for a
+// second digest over the same stream without a second pass over the file.
 bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       const RootMap& roots,
                                       hash::Hasher* hasher,
-                                      bool* saw_incbin = nullptr);
+                                      bool* saw_incbin = nullptr,
+                                      hash::Hasher* also = nullptr);
 
 // True if `line` contains an `.incbin` directive.
 //

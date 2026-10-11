@@ -88,8 +88,12 @@ std::string NormalizeLinemarker(const std::string& line, const RootMap& roots) {
 bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       const RootMap& roots,
                                       hash::Hasher* hasher,
-                                      bool* saw_incbin) {
+                                      bool* saw_incbin, hash::Hasher* also) {
   if (saw_incbin != nullptr) *saw_incbin = false;
+  const auto update = [&](std::string_view text) {
+    hasher->Update(text);
+    if (also != nullptr) also->Update(text);
+  };
   FILE* f = ::fopen(path.c_str(), "rb");
   if (f == nullptr) return false;
 
@@ -107,10 +111,10 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
   hash_batch.reserve(kHashBatchBytes);
   auto emit = [&](std::string_view text) {
     if (hash_batch.size() + text.size() > kHashBatchBytes) {
-      hasher->Update(hash_batch);
+      update(hash_batch);
       hash_batch.clear();
       if (text.size() > kHashBatchBytes) {
-        hasher->Update(text);
+        update(text);
         return;
       }
     }
@@ -190,7 +194,7 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
   }
 
   if (ok && !pending.empty()) feed_line(pending, false);
-  if (!hash_batch.empty()) hasher->Update(hash_batch);
+  if (!hash_batch.empty()) update(hash_batch);
   ::fclose(f);
   return ok;
 }

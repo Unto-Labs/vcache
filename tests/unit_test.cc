@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
@@ -900,6 +901,16 @@ void TestScratchDirs() {
   set_age(foreign_old, 7 * 3600);
   set_age(foreign_new, 3600);
 
+  // A foreign owner that holds its lock, as a compile in another container
+  // sharing the cache does: its pid says nothing here, the lock does.
+  const std::string foreign_locked = foreign_prefix + "-Qr90St";
+  util::MakeDirs(foreign_locked);
+  const int foreign_lock_fd = ::open((foreign_locked + "/.vcache-owner").c_str(),
+                                     O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  Check(foreign_lock_fd >= 0 && ::flock(foreign_lock_fd, LOCK_EX) == 0,
+        "a foreign owner holds its scratch lock");
+  set_age(foreign_locked, 7 * 3600);
+
   // Dead owners: a child makes its scratch directories and exits without
   // removing them, as a compile killed mid-run does.
   const pid_t child = ::fork();
@@ -930,6 +941,12 @@ void TestScratchDirs() {
   Check(!util::IsDirectory(foreign_old),
         "a foreign owner's directory older than the limit is removed although the pid is live here");
   Check(util::IsDirectory(foreign_new), "a foreign owner's directory younger than the limit is kept");
+  Check(util::IsDirectory(foreign_locked),
+        "a foreign owner's directory is kept however old while its lock is held");
+  if (foreign_lock_fd >= 0) ::close(foreign_lock_fd);
+  set_age(foreign_locked, 3600);
+  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 1 && !util::IsDirectory(foreign_locked),
+        "once its lock is released the foreign directory goes after the grace");
   Check(!dead_old.empty() && !util::IsDirectory(dead_old),
         "a dead owner's directory goes after the grace, long before the age limit");
   Check(!dead_new.empty() && util::IsDirectory(dead_new),

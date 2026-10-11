@@ -272,7 +272,7 @@ check "a finished compile leaves no scratch directory in the cache" \
 check "a finished compile leaves nothing in TMPDIR" \
   "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'vcache-*' | wc -l | tr -d ' ')" "0"
 mkdir -p "$VCACHE_DIR/tmp/vcache-killed" "$VCACHE_DIR/tmp/vcache-running"
-touch -d '7 hours ago' "$VCACHE_DIR/tmp/vcache-killed"
+perl -e 'utime time - 7 * 3600, time - 7 * 3600, @ARGV' "$VCACHE_DIR/tmp/vcache-killed"  # BSD touch has no relative -d
 "$VCACHE" --trim >/dev/null 2>&1
 check "--trim removes a scratch directory a killed compile left" \
   "$([[ -d $VCACHE_DIR/tmp/vcache-killed ]] && echo kept || echo removed)" "removed"

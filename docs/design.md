@@ -139,13 +139,15 @@ the build. `vcache --show-costs` summarises the records.
 Each compile, dependency scan and link works in a scratch directory under
 `<cache>/tmp/` (the system temp dir only when that cannot be created). It is
 removed when vcache exits; a vcache that is killed mid-compile cannot, so
-`--trim`, and a store that triggers an eviction check, sweep them. The name
-carries the owner's pid and a tag for its pid namespace and boot,
-`<prefix><pid>.<tag>-XXXXXX`. A directory whose owner is still running is kept
-however old its mtime, since a long compile rewriting existing files does not
-change it; one whose owner has exited goes after ten minutes. A directory the
-sweep cannot check (another container, an earlier boot, an older vcache) goes
-once it has not been modified for six hours.
+`--trim`, and a store that triggers an eviction check, sweep them. The owner
+holds an exclusive `flock` on `.vcache-owner` inside the directory while it
+runs, so a directory whose lock is held is kept however old its mtime, since a
+long compile rewriting existing files does not change it; one whose lock is free
+goes after ten minutes. The lock works on macOS and across containers sharing a
+cache, where a pid means nothing. Without a lock file (an older vcache) the
+owner's pid and a tag for its pid namespace and boot in the name,
+`<prefix><pid>.<tag>-XXXXXX`, decide the same where the sweep can see that pid;
+otherwise the directory goes once it has not been modified for six hours.
 
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,

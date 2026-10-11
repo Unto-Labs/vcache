@@ -7,10 +7,12 @@
 // keyed on what is known before the preprocessor runs: the source's path and
 // contents, the whole command line, the compiler, the roots, and the identity
 // of any precompiled header the command names. Each state remembers the files
-// an earlier compile's depfile listed, with their digests, and the key that
-// compile was stored under. A state is served only while every one of those
-// files still hashes the same. This is ccache's depend mode on vcache's
-// manifest machinery.
+// an earlier compile read, with their digests, the paths it probed and did not
+// find, and the key that compile was stored under. A state is served only while
+// every one of those files still hashes the same and every one of those paths
+// is still absent. The files come from the compile's depfile, as in ccache's
+// depend mode, and, where vcache-fstrace.so can watch the compile, from what
+// it saw the compiler open; the absent paths only from the latter.
 #pragma once
 
 #include <cstdint>
@@ -21,6 +23,7 @@
 
 #include "args/compiler_args.h"
 #include "core/depfile.h"
+#include "core/link_trace.h"
 #include "core/manifest.h"
 #include "core/roots.h"
 
@@ -31,6 +34,9 @@ struct CxxManifestState {
   // modes share entries; a key derived from this state's digests when not.
   std::string result_key;
   std::vector<ManifestFile> files;
+  // Canonical paths the compile probed and did not find. A header created at
+  // one would shadow a recorded file, or answer a __has_include differently.
+  std::vector<std::string> absent;
 };
 
 std::string RenderCxxManifest(const std::vector<CxxManifestState>& states);
@@ -99,6 +105,8 @@ std::optional<std::string_view> FindTimeMacro(std::string_view text);
 
 struct RecordedInputs {
   std::vector<ManifestFile> files;
+  // Canonical, sorted; only a traced compile records any.
+  std::vector<std::string> absent;
   // Local paths of the files whose bytes use __has_include or
   // __has_include_next, when the caller asked for them.
   std::vector<std::string> probing_files;
@@ -114,6 +122,87 @@ struct RecordedInputs {
 RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
                                    const RootMap& roots, int64_t started_ns,
                                    bool scan_incbin, bool find_probes = false);
+
+// What in the trace of a compile is not an input of it.
+struct CxxTraceFilter {
+  // This compile's scratch directory: the object, the depfile, the trace.
+  std::string scratch_dir;
+  std::string tracer;
+  // The precompiled headers the manifest key already identifies. Their bytes
+  // can differ between trees whose PCHs share one identity.
+  std::vector<std::string> keyed_pchs;
+  // The executables that ran and the shared objects they loaded.
+  std::vector<std::string> compiler_files;
+  // The compiler's own trees, from CompilerInstallDirs.
+  std::vector<std::string> compiler_dirs;
+  // Every directory the preprocessor searches, the compiler's own included.
+  // Nothing under one is dropped as the compiler's: a header appearing in or
+  // vanishing from /usr/include changes what the preprocessor finds.
+  std::vector<std::string> include_dirs;
+  // Directories on PATH, and the names of the compiler's executables. gcc's
+  // driver looks for itself and its tools along PATH, and which ones run is
+  // the compiler identity's business, so an absent path that is one of those
+  // names directly in one of those directories is dropped.
+  std::vector<std::string> search_path_dirs;
+  std::vector<std::string> search_path_names;
+};
+
+// The absolute directories on `search_path` (PATH's format).
+std::vector<std::string> SearchPathDirs(const std::string& search_path);
+
+// The trees of the compiler whose processes ran `executables`: under each
+// one's prefix (the parent of its bin/, or what precedes /libexec/), its
+// lib*/gcc, libexec/gcc and lib/clang. The compiler fingerprint in the key
+// stands for these. A tree reached through a symlink at the top of the
+// filesystem (/lib64 on a merged /usr) is listed under that spelling too.
+std::vector<std::string> CompilerInstallDirs(const std::vector<std::string>& executables);
+
+// True for a path in a compile's trace that says nothing about its inputs: the
+// link cache's IsIgnoredPath, the tracer, the keyed PCHs, the scratch
+// directory, the compiler's files, and its trees outside every include
+// directory.
+bool IsCxxTraceNoise(const std::string& path, const CxxTraceFilter& filter);
+
+// `path` with "." segments and doubled separators dropped, which never change
+// what it names. ".." stays: resolving it could cross a symlink.
+std::string WithoutDotSegments(const std::string& path);
+
+struct CxxTraceInputs {
+  // Absolute, spelled as WithoutDotSegments gives them, sorted.
+  std::vector<std::string> reads;
+  // The same, without any path that was also read.
+  std::vector<std::string> absent;
+  // Every path any traced process read, noise included: the evidence that the
+  // process which preprocessed was traced at all.
+  std::vector<std::string> all_reads;
+  // Every path opened for writing only.
+  std::vector<std::string> written;
+};
+
+// The files a traced compile read and the paths it found absent, with the
+// noise dropped. Executables and the shared objects they loaded are the
+// compiler's own, and a file only written is an output, so none is a read.
+CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceFilter& filter);
+
+// The first of `files` (canonical) that no traced process read, as a local
+// path, or nullopt. A compiler process that did not load the tracer (static,
+// another ELF class, setuid, a wrapper that drops LD_PRELOAD) records nothing,
+// so a state taken from its trace would miss every absent path; the files its
+// depfile names are what show it was traced.
+std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& files,
+                                            const RootMap& roots, const CxxTraceInputs& trace);
+
+// Adds to `recorded` every file of `trace` it does not list yet, by digest,
+// and every absent path, as the highest of its ancestors that does not exist
+// either, stopping at `cwd` and at every root. Declines, emptying `recorded`,
+// when such a file is gone (unless the trace wrote it too: the compiler's own
+// intermediate), is neither a file nor a directory, or changed at or after
+// `started_ns`. A directory is skipped: what it held is in the trace. Unlike a
+// depfile's headers these files were not preprocessed, so a time macro in one
+// changes nothing.
+void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const std::string& cwd,
+                       int64_t started_ns, const std::string& memo_dir,
+                       RecordedInputs* recorded);
 
 // The directories a compiler searches for <...> includes with no -I given, as
 // `<compiler> -E -v` lists them, lexically normalised. Empty when the list

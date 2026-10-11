@@ -237,6 +237,7 @@ void ApplyTomlFile(const std::string& path, Config* config) {
       }
     }
     if (auto v = TomlBool(*vc, "cxx_manifest")) config->cxx_manifest = *v;
+    if (auto v = TomlBool(*vc, "cxx_manifest_trace")) config->cxx_manifest_trace = *v;
     if (auto v = TomlString(*vc, "rust_dep_info")) {
       if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
         config->warnings.push_back("vcache.rust_dep_info: unknown policy '" + *v +
@@ -410,6 +411,8 @@ void ApplyEnvironment(Config* config) {
   }
 
   config->cxx_manifest = EnvBool("VCACHE_CXX_MANIFEST", config->cxx_manifest);
+  config->cxx_manifest_trace =
+      EnvBool("VCACHE_CXX_MANIFEST_TRACE", config->cxx_manifest_trace);
 
   if (auto v = Env("VCACHE_RUST_DEP_INFO")) {
     if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
@@ -592,6 +595,7 @@ std::string DescribeConfig(const Config& config) {
   out << "rust dep-info:    " << RustDepInfoPolicyName(config.rust_dep_info_policy)
       << "\n";
   out << "c/c++ manifest:   " << (config.cxx_manifest ? "on" : "off") << "\n";
+  out << "c/c++ manifest trace: " << (config.cxx_manifest_trace ? "on" : "off") << "\n";
   out << "read only:        " << (config.read_only ? "yes" : "no") << "\n";
   out << "error on media failure: "
       << (config.error_on_cache_media_failure ? "yes" : "no") << "\n";

@@ -123,17 +123,19 @@ from what is known before the preprocessor runs:
   directories
 - the identity of every precompiled header the command names
 
-A state lists every file the depfile of an earlier compile of that key named,
-with its digest, and the result key that compile stored under. A lookup takes
-the first state whose files all still hash the same, through the file-identity
-memo, so an unchanged header costs a `stat` and a read of its memo. A state
-that matches but whose
+A state lists the files an earlier compile of that key read, with their
+digests, the paths it probed and did not find, and the result key that compile
+stored under. A lookup takes the first state whose files all still hash the
+same, through the file-identity memo, so an unchanged header costs a `stat` and
+a read of its memo, and whose absent paths are all still absent, one `lstat`
+each and nothing hashed. A state that matches but whose
 entry is gone, or whose entry lacks the depfile this compile asked for, falls
 through to the preprocessor; the preprocessor usually computes the same key,
 which is then not asked for again.
 
-**Where the include set comes from.** The compile's own depfile, as in ccache's
-depend mode. A command with `-MD` writes one. A command with no dependency
+**Where the include set comes from.** Two sources, used together. The first is
+the compile's own depfile, as in ccache's depend mode. A command with `-MD`
+writes one. A command with no dependency
 flags gets `-MD -MF <scratch> -MT <output>` added; `-MD` writes the dependency
 list beside the object and changes nothing in it, which a test checks against
 the compiler run directly, and the scratch file is never stored, so the entry
@@ -142,6 +144,66 @@ command with it keeps to the preprocessor. So does a compile with
 `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` set: gcc writes that dependency
 file from the preprocessor, which a manifest hit never runs, and ignores the
 variable once `-MD` is on the command line.
+
+The second is a trace of the same compile. It runs with `vcache-fstrace.so`
+preloaded, as a link does (the `-E` run for the key does not), and the trace
+adds every file the compiler opened that the depfile does not name, and every
+path it probed and did not find. The depfile stays as the base: the trace cannot
+tell a header from the compiler's own files, which are dropped below, and `-MD`
+costs the compile nothing measurable. Of the trace, these are dropped:
+
+- what the link cache drops: `/proc`, `/sys`, the terminal and random devices,
+  directory self-references;
+- the tracer, this compile's scratch directory (the object, the depfile, the
+  trace), and the PCHs the key already identifies, whose bytes may differ
+  between trees that share one identity;
+- the compiler itself: the executables that ran, the shared objects they
+  loaded (the tracer's `L` records), and the compiler's own trees,
+  `lib*/gcc`, `libexec/gcc` and `lib/clang` under the prefix of each
+  executable (the parent of its `bin/`, or what precedes `/libexec/`), also as
+  spelled through a symlink at the top of the filesystem (`/lib64` on a merged
+  `/usr`). The compiler fingerprint stands for these, and hashing a 100 MB
+  `libLLVM` on every record buys nothing. Nothing under an include directory is
+  dropped this way, the compiler's own (as `<compiler> -E -v` lists them)
+  included: `/usr/include` and `/usr/local/include` change with the packages
+  installed, not with the compiler, so the prefix itself is never dropped;
+- files opened for writing only (`W`) and directories;
+- absent paths directly in a `PATH` directory that are named as one of the
+  compiler's executables (`as`, `cc1`, the driver's own name and so on): gcc's
+  driver looks for itself and its tools along `PATH`, and which ones run is the
+  compiler identity's business. A header probed in a `PATH` directory stays.
+
+The trace is used only when every file the depfile names, the source among
+them, is among its reads. A compiler process that did not load the tracer (a
+static or setuid binary, another ELF class, a `-B` wrapper that drops
+`LD_PRELOAD`) records nothing, so a trace without its reads says nothing about
+what it probed. A traced file that is gone when the state is recorded declines
+it, unless the trace wrote it as well as read it, as cc1 writes the assembly
+file `as` reads; one changed at or after the compile started declines it as a
+depfile's does. A traced file is not scanned for time macros or `.incbin`: the
+preprocessor did not read it. Each absent path is stored as the highest of its
+ancestors that does not exist either: nothing can appear below a missing
+directory without it appearing too, and gcc probes every header in every `-I`
+directory. For `src/daemon/server.cc` a state holds 1091 absent paths under gcc
+and 902 under clang. The walk stops at the working directory and at every
+root: above a root the path would name this tree's location, and a tree whose
+root exists would check that location instead of its own. A path through `..`
+is stored as probed, since resolving it could cross a symlink, and is compared
+with what was read as spelled. Absent paths are canonicalised through the roots
+like files, so a tree at another path checks its own.
+
+The state comes from the depfile alone, and the log says why, when tracing is
+off (`cxx_manifest_trace`), when there is no tracer (no `vcache-fstrace.so`
+beside the binary, `VCACHE_TRACER` naming nothing or something that is not an
+ELF shared object of vcache's own class and machine, a host other than Linux),
+when `LD_PRELOAD` is already set, when no process loaded the tracer, when the
+trace is marked incomplete, does not parse or names no process, when the
+compiler's include directories cannot be listed, and when the trace does not
+show a file the depfile names being read, and when ld.so refused a preload in
+some process of the compile. ld.so's "cannot be preloaded" lines that name the
+tracer are then taken out of the compile's stderr: they come from preloading
+it, and an entry would replay them on every hit. A refusal of any other object
+is the build's own and stays. The entry is stored as usual.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -168,9 +230,10 @@ PCH bytes are not), by `<pch>.vcache-key` (written by vcache beside a PCH it
 builds or restores: a digest of the PCH's inputs with paths canonicalised, the
 same in every worktree), or by the PCH's bytes. A side file older than the PCH is ignored: it
 describes an earlier build. A directory of `.gch` files is declined. gcc also
-uses `H.gch` for a plain `#include "H"`, again listing neither, so under gcc a
-state is not recorded while any directory an `#include` could search holds a
-`.gch` the key does not cover.
+uses `H.gch` for a plain `#include "H"`, again listing neither. The trace sees
+gcc open the `.gch`, and probe for one that is not there yet. From the depfile
+alone, under gcc a state is not recorded while any directory an `#include`
+could search holds a `.gch` the key does not cover.
 
 **What declines a state.** A file the depfile names that cannot be read, that
 was modified or had its inode changed at or after the moment the compile
@@ -182,29 +245,35 @@ gains such a token changes its digest, so the state is checked again when it is
 next written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
 compile off the manifest altogether. A depfile that does not name the source
 declines the state, since a state with nothing to check would always match.
-Under gcc, a file outside the compiler's own include directories (as
-`<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`) whose bytes use
-`__has_include` declines it too: clang's depfile names a header that was only
-probed, gcc's does not. For a derived key, `.incbin` declines it as well, since
+From the depfile alone under gcc, a file outside the compiler's own include
+directories (as `<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`)
+whose bytes use `__has_include` declines it too: clang's depfile names a header
+`__has_include` found and no `#include` read, gcc's does not, and the trace sees
+both. For a derived
+key, `.incbin` declines it as well, since
 no preprocessed text was checked for it. A declined state leaves the entry
 stored under the preprocessor key as usual.
 
-**The shadowing hole.** A depfile names the files a compile read, not the paths
-the preprocessor probed and did not find. A new header that would be found
-earlier on the include path than a recorded one is invisible to the manifest,
-so a lookup can still hit with the old answer until something recorded
-changes. ccache's direct and depend modes have the same hole and document it,
-as does `dep_scan` here. `vcache-fstrace.so` already records absent paths (`M`
-lines) for the link cache; recording them for compiles would close it.
+**Absent paths.** A depfile names the files a compile read, not the paths the
+preprocessor probed and did not find. A header created earlier on the include
+path than a recorded one, or one a `__has_include` would now find, changes
+nothing a depfile recorded; a recorded absent path that now exists rejects the
+state. The other side, a header `__has_include` (or `__has_include_next`) found
+but no `#include` read, is among the trace's files, as it is in clang's
+depfile, so deleting it rejects the state too. This holds in the system's
+include directories as well: a `-devel` package installed or removed changes
+`/usr/include`. Only the compiler's own trees outside every include directory
+are left out, on the assumption that they change only with the compiler, which
+its fingerprint follows.
 
-**The deleted-file case.** The other side of the same gap: a header that
-`__has_include` (or `__has_include_next`) found, but that the compile did not
-then include, decides an `#if` without being read. clang lists it in the
-depfile, so deleting it changes a recorded file and misses. gcc does not, so
-deleting it would still hit with the object built while it existed; the
-`__has_include` rule above declines such states under gcc. A system header
-that probes is exempt, on the assumption that the compiler's own include
-directories change only with the toolchain or the distribution.
+**From the depfile alone.** Without the trace the shadowing hole is back: a new
+header that would be found earlier on the include path than a recorded one is
+invisible, so a lookup can still hit with the old answer until something
+recorded changes. ccache's direct and depend modes have the same hole and
+document it, as does `dep_scan` here. The deleted-file case stays covered: clang
+lists a header `__has_include` found in its depfile, and under gcc the
+`__has_include` rule above declines such states. A system header that probes is
+exempt, on the same assumption about the compiler's own include directories.
 
 ## Compiler identity
 
@@ -233,6 +302,31 @@ readable.
 The checksum is not paranoia: a silently corrupt object linked into a binary is
 far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
+
+**Sidecar files.** Some outputs are too large to carry inside an entry. A link
+output, and a Rust output of 4 MiB or more other than its `.d`, is kept in the
+disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
+(`linkout`, `rustout`), and the entry names it by digest (a `kFile` section for
+link, a `kSidecarFile` section for Rust). Both go through `DiskStorage::PutFile`
+and `GetFile`. A sidecar is created by `CloneFile`, a reflink where the
+filesystem has one, and restored the same way into an exclusive temporary
+beside the output. The hit hashes that clone, not the stored file, and renames
+it into place only if it matches; a Rust hit verifies every sidecar before it
+places anything or forwards diagnostics. The checksum covers only the digest,
+so the hash is what proves the bytes. A Rust sidecar that fails it is removed,
+so failed hits cannot keep a torn file the freshest in the store.
+
+Sidecars sit in the shards, so `--trim`, `--clear` and the size budget count
+and evict them like entries, by their own mtime; `GetFile` refreshes it on
+every hit. Eviction is per file: an entry whose sidecar has gone is a failed
+hit and a recompile, never a wrong output. Storing a new sidecar runs the
+shard's eviction check, without the scratch sweep, since a sidecar is stored
+before its compile has placed the outputs. They are not fsynced; a lost one
+fails its hash. Rust sidecars are used only with a disk cache and no S3, so
+every entry that can reach another host is whole; the entry key records which
+of the two forms it has. A Rust miss stores each large output as a sidecar
+straight from the stage dir, before placing it by rename, so it is never read
+into memory.
 
 The metadata section is not part of any cache key. A stored compile or link
 appends `max_rss_kb` and `wall_ms`, taken from `wait4` on that process. For a
@@ -278,6 +372,105 @@ buckets without `ListBucket` permission return it for a missing key.
 
 **Chain.** First hit wins; the hit is written back into every faster layer it
 passed through. Any backend error is reported as a miss.
+
+## Restoring outputs
+
+A hit writes each output to a temporary file beside it and renames it into
+place, so a reader never sees a partial file. Outputs are not fsynced; cache
+entries are. A torn entry would be served to every later build. A torn output
+is what a crash during an uncached build leaves too, because rustc and gcc do
+not fsync what they write either. If the machine crashes after vcache returns
+and before the output reaches disk, the file can be empty or short while
+cargo's fingerprint, which checks mtimes and not contents, still counts it
+fresh. `cargo clean -p <crate>` recovers.
+
+A Rust miss moves rustc's outputs from the stage dir into the output directory
+with `rename(2)`, so the file in place is the one rustc wrote, with rustc's own
+mode bits. When the rename fails with `EXDEV`, because the scratch dir fell
+back to a `$TMPDIR` on another filesystem or the output directory is on one,
+the file is copied with `CloneFile` and given its execute bits under the
+umask. The `.d` is the exception: it names the stage dir, so it is written from
+the canonicalised copy captured for the entry and localised as a hit's is.
+Capture still reads every file once to build the entry.
+
+`VCACHE_LOG` gives each placement one line, so a build's log can be summed.
+"restored" and "placed" time the writes alone; "hit total" runs from asking the
+cache for the entry to the last output in place, so it adds reading the entry,
+checking its checksum and unpacking it. Without the fsync that is most of a
+Rust hit (below).
+
+```
+rust: restored 3 files, 41630234 bytes in 28.512 ms    a Rust hit
+rust: hit total 61.077 ms
+rust: placed 3 files, 41630234 bytes in 9.204 ms       a Rust miss
+hit: restored 2 files, 182311 bytes in 0.207 ms        a C or C++ hit
+hit total 0.391 ms
+```
+
+### Measurements
+
+A clean `cargo build` (dev profile) of sunbird's root workspace on a 128-core
+host, through `build-limited` (30 CPUs): 344 rustc runs, of which a warm build
+serves 341 from the cache, restoring 4,801 MiB. Store and target directory on
+one XFS filesystem, entries in the page cache, daemon off, `sync` before each
+build. Hit builds are four interleaved samples per binary, median and range;
+the fill is one sample. A summed time adds up every process's line, so with
+builds running in parallel it exceeds the wall time.
+
+| | origin/fbg | fsync kept | no fsync |
+|---|---|---|---|
+| warm build, wall | 6.6 s (6.3–7.5) | 6.4 s (5.6–8.7) | 3.6 s (3.3–3.9) |
+| warm build, summed "hit total" | not logged | 42.6 s (36.0–73.0) | 5.7 s (5.1–6.0) |
+| warm build, summed "restored" | not logged | 37.2 s (30.5–68.2) | 1.2 s (0.7–1.6) |
+| fill, wall | 129.8 s | 131.7 s | 118.1 s |
+| fill, summed "placed" | not logged | 21.6 s | 2.3 s |
+
+"fsync kept" is this change with only its `durable = false` arguments
+reverted. Without the fsync a warm build's restore cost is mostly reading and
+checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
+1,234 MiB restored) showed the same shape in two unsynced samples: summed
+"restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
+
+Placing a miss by rename, two synced fills each, interleaved: summed "placed"
+1,458 ms and 892 ms when rustc's outputs were read back and written again,
+48.6 ms and 47.4 ms by rename; fill wall 109.1 s and 103.5 s, then 102.8 s and
+100.4 s. Warm builds are unchanged, at 3.3 s and 4.2 s against 3.6 s and 4.2 s.
+
+Sidecars for outputs of 8 MiB or more, four interleaved warm builds against the
+same build with every output inline (median, range; the host was busier than in
+the runs above, so compare within the table only):
+
+| | inline | sidecars |
+|---|---|---|
+| warm build, wall | 4.8 s (3.4–5.6) | 3.0 s (2.3–3.1) |
+| warm build, summed "hit total" | 12.6 s (5.5–17.3) | 6.4 s (3.5–8.9) |
+| warm build, summed "restored" | 6.2 s (1.1–8.3) | 5.1 s (3.0–6.7) |
+| fill, wall (two runs) | 106.0 s, 102.6 s | 98.3 s, 100.7 s |
+| store after one fill | 682 entries, 5,035 MB | 682 entries, 728 MB, and 53 sidecars, 4,307 MB |
+
+With sidecars, "restored" includes cloning 4.3 GB and hashing every clone; the
+entries a warm build reads shrink from 5.0 GB to 0.7 GB, which is where "hit
+total" falls. The sidecars ran from 8.1 MiB to 1,056 MiB, median 13.4 MiB.
+`HashFile` on the largest took 0.13–0.15 s from the page cache and 0.36–0.38 s
+with its pages dropped first (NVMe), three runs each.
+
+The threshold was then varied from 1 MiB to 32 MiB on the same build, one fill
+and three interleaved warm builds per variant, 343 hits each (median, range):
+
+| threshold | sidecars after one fill | warm build, wall | summed "hit total" | `--trim` walk |
+|---|---|---|---|---|
+| 1 MiB | 249 | 4.3 s (3.9–5.5) | 10.0 s | 8 ms |
+| 2 MiB | 170 | 4.0 s (3.8–5.4) | 11.7 s | 27 ms |
+| 4 MiB | 135 | 4.5 s (3.8–4.7) | 11.8 s | 33 ms |
+| 8 MiB | 55 | 7.6 s (5.5–8.1) | 14.7 s | 27 ms |
+| 16 MiB | 24 | 7.5 s (5.4–8.8) | 18.7 s | 29 ms |
+| 32 MiB | 12 | 7.0 s (6.1–8.2) | 31.5 s | 29 ms |
+
+1, 2 and 4 MiB are one group and 8 MiB and above another; the trim walk, the
+reason 8 MiB was first chosen, is noise beside a 40 GB store that already holds
+about 17,000 files. 4 MiB takes the gain with the fewest sidecars, each of which
+is evicted on its own mtime (below). The medians overlap at the edges and the
+host was busy, so the choice rests on the grouping, not on the 1–4 MiB order.
 
 ## Incoming prefix-map flags
 
@@ -399,7 +592,7 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 ## Known limitations
 
 - **A preprocessor hit records no manifest state.** States are recorded from
-  the depfile of a compile that ran. A lookup whose manifest key has no matching
+  the depfile and the trace of a compile that ran. A lookup whose manifest key has no matching
   state but whose preprocessor key hits (a header edited only in a comment, a
   PCH rebuilt with different bytes and no `.sum`, an entry another tree stored
   in preprocessor mode) is served by the preprocessor, and keeps being served

@@ -64,6 +64,7 @@ read_only            = false
 hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 cxx_manifest         = true        # see "cxx_manifest"
+cxx_manifest_trace   = true        # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -92,6 +93,7 @@ timeout        = 30                # seconds
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
 | `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `true` |
+| `vcache.cxx_manifest_trace` | `VCACHE_CXX_MANIFEST_TRACE` | — | `true` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -910,17 +912,29 @@ contents, the whole command line except the output and depfile paths (`-I`,
 `-D` and `-include` included; the paths in include-path flags are
 canonicalised, while `-D` values and `-B` are kept as written), the files named
 by keyed flags, `hash_env_vars`, `CPATH` and its siblings, and each precompiled
-header the command names (below). A state lists every file the depfile of an
-earlier compile named, with its digest, and the key that compile was stored
-under. A lookup re-hashes the files of each state and serves the first that
+header the command names (below). A state lists the files an earlier compile
+read, with their digests, the paths it probed and did not find, and the key
+that compile was stored under. A lookup re-hashes the files of each state and
+checks its absent paths are still absent, and serves the first state that
 matches in full; an unchanged file costs a `stat` and a read of its memo,
-because digests are memoised by device, inode, size, mtime and ctime.
-Nothing is trusted on mtime alone. A manifest keeps up to eight states.
+because digests are memoised by device, inode, size, mtime and ctime, and an
+absent path one `lstat`. Nothing is trusted on mtime alone. A manifest keeps up
+to eight states.
 
-On a miss the compile records the state from its own depfile. A command with
-`-MD` already writes one; a command with no dependency flags gets
-`-MD -MF <scratch> -MT <output>` added, which changes no byte of the object and
-leaves no file in the tree. The result is stored under the ordinary
+On a miss the compile records the state from its own depfile and from a trace
+of it. A command with `-MD` already writes a depfile; a command with no
+dependency flags gets `-MD -MF <scratch> -MT <output>` added, which changes no
+byte of the object and leaves no file in the tree. The compile runs with
+`vcache-fstrace.so` preloaded, as a cached link does, and the trace adds the
+files the compiler opened that the depfile does not name (a header
+`__has_include` found, a `.gch` gcc used, a driver config file) and the paths
+it probed and did not find, the system's include directories included. The
+compiler's executables, the shared objects they load and its own trees
+(`lib*/gcc`, `libexec/gcc`, `lib/clang`) outside every include directory are
+left out: the compiler fingerprint stands for them. On `src/daemon/server.cc` a
+state holds 1091 absent paths under g++ and 902 under clang++, and a hit takes
+5.9 ms and 6.1 ms (min of 30; median 7.4 and 7.5), against 5.8 ms and 5.5 ms
+(median 6.7 and 6.7) before the trace. The result is stored under the ordinary
 preprocessor key, so a tree with `cxx_manifest` off hits entries a tree with it
 on stored, and the reverse. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
@@ -939,6 +953,29 @@ cxx_manifest = false
 $ export VCACHE_CXX_MANIFEST=0
 ```
 
+`cxx_manifest_trace` (`VCACHE_CXX_MANIFEST_TRACE`) chooses where a state comes
+from:
+
+| Setting | Meaning |
+| --- | --- |
+| `true` *(default)* | The depfile and a trace of the compile. |
+| `false` | The depfile alone, with the gcc rules below and the shadowing hole. |
+
+A state comes from the depfile alone, with a `cxx manifest: ... recording from
+the depfile` log line that says why, whenever the trace is not available too:
+no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), one
+that is not an ELF shared object of vcache's own class and machine, a host
+other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
+(a statically linked compiler), a trace the tracer marked incomplete or that
+does not parse, or a trace that does not show every file the depfile names
+being read: a compiler process that did not load the tracer (another ELF class,
+a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. When
+ld.so refuses to preload the tracer in some process of the compile, its "cannot
+be preloaded" lines naming the tracer are taken out of the compile's stderr, so
+neither the miss nor a later hit prints them, and the state comes from the
+depfile; the entry is stored as usual. A refusal of any other object is the
+build's own and is kept.
+
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:
 
@@ -950,21 +987,27 @@ says why:
   the depfile names: the digest stays the same while the expansion does not.
 - A file that changed after the compile started, which may not be the version
   the compile read.
-- Under gcc, a `.gch` in a directory an `#include` could have searched that
-  the command line does not name: gcc uses it without listing it or its header
-  in the depfile.
-- Under gcc, a file outside the compiler's own include directories that uses
-  `__has_include`. gcc's depfile does not name a header that was only probed,
-  so deleting it would go unseen; clang's does.
+- A file the compiler read, by the trace, that is gone by the time the state
+  is recorded, other than an intermediate it also wrote.
+- From the depfile alone under gcc, a `.gch` in a directory an `#include` could
+  have searched that the command line does not name: gcc uses it without
+  listing it or its header in the depfile. The trace sees it.
+- From the depfile alone under gcc, a file outside the compiler's own include
+  directories that uses `__has_include`. gcc's depfile does not name a header
+  `__has_include` found and no `#include` read, so deleting it would go unseen;
+  clang's does, and the trace does.
 
-Under gcc that last rule matters in practice. A translation unit whose headers
-use `__has_include` outside the compiler's own include directories records no
-state and stays on the preprocessor; Boost's config headers are one common
-source, as is any header on `CPATH` or `C_INCLUDE_PATH`, which vcache does not
-count as the compiler's own. The compiler's own directories come from
-`<compiler> -E -v`, run without the `CPATH` family and memoised under
-`<dir>/sysinc/`, which `--trim` prunes like `filehash/` and `--clear` empties.
-clang is unaffected: its depfile lists the files `__has_include` probed.
+Under gcc that last rule matters in practice. Without the trace, a translation
+unit whose headers use `__has_include` outside the compiler's own include
+directories records no state and stays on the preprocessor; Boost's config
+headers are one common source, as is any header on `CPATH` or
+`C_INCLUDE_PATH`, which vcache does not count as the compiler's own. With the
+trace such a unit records a state: `src/core/depfile.cc`, which includes Boost,
+hits in 10.1 ms where the preprocessor took 292 ms. The compiler's own
+directories come from `<compiler> -E -v`, run without the `CPATH` family and
+memoised under `<dir>/sysinc/`, which `--trim` prunes like `filehash/` and
+`--clear` empties. clang is unaffected: its depfile lists the files
+`__has_include` found.
 
 **Precompiled headers.** Neither compiler's depfile names the PCH it loaded,
 so each PCH the command names (`-include-pch F`, `-Xclang -include-pch -Xclang
@@ -989,14 +1032,18 @@ result is stored under a key derived from the manifest key and every recorded
 file's digest, as ccache's depend mode keys every result. Only a manifest
 lookup can find that entry.
 
-**The limitation worth knowing.** It is the one `dep_scan` has, and ccache's
-direct and depend modes have. A depfile names the files a compile read, not the
-paths it probed and did not find. Create a header that shadows one earlier on
-the include path, change nothing else, and a lookup can still hit with the old
-answer. The reverse, deleting a header that `__has_include` found but the
-compile did not read, is covered for clang by its depfile and for gcc by the
-rule above, except inside the compiler's own include directories. Set
-`cxx_manifest = false` to make these cases exact.
+**The limitation worth knowing.** A header created inside the compiler's own
+trees but outside its include directories (say `/usr/lib/gcc/<target>/<n>/`
+itself) is not seen: the trace leaves those trees to the compiler
+fingerprint. From the depfile alone the
+limitation is the one `dep_scan` has, and ccache's direct and depend modes
+have: a depfile names the files a compile read, not the paths it probed and did
+not find. Create a header that shadows one earlier on the include path, change
+nothing else, and a lookup can still hit with the old answer. The reverse,
+deleting a header that `__has_include` found but the compile did not read, is
+covered for clang by its depfile and for gcc by the rule above, except inside
+the compiler's own include directories. Set `cxx_manifest = false` to make
+these cases exact.
 
 ### `rust_dep_info`
 

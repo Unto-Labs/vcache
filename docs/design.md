@@ -123,17 +123,19 @@ from what is known before the preprocessor runs:
   directories
 - the identity of every precompiled header the command names
 
-A state lists every file the depfile of an earlier compile of that key named,
-with its digest, and the result key that compile stored under. A lookup takes
-the first state whose files all still hash the same, through the file-identity
-memo, so an unchanged header costs a `stat` and a read of its memo. A state
-that matches but whose
+A state lists the files an earlier compile of that key read, with their
+digests, the paths it probed and did not find, and the result key that compile
+stored under. A lookup takes the first state whose files all still hash the
+same, through the file-identity memo, so an unchanged header costs a `stat` and
+a read of its memo, and whose absent paths are all still absent, one `lstat`
+each and nothing hashed. A state that matches but whose
 entry is gone, or whose entry lacks the depfile this compile asked for, falls
 through to the preprocessor; the preprocessor usually computes the same key,
 which is then not asked for again.
 
-**Where the include set comes from.** The compile's own depfile, as in ccache's
-depend mode. A command with `-MD` writes one. A command with no dependency
+**Where the include set comes from.** Two sources, used together. The first is
+the compile's own depfile, as in ccache's depend mode. A command with `-MD`
+writes one. A command with no dependency
 flags gets `-MD -MF <scratch> -MT <output>` added; `-MD` writes the dependency
 list beside the object and changes nothing in it, which a test checks against
 the compiler run directly, and the scratch file is never stored, so the entry
@@ -142,6 +144,66 @@ command with it keeps to the preprocessor. So does a compile with
 `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` set: gcc writes that dependency
 file from the preprocessor, which a manifest hit never runs, and ignores the
 variable once `-MD` is on the command line.
+
+The second is a trace of the same compile. It runs with `vcache-fstrace.so`
+preloaded, as a link does (the `-E` run for the key does not), and the trace
+adds every file the compiler opened that the depfile does not name, and every
+path it probed and did not find. The depfile stays as the base: the trace cannot
+tell a header from the compiler's own files, which are dropped below, and `-MD`
+costs the compile nothing measurable. Of the trace, these are dropped:
+
+- what the link cache drops: `/proc`, `/sys`, the terminal and random devices,
+  directory self-references;
+- the tracer, this compile's scratch directory (the object, the depfile, the
+  trace), and the PCHs the key already identifies, whose bytes may differ
+  between trees that share one identity;
+- the compiler itself: the executables that ran, the shared objects they
+  loaded (the tracer's `L` records), and the compiler's own trees,
+  `lib*/gcc`, `libexec/gcc` and `lib/clang` under the prefix of each
+  executable (the parent of its `bin/`, or what precedes `/libexec/`), also as
+  spelled through a symlink at the top of the filesystem (`/lib64` on a merged
+  `/usr`). The compiler fingerprint stands for these, and hashing a 100 MB
+  `libLLVM` on every record buys nothing. Nothing under an include directory is
+  dropped this way, the compiler's own (as `<compiler> -E -v` lists them)
+  included: `/usr/include` and `/usr/local/include` change with the packages
+  installed, not with the compiler, so the prefix itself is never dropped;
+- files opened for writing only (`W`) and directories;
+- absent paths directly in a `PATH` directory that are named as one of the
+  compiler's executables (`as`, `cc1`, the driver's own name and so on): gcc's
+  driver looks for itself and its tools along `PATH`, and which ones run is the
+  compiler identity's business. A header probed in a `PATH` directory stays.
+
+The trace is used only when every file the depfile names, the source among
+them, is among its reads. A compiler process that did not load the tracer (a
+static or setuid binary, another ELF class, a `-B` wrapper that drops
+`LD_PRELOAD`) records nothing, so a trace without its reads says nothing about
+what it probed. A traced file that is gone when the state is recorded declines
+it, unless the trace wrote it as well as read it, as cc1 writes the assembly
+file `as` reads; one changed at or after the compile started declines it as a
+depfile's does. A traced file is not scanned for time macros or `.incbin`: the
+preprocessor did not read it. Each absent path is stored as the highest of its
+ancestors that does not exist either: nothing can appear below a missing
+directory without it appearing too, and gcc probes every header in every `-I`
+directory. For `src/daemon/server.cc` a state holds 1091 absent paths under gcc
+and 902 under clang. The walk stops at the working directory and at every
+root: above a root the path would name this tree's location, and a tree whose
+root exists would check that location instead of its own. A path through `..`
+is stored as probed, since resolving it could cross a symlink, and is compared
+with what was read as spelled. Absent paths are canonicalised through the roots
+like files, so a tree at another path checks its own.
+
+The state comes from the depfile alone, and the log says why, when tracing is
+off (`cxx_manifest_trace`), when there is no tracer (no `vcache-fstrace.so`
+beside the binary, `VCACHE_TRACER` naming nothing or something that is not an
+ELF shared object of vcache's own class and machine, a host other than Linux),
+when `LD_PRELOAD` is already set, when no process loaded the tracer, when the
+trace is marked incomplete, does not parse or names no process, when the
+compiler's include directories cannot be listed, and when the trace does not
+show a file the depfile names being read, and when ld.so refused a preload in
+some process of the compile. ld.so's "cannot be preloaded" lines that name the
+tracer are then taken out of the compile's stderr: they come from preloading
+it, and an entry would replay them on every hit. A refusal of any other object
+is the build's own and stays. The entry is stored as usual.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -168,9 +230,10 @@ PCH bytes are not), by `<pch>.vcache-key` (written by vcache beside a PCH it
 builds or restores: a digest of the PCH's inputs with paths canonicalised, the
 same in every worktree), or by the PCH's bytes. A side file older than the PCH is ignored: it
 describes an earlier build. A directory of `.gch` files is declined. gcc also
-uses `H.gch` for a plain `#include "H"`, again listing neither, so under gcc a
-state is not recorded while any directory an `#include` could search holds a
-`.gch` the key does not cover.
+uses `H.gch` for a plain `#include "H"`, again listing neither. The trace sees
+gcc open the `.gch`, and probe for one that is not there yet. From the depfile
+alone, under gcc a state is not recorded while any directory an `#include`
+could search holds a `.gch` the key does not cover.
 
 **What declines a state.** A file the depfile names that cannot be read, that
 was modified or had its inode changed at or after the moment the compile
@@ -182,29 +245,35 @@ gains such a token changes its digest, so the state is checked again when it is
 next written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
 compile off the manifest altogether. A depfile that does not name the source
 declines the state, since a state with nothing to check would always match.
-Under gcc, a file outside the compiler's own include directories (as
-`<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`) whose bytes use
-`__has_include` declines it too: clang's depfile names a header that was only
-probed, gcc's does not. For a derived key, `.incbin` declines it as well, since
+From the depfile alone under gcc, a file outside the compiler's own include
+directories (as `<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`)
+whose bytes use `__has_include` declines it too: clang's depfile names a header
+`__has_include` found and no `#include` read, gcc's does not, and the trace sees
+both. For a derived
+key, `.incbin` declines it as well, since
 no preprocessed text was checked for it. A declined state leaves the entry
 stored under the preprocessor key as usual.
 
-**The shadowing hole.** A depfile names the files a compile read, not the paths
-the preprocessor probed and did not find. A new header that would be found
-earlier on the include path than a recorded one is invisible to the manifest,
-so a lookup can still hit with the old answer until something recorded
-changes. ccache's direct and depend modes have the same hole and document it,
-as does `dep_scan` here. `vcache-fstrace.so` already records absent paths (`M`
-lines) for the link cache; recording them for compiles would close it.
+**Absent paths.** A depfile names the files a compile read, not the paths the
+preprocessor probed and did not find. A header created earlier on the include
+path than a recorded one, or one a `__has_include` would now find, changes
+nothing a depfile recorded; a recorded absent path that now exists rejects the
+state. The other side, a header `__has_include` (or `__has_include_next`) found
+but no `#include` read, is among the trace's files, as it is in clang's
+depfile, so deleting it rejects the state too. This holds in the system's
+include directories as well: a `-devel` package installed or removed changes
+`/usr/include`. Only the compiler's own trees outside every include directory
+are left out, on the assumption that they change only with the compiler, which
+its fingerprint follows.
 
-**The deleted-file case.** The other side of the same gap: a header that
-`__has_include` (or `__has_include_next`) found, but that the compile did not
-then include, decides an `#if` without being read. clang lists it in the
-depfile, so deleting it changes a recorded file and misses. gcc does not, so
-deleting it would still hit with the object built while it existed; the
-`__has_include` rule above declines such states under gcc. A system header
-that probes is exempt, on the assumption that the compiler's own include
-directories change only with the toolchain or the distribution.
+**From the depfile alone.** Without the trace the shadowing hole is back: a new
+header that would be found earlier on the include path than a recorded one is
+invisible, so a lookup can still hit with the old answer until something
+recorded changes. ccache's direct and depend modes have the same hole and
+document it, as does `dep_scan` here. The deleted-file case stays covered: clang
+lists a header `__has_include` found in its depfile, and under gcc the
+`__has_include` rule above declines such states. A system header that probes is
+exempt, on the same assumption about the compiler's own include directories.
 
 ## Compiler identity
 
@@ -503,7 +572,7 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 ## Known limitations
 
 - **A preprocessor hit records no manifest state.** States are recorded from
-  the depfile of a compile that ran. A lookup whose manifest key has no matching
+  the depfile and the trace of a compile that ran. A lookup whose manifest key has no matching
   state but whose preprocessor key hits (a header edited only in a comment, a
   PCH rebuilt with different bytes and no `.sum`, an entry another tree stored
   in preprocessor mode) is served by the preprocessor, and keeps being served

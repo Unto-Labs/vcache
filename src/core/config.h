@@ -176,6 +176,12 @@ struct Config {
   // lookup preprocesses. Both modes store under the same keys.
   bool cxx_manifest = true;
 
+  // Record a C or C++ manifest state from a trace of the compile, through
+  // vcache-fstrace.so, as well as from its depfile: the trace sees the paths
+  // the compiler probed and did not find. Off, or without the tracer, a state
+  // comes from the depfile alone.
+  bool cxx_manifest_trace = true;
+
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store
   bool recache = false;    // ignore hits, recompile and overwrite

@@ -306,12 +306,18 @@ Steps 4 and 5 cost a preprocessor run on every lookup, so a C or C++ lookup
 first checks a manifest, as ccache's depend mode does. It is keyed on the
 source, the whole command line (`-I` and `-D` included), the compiler, the
 roots and any precompiled header the command names, and each state in it lists
-the files an earlier compile's depfile named, with their digests, and the key
-that compile stored under. When every file of a state still hashes the same,
-that key is looked up and the preprocessor never runs. The key is the ordinary
-preprocessor key, so trees with the manifest on and off share entries. A miss
-records its state from the compile's own `-MD` output, which vcache requests
-when the build did not. See
+the files an earlier compile read, with their digests, the paths it probed and
+did not find, and the key that compile stored under. When every file of a state
+still hashes the same and every one of those paths is still absent, that key is
+looked up and the preprocessor never runs. The key is the ordinary preprocessor
+key, so trees with the manifest on and off share entries. A miss records its
+state from the compile's own `-MD` output, which vcache requests when the build
+did not, and from a trace of the compile through `vcache-fstrace.so`, which
+sees what the preprocessor looked for and did not find: a header created
+earlier on the include path misses, except inside the compiler's own trees
+outside its include directories, and except where the trace is not available
+(no tracer, another platform, a compiler process that does not load it), when
+the state comes from the depfile alone and that hole stays open. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

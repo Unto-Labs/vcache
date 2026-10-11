@@ -3,6 +3,7 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -262,6 +263,64 @@ void TestLinkTraceClassification() {
   Check(core::ParseTraceLog(log, {}, "/", &second), "second trace parses");
   Check(second.absent.empty(), "a path later found is not left in the absent set");
   Check(second.inputs.size() == 1, "and is recorded as an input");
+
+  // Loaded objects and files written only are their own kinds in the log, and
+  // the link cache keeps both as inputs, as it did before they were told apart.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\tmap.txt\n");
+  core::TraceRecords records;
+  Check(core::ReadTraceRecords(log, "/home/u/proj", &records), "the kinds parse");
+  Check(records.loaded.size() == 1 && records.loaded[0] == "/usr/lib64/libbfd.so" &&
+            records.written.size() == 1 && records.written[0] == "/home/u/proj/map.txt" &&
+            records.reads.empty(),
+        "a loaded object and a file written only are kept apart from reads, made absolute");
+  core::LinkTrace kinds;
+  Check(core::ParseTraceLog(log, {}, "/home/u/proj", &kinds), "the kinds parse for a link");
+  CheckEq(util::Join(kinds.inputs, " "), "/home/u/proj/map.txt /usr/lib64/libbfd.so",
+          "a link keeps both as inputs");
+  Check(!core::TraceMarkedIncomplete(log), "a trace with no marker is not incomplete");
+  util::WriteFileAtomic(log + ".incomplete", "");
+  Check(core::TraceMarkedIncomplete(log), "the marker beside it makes it incomplete");
+  util::RemoveFile(log + ".incomplete");
+
+  // Only a shared object ld.so would load into this binary is preloaded.
+  Dl_info libc_info{};
+  const bool found_libc =
+      ::dladdr(::dlsym(RTLD_DEFAULT, "getpid"), &libc_info) != 0 && libc_info.dli_fname;
+  Check(found_libc && core::TracerLoadsHere(libc_info.dli_fname),
+        "a shared object this binary loaded can be preloaded");
+  Check(!core::TracerLoadsHere(dir + "/missing.so"), "a missing tracer cannot");
+  util::WriteFileAtomic(dir + "/text.so", "not an ELF file at all\n");
+  Check(!core::TracerLoadsHere(dir + "/text.so"), "nor can a file that is not ELF");
+  if (found_libc) {
+    const std::string elf = util::ReadFile(libc_info.dli_fname).value_or("");
+    std::string other_class = elf.substr(0, 64);
+    other_class[4] = other_class[4] == 1 ? 2 : 1;
+    util::WriteFileAtomic(dir + "/class.so", other_class);
+    Check(!core::TracerLoadsHere(dir + "/class.so"), "nor one of the other ELF class");
+    std::string executable = elf.substr(0, 64);
+    executable[16] = 2;  // ET_EXEC
+    util::WriteFileAtomic(dir + "/exec.so", executable);
+    Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
+  }
+
+  // ld.so's refusals are taken out of a traced compile's stderr, line by line.
+  bool refused = false;
+  const std::string other_refusal =
+      "ERROR: ld.so: object '/b/wrap.so' from LD_PRELOAD cannot be preloaded "
+      "(cannot open shared object file): ignored.\n";
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:1: warning: x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS64): ignored.\n" + other_refusal +
+                  "last",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal + "last",
+          "a refusal of the tracer goes; another object's and the compiler's lines stay");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals("a.c:1: warning: x\n" + other_refusal,
+                                       "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal,
+          "stderr with no refusal of the tracer is untouched");
+  Check(!refused, "and reports none");
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
@@ -5437,6 +5496,177 @@ void TestFileDigestMemo() {
   Check(util::FileExists(young_memo), "trim keeps a memo younger than 30 days");
 }
 
+void TestCxxManifestTrace() {
+  Section("core::cxx manifest trace");
+
+  auto scratch = util::MakeTempDir("vcache-cxx-trace-");
+  Check(scratch.has_value(), "cxx trace scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string& dir = *scratch;
+
+  // The compiler's own trees, from the executables that ran, wherever they are.
+  const std::string gcc14_trees =
+      "/opt/gcc-14/lib/clang /opt/gcc-14/lib/gcc /opt/gcc-14/lib32/gcc /opt/gcc-14/lib64/gcc "
+      "/opt/gcc-14/libexec/gcc /opt/gcc-14/libx32/gcc";
+  CheckEq(util::Join(core::CompilerInstallDirs(
+                         {"/opt/gcc-14/bin/g++",
+                          "/opt/gcc-14/libexec/gcc/x86_64-linux-gnu/14/cc1plus"}),
+                     " "),
+          gcc14_trees, "a bin/ or libexec/ executable names the trees under the prefix above it");
+  CheckEq(util::Join(core::CompilerInstallDirs({"/opt/gcc-14/clang"}), " "), gcc14_trees,
+          "an executable outside bin/ names the trees under its own directory");
+  const std::vector<std::string> usr_trees = core::CompilerInstallDirs({"/usr/bin/gcc"});
+  Check(std::find(usr_trees.begin(), usr_trees.end(), "/usr/lib/gcc") != usr_trees.end() &&
+            std::none_of(usr_trees.begin(), usr_trees.end(),
+                         [](const std::string& tree) { return tree == "/usr"; }),
+        "a compiler in /usr gives /usr/lib/gcc, never /usr itself");
+
+  CheckEq(util::Join(core::SearchPathDirs("/usr/bin::rel:/home/u/bin/"), " "),
+          "/usr/bin /home/u/bin", "PATH loses empty and relative entries");
+
+  CheckEq(core::WithoutDotSegments("/a/./b//c/./"), "/a/b/c", ". segments and doubled / go");
+  CheckEq(core::WithoutDotSegments("/a/b/../c/.d"), "/a/b/../c/.d", ".. and dot names stay");
+
+  // What is noise.
+  core::CxxTraceFilter filter;
+  filter.scratch_dir = dir + "/scratch";
+  filter.tracer = "/opt/vc/vcache-fstrace.so";
+  filter.keyed_pchs = {"/home/u/proj/h.h.gch"};
+  filter.compiler_files = {"/usr/bin/g++", "/lib64/libc.so.6"};
+  filter.compiler_dirs = {"/usr/lib/gcc", "/usr/libexec/gcc"};
+  filter.include_dirs = {"/usr/lib/gcc/x/16/include", "/usr/include", "/home/u/proj/inc"};
+  filter.search_path_dirs = {"/home/u/bin", "/home/u/proj/tools"};
+  filter.search_path_names = {"g++", "as"};
+  Check(core::IsCxxTraceNoise("/proc/self/exe", filter), "/proc is noise, as for a link");
+  Check(core::IsCxxTraceNoise("/opt/vc/vcache-fstrace.so", filter), "the tracer is noise");
+  Check(core::IsCxxTraceNoise(dir + "/scratch/out", filter), "the scratch directory is noise");
+  Check(core::IsCxxTraceNoise("/home/u/proj/h.h.gch", filter), "a keyed PCH is noise");
+  Check(core::IsCxxTraceNoise("/usr/bin/g++", filter) &&
+            core::IsCxxTraceNoise("/lib64/libc.so.6", filter),
+        "the executables that ran and the objects they loaded are noise");
+  Check(core::IsCxxTraceNoise("/usr/libexec/gcc/x/16/cc1plus", filter) &&
+            core::IsCxxTraceNoise("/usr/bin/../lib/gcc/x/16/specs", filter),
+        "the compiler's trees are noise, through .. too");
+  Check(!core::IsCxxTraceNoise("/usr/include/stdio.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/local/include/zz.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gcc/x/16/include/stddef.h", filter),
+        "the system headers are not, nor is the compiler's own include directory");
+  Check(!core::IsCxxTraceNoise("/home/u/proj/inc/a.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gccx/a.h", filter) &&
+            !core::IsCxxTraceNoise("/etc/clang/x.cfg", filter),
+        "a project header, a sibling with a longer name and a driver config are not");
+
+  // Selection from the records.
+  core::TraceRecords records;
+  records.tools = {"/usr/bin/g++"};
+  records.loaded = {"/opt/lib/libmpc.so.3"};
+  records.written = {"/home/u/proj/./log.txt"};
+  records.reads = {"/home/u/proj/./inc/a.h", "/home/u/proj/inc/a.h", "/usr/libexec/gcc/x/cc1",
+                   "/home/u/proj/tmp.s", "/home/u/proj/second/h.h", "/home/u/proj/inc/x.h"};
+  records.absent = {"/home/u/proj/first/h.h", "/home/u/proj/./first//h.h.gch",
+                    "/home/u/proj/tmp.s", "/home/u/bin/g++", "/home/u/proj/tools/cfg.h",
+                    "/home/u/proj/tools/as", "/usr/lib/gcc/x/16/plugin",
+                    "/home/u/proj/build/../inc/x.h", "/home/u/proj/a/../b.h"};
+  const core::CxxTraceInputs selected = core::SelectCxxTraceInputs(records, filter);
+  CheckEq(util::Join(selected.reads, " "),
+          "/home/u/proj/inc/a.h /home/u/proj/inc/x.h /home/u/proj/second/h.h /home/u/proj/tmp.s",
+          "reads lose the noise and . segments, once each; executables, loaded objects "
+          "and files written only are not reads");
+  CheckEq(util::Join(selected.absent, " "),
+          "/home/u/proj/a/../b.h /home/u/proj/build/../inc/x.h /home/u/proj/first/h.h "
+          "/home/u/proj/first/h.h.gch /home/u/proj/tools/cfg.h",
+          "absent paths lose the noise, what was later read as spelled, and the driver's "
+          "search for its tools along PATH; a header probed in a PATH directory stays");
+  CheckEq(util::Join(selected.written, " "), "/home/u/proj/log.txt",
+          "files written only are kept apart");
+  Check(std::binary_search(selected.all_reads.begin(), selected.all_reads.end(),
+                           "/usr/libexec/gcc/x/cc1"),
+        "every read is evidence that a process was traced, noise included");
+
+  // A compiler process that did not load the tracer read nothing in the trace.
+  const core::RootMap roots = MakeRoots({dir + "/proj=proj"});
+  core::CxxTraceInputs seen;
+  seen.all_reads = {dir + "/proj/a.cc", dir + "/proj/inc/a.h"};
+  Check(!core::FindUntracedFile({{"/vcache/proj/./a.cc", "d"}, {"/vcache/proj/inc/a.h", "d"}},
+                                roots, seen)
+             .has_value(),
+        "a depfile whose every file the trace read was traced");
+  CheckEq(core::FindUntracedFile({{"/vcache/proj/a.cc", "d"}, {"/vcache/proj/b.h", "d"}}, roots,
+                                 seen)
+              .value_or(""),
+          dir + "/proj/b.h", "a file the trace never read is named, localised");
+
+  // Recording the selection beside a depfile's files.
+  util::MakeDirs(dir + "/proj/inc");
+  util::MakeDirs(dir + "/out");
+  util::WriteFileAtomic(dir + "/proj/a.cc", "int a;\n");
+  util::WriteFileAtomic(dir + "/proj/opt.h", "#pragma once\n");
+  util::WriteFileAtomic(dir + "/proj/stamp.h", "const char* t = __TIME__;\n");
+  const std::string memo_dir = dir + "/memo";
+  const int64_t later_ns = (static_cast<int64_t>(std::time(nullptr)) + 60) * 1'000'000'000;
+  const auto add = [&](std::vector<std::string> reads, std::vector<std::string> absent,
+                       std::vector<std::string> written, int64_t started_ns,
+                       const core::RootMap& with_roots) {
+    core::RecordedInputs recorded;
+    recorded.files = {{with_roots.Canonicalize(dir + "/proj/a.cc"), hash::HashString("int a;\n")}};
+    core::CxxTraceInputs trace;
+    trace.reads = std::move(reads);
+    trace.absent = std::move(absent);
+    trace.written = std::move(written);
+    core::AddCxxTraceInputs(trace, with_roots, dir + "/proj", started_ns, memo_dir, &recorded);
+    return recorded;
+  };
+  const core::RecordedInputs added =
+      add({dir + "/proj/a.cc", dir + "/proj/inc", dir + "/proj/opt.h", dir + "/proj/stamp.h"},
+          {dir + "/proj/first/bits/c.h", dir + "/proj/first/h.h", dir + "/proj/first/../h2.h",
+           dir + "/proj/inc/none.h", "/opt/rh"},
+          {}, later_ns, roots);
+  Check(added.declined.empty(), "a trace's extras are recorded");
+  Check(added.files.size() == 3 && added.files[1].first == "/vcache/proj/opt.h" &&
+            added.files[1].second == hash::HashString("#pragma once\n") &&
+            added.files[2].first == "/vcache/proj/stamp.h",
+        "a file the depfile named is not added twice, a directory not at all, and a time "
+        "macro in one the preprocessor did not read declines nothing");
+  CheckEq(util::Join(added.absent, " "),
+          "/opt/rh /vcache/proj/first /vcache/proj/first/../h2.h /vcache/proj/inc/none.h",
+          "absent paths are canonical and sorted, each the highest missing directory above "
+          "it, except through ..");
+  const core::RootMap out_root = MakeRoots({dir + "/proj=proj", dir + "/no-out/gen=gen"});
+  CheckEq(
+      util::Join(add({}, {dir + "/no-out/gen/include/h.h"}, {}, later_ns, out_root).absent, " "),
+      "/vcache/gen", "the walk stops at a root that does not exist yet, below a missing parent");
+  const core::RootMap nested_root = MakeRoots({dir + "/proj/no-a/sub=sub"});
+  CheckEq(util::Join(add({}, {dir + "/proj/no-a/sub/x/h.h"}, {}, later_ns, nested_root).absent,
+                     " "),
+          "/vcache/sub", "and at one inside the working directory");
+  const core::RecordedInputs gone =
+      add({dir + "/proj/gone.h"}, {dir + "/proj/x.h"}, {}, later_ns, roots);
+  Check(!gone.declined.empty() && gone.files.empty() && gone.absent.empty(),
+        "a file the compile read that is gone declines the state");
+  Check(!add({"/tmp/ccAbCdEf.h"}, {}, {}, later_ns, roots).declined.empty(),
+        "in the temporary directory too, unless the trace wrote it");
+  Check(add({dir + "/proj/ccAbCdEf.s"}, {}, {dir + "/proj/ccAbCdEf.s"}, later_ns, roots)
+            .declined.empty(),
+        "an intermediate the compile wrote and read and then removed declines nothing");
+  Check(!add({dir + "/proj/opt.h"}, {}, {}, 0, roots).declined.empty(),
+        "a file changed after the compile started declines the state");
+  Check(!add({"/dev/zero"}, {}, {}, later_ns, roots).declined.empty(),
+        "a device the compile read declines the state");
+
+  // A lookup checks each absent path is still absent.
+  Check(!core::FindAppearedPath({"/vcache/proj/first/h.h"}, roots).has_value(),
+        "an absent path that is still absent passes");
+  util::MakeDirs(dir + "/proj/first");
+  util::WriteFileAtomic(dir + "/proj/first/h.h", "#define V 1\n");
+  CheckEq(core::FindAppearedPath({"/vcache/proj/nothing.h", "/vcache/proj/first/h.h"}, roots)
+              .value_or(""),
+          dir + "/proj/first/h.h exists now", "one that exists now is named, localised");
+}
+
 void TestCxxManifest() {
   Section("core::cxx manifest");
 
@@ -5457,11 +5687,41 @@ void TestCxxManifest() {
   std::vector<core::CxxManifestState> rejected;
   Check(!core::ParseCxxManifest("vcache-depmanifest-2\nentry " + key_a + "\n", &rejected),
         "a dep-scan manifest is not read as a C/C++ manifest");
-  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\nstate abc\n", &rejected),
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate abc\n", &rejected),
         "a state with a short key is rejected");
   rejected.clear();
-  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\n" + digest + " /a.h\n", &rejected),
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\n" + digest + " /a.h\n", &rejected),
         "a file line before any state is rejected");
+
+  // Absent paths.
+  const std::vector<core::CxxManifestState> with_absent = {
+      {key_a, {{"/vcache/proj/src/a.cc", digest}},
+       {"/vcache/proj/first/a.h", "/vcache/proj/with space/a.h.gch"}},
+      {key_b, {}, {"/opt/rh"}},
+  };
+  const std::string rendered_absent = core::RenderCxxManifest(with_absent);
+  Check(rendered_absent.find("\nabsent /vcache/proj/first/a.h\n") != std::string::npos,
+        "an absent path renders as its own line kind");
+  std::vector<core::CxxManifestState> parsed_absent;
+  Check(core::ParseCxxManifest(rendered_absent, &parsed_absent) && parsed_absent.size() == 2 &&
+            parsed_absent[0].files == with_absent[0].files &&
+            parsed_absent[0].absent == with_absent[0].absent &&
+            parsed_absent[1].absent == with_absent[1].absent,
+        "and reads back into its own state, a path with a space included");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nabsent /a.h\n", &rejected),
+        "an absent line before any state is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate " + key_a + "\nabsent \n",
+                                &rejected),
+        "an absent line with no path is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate " + key_a + "\nabsent a.h\n",
+                                &rejected),
+        "an absent line with a relative path is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\nstate " + key_a + "\n", &rejected),
+        "a manifest from before absent paths is not read: its states never checked any");
 
   // Key arguments.
   const core::RootMap no_roots = MakeRoots({});
@@ -6553,6 +6813,7 @@ int main(int argc, char** argv) {
   TestRustcFingerprint();
   TestFileDigestMemo();
   TestCxxManifest();
+  TestCxxManifestTrace();
   TestRustOutputNames();
   TestHashAndScanFile();
   TestUploadGeneration();

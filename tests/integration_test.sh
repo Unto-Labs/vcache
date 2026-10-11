@@ -1005,7 +1005,7 @@ fi
 # --------------------------------------------------------------------------
 section "9j. Rust: large outputs are sidecars, restored by clone"
 
-# An output of 8 MiB or more is kept beside the entry as <digest>.rustout and
+# An output of 4 MiB or more is kept beside the entry as <digest>.rustout and
 # cloned on a hit, so its bytes never pass through the entry or memory. The
 # entry's checksum then covers only the digest, so every hit hashes the clone.
 if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
@@ -1020,11 +1020,12 @@ else
       ! -name '*.rustout' -printf '%s\n' 2>/dev/null | sort -n | tail -1
   }
   reason_count() { local n; n=$(stat_of "$1"); echo "${n:-0}"; }
-  # 9 MiB of non-zero static data, so the rlib crosses the threshold; the
-  # unused function makes rustc warn, which a hit replays.
+  # 2 MiB of non-zero static data makes a 6 MiB rlib (object, embedded bitcode
+  # and metadata), above the 4 MiB threshold and below the 8 MiB one before it;
+  # the unused function makes rustc warn, which a hit replays.
   big_crate() {  # $1 = tree
     mkdir -p "$WORK/$1/src"
-    printf '%s\n' 'pub static BIG: [u8; 9 << 20] = [7; 9 << 20];' \
+    printf '%s\n' 'pub static BIG: [u8; 2 << 20] = [7; 2 << 20];' \
       'pub fn value(i: usize) -> u8 { BIG[i] }' 'fn unused() {}' > "$WORK/$1/src/lib.rs"
   }
   sidecar_log="$WORK/sidecar.vlog"
@@ -1114,7 +1115,7 @@ else
     VCACHE_S3_ENDPOINT=http://127.0.0.1:9 VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
     VCACHE_S3_NO_CREDENTIALS=1
   check "with S3 configured the large rlib stays inline" \
-    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 9437184 ]] && echo inline)" "0 inline"
+    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 5242880 ]] && echo inline)" "0 inline"
 
   # A cargo-made OUT_DIR baked into a large output, split across the scan's
   # 1 MiB reads, must keep the entry out of the store. The build still gets

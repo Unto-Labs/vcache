@@ -22,6 +22,7 @@
 #include "core/depfile.h"
 #include "core/stats.h"
 #include "daemon/client.h"
+#include "hash/file_memo.h"
 #include "hash/hasher.h"
 #include "rust/rust_manifest.h"
 #include "storage/disk_storage.h"
@@ -160,12 +161,14 @@ CrateInputs CollectCrateInputs(const args::RustcArgs& parsed,
 
 // Digests every --extern, sorted by name. nullopt if a dependency cannot be
 // read, since then nothing pins what would be linked.
-std::optional<std::vector<RustExtern>> HashExterns(const args::RustcArgs& parsed) {
+std::optional<std::vector<RustExtern>> HashExterns(const args::RustcArgs& parsed,
+                                                   const std::string& cache_dir) {
+  const std::string memo_dir = hash::FileDigestMemoDir(cache_dir);
   std::vector<RustExtern> externs;
   for (const args::ExternCrate& ext : parsed.externs) {
     RustExtern hashed{ext.name, ""};
     if (!ext.path.empty()) {
-      auto digest = hash::HashFile(ext.path);
+      auto digest = hash::HashFileMemoized(ext.path, memo_dir);
       if (!digest) {
         VCACHE_LOG("rust: could not read extern " + ext.path);
         return std::nullopt;
@@ -836,7 +839,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   const std::string rustc_fingerprint =
       ResolveRustcFingerprint(parsed.compiler, cache_dir);
 
-  const std::optional<std::vector<RustExtern>> externs = HashExterns(parsed);
+  const std::optional<std::vector<RustExtern>> externs = HashExterns(parsed, cache_dir);
   if (!externs) {
     core::RecordDecision(cache_dir, Reason::kNoCacheKey);
     return RunPassthrough(argv);
@@ -903,7 +906,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       }
       VCACHE_LOG("rust key " + states[i].key + " for " + parsed.source);
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
-      core::RecordCounter(cache_dir, HitCounter(got));
+      core::RecordCounters(cache_dir, HitCounter(got), core::Counter::kManifestHit);
       if (i > 0 && !config.read_only) {
         StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }

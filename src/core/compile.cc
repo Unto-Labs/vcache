@@ -5,19 +5,23 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "args/compiler_args.h"
 #include "core/cost.h"
+#include "core/cxx_manifest.h"
 #include "core/depfile.h"
 #include "core/manifest.h"
 #include "core/preprocessed.h"
 #include "core/stats.h"
 #include "daemon/client.h"
+#include "hash/file_memo.h"
 #include "hash/hasher.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -85,25 +89,40 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
     cmd.push_back(arg);
   }
   if (!compiler_id.is_clang) cmd.push_back("-fno-working-directory");
+  // A PCH carries the header's macro definitions to every compile that loads
+  // it, and plain -E drops them: a header that only changes `#define FOO 1` to
+  // `#define FOO 2` would preprocess identically, and clang's size check would
+  // accept the old PCH too. -dD keeps the definitions in the text.
+  if (parsed.produces_pch) cmd.push_back("-dD");
   cmd.push_back("-E");
   cmd.push_back(parsed.source);
   return cmd;
 }
 
 // Assembles the real compile command with prefix maps injected.
+//
+// `add_md` asks for a depfile the caller did not: the C/C++ manifest records
+// the files a compile read from it. -MD writes the file beside the object and
+// changes nothing in the object itself.
 std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
                                              const RootMap& roots,
                                              const std::string& output,
-                                             const std::string& depfile) {
+                                             const std::string& depfile,
+                                             bool add_md = false) {
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
   for (const std::string& arg : parsed.base_args) cmd.push_back(arg);
+  if (parsed.xclang_emit_pch) {
+    cmd.push_back("-Xclang");
+    cmd.push_back("-emit-pch");
+  }
   for (const std::string& arg : roots.PrefixMapArgs(PrefixMapStyle::kC)) {
     cmd.push_back(arg);
   }
   // Dependency flags only belong on the real compile.
   if (!depfile.empty()) {
     for (const std::string& arg : parsed.dep_args) cmd.push_back(arg);
+    if (add_md) cmd.push_back("-MD");
   }
   if (parsed.compile_only) cmd.push_back("-c");
   if (parsed.assemble_only) cmd.push_back("-S");
@@ -128,7 +147,8 @@ std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
 // differs slightly between C and C++, so probe in the language being compiled.
 const char* NativeProbeLanguage(args::Language lang) {
   switch (lang) {
-    case args::Language::kCxx: return "c++";
+    case args::Language::kCxx:
+    case args::Language::kCxxHeader: return "c++";
     case args::Language::kObjC: return "objective-c";
     case args::Language::kObjCxx: return "objective-c++";
     default: return "c";
@@ -228,6 +248,18 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // -I-style differences between checkouts do not change the key.
   for (const std::string& arg : parsed.key_args) {
     hasher.UpdateDelimited(roots.Canonicalize(arg));
+  }
+
+  // A PCH records the absolute path of every input, even one named relatively,
+  // and clang refuses to load it once one of them is missing, so it is reusable
+  // only at the paths it was built at. The directory and the command line go in
+  // as typed, not canonicalised, so two trees at different paths never share a
+  // PCH entry; a rebuild of the same tree, or containers that mount every tree
+  // at one path, still hit.
+  if (parsed.produces_pch) {
+    hasher.UpdateDelimited("pch-built-at");
+    hasher.UpdateDelimited(util::CurrentDir());
+    for (const std::string& arg : parsed.argv) hasher.UpdateDelimited(arg);
   }
 
   // Linker-only flags change nothing about the object under -c, and gcc ignores
@@ -520,7 +552,7 @@ bool EmitDepOutput(const std::string& path, const std::string& text) {
     ::fflush(stdout);
     return true;
   }
-  return util::WriteFileAtomic(path, text);
+  return util::WriteFileAtomic(path, text, /*durable=*/false);
 }
 
 }  // namespace
@@ -792,11 +824,318 @@ RootMap BuildRootMap(const Config& config, std::vector<std::string>* warnings) {
   return roots;
 }
 
+namespace {
+
+// New kinds of entry, so neither changes an existing key: the manifest itself,
+// and the result key of a compile that could not be preprocessed.
+constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v2";
+constexpr std::string_view kCxxDerivedKeyVersion = "vcache-cxx-derived-v1";
+
+// gcc writes a dependency file named by one of these from the preprocessor.
+// A manifest hit runs none, and a compile with -MD added ignores them.
+constexpr const char* kDependencyEnvVars[] = {"DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES"};
+
+bool UsesDependencyFlag(const args::CompilerArgs& parsed, std::string_view flag) {
+  for (const std::string& arg : parsed.dep_args) {
+    if (arg == flag) return true;
+  }
+  return false;
+}
+
+// The manifest key: everything the preprocessor key covers except the
+// preprocessed text, plus everything that decides that text before a header is
+// read. The working directory is in it because relative -I paths and relative
+// sources resolve against it; the source's canonical path because quoted
+// includes resolve beside it. Returns empty, after logging why, when this
+// compile cannot use a manifest.
+std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMap& roots,
+                                  const CompilerId& compiler_id, const Config& config,
+                                  const std::string& native_target, const std::string& cwd,
+                                  const std::string& memo_dir,
+                                  std::vector<std::string>* keyed_pchs) {
+  // -MMD leaves system headers out of the depfile, so a state recorded from it
+  // would not notice a system header changing.
+  if (UsesDependencyFlag(parsed, "-MMD")) {
+    VCACHE_LOG("cxx manifest: -MMD omits system headers; using the preprocessor");
+    return "";
+  }
+  for (const char* name : kDependencyEnvVars) {
+    if (std::getenv(name) != nullptr) {
+      VCACHE_LOG(std::string("cxx manifest: ") + name + " is set; using the preprocessor");
+      return "";
+    }
+  }
+  // -DSTAMP=__TIME__ expands differently on every run, and nothing the manifest
+  // hashes would change.
+  for (const std::string& arg : parsed.argv) {
+    if (const auto macro = FindTimeMacro(arg)) {
+      VCACHE_LOG("cxx manifest: the command line uses " + std::string(*macro) +
+                 "; using the preprocessor");
+      return "";
+    }
+  }
+  const ConsumedPchs pchs = FindConsumedPchs(parsed, cwd);
+  if (!pchs.unsupported.empty()) {
+    VCACHE_LOG("cxx manifest: " + pchs.unsupported + "; using the preprocessor");
+    return "";
+  }
+  std::vector<std::string> pch_identities;
+  for (const std::string& pch : pchs.paths) {
+    std::optional<std::string> identity = PchIdentity(pch, memo_dir);
+    if (!identity) {
+      VCACHE_LOG("cxx manifest: cannot read PCH " + pch + "; using the preprocessor");
+      return "";
+    }
+    VCACHE_LOG("cxx manifest: PCH " + pch + " is " + identity->substr(0, identity->find(' ')));
+    pch_identities.push_back(std::move(*identity));
+  }
+  const std::optional<std::string> source_digest =
+      hash::HashFileMemoized(parsed.source, memo_dir);
+  if (!source_digest) {
+    VCACHE_LOG("cxx manifest: cannot read " + parsed.source + "; using the preprocessor");
+    return "";
+  }
+
+  hash::Hasher hasher;
+  hasher.UpdateDelimited(kCxxManifestKeyVersion);
+  // States name result keys of this version, so a bump must not be bypassed by
+  // a manifest written before it.
+  hasher.UpdateDelimited(kCacheKeyVersion);
+  hasher.UpdateDelimited(compiler_id.fingerprint);
+  hasher.UpdateDelimited(native_target);
+  hasher.UpdateDelimited(roots.Fingerprint());
+  hasher.UpdateDelimited(roots.Canonicalize(cwd));
+  hasher.UpdateDelimited(roots.Canonicalize(CxxAbsolutePath(cwd, parsed.source)));
+  // And as typed: __FILE__ and the debug info name the source as the command
+  // line spelled it, so src/f.c and /abs/src/f.c in one directory differ.
+  hasher.UpdateDelimited(roots.Canonicalize(parsed.source));
+  hasher.UpdateDelimited(*source_digest);
+  // A PCH loads only at the paths that built it, so ComputeKey keys a PCH build
+  // on the raw cwd and argv; a manifest state names that key, and must not
+  // hand a tree at another path the entry.
+  if (parsed.produces_pch) {
+    hasher.UpdateDelimited("pch-built-at");
+    hasher.UpdateDelimited(cwd);
+    for (const std::string& arg : parsed.argv) hasher.UpdateDelimited(arg);
+  }
+  const std::vector<std::string> key_args =
+      CxxManifestKeyArgs(parsed, roots, compiler_id.is_clang);
+  hasher.UpdateU64(key_args.size());
+  for (const std::string& arg : key_args) hasher.UpdateDelimited(arg);
+  for (const std::string& path : parsed.key_files) {
+    const std::optional<std::string> digest = hash::HashFileMemoized(path, memo_dir);
+    if (!digest) {
+      VCACHE_LOG("cxx manifest: cannot hash keyed input file " + path);
+      return "";
+    }
+    hasher.UpdateDelimited(*digest);
+  }
+  for (const std::string& name : config.extra_env_vars) {
+    const char* value = std::getenv(name.c_str());
+    hasher.UpdateDelimited(name);
+    hasher.UpdateDelimited(value != nullptr ? value : "");
+  }
+  for (const char* name : kIncludePathEnvVars) {
+    const char* value = std::getenv(name);
+    hasher.UpdateDelimited(name);
+    hasher.UpdateDelimited(value != nullptr ? "=" + roots.CanonicalizeText(value) : "unset");
+  }
+  hasher.UpdateU64(pch_identities.size());
+  for (const std::string& identity : pch_identities) hasher.UpdateDelimited(identity);
+  *keyed_pchs = pchs.paths;
+  return hasher.Hex();
+}
+
+// The result key of a compile the preprocessor could not handle, from the
+// state's digests, as ccache's depend mode keys every result. Only a manifest
+// lookup can name it.
+std::string DeriveCxxResultKey(const std::string& manifest_key,
+                               const std::vector<ManifestFile>& files) {
+  hash::Hasher hasher;
+  hasher.UpdateDelimited(kCxxDerivedKeyVersion);
+  hasher.UpdateDelimited(manifest_key);
+  for (const auto& [path, digest] : files) {
+    hasher.UpdateDelimited(path);
+    hasher.UpdateDelimited(digest);
+  }
+  return hasher.Hex();
+}
+
+std::vector<CxxManifestState> LoadCxxManifest(storage::CacheChain* cache,
+                                              const std::string& manifest_key,
+                                              const std::string& cache_dir,
+                                              bool* media_failed, bool log_if_absent,
+                                              bool* get_failed) {
+  std::vector<CxxManifestState> states;
+  storage::GetResult got = cache->Get(manifest_key);
+  const bool failed = ReportCacheMediaErrors(got.errors, cache_dir);
+  *media_failed |= failed;
+  if (get_failed != nullptr) *get_failed = failed;
+  storage::Blob blob;
+  if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
+    if (log_if_absent) VCACHE_LOG("cxx manifest: none stored");
+    return states;
+  }
+  if (!ParseCxxManifest(blob.dep_manifest, &states)) {
+    VCACHE_LOG("cxx manifest: did not parse; starting a new one");
+    states.clear();
+  }
+  return states;
+}
+
+void StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_key,
+                      CxxManifestState fresh, const std::vector<CxxManifestState>& loaded,
+                      const std::string& cache_dir, bool* media_failed) {
+  PauseBeforeManifestPut();
+  bool reread_failed = false;
+  const std::vector<CxxManifestState> reread =
+      LoadCxxManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
+  const std::vector<CxxManifestState> states = MergeManifestStates(
+      std::move(fresh), reread, loaded, &CxxManifestState::result_key);
+  storage::Blob blob;
+  blob.dep_manifest = RenderCxxManifest(states);
+  blob.has_dep_manifest = true;
+  blob.meta = "c/c++ manifest\nstates: " + std::to_string(states.size()) + "\n";
+  const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
+  *media_failed |= ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
+  VCACHE_LOG(put.stored ? "cxx manifest: stored " + std::to_string(states.size()) + " states"
+                        : std::string("cxx manifest: could not store"));
+}
+
+// The compiler's own <...> include directories, from `<compiler> -E -v` in the
+// compile's language with the flags that can move them. Memoised in the cache
+// directory, since the probe is a process; empty when it fails.
+//
+// The probe runs without the CPATH family: gcc lists those directories among
+// its own, and a project header there would pass for a compiler header. That
+// also keeps the memo independent of them. GCC_EXEC_PREFIX and COMPILER_PATH
+// choose which compiler parts run, so they are in the memo key.
+std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
+                                           const CompilerId& compiler_id,
+                                           const std::string& cache_dir) {
+  std::vector<std::string> cmd{parsed.compiler};
+  for (size_t i = 0; i < parsed.key_args.size(); ++i) {
+    const std::string& arg = parsed.key_args[i];
+    if (util::StartsWith(arg, "--vcache-") || arg == "-MP") continue;
+    if (arg == "-MT" || arg == "-MQ") {
+      ++i;
+      continue;
+    }
+    if (util::StartsWith(arg, "-MT") || util::StartsWith(arg, "-MQ")) continue;
+    cmd.push_back(arg);
+  }
+  cmd.insert(cmd.end(), {"-x", NativeProbeLanguage(parsed.language), "-E", "-v", "/dev/null"});
+
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("system-include-dirs-memo-v2");
+  memo_key.UpdateDelimited(compiler_id.fingerprint);
+  for (const std::string& arg : cmd) memo_key.UpdateDelimited(arg);
+  for (const char* name : {"GCC_EXEC_PREFIX", "COMPILER_PATH"}) {
+    const char* value = std::getenv(name);
+    memo_key.UpdateDelimited(value != nullptr ? std::string(name) + "=" + value : "unset");
+  }
+  const std::string memo_path = SystemIncludeMemoDir(cache_dir) + "/" + memo_key.Hex();
+  if (auto cached = util::ReadFile(memo_path)) {
+    return util::Split(*cached, '\n', /*skip_empty=*/true);
+  }
+  util::ProcOptions options{.capture_stdout = true, .capture_stderr = true};
+  options.unset_env.assign(std::begin(kIncludePathEnvVars), std::end(kIncludePathEnvVars));
+  util::ProcResult probe = util::Run(cmd, options);
+  std::vector<std::string> dirs =
+      probe.exit_code == 0 ? ParseSystemIncludeDirs(probe.stderr_data) : std::vector<std::string>{};
+  if (dirs.empty()) {
+    VCACHE_LOG("cxx manifest: could not list the compiler's include directories");
+    return dirs;
+  }
+  util::WriteFileAtomic(memo_path, util::Join(dirs, "\n") + "\n");
+  return dirs;
+}
+
+// What the compile that just ran read, from the depfile it wrote. Declined, as
+// RecordDepfileInputs declines; when the source is not among the files; and
+// under gcc when a .gch the key does not cover sits where an #include could
+// have picked it up, or when a file outside the compiler's own include
+// directories uses __has_include, since gcc's depfile does not name a header
+// that was only probed.
+RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
+                                     const args::CompilerArgs& parsed, const RootMap& roots,
+                                     const CompilerId& compiler_id, const std::string& cwd,
+                                     const std::string& cache_dir,
+                                     const std::vector<std::string>& keyed_pchs,
+                                     int64_t started_ns, bool scan_incbin) {
+  RecordedInputs inputs;
+  const std::optional<std::string> text = util::ReadFile(depfile_path);
+  std::optional<DepFile> dep;
+  if (text) dep = ParseDepFile(*text);
+  if (!dep) {
+    inputs.declined = "the compile wrote no readable dependency file";
+    return inputs;
+  }
+  inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin,
+                               /*find_probes=*/!compiler_id.is_clang);
+  if (!inputs.declined.empty()) return inputs;
+  // A state lists what it is checked against; one without the source would
+  // match whatever is on disk. Compared lexically normalised, since both
+  // compilers drop a leading ./ from the source they write.
+  const auto normal = [](const std::string& path) {
+    return std::filesystem::path(path).lexically_normal().string();
+  };
+  const std::string source = normal(CxxAbsolutePath(cwd, parsed.source));
+  if (std::none_of(inputs.files.begin(), inputs.files.end(), [&](const ManifestFile& file) {
+        return normal(roots.Localize(file.first)) == source;
+      })) {
+    inputs.files.clear();
+    inputs.declined = "the dependency file does not name the source";
+    return inputs;
+  }
+  if (compiler_id.is_clang) return inputs;
+
+  if (!inputs.probing_files.empty()) {
+    const std::vector<std::string> system_dirs =
+        SystemIncludeDirs(parsed, compiler_id, cache_dir);
+    for (const std::string& path : inputs.probing_files) {
+      if (system_dirs.empty() || !UnderAnyDir(path, system_dirs)) {
+        inputs.files.clear();
+        inputs.declined = path + " uses __has_include, and gcc's depfile does not name " +
+                          "a header that was only probed";
+        return inputs;
+      }
+    }
+  }
+
+  std::vector<std::string> dirs = {cwd, util::DirName(CxxAbsolutePath(cwd, parsed.source))};
+  for (std::string& dir : CxxIncludeDirs(parsed, cwd)) dirs.push_back(std::move(dir));
+  for (const ManifestFile& file : inputs.files) {
+    dirs.push_back(util::DirName(roots.Localize(file.first)));
+  }
+  if (auto gch = FindUnkeyedGch(dirs, keyed_pchs)) {
+    inputs.files.clear();
+    inputs.declined = "gcc could have used " + *gch + ", which the depfile does not name";
+  }
+  return inputs;
+}
+
+}  // namespace
+
+bool PchCarriesTimestamps(const args::CompilerArgs& parsed, bool is_clang) {
+  return parsed.produces_pch && is_clang && !parsed.pch_timestamp_disabled;
+}
+
 int RunCompile(const std::vector<std::string>& argv, const Config& config,
                const RootMap& roots, storage::CacheChain* cache) {
   const std::string& cache_dir = config.disk.dir;
 
   args::CompilerArgs parsed = args::Parse(argv);
+
+  // Every path below, passthrough included, may replace the PCH, so the key
+  // that described the old one goes first. Only a run that knows the new PCH's
+  // key writes the file again.
+  const std::string pch_key_file =
+      parsed.produces_pch && !parsed.output.empty() && parsed.output != "-" &&
+              parsed.output != "/dev/null"
+          ? parsed.output + std::string(kPchKeyFileSuffix)
+          : "";
+  if (!pch_key_file.empty()) util::RemoveFile(pch_key_file);
 
   if (!parsed.cacheable()) {
     RecordDecision(cache_dir, *parsed.uncacheable);
@@ -839,6 +1178,11 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const CompilerId compiler_id =
       ResolveCompilerId(parsed.compiler, check_mode, cache_dir, roots);
 
+  if (PchCarriesTimestamps(parsed, compiler_id.is_clang)) {
+    RecordDecision(cache_dir, {Reason::kPchWithTimestamps, parsed.output});
+    return RunPassthrough(argv);
+  }
+
   // -march=native and friends: resolve them to a concrete target fingerprint,
   // or decline to cache if the caller asked for that or the probe failed.
   std::string native_target;
@@ -868,6 +1212,105 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     ~TempDirGuard() { util::RemoveRecursive(path); }
   } guard{*temp_dir};
 
+  // Taken before anything reads the sources: a file changed after this may not
+  // be the version the compile read, so it is not recorded in a manifest.
+  const int64_t started_ns = util::NowUnixNs();
+  const std::string cwd = util::CurrentDir();
+  const std::string memo_dir = hash::FileDigestMemoDir(cache_dir);
+
+  // Tracks whether any layer was broken, as opposed to cold, across this whole
+  // invocation. A hit does not clear it: the media still failed.
+  bool media_failed = false;
+
+  // Written after the PCH itself, so no reader pairs this key with the PCH it
+  // replaced.
+  const auto write_pch_key_file = [&](const std::string& pch_key) {
+    if (pch_key_file.empty()) return;
+    if (!util::WriteFileAtomic(pch_key_file, pch_key + "\n", /*durable=*/false)) {
+      VCACHE_LOG("could not write " + pch_key_file);
+    }
+  };
+
+  // Serves `result_key` when its entry exists and fits this compile.
+  // `manifest_state` names the manifest state that chose the key; it is empty
+  // when the preprocessed text did.
+  const auto try_hit = [&](const std::string& result_key, const std::string& manifest_state) {
+    if (cache == nullptr) return false;
+    const auto lookup_started = std::chrono::steady_clock::now();
+    storage::GetResult got = cache->Get(result_key);
+    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
+    if (got.hit) {
+      storage::Blob blob;
+      const bool blob_decoded = storage::DeserializeBlob(got.value, &blob);
+      // Dependency flags are not in the key, so an entry stored by a compile
+      // without -MD serves this one too, and has no depfile to replay. The
+      // recompile stores one, and the entry then serves both shapes.
+      if (blob_decoded && parsed.generates_deps && !parsed.depfile.empty() &&
+          !blob.has_depfile) {
+        VCACHE_LOG("hit on " + got.layer + " has no dependency file for " + parsed.depfile +
+                   "; recompiling");
+        return false;
+      }
+      if (blob_decoded && MaterializeHit(blob, parsed, roots, lookup_started)) {
+        write_pch_key_file(result_key);
+        const Counter layer = got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
+        if (manifest_state.empty()) {
+          VCACHE_LOG("hit on " + got.layer);
+          RecordCounter(cache_dir, layer);
+        } else {
+          VCACHE_LOG("cxx manifest hit on " + got.layer + ": " + manifest_state +
+                     "; preprocessor skipped");
+          RecordCounters(cache_dir, layer, Counter::kManifestHit);
+        }
+        return true;
+      }
+      VCACHE_LOG("hit on " + got.layer + " but entry was unusable; recompiling");
+    }
+    return false;
+  };
+
+  // ---- manifest: answer without preprocessing -----------------------------
+
+  std::string manifest_key;
+  std::vector<std::string> keyed_pchs;
+  std::vector<CxxManifestState> manifest_states;
+  if (config.cxx_manifest && cache != nullptr) {
+    manifest_key = ComputeCxxManifestKey(parsed, roots, compiler_id, config, native_target,
+                                         cwd, memo_dir, &keyed_pchs);
+    if (!manifest_key.empty()) {
+      VCACHE_LOG("cxx manifest key " + manifest_key + " for " + parsed.source);
+      manifest_states =
+          LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr);
+    }
+  }
+
+  // A result key a matching state named that did not serve. The preprocessor
+  // usually arrives at the same key, and asking again would only repeat why.
+  std::string manifest_unserved_key;
+  const auto try_manifest_hit = [&]() {
+    for (size_t i = 0; i < manifest_states.size(); ++i) {
+      const std::string which = manifest_key.substr(0, 16) + " state " + std::to_string(i + 1) +
+                                " of " + std::to_string(manifest_states.size());
+      if (auto stale = FindStaleManifestFile(manifest_states[i].files, roots, memo_dir)) {
+        VCACHE_LOG("cxx manifest: " + which + " rejected: " + *stale);
+        continue;
+      }
+      if (try_hit(manifest_states[i].result_key, which)) {
+        if (i > 0 && !config.read_only) {
+          StoreCxxManifest(cache, manifest_key, manifest_states[i], manifest_states, cache_dir,
+                           &media_failed);
+        }
+        return true;
+      }
+      manifest_unserved_key = manifest_states[i].result_key;
+      VCACHE_LOG("cxx manifest: " + which + " matched but its entry did not serve");
+    }
+    return false;
+  };
+  if (!config.recache && try_manifest_hit()) {
+    return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+  }
+
   // ---- preprocess ---------------------------------------------------------
 
   const std::string preprocessed = *temp_dir + "/pp.i";
@@ -877,57 +1320,48 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   util::ProcResult pp = util::Run(
       pp_cmd, {.capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed});
-  if (pp.exit_code != 0) {
+  // A compile the preprocessor cannot handle can still be cached from what the
+  // compile itself reads: a PCH consumer whose command lacks an include path
+  // the PCH's header text needs compiles, and fails only under -E. Only an
+  // error the compiler reported (status 1) qualifies; a tool that could not
+  // run or crashed gets the original command line, as before.
+  const bool derive_key = pp.exit_code == 1 && !manifest_key.empty() && !config.read_only;
+  const std::string pp_failure =
+      pp.exit_code != 0
+          ? "exit code " + std::to_string(pp.exit_code) + ": " + pp.stderr_data.substr(0, 512)
+          : "";
+  std::string key;
+  if (pp.exit_code != 0 && !derive_key) {
     // The compilation itself will fail too; let the compiler produce the real
     // diagnostics rather than reporting a vcache-shaped error.
-    RecordDecision(cache_dir, {Reason::kPreprocessorError,
-                               "exit code " + std::to_string(pp.exit_code) + ": " +
-                                   pp.stderr_data.substr(0, 512)});
+    RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
     return RunPassthrough(argv);
   }
-
-  bool saw_incbin = false;
-  const std::string key = ComputeKey(parsed, roots, compiler_id, config,
-                                     native_target, preprocessed, &saw_incbin);
-  if (key.empty()) {
-    RecordDecision(cache_dir, Reason::kNoCacheKey);
-    return RunPassthrough(argv);
+  if (derive_key) {
+    VCACHE_LOG("cxx manifest: preprocessing failed; deriving the key from what the compile "
+               "reads: " + pp_failure);
+  } else {
+    bool saw_incbin = false;
+    key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
+                     &saw_incbin);
+    if (key.empty()) {
+      RecordDecision(cache_dir, Reason::kNoCacheKey);
+      return RunPassthrough(argv);
+    }
+    // The preprocessed text is the whole of what vcache knows about this
+    // compilation, and .incbin means the assembler will read a file that text
+    // never mentions. Two builds can preprocess identically and still owe
+    // different objects, so there is no key that would be honest here.
+    if (saw_incbin) {
+      RecordDecision(cache_dir, Reason::kIncbin);
+      return RunPassthrough(argv);
+    }
+    VCACHE_LOG("key " + key + " for " + parsed.source + " -> " + parsed.output);
   }
-  // The preprocessed text is the whole of what vcache knows about this
-  // compilation, and .incbin means the assembler will read a file that text
-  // never mentions. Two builds can preprocess identically and still owe
-  // different objects, so there is no key that would be honest here.
-  if (saw_incbin) {
-    RecordDecision(cache_dir, Reason::kIncbin);
-    return RunPassthrough(argv);
-  }
-  VCACHE_LOG("key " + key + " for " + parsed.source + " -> " + parsed.output);
 
   // ---- lookup -------------------------------------------------------------
 
-  // Tracks whether any layer was broken, as opposed to cold, across this whole
-  // invocation. A hit does not clear it: the media still failed.
-  bool media_failed = false;
-
-  const auto try_hit = [&]() {
-    if (cache == nullptr) return false;
-    const auto lookup_started = std::chrono::steady_clock::now();
-    storage::GetResult got = cache->Get(key);
-    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
-    if (got.hit) {
-      storage::Blob blob;
-      if (storage::DeserializeBlob(got.value, &blob) &&
-          MaterializeHit(blob, parsed, roots, lookup_started)) {
-        VCACHE_LOG("hit on " + got.layer);
-        RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
-                                                   : Counter::kHitDisk);
-        return true;
-      }
-      VCACHE_LOG("hit on " + got.layer + " but entry was unusable; recompiling");
-    }
-    return false;
-  };
-  if (!config.recache && try_hit()) {
+  if (!derive_key && !config.recache && key != manifest_unserved_key && try_hit(key, "")) {
     return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
   }
 
@@ -937,22 +1371,47 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
     const auto cost_key = ComputeCostKey("compile", parsed.source,
         args::LanguageName(parsed.language), parsed.key_args, roots);
-    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
-    if (outcome != daemon::LeaseOutcome::kCompile && try_hit()) {
-      session->ReleaseLease(true);
-      return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+    // Without a result key yet, peers wait on the manifest key and look in the
+    // manifest once the holder has recorded its state there.
+    const std::string& lease_key = derive_key ? manifest_key : key;
+    const auto outcome =
+        session->AcquireLease(lease_key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
+    if (outcome != daemon::LeaseOutcome::kCompile) {
+      bool served = false;
+      if (derive_key) {
+        manifest_states =
+            LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, false, nullptr);
+        served = try_manifest_hit();
+      } else {
+        served = try_hit(key, "");
+      }
+      if (served) {
+        session->ReleaseLease(true);
+        return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+      }
     }
   }
-  RecordCounter(cache_dir, Counter::kMiss);
+  // Counted once the compile succeeds when the key is derived: until then this
+  // is the preprocessor failure it was before the manifest existed.
+  if (!derive_key) RecordCounter(cache_dir, Counter::kMiss);
 
   // Compile to a temporary and move into place only on success, so a failed
   // build never leaves a half-written object where make expects a good one.
   const std::string tmp_output = *temp_dir + "/out" ;
   const std::string tmp_depfile =
       parsed.generates_deps && !parsed.depfile.empty() ? *temp_dir + "/out.d" : "";
+  // The depfile a manifest state is read from: the caller's -MD output, or one
+  // vcache asks for when the caller asked for none.
+  const bool add_md = !manifest_key.empty() && !parsed.generates_deps;
+  std::string manifest_depfile;
+  if (add_md) {
+    manifest_depfile = *temp_dir + "/manifest.d";
+  } else if (!manifest_key.empty() && UsesDependencyFlag(parsed, "-MD")) {
+    manifest_depfile = tmp_depfile;
+  }
 
-  const std::vector<std::string> compile_cmd =
-      BuildCompileCommand(parsed, roots, tmp_output, tmp_depfile);
+  const std::vector<std::string> compile_cmd = BuildCompileCommand(
+      parsed, roots, tmp_output, add_md ? manifest_depfile : tmp_depfile, add_md);
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
   util::ProcOptions compile_options{.capture_stderr = true};
@@ -983,11 +1442,15 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     // No object is placed, exactly as the compiler leaves none.
     if (!tmp_depfile.empty()) {
       if (auto text = util::ReadFile(tmp_depfile)) {
-        util::WriteFileAtomic(parsed.depfile, *text);
+        util::WriteFileAtomic(parsed.depfile, *text, /*durable=*/false);
       }
     }
     VCACHE_LOG("compile failed with exit code " + std::to_string(compiled.exit_code));
-    RecordCounter(cache_dir, Counter::kCompileFailed);
+    if (derive_key) {
+      RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
+    } else {
+      RecordCounter(cache_dir, Counter::kCompileFailed);
+    }
     return compiled.exit_code;
   }
 
@@ -1001,7 +1464,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (!tmp_depfile.empty()) {
     auto text = util::ReadFile(tmp_depfile);
     if (text) {
-      if (!util::WriteFileAtomic(parsed.depfile, *text)) {
+      if (!util::WriteFileAtomic(parsed.depfile, *text, /*durable=*/false)) {
         VCACHE_LOG("could not write dependency file " + parsed.depfile);
       }
       // Store it canonicalised so the entry is directory-independent; gcc does
@@ -1015,6 +1478,33 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       }
     }
   }
+
+  // ---- what the compile read, for the manifest ----------------------------
+
+  RecordedInputs manifest_inputs;
+  if (!manifest_key.empty()) {
+    if (manifest_depfile.empty()) {
+      manifest_inputs.declined = "the compile writes no -MD dependency file";
+    } else {
+      manifest_inputs =
+          ReadCxxManifestInputs(manifest_depfile, parsed, roots, compiler_id, cwd, cache_dir,
+                                keyed_pchs,
+                                started_ns, /*scan_incbin=*/derive_key);
+    }
+    if (!manifest_inputs.declined.empty()) {
+      VCACHE_LOG("cxx manifest: not recording: " + manifest_inputs.declined);
+    }
+  }
+  if (derive_key) {
+    if (!manifest_inputs.declined.empty()) {
+      RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
+      return compiled.exit_code;
+    }
+    RecordCounter(cache_dir, Counter::kMiss);
+    key = DeriveCxxResultKey(manifest_key, manifest_inputs.files);
+    VCACHE_LOG("derived key " + key + " for " + parsed.source + " -> " + parsed.output);
+  }
+  write_pch_key_file(key);
 
   // ---- store --------------------------------------------------------------
 
@@ -1050,13 +1540,19 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
-  if (session) session->ReleaseLease(put.stored);
   media_failed |= ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     RecordCounter(cache_dir, Counter::kStored);
+    // After the entry, so a state never names a result that is not there yet,
+    // and before the lease goes, so a peer woken on the manifest key finds it.
+    if (!manifest_key.empty() && manifest_inputs.declined.empty()) {
+      StoreCxxManifest(cache, manifest_key, {key, std::move(manifest_inputs.files)},
+                       manifest_states, cache_dir, &media_failed);
+    }
   } else {
     RecordCounter(cache_dir, Counter::kStoreFailed);
   }
+  if (session) session->ReleaseLease(put.stored);
   // Only override a successful compile. A real compiler failure is the more
   // useful exit code to propagate, and the object is already in place either
   // way, so this reports the cache fault without hiding the build result.

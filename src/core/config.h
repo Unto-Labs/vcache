@@ -171,6 +171,11 @@ struct Config {
 
   RustDepInfoPolicy rust_dep_info_policy = RustDepInfoPolicy::kManifest;
 
+  // Look a C or C++ compile up in a manifest of the files an earlier compile
+  // read before running the preprocessor, and record one on a miss. Off, every
+  // lookup preprocesses. Both modes store under the same keys.
+  bool cxx_manifest = true;
+
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store
   bool recache = false;    // ignore hits, recompile and overwrite

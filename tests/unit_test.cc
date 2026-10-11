@@ -36,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,6 +49,7 @@
 #include "core/compile.h"
 #include "core/config.h"
 #include "core/cost.h"
+#include "core/cxx_manifest.h"
 #include "core/depfile.h"
 #include "core/preprocessed.h"
 #include "core/roots.h"
@@ -57,6 +59,7 @@
 #include "daemon/protocol.h"
 #include "daemon/client.h"
 #include "daemon/server.h"
+#include "hash/file_memo.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "rust/rust_compile.h"
@@ -709,6 +712,128 @@ void TestPreprocessedNormalization() {
         "does not fire without the leading dot");
   Check(!core::ContainsIncbin("static void inc(void);"),
         "does not fire on ordinary code");
+}
+
+void TestPreprocessedHashSlicing() {
+  Section("core::preprocessed hash slicing");
+
+  auto scratch = util::MakeTempDir("vcache-preprocessed-hash-");
+  Check(scratch.has_value(), "preprocessed hash scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const core::RootMap roots = MakeRoots({"/home/u/proj=proj"});
+
+  // The per-line loop the hasher used to be fed by: the slicing may change,
+  // the byte stream and the .incbin verdict may not, or every cache key moves.
+  auto reference = [&](const std::string& text, bool* saw_incbin) {
+    hash::Hasher hasher;
+    *saw_incbin = false;
+    size_t start = 0;
+    while (start < text.size()) {
+      const size_t newline = text.find('\n', start);
+      const bool with_newline = newline != std::string::npos;
+      const std::string line =
+          text.substr(start, with_newline ? newline - start : std::string::npos);
+      if (!line.empty() && line[0] == '#') {
+        hasher.Update(core::NormalizeLinemarker(line, roots));
+      } else {
+        hasher.Update(line);
+        if (!*saw_incbin && core::ContainsIncbin(line)) *saw_incbin = true;
+      }
+      if (with_newline) hasher.Update("\n");
+      start = with_newline ? newline + 1 : text.size();
+    }
+    return hasher.Hex();
+  };
+
+  int case_number = 0;
+  auto check_case = [&](const std::string& text, const std::string& what) {
+    const std::string path = *scratch + "/case" + std::to_string(case_number++) + ".i";
+    // Not util::WriteFileAtomic: its first call fixes the process's file mode,
+    // which the written-file-permissions section needs to set up itself.
+    FILE* out = std::fopen(path.c_str(), "wb");
+    const bool written = out != nullptr &&
+                         std::fwrite(text.data(), 1, text.size(), out) == text.size();
+    if (out == nullptr || std::fclose(out) != 0 || !written) {
+      Check(false, what + ": scratch file written");
+      return;
+    }
+    bool expected_incbin = false;
+    const std::string expected = reference(text, &expected_incbin);
+    hash::Hasher hasher;
+    bool saw_incbin = !expected_incbin;
+    const bool read = core::HashNormalizedPreprocessedOutput(path, roots, &hasher, &saw_incbin);
+    Check(read, what + ": file read");
+    CheckEq(hasher.Hex(), expected, what + ": digest matches the per-line loop");
+    Check(saw_incbin == expected_incbin, what + ": .incbin verdict matches the per-line loop");
+  };
+
+  constexpr size_t kReadSize = 1 << 20;
+  const std::string marker = "# 1 \"/home/u/proj/src/a.cc\"";
+  const std::string system_marker = "# 3 \"/usr/include/stdio.h\" 2";
+
+  check_case("", "an empty file");
+  check_case(marker + "\nint a;\n\nint b;\n" + system_marker + "\n#pragma once\nint c;\n",
+             "linemarkers under a root among plain lines");
+  check_case("int a;\n" + marker, "a linemarker without a trailing newline");
+  check_case(marker + "\nint a;", "a plain line without a trailing newline");
+  check_case("\n\n#\n\n", "empty lines and a bare '#'");
+  check_case("int a; // # 1 \"/home/u/proj/a.cc\"\n  " + marker + "\nchar c = '#';\n",
+             "a '#' inside a plain line is not a linemarker");
+  check_case(marker + "\n" + std::string(kReadSize + kReadSize / 2, 'x') + "\n" + marker + "\n",
+             "a plain line longer than one read");
+  check_case(std::string(2 * kReadSize + 17, 'y'), "an unterminated line over two reads");
+  {
+    const std::string lead = std::string(kReadSize - 11, 'p') + "\n";
+    check_case(lead + "int straddling_the_read_boundary;\n" + marker + "\n",
+               "a plain line straddling the read boundary");
+    check_case(lead + marker + "\nint a;\n", "a linemarker straddling the read boundary");
+  }
+  check_case(std::string(kReadSize, 't') + marker + "\n" + marker + "\n",
+             "a '#' just after the read boundary in the middle of a line");
+  {
+    const std::string lead = std::string(kReadSize - 1, 'q') + "\n";
+    check_case(lead + marker + "\nint a;\n", "a linemarker starting exactly at the read boundary");
+    check_case(lead + "int a;\n" + marker + "\n",
+               "a plain line starting exactly at the read boundary");
+  }
+  check_case(marker + "\n" + "asm(\"\\t.incbin \\\"kernel/config_data.gz\\\"\");\nint a;\n",
+             "an .incbin in a plain line");
+  check_case("# 1 \"/home/u/proj/.incbin\"\n#pragma .incbin\nint a;\n",
+             "an .incbin only in '#' lines");
+  check_case(std::string(kReadSize - 3, 'r') + ".incbin\n",
+             "an .incbin straddling the read boundary");
+  check_case(std::string(kReadSize - 1, 's') + "\n.incbin\n",
+             "an .incbin starting exactly at the read boundary");
+
+  const std::vector<std::string> pieces = {
+      marker, system_marker, "# 42 \"/home/u/proj/inc/b.h\" 1 3 4", "#pragma once", "#", "",
+      "int x = 1;", "  return a.b->c;", "asm(\".incbin \\\"blob\\\"\");", "\t.incbin \"x\"",
+      "# 7 \"/home/u/proj/.incbin\"", "char c = '#';", "  " + marker, "#define X 1",
+  };
+  for (const unsigned seed : {1u, 2u, 3u, 4u, 5u}) {
+    std::mt19937 rng(seed);
+    std::string text;
+    const size_t target = 2 * kReadSize + rng() % kReadSize;
+    while (text.size() < target) {
+      const unsigned pick = rng() % 100;
+      if (pick < 2) {
+        text += std::string(rng() % (kReadSize / 2), 'z');
+      } else {
+        // .incbin pieces are rare so that most seeds also exercise its absence.
+        const size_t index = rng() % pieces.size();
+        if (pieces[index].find(".incbin") != std::string::npos && rng() % 50 != 0) continue;
+        text += pieces[index];
+      }
+      text += '\n';
+    }
+    if (seed % 2 == 0) text.pop_back();
+    check_case(text, "seeded mix " + std::to_string(seed));
+  }
 }
 
 void TestManifestMerge() {
@@ -4743,6 +4868,76 @@ void TestCloneFile() {
         "a missing source fails with ENOENT");
 }
 
+void TestPchArgs() {
+  Section("args::CompilerArgs (precompiled headers)");
+  using core::Reason;
+
+  // gcc's spelling: a header language under -c.
+  auto gch = args::Parse({"g++", "-O2", "-x", "c++-header", "-c", "h.h", "-o", "h.h.gch"});
+  Check(gch.cacheable(), "a gcc .gch build is cacheable");
+  Check(gch.language == args::Language::kCxxHeader, "-x c++-header is the C++ header language");
+  Check(gch.produces_pch, "and produces a PCH");
+  CheckEq(gch.output, "h.h.gch", "the .gch is the output");
+  Check(args::Parse({"gcc", "-x", "c-header", "-c", "h.h", "-o", "h.h.gch"}).language ==
+            args::Language::kCHeader,
+        "-x c-header is the C header language");
+  Check(gch.key_args !=
+            args::Parse({"g++", "-O2", "-x", "c++", "-c", "h.h", "-o", "h.o"}).key_args,
+        "the header language is part of the key");
+
+  // CMake's clang spelling: -emit-pch passed to cc1, the header pulled in by a
+  // cc1 -include, and a .cxx stub as the input.
+  auto cmake = args::Parse({"clang++", "-O2", "-Xclang", "-fno-pch-timestamp", "-Xclang",
+                            "-emit-pch", "-Xclang", "-include", "-Xclang", "cmake_pch.hxx",
+                            "-x", "c++-header", "-o", "cmake_pch.hxx.pch", "-c",
+                            "cmake_pch.hxx.cxx"});
+  Check(cmake.cacheable(), "CMake's clang PCH build is cacheable");
+  CheckEq(cmake.source, "cmake_pch.hxx.cxx", "the -Xclang -include value is not a source");
+  CheckEq(cmake.output, "cmake_pch.hxx.pch", "the .pch is the output");
+  Check(cmake.produces_pch && cmake.xclang_emit_pch && cmake.pch_timestamp_disabled,
+        "-emit-pch and -fno-pch-timestamp are recognised through -Xclang");
+  Check(std::find(cmake.base_args.begin(), cmake.base_args.end(), "-emit-pch") ==
+            cmake.base_args.end(),
+        "-emit-pch is held out of the flags the preprocessor sees");
+  Check(std::find(cmake.key_args.begin(), cmake.key_args.end(), "-emit-pch") !=
+            cmake.key_args.end(),
+        "but stays in the key");
+
+  // -emit-pch on a source language still writes a PCH, not an object.
+  Check(args::Parse({"clang++", "-Xclang", "-emit-pch", "-c", "a.cc", "-o", "a.pch"})
+            .produces_pch,
+        "-Xclang -emit-pch makes any compile a PCH build");
+  Check(!args::Parse({"clang++", "-c", "a.cc", "-o", "a.o"}).produces_pch,
+        "an ordinary compile is not a PCH build");
+
+  auto no_output = args::Parse({"g++", "-x", "c++-header", "-c", "h.h"});
+  Check(!no_output.cacheable() && no_output.uncacheable->reason == Reason::kNoOutputFlag,
+        "a PCH build without -o is declined as no -o");
+  Check(!args::Parse({"g++", "-x", "c++-header", "-S", "h.h", "-o", "h.s"}).cacheable(),
+        "a header under -S is declined");
+  Check(!args::Parse({"clang++", "-x", "c++-header", "-c", "h.h", "-o", "h.pch", "-Xclang",
+                      "-fno-validate-pch"})
+             .cacheable(),
+        "-fno-validate-pch stays declined on a PCH build");
+  Check(!args::Parse({"g++", "-x", "c++-header", "-c", "h.h", "-o", "h.h.gch",
+                      "-fpch-preprocess"})
+             .cacheable(),
+        "-fpch-preprocess stays declined on a PCH build");
+
+  // Only clang's PCH holds header mtimes, and only without -fno-pch-timestamp.
+  Check(core::PchCarriesTimestamps(gch, /*is_clang=*/true) &&
+            !core::PchCarriesTimestamps(gch, /*is_clang=*/false),
+        "a clang PCH build without -fno-pch-timestamp carries timestamps; gcc's does not");
+  Check(!core::PchCarriesTimestamps(cmake, /*is_clang=*/true),
+        "-Xclang -fno-pch-timestamp removes them");
+  Check(!core::PchCarriesTimestamps(args::Parse({"clang++", "-c", "a.cc", "-o", "a.o"}),
+                                    /*is_clang=*/true),
+        "an ordinary clang compile is not affected");
+  CheckEq(core::Decision(Reason::kPchWithTimestamps, "h.pch").Describe(),
+          std::string("pch timestamps: h.pch"),
+          "the reason is logged and counted as pch timestamps");
+}
+
 void TestStats() {
   Section("core::Stats reasons");
   using core::Counter;
@@ -4754,7 +4949,8 @@ void TestStats() {
             old_stats.Get(Counter::kCacheMediaError) == 9,
         "a nine-line file from an older version parses positionally");
   Check(old_stats.reasons.empty(), "and has no reasons");
-  CheckEq(core::RenderStats(old_stats), old_format, "and renders back byte for byte");
+  CheckEq(core::RenderStats(old_stats), old_format + "0\n",
+          "and renders back with a zero manifest-hit counter after them");
 
   core::Stats stats;
   stats.Add(Counter::kMiss, 5);
@@ -4771,12 +4967,12 @@ void TestStats() {
         "a passthrough reason is counted on its own");
   const std::string rendered = core::RenderStats(stats);
   CheckEq(rendered,
-          "0\n0\n5\n3\n0\n0\n0\n1\n0\n"
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n"
           "reason\tlink\t1\n"
           "reason\tno rust dep-info\t1\n"
           "reason\tno temp dir\t1\n"
           "reason\tpreprocess only\t2\n",
-          "reason lines follow the nine positional counters");
+          "reason lines follow the ten positional counters");
   const core::Stats reparsed = core::ParseStats(rendered);
   Check(reparsed.reasons == stats.reasons &&
             std::equal(std::begin(reparsed.values), std::end(reparsed.values),
@@ -4794,7 +4990,7 @@ void TestStats() {
   Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
         "unknown trailing lines are ignored");
   CheckEq(core::RenderStats(extended),
-          old_format + "reason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          old_format + "0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
           "a reason this version does not know is carried through");
 
   const core::Stats damaged = core::ParseStats(old_format +
@@ -4825,6 +5021,15 @@ void TestStats() {
                    "  no rust dep-info    1\n"
                    "cache media errors  0\n") != std::string::npos,
         "preprocess failures are broken down too");
+  core::Stats manifest_stats;
+  manifest_stats.Add(Counter::kHitDisk, 3);
+  manifest_stats.Add(Counter::kManifestHit, 2);
+  Check(core::FormatStats(manifest_stats, "/c", 0, 1)
+                .find("cache hit (disk)    3\n"
+                      "cache hit (s3)      0\n"
+                      "manifest hits       2\n"
+                      "cache miss          0\n") != std::string::npos,
+        "--show-stats lists manifest hits under the hits they are part of");
   const std::string plain = core::FormatStats(core::Stats{}, "/c", 0, 1);
   Check(plain.find("passthrough") == std::string::npos && plain.find("\n  ") == std::string::npos,
         "--show-stats adds nothing while every reason is zero");
@@ -4849,7 +5054,7 @@ void TestStats() {
         "a link through the compile path is declined as link");
   Check(args::ParseRustc({"rustc", "--emit=link", "a.rs"}).uncacheable->reason == Reason::kNoOutDir,
         "rustc without --out-dir is declined as no --out-dir");
-  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoLinkOutput,
+  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoOutputFlag,
         "a link without -o is declined as no -o");
 }
 
@@ -5163,6 +5368,304 @@ void TestRustcFingerprint() {
   Age(copy, 100);
   CheckEq(rust::ResolveRustcFingerprint(copy, *scratch), first,
           "two rustc files with one banner share a fingerprint");
+}
+
+void TestFileDigestMemo() {
+  Section("hash::file digest memo");
+
+  auto scratch = util::MakeTempDir("vcache-filehash-memo-");
+  Check(scratch.has_value(), "file digest memo scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string memo_dir = hash::FileDigestMemoDir(*scratch);
+  auto memo_files = [&memo_dir]() { return util::ListFilesRecursive(memo_dir); };
+  auto overwrite_memos = [&memo_files](const std::string& text) {
+    for (const util::FileEntry& memo : memo_files()) util::WriteFileAtomic(memo.path, text);
+  };
+  // Every file below was written moments ago; this clock treats it as settled.
+  auto settled_now_ns = []() {
+    struct timespec now {};
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    return (static_cast<int64_t>(now.tv_sec) + 60) * 1'000'000'000;
+  };
+
+  const std::string rlib = *scratch + "/libdep.rlib";
+  util::WriteFileAtomic(rlib, std::string(3 << 20, 'r') + "tail");
+  const std::string real_digest = hash::HashFile(rlib).value_or("");
+
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a memoised digest equals HashFile");
+  Check(memo_files().size() == 1, "a settled file gets one memo");
+
+  const std::string planted(hash::kDigestHexLen, 'a');
+  overwrite_memos(planted);
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""), planted,
+          "the second lookup answers from the memo");
+
+  Age(rlib, 100);
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a file with a new mtime is hashed again");
+
+  overwrite_memos("short");
+  CheckEq(hash::HashFileMemoizedAt(rlib, memo_dir, settled_now_ns()).value_or(""),
+          real_digest, "a memo of the wrong length is ignored");
+
+  const std::string fresh_memo_dir = *scratch + "/fresh-filehash";
+  CheckEq(hash::HashFileMemoized(rlib, fresh_memo_dir).value_or(""), real_digest,
+          "a file changed within the last 2 s still gets its real digest");
+  Check(util::ListFilesRecursive(fresh_memo_dir).empty(),
+        "a file changed within the last 2 s gets no memo");
+
+  Check(!hash::HashFileMemoized(*scratch + "/absent.rlib", memo_dir).has_value(),
+        "a missing file has no digest");
+
+  // Trim drops memos untouched for 30 days and keeps younger ones.
+  const std::string cache = *scratch + "/cache";
+  const std::string stale_memo = hash::FileDigestMemoDir(cache) + "/stale";
+  const std::string young_memo = hash::FileDigestMemoDir(cache) + "/young";
+  util::WriteFileAtomic(stale_memo, planted);
+  util::WriteFileAtomic(young_memo, planted);
+  Age(stale_memo, 31 * 24 * 3600);
+  Age(young_memo, 29 * 24 * 3600);
+  storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/false);
+  disk.Trim();
+  Check(!util::FileExists(stale_memo), "trim removes a memo older than 30 days");
+  Check(util::FileExists(young_memo), "trim keeps a memo younger than 30 days");
+}
+
+void TestCxxManifest() {
+  Section("core::cxx manifest");
+
+  // Render and parse.
+  const std::string key_a(hash::kDigestHexLen, 'a');
+  const std::string key_b(hash::kDigestHexLen, 'b');
+  const std::string digest(hash::kDigestHexLen, 'd');
+  const std::vector<core::CxxManifestState> states = {
+      {key_a, {{"/vcache/proj/src/a.cc", digest}, {"/vcache/proj/inc/with space.h", digest}}},
+      {key_b, {}},
+  };
+  const std::string rendered = core::RenderCxxManifest(states);
+  std::vector<core::CxxManifestState> parsed;
+  Check(core::ParseCxxManifest(rendered, &parsed), "a rendered manifest parses");
+  Check(parsed.size() == 2 && parsed[0].result_key == key_a && parsed[1].result_key == key_b &&
+            parsed[0].files == states[0].files && parsed[1].files.empty(),
+        "and reads back every state and file, a path with a space included");
+  std::vector<core::CxxManifestState> rejected;
+  Check(!core::ParseCxxManifest("vcache-depmanifest-2\nentry " + key_a + "\n", &rejected),
+        "a dep-scan manifest is not read as a C/C++ manifest");
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\nstate abc\n", &rejected),
+        "a state with a short key is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\n" + digest + " /a.h\n", &rejected),
+        "a file line before any state is rejected");
+
+  // Key arguments.
+  const core::RootMap no_roots = MakeRoots({});
+  const auto key_args = [&no_roots](const std::vector<std::string>& argv) {
+    return util::Join(core::CxxManifestKeyArgs(args::Parse(argv), no_roots,
+                                               /*keep_link_args=*/false),
+                      "\n");
+  };
+  const std::string plain = key_args({"g++", "-O2", "-Iinc", "-c", "a.cc", "-o", "a.o"});
+  Check(plain != key_args({"g++", "-O2", "-Iother", "-c", "a.cc", "-o", "a.o"}),
+        "-I is key material, unlike in the preprocessor key");
+  Check(key_args({"g++", "-DX=1", "-c", "a.cc"}) != key_args({"g++", "-DX=2", "-c", "a.cc"}),
+        "-D is key material");
+  Check(key_args({"g++", "-include", "a.h", "-c", "a.cc"}) !=
+            key_args({"g++", "-include", "b.h", "-c", "a.cc"}),
+        "-include is key material");
+  CheckEq(plain, key_args({"g++", "-O2", "-Iinc", "-c", "a.cc", "-o", "elsewhere.o"}),
+          "the output path is not key material");
+  CheckEq(key_args({"g++", "-MD", "-MF", "a.d", "-c", "a.cc"}),
+          key_args({"g++", "-MD", "-MF", "b.d", "-c", "a.cc"}),
+          "the depfile path is not key material");
+  Check(key_args({"g++", "-MD", "-MT", "x.o", "-c", "a.cc"}) !=
+            key_args({"g++", "-MD", "-MT", "y.o", "-c", "a.cc"}),
+        "the depfile target is key material");
+  Check(key_args({"g++", "-c", "a.cc"}) != key_args({"g++", "-S", "a.cc"}),
+        "-c and -S are told apart");
+  CheckEq(key_args({"g++", "-c", "a.cc", "-L/opt/lib"}), key_args({"g++", "-c", "a.cc"}),
+          "a linker-only flag is dropped for gcc");
+  Check(util::Join(core::CxxManifestKeyArgs(args::Parse({"gcc", "-B/home/a/proj/bin", "-c", "a.c"}),
+                                            MakeRoots({"/home/a/proj=proj"}), false),
+                   " ")
+            .find("-B/vcache/proj/bin") == std::string::npos,
+        "a joined -B path is not canonicalised");
+  CheckEq(util::Join(core::CxxManifestKeyArgs(
+                         args::Parse({"g++", "-I/home/a/proj/inc", "-c", "a.cc"}),
+                         MakeRoots({"/home/a/proj=proj"}), false),
+                     "\n"),
+          util::Join(core::CxxManifestKeyArgs(
+                         args::Parse({"g++", "-I/home/b/proj/inc", "-c", "a.cc"}),
+                         MakeRoots({"/home/b/proj=proj"}), false),
+                     "\n"),
+          "include paths under per-checkout roots canonicalise alike");
+
+  // Time macros.
+  Check(core::FindTimeMacro("const char* t = __TIME__;").value_or("") == "__TIME__",
+        "__TIME__ is found");
+  Check(core::FindTimeMacro("x(__DATE__)").value_or("") == "__DATE__", "__DATE__ is found");
+  Check(core::FindTimeMacro("x(__TIMESTAMP__)").value_or("") == "__TIMESTAMP__",
+        "__TIMESTAMP__ is found");
+  Check(!core::FindTimeMacro("int __TIME = 1; __LINE__ __FILE__").has_value(),
+        "other macros and near misses are not");
+
+  auto scratch = util::MakeTempDir("vcache-cxx-manifest-");
+  Check(scratch.has_value(), "cxx manifest scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string& dir = *scratch;
+  const std::string memo_dir = dir + "/memo";
+
+  // PCH identity, in order of preference.
+  const std::string pch = dir + "/h.pch";
+  util::WriteFileAtomic(pch, "pch bytes");
+  Age(pch, 100);
+  const std::string bytes_identity = core::PchIdentity(pch, memo_dir).value_or("");
+  CheckEq(bytes_identity, "bytes " + hash::HashString("pch bytes"),
+          "a PCH with no side file is identified by its bytes");
+  util::WriteFileAtomic(pch + ".vcache-key", std::string(hash::kDigestHexLen, 'k') + "\n");
+  Check(util::StartsWith(core::PchIdentity(pch, memo_dir).value_or(""), "vcache-key "),
+        "a .vcache-key beside it is preferred to the bytes");
+  util::WriteFileAtomic(pch + ".sum", "0123abcd  -\n");
+  CheckEq(core::PchIdentity(pch, memo_dir).value_or(""),
+          "sum " + hash::HashString("0123abcd  -\n"), "a .sum is preferred to both");
+  Age(pch + ".sum", 200);
+  Check(util::StartsWith(core::PchIdentity(pch, memo_dir).value_or(""), "vcache-key "),
+        "a .sum older than the PCH is ignored");
+  Age(pch + ".vcache-key", 200);
+  CheckEq(core::PchIdentity(pch, memo_dir).value_or(""), bytes_identity,
+          "so is a .vcache-key older than the PCH");
+  util::WriteFileAtomic(pch + ".sum", "\n");
+  CheckEq(core::PchIdentity(pch, memo_dir).value_or(""), bytes_identity,
+          "an empty .sum is ignored");
+  Check(!core::PchIdentity(dir + "/absent.pch", memo_dir).has_value(),
+        "a missing PCH has no identity");
+
+  // Which PCHs a command consumes.
+  util::MakeDirs(dir + "/inc");
+  util::WriteFileAtomic(dir + "/inc/g.h.gch", "gch");
+  util::WriteFileAtomic(dir + "/l.h.pch", "pch");
+  const auto consumed = [&dir](const std::vector<std::string>& argv) {
+    return util::Join(core::FindConsumedPchs(args::Parse(argv), dir).paths, " ");
+  };
+  CheckEq(consumed({"clang++", "-include-pch", "x.pch", "-c", "a.cc"}), dir + "/x.pch",
+          "-include-pch names its PCH, relative to the working directory");
+  CheckEq(consumed({"clang++", "-Xclang", "-include-pch", "-Xclang", "/abs/y.pch", "-c",
+                    "a.cc"}),
+          "/abs/y.pch", "so does -Xclang -include-pch -Xclang");
+  CheckEq(consumed({"g++", "-I", "inc", "-include", "g.h", "-c", "a.cc"}),
+          dir + "/inc/g.h.gch", "-include finds a .gch beside the header on the include path");
+  CheckEq(consumed({"clang++", "-includel.h", "-c", "a.cc"}), dir + "/l.h.pch",
+          "the joined -include spelling finds a .pch in the working directory");
+  CheckEq(consumed({"g++", "-include", "plain.h", "-c", "a.cc"}), "",
+          "an -include with no PCH beside it consumes none");
+  util::MakeDirs(dir + "/multi.h.gch");
+  Check(!core::FindConsumedPchs(args::Parse({"g++", "-include", "multi.h", "-c", "a.cc"}), dir)
+             .unsupported.empty(),
+        "a .gch directory is unsupported");
+
+  // Recording what a compile read.
+  util::WriteFileAtomic(dir + "/a.cc", "#include \"a.h\"\n");
+  util::WriteFileAtomic(dir + "/a.h", "int a;\n");
+  util::WriteFileAtomic(dir + "/t.h", "const char* t = __TIMESTAMP__;\n");
+  util::WriteFileAtomic(dir + "/bin.h", "asm(\".incbin \\\"x\\\"\");\n");
+  const core::RootMap roots = MakeRoots({dir + "=proj"});
+  const int64_t later_ns = (static_cast<int64_t>(std::time(nullptr)) + 60) * 1'000'000'000;
+  const auto record = [&](const std::string& depfile, int64_t started_ns, bool incbin) {
+    return core::RecordDepfileInputs(core::ParseDepFile(depfile).value_or(core::DepFile{}), dir,
+                                     roots, started_ns, incbin);
+  };
+  const core::RecordedInputs good = record("a.o: a.cc " + dir + "/a.h a.cc\n", later_ns, true);
+  Check(good.declined.empty() && good.files.size() == 2, "a depfile's files are recorded once");
+  Check(!good.files.empty() && good.files[0].first == "/vcache/proj/a.cc" &&
+            good.files[0].second == hash::HashString("#include \"a.h\"\n"),
+        "relative paths are recorded absolute and canonical, with their digest");
+  Check(!record("a.o: a.cc t.h\n", later_ns, false).declined.empty(),
+        "a file using a time macro declines the state");
+  Check(record("a.o: a.cc bin.h\n", later_ns, false).declined.empty(),
+        ".incbin is allowed when the preprocessed text was checked");
+  Check(!record("a.o: a.cc bin.h\n", later_ns, true).declined.empty(),
+        "and declines the state when it was not");
+  Check(!record("a.o: a.cc gone.h\n", later_ns, false).declined.empty(),
+        "an unreadable file declines the state");
+  Check(!record("a.o: a.cc a.h\n", 0, false).declined.empty(),
+        "a file changed after the compile started declines the state");
+
+  // gcc picks up a .gch beside an #include without naming it.
+  Check(core::FindUnkeyedGch({dir + "/inc"}, {}).value_or("") == dir + "/inc/g.h.gch",
+        "a .gch on the include path is found");
+  Check(!core::FindUnkeyedGch({dir + "/inc"}, {dir + "/inc/g.h.gch"}).has_value(),
+        "unless the key already covers it");
+  Check(!core::FindUnkeyedGch({dir + "/absent"}, {}).has_value(),
+        "a directory that does not exist has none");
+
+  // gcc's depfile leaves out a header __has_include only probed.
+  util::WriteFileAtomic(dir + "/probe.h", "#if __has_include(\"opt.h\")\n#endif\n");
+  const core::RecordedInputs probes =
+      record("a.o: a.cc probe.h a.h\n", later_ns, false);
+  Check(probes.probing_files.empty(), "probes are not listed unless asked for");
+  const core::RecordedInputs listed = core::RecordDepfileInputs(
+      core::ParseDepFile("a.o: a.cc probe.h a.h\n").value_or(core::DepFile{}), dir, roots,
+      later_ns, false, /*find_probes=*/true);
+  CheckEq(util::Join(listed.probing_files, " "), dir + "/probe.h",
+          "a file using __has_include is listed when asked for");
+
+  const std::string verbose =
+      "ignoring nonexistent directory \"/x\"\n"
+      "#include \"...\" search starts here:\n"
+      " /quoted\n"
+      "#include <...> search starts here:\n"
+      " /usr/lib/gcc/x86_64-redhat-linux/16/../../../../include/c++/16\n"
+      " /usr/local/include\n"
+      " /usr/include\n"
+      "End of search list.\n";
+  const std::vector<std::string> system_dirs = core::ParseSystemIncludeDirs(verbose);
+  CheckEq(util::Join(system_dirs, " "), "/usr/include/c++/16 /usr/local/include /usr/include",
+          "the compiler's <...> directories are read from -E -v, normalised");
+  Check(core::ParseSystemIncludeDirs("#include <...> search starts here:\n /usr/include\n")
+            .empty(),
+        "a list with no end is not trusted");
+  Check(core::UnderAnyDir("/usr/lib/gcc/x86_64-redhat-linux/16/../../../../include/c++/16/cstdint",
+                          system_dirs),
+        "a header under one of them is recognised through ..");
+  Check(!core::UnderAnyDir("/usr/includes/x.h", system_dirs) &&
+            !core::UnderAnyDir(dir + "/probe.h", system_dirs),
+        "a sibling with a longer name and a project header are not");
+
+  // CPATH and friends add include directories, so a .gch can sit there too.
+  ::setenv("CPATH", (dir + "/inc::rel").c_str(), 1);
+  CheckEq(util::Join(core::CxxIncludeDirs(args::Parse({"g++", "-Ione", "-c", "a.cc"}), dir), " "),
+          dir + "/one " + dir + "/inc " + dir + " " + dir + "/rel",
+          "CPATH's directories follow the command line's, an empty one naming the cwd");
+  CheckEq(core::FindConsumedPchs(args::Parse({"g++", "-include", "g.h", "-c", "a.cc"}), dir)
+              .paths.empty()
+              ? std::string("none")
+              : core::FindConsumedPchs(args::Parse({"g++", "-include", "g.h", "-c", "a.cc"}), dir)
+                    .paths.front(),
+          dir + "/inc/g.h.gch", "-include finds a .gch in a CPATH directory");
+  ::unsetenv("CPATH");
+
+  // The include-directory memos go with --trim's age rule and with --clear.
+  const std::string cache = dir + "/cache";
+  const std::string stale_memo = core::SystemIncludeMemoDir(cache) + "/stale";
+  const std::string young_memo = core::SystemIncludeMemoDir(cache) + "/young";
+  util::WriteFileAtomic(stale_memo, "/usr/include\n");
+  util::WriteFileAtomic(young_memo, "/usr/include\n");
+  Age(stale_memo, 31 * 24 * 3600);
+  Age(young_memo, 29 * 24 * 3600);
+  storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/false);
+  disk.Trim();
+  Check(!util::FileExists(stale_memo), "trim removes an include-directory memo older than 30 days");
+  Check(util::FileExists(young_memo), "trim keeps a younger one");
+  Check(disk.Clear() && !util::FileExists(young_memo), "clear removes the include-directory memos");
 }
 
 void TestRustOutputNames() {
@@ -5993,6 +6496,7 @@ int main(int argc, char** argv) {
   TestDepFile();
   TestDepFileEnvDeps();
   TestPreprocessedNormalization();
+  TestPreprocessedHashSlicing();
   TestBlob();
   TestBlobSidecars();
   TestCacheChain();
@@ -6013,6 +6517,7 @@ int main(int argc, char** argv) {
   TestLinkArgs();
   TestCompilerArgs();
   TestClangArgs();
+  TestPchArgs();
   TestDepScanKeyArgs();
   TestRustcArgs();
   TestSigV4();
@@ -6046,6 +6551,8 @@ int main(int argc, char** argv) {
   TestCost();
   TestMemoryEstimates();
   TestRustcFingerprint();
+  TestFileDigestMemo();
+  TestCxxManifest();
   TestRustOutputNames();
   TestHashAndScanFile();
   TestUploadGeneration();

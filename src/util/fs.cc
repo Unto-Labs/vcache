@@ -235,9 +235,12 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
     }
     written += static_cast<size_t>(n);
   }
-  // Cache entries must survive a crash intact, so flush before the rename.
-  // A cost file is a statistic: losing it costs an estimate, not a wrong object.
-  // A restored output is as durable as the compiler's own, which is not flushed.
+  // Cache entries and memos must survive a crash intact, so flush before the
+  // rename: a torn entry would be served to every later build. A build output
+  // vcache writes into the tree is not worth the fsync, nor the slower rename
+  // that follows one: it can be restored from the cache again, and after a
+  // crash the build tool re-checks it like anything else it produced. A cost
+  // file is a statistic: losing it costs an estimate, not a wrong object.
   if (ok && durable && ::fsync(fd) != 0) {
     saved_errno = errno;
     ok = false;
@@ -267,7 +270,7 @@ bool LinkOrCopy(const std::string& from, const std::string& to) {
 
   auto data = ReadFile(from);
   if (!data) return false;
-  return WriteFileAtomic(to, *data);
+  return WriteFileAtomic(to, *data, /*durable=*/false);
 }
 
 std::optional<std::string> CloneToTempBeside(const std::string& from, const std::string& beside) {
@@ -390,6 +393,12 @@ std::optional<int64_t> FileMtime(const std::string& path) {
   const struct timespec mtime = StatMtime(st);
   return static_cast<int64_t>(mtime.tv_sec) * 1000000000 +
          static_cast<int64_t>(mtime.tv_nsec);
+}
+
+int64_t NowUnixNs() {
+  struct timespec now {};
+  ::clock_gettime(CLOCK_REALTIME, &now);
+  return static_cast<int64_t>(now.tv_sec) * 1000000000 + static_cast<int64_t>(now.tv_nsec);
 }
 
 std::optional<std::string> RealPath(const std::string& path) {

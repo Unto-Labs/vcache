@@ -77,10 +77,11 @@ using core::RootMap;
 constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v4";
 constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v2";
 
-// Provisional. On a measured store, outputs of 8 MiB or more were 9% of the
-// files and 66% of the bytes; every sidecar is one more file for the trimmer
-// to stat on each walk.
-constexpr uint64_t kSidecarMinBytes = 8ull << 20;
+// Measured on a sunbird dev build: thresholds of 1, 2 and 4 MiB gave the same
+// warm build, 8 MiB and above a slower one, and the trimmer's walk did not
+// move. 4 MiB takes the gain with the fewest files that can be evicted apart
+// from their entry (docs/design.md, "Restoring outputs").
+constexpr uint64_t kSidecarMinBytes = 4ull << 20;
 const std::string kSidecarSuffix = "rustout";
 
 // Sidecars live only in the disk cache, so an entry that can reach S3 keeps

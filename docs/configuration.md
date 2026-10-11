@@ -535,7 +535,7 @@ it.
 `vcache --trim` sweeps every shard on demand; `vcache --clear` empties the cache
 and resets counters.
 
-Link outputs, and Rust outputs of 8 MiB or more, are stored beside the entries
+Link outputs, and Rust outputs of 4 MiB or more, are stored beside the entries
 as `<digest>.linkout` and `<digest>.rustout` files in the same shards, and a
 hit clones them (a reflink where the filesystem supports one) and hashes the
 clone before publishing it. They count against `size` like entries. Rust keeps

@@ -304,7 +304,7 @@ far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
 
 **Sidecar files.** Some outputs are too large to carry inside an entry. A link
-output, and a Rust output of 8 MiB or more other than its `.d`, is kept in the
+output, and a Rust output of 4 MiB or more other than its `.d`, is kept in the
 disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
 (`linkout`, `rustout`), and the entry names it by digest (a `kFile` section for
 link, a `kSidecarFile` section for Rust). Both go through `DiskStorage::PutFile`
@@ -451,6 +451,24 @@ entries a warm build reads shrink from 5.0 GB to 0.7 GB, which is where "hit
 total" falls. The sidecars ran from 8.1 MiB to 1,056 MiB, median 13.4 MiB.
 `HashFile` on the largest took 0.13–0.15 s from the page cache and 0.36–0.38 s
 with its pages dropped first (NVMe), three runs each.
+
+The threshold was then varied from 1 MiB to 32 MiB on the same build, one fill
+and three interleaved warm builds per variant, 343 hits each (median, range):
+
+| threshold | sidecars after one fill | warm build, wall | summed "hit total" | `--trim` walk |
+|---|---|---|---|---|
+| 1 MiB | 249 | 4.3 s (3.9–5.5) | 10.0 s | 8 ms |
+| 2 MiB | 170 | 4.0 s (3.8–5.4) | 11.7 s | 27 ms |
+| 4 MiB | 135 | 4.5 s (3.8–4.7) | 11.8 s | 33 ms |
+| 8 MiB | 55 | 7.6 s (5.5–8.1) | 14.7 s | 27 ms |
+| 16 MiB | 24 | 7.5 s (5.4–8.8) | 18.7 s | 29 ms |
+| 32 MiB | 12 | 7.0 s (6.1–8.2) | 31.5 s | 29 ms |
+
+1, 2 and 4 MiB are one group and 8 MiB and above another; the trim walk, the
+reason 8 MiB was first chosen, is noise beside a 40 GB store that already holds
+about 17,000 files. 4 MiB takes the gain with the fewest sidecars, each of which
+is evicted on its own mtime (below). The medians overlap at the edges and the
+host was busy, so the choice rests on the grouping, not on the 1–4 MiB order.
 
 ## Incoming prefix-map flags
 

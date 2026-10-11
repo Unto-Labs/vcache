@@ -12,7 +12,7 @@
 // Outputs are captured by compiling into a temporary directory and recording
 // everything that appears there, which avoids having to model rustc's naming
 // rules for rlib/rmeta/dSYM artifacts. A miss moves them into the output
-// directory by rename. With a disk cache and no S3, an output of 8 MiB or more
+// directory by rename. With a disk cache and no S3, an output of 4 MiB or more
 // is stored beside the entry as a content-addressed sidecar and restored by
 // reflink, instead of travelling through the entry and memory.
 #pragma once

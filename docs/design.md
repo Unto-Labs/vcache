@@ -157,36 +157,51 @@ costs the compile nothing measurable. Of the trace, these are dropped:
 - the tracer, this compile's scratch directory (the object, the depfile, the
   trace), and the PCHs the key already identifies, whose bytes may differ
   between trees that share one identity;
-- the compiler's installation: the prefix of each executable that ran (the
-  parent of its `bin/`, or what precedes `/libexec/`; `/usr` for the system
-  compilers), also as spelled through a symlink at the top of the filesystem
-  (`/lib64` on a merged `/usr`), and the shared objects the processes loaded
-  (the tracer's `L` records). The compiler fingerprint stands for these, and
-  hashing a 100 MB `libLLVM` on every record buys nothing. A prefix that is `/`
-  or holds the working directory, the source's directory or a root gives only
-  its `lib*/gcc`, `libexec/gcc` and `lib/clang` trees;
+- the compiler itself: the executables that ran, the shared objects they
+  loaded (the tracer's `L` records), and the compiler's own trees,
+  `lib*/gcc`, `libexec/gcc` and `lib/clang` under the prefix of each
+  executable (the parent of its `bin/`, or what precedes `/libexec/`), also as
+  spelled through a symlink at the top of the filesystem (`/lib64` on a merged
+  `/usr`). The compiler fingerprint stands for these, and hashing a 100 MB
+  `libLLVM` on every record buys nothing. Nothing under an include directory is
+  dropped this way, the compiler's own (as `<compiler> -E -v` lists them)
+  included: `/usr/include` and `/usr/local/include` change with the packages
+  installed, not with the compiler, so the prefix itself is never dropped;
 - files opened for writing only (`W`) and directories;
-- absent paths directly in a `PATH` directory: gcc's driver looks for itself
-  along `PATH`, and which compiler runs is the compiler identity's business.
+- absent paths directly in a `PATH` directory that are named as one of the
+  compiler's executables (`as`, `cc1`, the driver's own name and so on): gcc's
+  driver looks for itself and its tools along `PATH`, and which ones run is the
+  compiler identity's business. A header probed in a `PATH` directory stays.
 
-A traced file that is gone when the state is recorded declines it, unless it
-sat directly in the temporary directory, where gcc writes its assembly
-intermediate; one changed at or after the compile started declines it as a
+The trace is used only when every file the depfile names, the source among
+them, is among its reads. A compiler process that did not load the tracer (a
+static or setuid binary, another ELF class, a `-B` wrapper that drops
+`LD_PRELOAD`) records nothing, so a trace without its reads says nothing about
+what it probed. A traced file that is gone when the state is recorded declines
+it, unless the trace wrote it as well as read it, as cc1 writes the assembly
+file `as` reads; one changed at or after the compile started declines it as a
 depfile's does. A traced file is not scanned for time macros or `.incbin`: the
 preprocessor did not read it. Each absent path is stored as the highest of its
 ancestors that does not exist either: nothing can appear below a missing
-directory without it appearing too, and gcc, which probes every header in every
-`-I` directory, would otherwise record 1964 paths for `src/daemon/server.cc`
-where it now records 484 (clang, which skips a missing directory, records 535).
-A path through `..` is stored as probed, since resolving it could cross a
-symlink. Absent paths are canonicalised through the roots like files, so a tree
-at another path checks its own.
+directory without it appearing too, and gcc probes every header in every `-I`
+directory. For `src/daemon/server.cc` a state holds 1091 absent paths under gcc
+and 902 under clang. The walk stops at the working directory and at every
+root: above a root the path would name this tree's location, and a tree whose
+root exists would check that location instead of its own. A path through `..`
+is stored as probed, since resolving it could cross a symlink, and is compared
+with what was read as spelled. Absent paths are canonicalised through the roots
+like files, so a tree at another path checks its own.
 
 The state comes from the depfile alone, and the log says why, when tracing is
 off (`cxx_manifest_trace`), when there is no tracer (no `vcache-fstrace.so`
-beside the binary, `VCACHE_TRACER` naming nothing, a host other than Linux),
-when `LD_PRELOAD` is already set, and when the trace is marked incomplete, does
-not parse or names no process, which means the tracer was not loaded.
+beside the binary, `VCACHE_TRACER` naming nothing or something that is not an
+ELF shared object of vcache's own class and machine, a host other than Linux),
+when `LD_PRELOAD` is already set, when no process loaded the tracer, when the
+trace is marked incomplete, does not parse or names no process, when the
+compiler's include directories cannot be listed, and when the trace does not
+show a file the depfile names being read. A compile whose stderr carries
+ld.so's "cannot be preloaded" message is not stored at all: the entry would
+replay it on every hit.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -231,7 +246,8 @@ declines the state, since a state with nothing to check would always match.
 From the depfile alone under gcc, a file outside the compiler's own include
 directories (as `<compiler> -E -v` lists them, memoised under `<cache>/sysinc/`)
 whose bytes use `__has_include` declines it too: clang's depfile names a header
-that was only probed, gcc's does not, and the trace sees both. For a derived
+`__has_include` found and no `#include` read, gcc's does not, and the trace sees
+both. For a derived
 key, `.incbin` declines it as well, since
 no preprocessed text was checked for it. A declined state leaves the entry
 stored under the preprocessor key as usual.
@@ -242,16 +258,18 @@ path than a recorded one, or one a `__has_include` would now find, changes
 nothing a depfile recorded; a recorded absent path that now exists rejects the
 state. The other side, a header `__has_include` (or `__has_include_next`) found
 but no `#include` read, is among the trace's files, as it is in clang's
-depfile, so deleting it rejects the state too. Inside the compiler's
-installation neither is recorded, on the assumption that it changes only with
-the toolchain or the distribution, which the compiler fingerprint follows.
+depfile, so deleting it rejects the state too. This holds in the system's
+include directories as well: a `-devel` package installed or removed changes
+`/usr/include`. Only the compiler's own trees outside every include directory
+are left out, on the assumption that they change only with the compiler, which
+its fingerprint follows.
 
 **From the depfile alone.** Without the trace the shadowing hole is back: a new
 header that would be found earlier on the include path than a recorded one is
 invisible, so a lookup can still hit with the old answer until something
 recorded changes. ccache's direct and depend modes have the same hole and
 document it, as does `dep_scan` here. The deleted-file case stays covered: clang
-lists a header that was only probed in its depfile, and under gcc the
+lists a header `__has_include` found in its depfile, and under gcc the
 `__has_include` rule above declines such states. A system header that probes is
 exempt, on the same assumption about the compiler's own include directories.
 

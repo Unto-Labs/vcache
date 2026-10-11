@@ -928,11 +928,12 @@ byte of the object and leaves no file in the tree. The compile runs with
 `vcache-fstrace.so` preloaded, as a cached link does, and the trace adds the
 files the compiler opened that the depfile does not name (a header
 `__has_include` found, a `.gch` gcc used, a driver config file) and the paths
-it probed and did not find. The compiler's own installation is left out of
-both, as are the shared objects it loads: the compiler fingerprint stands for
-them. On `src/daemon/server.cc` a state holds 484 absent paths under g++ and
-535 under clang++, and a hit takes 7.4 ms and 6.6 ms, against 7.2 ms and
-6.1 ms with none. The result is stored under the ordinary
+it probed and did not find, the system's include directories included. The
+compiler's executables, the shared objects they load and its own trees
+(`lib*/gcc`, `libexec/gcc`, `lib/clang`) outside every include directory are
+left out: the compiler fingerprint stands for them. On `src/daemon/server.cc` a
+state holds 1091 absent paths under g++ and 902 under clang++, and a hit takes
+5.9 ms and 6.1 ms, against 5.0 ms and 5.7 ms with none. The result is stored under the ordinary
 preprocessor key, so a tree with `cxx_manifest` off hits entries a tree with it
 on stored, and the reverse. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
@@ -961,10 +962,13 @@ from:
 
 A state comes from the depfile alone, with a `cxx manifest: ... recording from
 the depfile` log line that says why, whenever the trace is not available too:
-no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), a
-host other than Linux, `LD_PRELOAD` already set, or a trace the tracer marked
-incomplete, that does not parse, or that names no process because the tracer
-was never loaded (a statically linked compiler).
+no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), one
+that is not an ELF shared object of vcache's own class and machine, a host
+other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
+(a statically linked compiler), a trace the tracer marked incomplete or that
+does not parse, or a trace that does not show every file the depfile names
+being read: a compiler process that did not load the tracer (another ELF class,
+a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:
@@ -978,14 +982,16 @@ says why:
 - A file that changed after the compile started, which may not be the version
   the compile read.
 - A file the compiler read, by the trace, that is gone by the time the state
-  is recorded, other than its own intermediate in the temporary directory.
+  is recorded, other than an intermediate it also wrote.
+- ld.so's "cannot be preloaded" message on the compile's stderr: nothing is
+  stored, since an entry would replay it.
 - From the depfile alone under gcc, a `.gch` in a directory an `#include` could
   have searched that the command line does not name: gcc uses it without
   listing it or its header in the depfile. The trace sees it.
 - From the depfile alone under gcc, a file outside the compiler's own include
   directories that uses `__has_include`. gcc's depfile does not name a header
-  that was only probed, so deleting it would go unseen; clang's does, and the
-  trace does.
+  `__has_include` found and no `#include` read, so deleting it would go unseen;
+  clang's does, and the trace does.
 
 Under gcc that last rule matters in practice. Without the trace, a translation
 unit whose headers use `__has_include` outside the compiler's own include
@@ -993,11 +999,11 @@ directories records no state and stays on the preprocessor; Boost's config
 headers are one common source, as is any header on `CPATH` or
 `C_INCLUDE_PATH`, which vcache does not count as the compiler's own. With the
 trace such a unit records a state: `src/core/depfile.cc`, which includes Boost,
-hits in 9.8 ms where the preprocessor took 291 ms. The compiler's own
+hits in 9.1 ms where the preprocessor took 250 ms. The compiler's own
 directories come from `<compiler> -E -v`, run without the `CPATH` family and
 memoised under `<dir>/sysinc/`, which `--trim` prunes like `filehash/` and
 `--clear` empties. clang is unaffected: its depfile lists the files
-`__has_include` probed.
+`__has_include` found.
 
 **Precompiled headers.** Neither compiler's depfile names the PCH it loaded,
 so each PCH the command names (`-include-pch F`, `-Xclang -include-pch -Xclang
@@ -1023,8 +1029,9 @@ file's digest, as ccache's depend mode keys every result. Only a manifest
 lookup can find that entry.
 
 **The limitation worth knowing.** A header created inside the compiler's own
-installation (under `/usr` for the system compilers) is not seen: the trace
-leaves the installation to the compiler fingerprint. From the depfile alone the
+trees but outside its include directories (say `/usr/lib/gcc/<target>/<n>/`
+itself) is not seen: the trace leaves those trees to the compiler
+fingerprint. From the depfile alone the
 limitation is the one `dep_scan` has, and ccache's direct and depend modes
 have: a depfile names the files a compile read, not the paths it probed and did
 not find. Create a header that shadows one earlier on the include path, change

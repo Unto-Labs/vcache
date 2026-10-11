@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/link_trace.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 
 #include "util/fs.h"
 #include "util/str.h"
@@ -86,6 +89,32 @@ std::string TracerPath() {
   auto self = util::SelfPath();
   if (!self) return "";
   return util::DirName(*self) + "/vcache-fstrace.so";
+}
+
+bool TracerLoadsHere(const std::string& tracer) {
+  // e_ident's class and data bytes, e_type and e_machine all sit in the first
+  // 20 bytes, at the same offsets in both classes.
+  const auto header = [](const std::string& path) -> std::optional<std::string> {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::nullopt;
+    std::string bytes(20, '\0');
+    const ssize_t got = ::read(fd, bytes.data(), bytes.size());
+    ::close(fd);
+    if (got != static_cast<ssize_t>(bytes.size()) || bytes.compare(0, 4, "\x7f" "ELF") != 0) {
+      return std::nullopt;
+    }
+    return bytes;
+  };
+  const std::optional<std::string> self = util::SelfPath();
+  if (!self) return false;
+  const std::optional<std::string> ours = header(*self);
+  const std::optional<std::string> theirs = header(tracer);
+  if (!ours || !theirs) return false;
+  constexpr char kSharedObjectType = 3;  // ET_DYN
+  const bool little_endian = (*theirs)[5] == 1;
+  const char type = (*theirs)[little_endian ? 16 : 17];
+  return (*ours)[4] == (*theirs)[4] && (*ours)[5] == (*theirs)[5] &&
+         ours->compare(18, 2, *theirs, 18, 2) == 0 && type == kSharedObjectType;
 }
 
 bool ParseTraceLog(const std::string& log_path,

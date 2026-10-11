@@ -13,7 +13,10 @@
  *   M  a path probed and not found (ENOENT)         -- its ABSENCE is an input
  *   P  an executable that ran                       -- part of the toolchain
  *   L  a shared object a process that ran loaded    -- part of the toolchain
- *   W  a path opened for writing only               -- an output, not an input
+ *   W  a path opened for writing only               -- an output; a C/C++
+ *                                                       manifest drops it, the
+ *                                                       link cache keeps it as
+ *                                                       an input all the same
  *   D  a directory that was listed
  *
  * The second is the half a "record what was read" manifest cannot express, and

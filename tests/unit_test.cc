@@ -3,6 +3,7 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -280,6 +281,27 @@ void TestLinkTraceClassification() {
   util::WriteFileAtomic(log + ".incomplete", "");
   Check(core::TraceMarkedIncomplete(log), "the marker beside it makes it incomplete");
   util::RemoveFile(log + ".incomplete");
+
+  // Only a shared object ld.so would load into this binary is preloaded.
+  Dl_info libc_info{};
+  const bool found_libc =
+      ::dladdr(::dlsym(RTLD_DEFAULT, "getpid"), &libc_info) != 0 && libc_info.dli_fname;
+  Check(found_libc && core::TracerLoadsHere(libc_info.dli_fname),
+        "a shared object this binary loaded can be preloaded");
+  Check(!core::TracerLoadsHere(dir + "/missing.so"), "a missing tracer cannot");
+  util::WriteFileAtomic(dir + "/text.so", "not an ELF file at all\n");
+  Check(!core::TracerLoadsHere(dir + "/text.so"), "nor can a file that is not ELF");
+  if (found_libc) {
+    const std::string elf = util::ReadFile(libc_info.dli_fname).value_or("");
+    std::string other_class = elf.substr(0, 64);
+    other_class[4] = other_class[4] == 1 ? 2 : 1;
+    util::WriteFileAtomic(dir + "/class.so", other_class);
+    Check(!core::TracerLoadsHere(dir + "/class.so"), "nor one of the other ELF class");
+    std::string executable = elf.substr(0, 64);
+    executable[16] = 2;  // ET_EXEC
+    util::WriteFileAtomic(dir + "/exec.so", executable);
+    Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
+  }
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
@@ -5467,46 +5489,55 @@ void TestCxxManifestTrace() {
   } guard{*scratch};
   const std::string& dir = *scratch;
 
-  // The compiler's installation, from the executables that ran.
+  // The compiler's own trees, from the executables that ran, wherever they are.
+  const std::string gcc14_trees =
+      "/opt/gcc-14/lib/clang /opt/gcc-14/lib/gcc /opt/gcc-14/lib32/gcc /opt/gcc-14/lib64/gcc "
+      "/opt/gcc-14/libexec/gcc /opt/gcc-14/libx32/gcc";
   CheckEq(util::Join(core::CompilerInstallDirs(
                          {"/opt/gcc-14/bin/g++",
-                          "/opt/gcc-14/libexec/gcc/x86_64-linux-gnu/14/cc1plus"},
-                         {"/home/u/proj"}),
+                          "/opt/gcc-14/libexec/gcc/x86_64-linux-gnu/14/cc1plus"}),
                      " "),
-          "/opt/gcc-14", "a bin/ or libexec/ executable names the prefix above it");
-  CheckEq(util::Join(core::CompilerInstallDirs({"/opt/tc/clang"}, {"/home/u/proj"}), " "),
-          "/opt/tc", "an executable outside bin/ names its own directory");
-  CheckEq(util::Join(core::CompilerInstallDirs({"/home/u/proj/bin/gcc"}, {"/home/u/proj"}), " "),
-          "/home/u/proj/lib/clang /home/u/proj/lib/gcc /home/u/proj/lib32/gcc "
-          "/home/u/proj/lib64/gcc /home/u/proj/libexec/gcc /home/u/proj/libx32/gcc",
-          "a prefix holding the project gives only its compiler trees");
-  CheckEq(util::Join(core::CompilerInstallDirs({"/home/u/proj/tc/bin/gcc"}, {"/home/u/proj/src"}),
-                     " "),
-          "/home/u/proj/tc", "a prefix beside the project is whole");
-  Check(core::CompilerInstallDirs({"/gcc"}, {}).size() == 6,
-        "the root directory as a prefix gives only the compiler trees");
+          gcc14_trees, "a bin/ or libexec/ executable names the trees under the prefix above it");
+  CheckEq(util::Join(core::CompilerInstallDirs({"/opt/gcc-14/clang"}), " "), gcc14_trees,
+          "an executable outside bin/ names the trees under its own directory");
+  const std::vector<std::string> usr_trees = core::CompilerInstallDirs({"/usr/bin/gcc"});
+  Check(std::find(usr_trees.begin(), usr_trees.end(), "/usr/lib/gcc") != usr_trees.end() &&
+            std::none_of(usr_trees.begin(), usr_trees.end(),
+                         [](const std::string& tree) { return tree == "/usr"; }),
+        "a compiler in /usr gives /usr/lib/gcc, never /usr itself");
 
-  // Directories on PATH, less the project's.
-  CheckEq(util::Join(core::SearchPathDirs("/usr/bin::rel:/home/u/proj/bin/:/home/u/bin",
-                                          {"/home/u/proj/bin"}),
-                     " "),
-          "/usr/bin /home/u/bin", "PATH loses empty, relative and project entries");
+  CheckEq(util::Join(core::SearchPathDirs("/usr/bin::rel:/home/u/bin/"), " "),
+          "/usr/bin /home/u/bin", "PATH loses empty and relative entries");
+
+  CheckEq(core::WithoutDotSegments("/a/./b//c/./"), "/a/b/c", ". segments and doubled / go");
+  CheckEq(core::WithoutDotSegments("/a/b/../c/.d"), "/a/b/../c/.d", ".. and dot names stay");
 
   // What is noise.
-  const core::CxxTraceFilter filter{dir + "/scratch", "/opt/vc/vcache-fstrace.so",
-                                    {"/home/u/proj/h.h.gch"}, {"/usr", "/lib64"},
-                                    {"/home/u/bin"}};
+  core::CxxTraceFilter filter;
+  filter.scratch_dir = dir + "/scratch";
+  filter.tracer = "/opt/vc/vcache-fstrace.so";
+  filter.keyed_pchs = {"/home/u/proj/h.h.gch"};
+  filter.compiler_files = {"/usr/bin/g++", "/lib64/libc.so.6"};
+  filter.compiler_dirs = {"/usr/lib/gcc", "/usr/libexec/gcc"};
+  filter.include_dirs = {"/usr/lib/gcc/x/16/include", "/usr/include", "/home/u/proj/inc"};
+  filter.search_path_dirs = {"/home/u/bin", "/home/u/proj/tools"};
+  filter.search_path_names = {"g++", "as"};
   Check(core::IsCxxTraceNoise("/proc/self/exe", filter), "/proc is noise, as for a link");
   Check(core::IsCxxTraceNoise("/opt/vc/vcache-fstrace.so", filter), "the tracer is noise");
   Check(core::IsCxxTraceNoise(dir + "/scratch/out", filter), "the scratch directory is noise");
   Check(core::IsCxxTraceNoise("/home/u/proj/h.h.gch", filter), "a keyed PCH is noise");
-  Check(core::IsCxxTraceNoise("/usr/include/stdio.h", filter) &&
-            core::IsCxxTraceNoise("/usr/bin/../lib/gcc/x/16/include/stddef.h", filter) &&
+  Check(core::IsCxxTraceNoise("/usr/bin/g++", filter) &&
             core::IsCxxTraceNoise("/lib64/libc.so.6", filter),
-        "the compiler's installation is noise, through .. too");
+        "the executables that ran and the objects they loaded are noise");
+  Check(core::IsCxxTraceNoise("/usr/libexec/gcc/x/16/cc1plus", filter) &&
+            core::IsCxxTraceNoise("/usr/bin/../lib/gcc/x/16/specs", filter),
+        "the compiler's trees are noise, through .. too");
+  Check(!core::IsCxxTraceNoise("/usr/include/stdio.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/local/include/zz.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gcc/x/16/include/stddef.h", filter),
+        "the system headers are not, nor is the compiler's own include directory");
   Check(!core::IsCxxTraceNoise("/home/u/proj/inc/a.h", filter) &&
-            !core::IsCxxTraceNoise("/usrlocal/a.h", filter) &&
-            !core::IsCxxTraceNoise("/usr/../home/u/a.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gccx/a.h", filter) &&
             !core::IsCxxTraceNoise("/etc/clang/x.cfg", filter),
         "a project header, a sibling with a longer name and a driver config are not");
 
@@ -5514,42 +5545,67 @@ void TestCxxManifestTrace() {
   core::TraceRecords records;
   records.tools = {"/usr/bin/g++"};
   records.loaded = {"/opt/lib/libmpc.so.3"};
-  records.written = {"/home/u/proj/log.txt"};
-  records.reads = {"/home/u/proj/./inc/a.h", "/home/u/proj/inc/a.h", "/usr/include/stdio.h",
-                   "/home/u/proj/tmp.s", "/home/u/proj/second/h.h"};
+  records.written = {"/home/u/proj/./log.txt"};
+  records.reads = {"/home/u/proj/./inc/a.h", "/home/u/proj/inc/a.h", "/usr/libexec/gcc/x/cc1",
+                   "/home/u/proj/tmp.s", "/home/u/proj/second/h.h", "/home/u/proj/inc/x.h"};
   records.absent = {"/home/u/proj/first/h.h", "/home/u/proj/./first//h.h.gch",
-                    "/home/u/proj/tmp.s", "/home/u/bin/g++", "/usr/local/include/h.h",
-                    "/home/u/proj/a/../b.h"};
+                    "/home/u/proj/tmp.s", "/home/u/bin/g++", "/home/u/proj/tools/cfg.h",
+                    "/home/u/proj/tools/as", "/usr/lib/gcc/x/16/plugin",
+                    "/home/u/proj/build/../inc/x.h", "/home/u/proj/a/../b.h"};
   const core::CxxTraceInputs selected = core::SelectCxxTraceInputs(records, filter);
   CheckEq(util::Join(selected.reads, " "),
-          "/home/u/proj/inc/a.h /home/u/proj/second/h.h /home/u/proj/tmp.s",
+          "/home/u/proj/inc/a.h /home/u/proj/inc/x.h /home/u/proj/second/h.h /home/u/proj/tmp.s",
           "reads lose the noise and . segments, once each; executables, loaded objects "
           "and files written only are not reads");
   CheckEq(util::Join(selected.absent, " "),
-          "/home/u/proj/a/../b.h /home/u/proj/first/h.h /home/u/proj/first/h.h.gch",
-          "absent paths lose the noise, what was later read and the PATH search; .. stays");
+          "/home/u/proj/a/../b.h /home/u/proj/build/../inc/x.h /home/u/proj/first/h.h "
+          "/home/u/proj/first/h.h.gch /home/u/proj/tools/cfg.h",
+          "absent paths lose the noise, what was later read as spelled, and the driver's "
+          "search for its tools along PATH; a header probed in a PATH directory stays");
+  CheckEq(util::Join(selected.written, " "), "/home/u/proj/log.txt",
+          "files written only are kept apart");
+  Check(std::binary_search(selected.all_reads.begin(), selected.all_reads.end(),
+                           "/usr/libexec/gcc/x/cc1"),
+        "every read is evidence that a process was traced, noise included");
+
+  // A compiler process that did not load the tracer read nothing in the trace.
+  const core::RootMap roots = MakeRoots({dir + "/proj=proj"});
+  core::CxxTraceInputs seen;
+  seen.all_reads = {dir + "/proj/a.cc", dir + "/proj/inc/a.h"};
+  Check(!core::FindUntracedFile({{"/vcache/proj/./a.cc", "d"}, {"/vcache/proj/inc/a.h", "d"}},
+                                roots, seen)
+             .has_value(),
+        "a depfile whose every file the trace read was traced");
+  CheckEq(core::FindUntracedFile({{"/vcache/proj/a.cc", "d"}, {"/vcache/proj/b.h", "d"}}, roots,
+                                 seen)
+              .value_or(""),
+          dir + "/proj/b.h", "a file the trace never read is named, localised");
 
   // Recording the selection beside a depfile's files.
-  const core::RootMap roots = MakeRoots({dir + "/proj=proj"});
   util::MakeDirs(dir + "/proj/inc");
+  util::MakeDirs(dir + "/out");
   util::WriteFileAtomic(dir + "/proj/a.cc", "int a;\n");
   util::WriteFileAtomic(dir + "/proj/opt.h", "#pragma once\n");
   util::WriteFileAtomic(dir + "/proj/stamp.h", "const char* t = __TIME__;\n");
   const std::string memo_dir = dir + "/memo";
   const int64_t later_ns = (static_cast<int64_t>(std::time(nullptr)) + 60) * 1'000'000'000;
   const auto add = [&](std::vector<std::string> reads, std::vector<std::string> absent,
-                       int64_t started_ns) {
+                       std::vector<std::string> written, int64_t started_ns,
+                       const core::RootMap& with_roots) {
     core::RecordedInputs recorded;
-    recorded.files = {{"/vcache/proj/a.cc", hash::HashString("int a;\n")}};
-    core::AddCxxTraceInputs({std::move(reads), std::move(absent)}, roots, started_ns, memo_dir,
-                            &recorded);
+    recorded.files = {{with_roots.Canonicalize(dir + "/proj/a.cc"), hash::HashString("int a;\n")}};
+    core::CxxTraceInputs trace;
+    trace.reads = std::move(reads);
+    trace.absent = std::move(absent);
+    trace.written = std::move(written);
+    core::AddCxxTraceInputs(trace, with_roots, dir + "/proj", started_ns, memo_dir, &recorded);
     return recorded;
   };
   const core::RecordedInputs added =
-      add({dir + "/proj/a.cc", dir + "/proj/opt.h", dir + "/proj/inc", dir + "/proj/stamp.h"},
-          {dir + "/proj/first/h.h", dir + "/proj/first/bits/c.h", dir + "/proj/first/../h2.h",
+      add({dir + "/proj/a.cc", dir + "/proj/inc", dir + "/proj/opt.h", dir + "/proj/stamp.h"},
+          {dir + "/proj/first/bits/c.h", dir + "/proj/first/h.h", dir + "/proj/first/../h2.h",
            dir + "/proj/inc/none.h", "/opt/rh"},
-          later_ns);
+          {}, later_ns, roots);
   Check(added.declined.empty(), "a trace's extras are recorded");
   Check(added.files.size() == 3 && added.files[1].first == "/vcache/proj/opt.h" &&
             added.files[1].second == hash::HashString("#pragma once\n") &&
@@ -5560,16 +5616,26 @@ void TestCxxManifestTrace() {
           "/opt/rh /vcache/proj/first /vcache/proj/first/../h2.h /vcache/proj/inc/none.h",
           "absent paths are canonical and sorted, each the highest missing directory above "
           "it, except through ..");
-  const core::RecordedInputs gone = add({dir + "/proj/gone.h"}, {dir + "/proj/x.h"}, later_ns);
+  const core::RootMap out_root = MakeRoots({dir + "/proj=proj", dir + "/no-out/gen=gen"});
+  CheckEq(
+      util::Join(add({}, {dir + "/no-out/gen/include/h.h"}, {}, later_ns, out_root).absent, " "),
+      "/vcache/gen", "the walk stops at a root that does not exist yet, below a missing parent");
+  const core::RootMap nested_root = MakeRoots({dir + "/proj/no-a/sub=sub"});
+  CheckEq(util::Join(add({}, {dir + "/proj/no-a/sub/x/h.h"}, {}, later_ns, nested_root).absent,
+                     " "),
+          "/vcache/sub", "and at one inside the working directory");
+  const core::RecordedInputs gone =
+      add({dir + "/proj/gone.h"}, {dir + "/proj/x.h"}, {}, later_ns, roots);
   Check(!gone.declined.empty() && gone.files.empty() && gone.absent.empty(),
         "a file the compile read that is gone declines the state");
-  ::setenv("TMPDIR", (dir + "/tmpdir").c_str(), 1);
-  Check(add({dir + "/tmpdir/ccAbCdEf.s"}, {}, later_ns).declined.empty(),
-        "unless it sat in the temporary directory, as the compiler's intermediates do");
-  ::unsetenv("TMPDIR");
-  Check(!add({dir + "/proj/opt.h"}, {}, 0).declined.empty(),
+  Check(!add({"/tmp/ccAbCdEf.h"}, {}, {}, later_ns, roots).declined.empty(),
+        "in the temporary directory too, unless the trace wrote it");
+  Check(add({dir + "/proj/ccAbCdEf.s"}, {}, {dir + "/proj/ccAbCdEf.s"}, later_ns, roots)
+            .declined.empty(),
+        "an intermediate the compile wrote and read and then removed declines nothing");
+  Check(!add({dir + "/proj/opt.h"}, {}, {}, 0, roots).declined.empty(),
         "a file changed after the compile started declines the state");
-  Check(!add({"/dev/zero"}, {}, later_ns).declined.empty(),
+  Check(!add({"/dev/zero"}, {}, {}, later_ns, roots).declined.empty(),
         "a device the compile read declines the state");
 
   // A lookup checks each absent path is still absent.

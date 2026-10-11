@@ -4741,24 +4741,45 @@ l=$(mf_log shx-a2); mf_shx "$WORK/mf-shx-a" "$l"
 check "while the first tree still hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
 
 # The trace is written to the compile's scratch directory, and goes with it.
+# The compiler here is a wrapper that notes what LD_PRELOAD each run of it
+# sees: only the real compile of a miss runs under the tracer.
 reset_cache
 tl="$WORK/mf-tracelog"
-mkdir -p "$tl"
+mkdir -p "$tl/bin"
 printf '#define V 4\n' > "$tl/h.h"
 printf '#include "h.h"\nint v = V;\n' > "$tl/main.c"
+cat > "$tl/bin/gcc" <<EOF
+#!/bin/sh
+printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$tl/calls"
+exec gcc "\$@"
+EOF
+chmod +x "$tl/bin/gcc"
 mf_traced() {  # $1 log, then variables
   local log=$1; shift
   ( cd "$tl" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
-      "$VCACHE" gcc -O2 -c main.c -o m.o ) 2>/dev/null
+      "$VCACHE" "$tl/bin/gcc" -O2 -c main.c -o m.o ) 2>/dev/null
 }
+traced_calls() {
+  grep -c 'vcache-fstrace\.so|.* -o [^ ]*/out main\.c$' "$tl/calls" 2>/dev/null || true
+}
+rm -f "$tl/calls"
 l=$(mf_log trace1); mf_traced "$l"
 check "a miss records from a trace" "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
+check "its compile runs under the tracer" "$(traced_calls)" "1"
+check "and its -E run does not" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
 check "and leaves no trace behind" \
   "$(find "$VCACHE_DIR" "$tl" -name 'trace*' | wc -l | tr -d ' ')" "0"
+calls_before=$(wc -l < "$tl/calls")
 l=$(mf_log trace2); mf_traced "$l"
-check "a hit is traced by nothing" "$(grep -c 'preprocessor skipped' "$l")" "1"
-check "and leaves no scratch behind" \
+check "a hit runs no compiler, traced or not" \
+  "$(grep -c 'preprocessor skipped' "$l")/$(( $(wc -l < "$tl/calls") - calls_before ))" "1/0"
+check "and leaves no trace or scratch behind" \
   "$(find "$VCACHE_DIR/tmp" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
+reset_cache
+rm -f "$tl/calls"
+l=$(mf_log trace-ro); mf_traced "$l" VCACHE_READONLY=1
+check "a read-only miss compiles untraced" \
+  "$(traced_calls)/$(grep -c 'recorded from the trace' "$l" || true)" "0/0"
 
 # A trace that cannot be trusted to be whole is not used; the state comes from
 # the depfile, as it does where there is no tracer.
@@ -4776,14 +4797,174 @@ if [[ -f "$WORK/stub-tracer.so" ]]; then
   check "a trace naming no process falls back to the depfile" \
     "$(grep -c 'the trace names no process; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  reset_cache
+  l=$(mf_log trace-nolog)
+  mf_traced "$l" VCACHE_TRACER="$WORK/stub-tracer.so"
+  check "a tracer that writes no log is reported as never loaded" \
+    "$(grep -c 'no process loaded the tracer; recording from the depfile' "$l")" "1"
+  # vcache does not replace or extend a preload the build set.
+  reset_cache
+  rm -f "$tl/calls"
+  l=$(mf_log trace-inherited)
+  mf_traced "$l" LD_PRELOAD="$WORK/stub-tracer.so"
+  check "an inherited LD_PRELOAD records from the depfile" \
+    "$(grep -c 'LD_PRELOAD is set; recording from the depfile' "$l")" "1"
+  check "and the compile runs with that preload alone" \
+    "$(grep -c "^$WORK/stub-tracer\.so|.* -o [^ ]*/out main\.c$" "$tl/calls")/$(traced_calls)" \
+    "1/0"
 else
-  skipped "incomplete compile trace: the stub tracer was not built"
+  skipped "untrustworthy compile traces: the stub tracer was not built"
 fi
 reset_cache
 l=$(mf_log trace-none); mf_traced "$l" VCACHE_TRACER="$WORK/no-such-tracer.so"
 check "without a tracer the state comes from the depfile" \
   "$(grep -c "no tracer at '$WORK/no-such-tracer.so'; recording from the depfile" "$l")" "1"
 check "and is still recorded" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+
+# A tracer ld.so would refuse is not preloaded: the refusal would go to the
+# compile's stderr, and from there into the entry and every hit.
+reset_cache
+printf 'not an ELF file\n' > "$tl/notelf.so"
+l=$(mf_log trace-notelf)
+( cd "$tl" && VCACHE_TRACER="$tl/notelf.so" VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+    "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/notelf-miss.err"
+check "a tracer that is not a shared object is not preloaded" \
+  "$(grep -c 'is not a shared object this binary.s loader would preload' "$l")" "1"
+( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/notelf-hit.err"
+check "and neither the miss nor the hit prints a loader message" \
+  "$(cat "$tl/notelf-miss.err" "$tl/notelf-hit.err" | grep -c 'cannot be preloaded' || true)" "0"
+
+# A compile in which ld.so ignored a preload anyway is not stored.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  mkdir -p "$tl/badwrap"
+  printf '#!/bin/sh\nLD_PRELOAD="$LD_PRELOAD %s/no-such-lib.so" exec %s "$@"\n' \
+    "$tl" "$(gcc -print-prog-name=cc1)" > "$tl/badwrap/cc1"
+  chmod +x "$tl/badwrap/cc1"
+  ( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -B "$tl/badwrap/" -O2 -c main.c -o m.o ) \
+    2> "$tl/badwrap.err"
+  check "a compile whose stderr has ld.so ignoring a preload says so" \
+    "$(grep -c 'cannot be preloaded' "$tl/badwrap.err")" "1"
+  check "and stores nothing to replay it from" "$(disk_entries)" "0"
+fi
+
+# A compiler process that did not load the tracer records nothing, so the
+# trace says nothing about what it probed. Here cc1 runs behind a wrapper that
+# drops LD_PRELOAD; the depfile path, with its gcc declines, applies.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  ut="$WORK/mf-untraced"
+  mkdir -p "$ut/wrap" "$ut/inc"
+  printf '#!/bin/sh\nunset LD_PRELOAD\nexec %s "$@"\n' "$(gcc -print-prog-name=cc1)" \
+    > "$ut/wrap/cc1"
+  chmod +x "$ut/wrap/cc1"
+  printf '#pragma once\n' > "$ut/inc/opt.h"
+  printf '#if __has_include("opt.h")\nint have = 1;\n#else\nint have = 0;\n#endif\n' \
+    > "$ut/main.c"
+  mf_untraced() {  # $1 log
+    ( cd "$ut" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" gcc -B "$ut/wrap/" -O2 -I inc -c main.c -o m.o ) 2>/dev/null
+  }
+  l=$(mf_log untraced1); mf_untraced "$l"
+  check "gcc: a trace that never saw the preprocessor read falls back to the depfile" \
+    "$(grep -c 'the trace does not show .*main\.c being read; recording from the depfile' "$l")" "1"
+  check "gcc: where __has_include declines the state" \
+    "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
+  mf_untraced "$(mf_log untraced2)"
+  rm -f "$ut/inc/opt.h"
+  mf_untraced "$(mf_log untraced3)"
+  ( cd "$ut" && gcc -B "$ut/wrap/" -O2 -I inc -c main.c -o plain.o ) 2>/dev/null
+  check "gcc: so the object follows the probed header's removal" \
+    "$(cmp -s "$ut/m.o" "$ut/plain.o" && echo same)" "same"
+fi
+
+# The headers of the system are not the compiler's: a header appearing in or
+# vanishing from /usr/local/include changes what __has_include answers.
+# Checked in a private mount namespace, over an empty /usr/local/include.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang && unshare -rm true 2>/dev/null; then
+  ul="$WORK/mf-usrlocal"
+  mkdir -p "$ul/fake" "$ul/p"
+  printf '#if __has_include(<zzrev2.h>)\nint have = 1;\n#else\nint have = 0;\n#endif\n' \
+    > "$ul/p/hasinc.c"
+  cat > "$ul/run.sh" <<'EOF'
+#!/bin/bash
+# $1 vcache, $2 work directory. Prints one name=value line per result.
+V=$1 W=$2
+mount --bind "$W/fake" /usr/local/include || exit 1
+cd "$W/p"
+run() {  # $1 cache, $2 log
+  VCACHE_DIR="$W/$1" VCACHE_MAP_CWD=0 VCACHE_LOG="$W/$2.log" \
+    "$V" gcc -O2 -c hasinc.c -o h.o 2>/dev/null
+}
+same() { gcc -O2 -c hasinc.c -o plain.o && cmp -s h.o plain.o && echo same || echo differs; }
+run appear a1; run appear a2
+echo "hit=$(grep -c 'preprocessor skipped' "$W/a2.log")"
+printf '#pragma once\n' > /usr/local/include/zzrev2.h
+run appear a3
+echo "appear=$(grep -c 'rejected: /usr/local/include/zzrev2.h exists now' "$W/a3.log")"
+echo "appear-object=$(same)"
+run vanish v1; run vanish v2
+rm /usr/local/include/zzrev2.h
+run vanish v3
+echo "vanish=$(grep -c 'rejected: /usr/local/include/zzrev2.h is gone' "$W/v3.log")"
+echo "vanish-object=$(same)"
+EOF
+  ul_out=$(unshare -rm bash "$ul/run.sh" "$VCACHE" "$ul" 2>/dev/null)
+  check "gcc: a system-header state hits" "$(grep -c '^hit=1$' <<<"$ul_out")" "1"
+  check "gcc: a header appearing in /usr/local/include misses" \
+    "$(sed -n 's/^appear=//p' <<<"$ul_out")" "1"
+  check "gcc: and the object sees it" "$(sed -n 's/^appear-object=//p' <<<"$ul_out")" "same"
+  check "gcc: a header vanishing from /usr/local/include misses" \
+    "$(sed -n 's/^vanish=//p' <<<"$ul_out")" "1"
+  check "gcc: and the object follows" "$(sed -n 's/^vanish-object=//p' <<<"$ul_out")" "same"
+else
+  skipped "/usr/local/include: gcc is missing or is clang, or unshare -rm is not allowed"
+fi
+
+# The walk from an absent path up to the highest missing directory stops at a
+# root: above it, the path would name this tree's location, and a tree whose
+# generated-header root exists would check this tree's instead.
+reset_cache
+for t in a b; do
+  mkdir -p "$WORK/mf-walk/$t/inc"
+  printf '#define V 2\n' > "$WORK/mf-walk/$t/inc/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$WORK/mf-walk/$t/main.c"
+done
+mkdir -p "$WORK/mf-walk/b-out/gen/include"
+mf_walk() {  # $1 tree, $2 log
+  ( cd "$WORK/mf-walk/$1" && \
+      VCACHE_ROOTS="$WORK/mf-walk/$1=proj:$WORK/mf-walk/$1-out/gen=gen" VCACHE_LOG="$2" \
+      "$VCACHE" gcc -O2 -I "$WORK/mf-walk/$1-out/gen/include" -I inc -c main.c -o m.o ) \
+    2>/dev/null
+}
+mf_walk a "$(mf_log walk-a)"
+printf '#define V 1\n' > "$WORK/mf-walk/b-out/gen/include/h.h"
+l=$(mf_log walk-b); mf_walk b "$l"
+( cd "$WORK/mf-walk/b" && gcc -O2 -I "$WORK/mf-walk/b-out/gen/include" -I inc -c main.c \
+    -o plain.o ) 2>/dev/null
+check "a root that did not exist in one tree is checked in another" \
+  "$(grep -c "rejected: $WORK/mf-walk/b-out/gen" "$l")" "1"
+check "whose object uses its generated header" \
+  "$(cmp -s "$WORK/mf-walk/b/m.o" "$WORK/mf-walk/b/plain.o" && echo same)" "same"
+
+# A header probed in a directory that is also on PATH is a header probe.
+reset_cache
+mkdir -p "$WORK/mf-pathdir/tools" "$WORK/mf-pathdir/inc"
+printf '#include "cfg.h"\n' > "$WORK/mf-pathdir/tools/api.h"
+printf '#define V 2\n' > "$WORK/mf-pathdir/inc/cfg.h"
+printf '#include "tools/api.h"\nint v = V;\n' > "$WORK/mf-pathdir/main.c"
+mf_pathdir() {  # $1 log
+  ( cd "$WORK/mf-pathdir" && PATH="$WORK/mf-pathdir/tools:$PATH" VCACHE_MAP_CWD=0 \
+      VCACHE_LOG="$1" "$VCACHE" gcc -O2 -I inc -c main.c -o m.o ) 2>/dev/null
+}
+mf_pathdir "$(mf_log pathdir1)"
+printf '#define V 1\n' > "$WORK/mf-pathdir/tools/cfg.h"
+l=$(mf_log pathdir2); mf_pathdir "$l"
+( cd "$WORK/mf-pathdir" && gcc -O2 -I inc -c main.c -o plain.o ) 2>/dev/null
+check "a header created in a PATH directory the include probed misses" \
+  "$(grep -c 'rejected: .*tools/cfg\.h exists now' "$l")" "1"
+check "and the object uses it" \
+  "$(cmp -s "$WORK/mf-pathdir/m.o" "$WORK/mf-pathdir/plain.o" && echo same)" "same"
 
 # gcc writes a dependency file named by DEPENDENCIES_OUTPUT during the -E run
 # and ignores the variable once -MD is on the command line.

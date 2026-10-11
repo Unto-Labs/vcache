@@ -11,6 +11,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vcache::core {
@@ -46,6 +47,14 @@ bool TraceMarkedIncomplete(const std::string& log_path);
 // VCACHE_TRACER when set, else vcache-fstrace.so beside this binary; empty
 // when this binary cannot locate itself.
 std::string TracerPath();
+
+// True when `tracer` is an ELF shared object of this binary's class, byte
+// order and machine. ld.so refuses to preload anything else, and says so on
+// the traced process's stderr, which a cached entry would replay.
+bool TracerLoadsHere(const std::string& tracer);
+
+// The message ld.so writes to stderr when it ignores an LD_PRELOAD entry.
+inline constexpr std::string_view kPreloadIgnoredMessage = "from LD_PRELOAD cannot be preloaded";
 
 // Parses a tracer log. `outputs` are the files this link writes; they are
 // excluded from every set, since an output is not an input to itself.

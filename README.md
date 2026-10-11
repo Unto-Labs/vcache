@@ -314,7 +314,10 @@ key, so trees with the manifest on and off share entries. A miss records its
 state from the compile's own `-MD` output, which vcache requests when the build
 did not, and from a trace of the compile through `vcache-fstrace.so`, which
 sees what the preprocessor looked for and did not find: a header created
-earlier on the include path misses. See
+earlier on the include path misses, except inside the compiler's own trees
+outside its include directories, and except where the trace is not available
+(no tracer, another platform, a compiler process that does not load it), when
+the state comes from the depfile alone and that hole stays open. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

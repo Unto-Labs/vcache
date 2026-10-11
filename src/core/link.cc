@@ -289,7 +289,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   }
 
   const std::string tracer = TracerPath();
-  if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0) {
+  if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0 || !TracerLoadsHere(tracer)) {
     // Without the tracer there is no absent set, and without an absent set a
     // hit cannot be shown to be sound. Decline rather than cache on a guess.
     RecordDecision(cache_dir, {Reason::kNoTracer, tracer});

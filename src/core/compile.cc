@@ -1096,6 +1096,11 @@ std::string CxxManifestTracer(const Config& config) {
     VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from the depfile");
     return "";
   }
+  if (!TracerLoadsHere(tracer)) {
+    VCACHE_LOG("cxx manifest: '" + tracer + "' is not a shared object this binary's loader "
+               "would preload; recording from the depfile");
+    return "";
+  }
   // Replacing it would change what the compile runs with, and adding to it
   // would trace a library loaded before the tracer could see it.
   const char* inherited_preload = std::getenv("LD_PRELOAD");
@@ -1111,17 +1116,30 @@ std::string CxxManifestTracer(const Config& config) {
 #endif
 }
 
+// The basenames of the executables a compiler driver runs, besides itself.
+constexpr const char* kCompilerToolNames[] = {
+    "as", "ld", "collect2", "cc1", "cc1plus", "cc1obj", "cc1objplus", "lto1", "lto-wrapper",
+    "gcc", "g++", "cc", "c++", "cpp", "clang", "clang++",
+};
+
 // What the trace of the compile adds to its depfile, or nullopt, after logging
-// why, when the trace cannot be trusted to be whole: the tracer said it lost a
-// record, a record is malformed, or no process announced itself, which means
-// the tracer was never loaded (a static compiler, a hardened loader).
+// why, when the trace cannot be trusted to be whole: no process loaded the
+// tracer (a static compiler, a hardened loader), the tracer said it lost a
+// record, a record is malformed, or the compiler's include directories cannot
+// be listed, which leaves nothing to tell its trees from what they hold.
 std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
                                                    const std::string& tracer,
                                                    const std::string& scratch_dir,
                                                    const std::vector<std::string>& keyed_pchs,
                                                    const args::CompilerArgs& parsed,
+                                                   const CompilerId& compiler_id,
                                                    const RootMap& roots,
-                                                   const std::string& cwd) {
+                                                   const std::string& cwd,
+                                                   const std::string& cache_dir) {
+  if (!util::FileExists(trace_log)) {
+    VCACHE_LOG("cxx manifest: no process loaded the tracer; recording from the depfile");
+    return std::nullopt;
+  }
   if (TraceMarkedIncomplete(trace_log)) {
     VCACHE_LOG("cxx manifest: the trace is incomplete; recording from the depfile");
     return std::nullopt;
@@ -1135,24 +1153,40 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
     VCACHE_LOG("cxx manifest: the trace names no process; recording from the depfile");
     return std::nullopt;
   }
-  std::vector<std::string> project_dirs = {cwd,
-                                           util::DirName(CxxAbsolutePath(cwd, parsed.source))};
-  for (const Root& root : roots.roots()) project_dirs.push_back(root.path);
-  CxxTraceFilter filter{scratch_dir, tracer, keyed_pchs,
-                        CompilerInstallDirs(records.tools, project_dirs), {}};
-  for (std::string& dir : CxxIncludeDirs(parsed, cwd)) project_dirs.push_back(std::move(dir));
-  filter.search_path_dirs = SearchPathDirs(EnvOr("PATH", ""), project_dirs);
+  std::vector<std::string> include_dirs = SystemIncludeDirs(parsed, compiler_id, cache_dir);
+  if (include_dirs.empty()) {
+    VCACHE_LOG("cxx manifest: the compiler's include directories are unknown; recording from "
+               "the depfile");
+    return std::nullopt;
+  }
+  for (std::string& dir : CxxIncludeDirs(parsed, cwd)) include_dirs.push_back(std::move(dir));
+  CxxTraceFilter filter;
+  filter.scratch_dir = scratch_dir;
+  filter.tracer = tracer;
+  filter.keyed_pchs = keyed_pchs;
+  filter.compiler_files = records.tools;
+  filter.compiler_files.insert(filter.compiler_files.end(), records.loaded.begin(),
+                               records.loaded.end());
+  filter.compiler_dirs = CompilerInstallDirs(records.tools);
+  filter.include_dirs = std::move(include_dirs);
+  filter.search_path_dirs = SearchPathDirs(EnvOr("PATH", ""));
+  filter.search_path_names.assign(std::begin(kCompilerToolNames), std::end(kCompilerToolNames));
+  filter.search_path_names.push_back(util::BaseName(parsed.compiler));
+  for (const std::string& tool : records.tools) {
+    filter.search_path_names.push_back(util::BaseName(tool));
+  }
   return SelectCxxTraceInputs(records, filter);
 }
 
 // What the compile that just ran read, from the depfile it wrote and, with a
-// `trace`, from what the tracer saw it open and fail to find. Declined, as
-// RecordDepfileInputs and AddCxxTraceInputs decline, and when the source is
-// not among the files. Without a trace, also declined under gcc when a .gch
-// the key does not cover sits where an #include could have picked it up, or
-// when a file outside the compiler's own include directories uses
-// __has_include, since gcc's depfile names neither a .gch nor a header that
-// was only probed. The trace sees both.
+// `trace` that shows every file the depfile names being read, from what the
+// tracer saw it open and fail to find. Declined, as RecordDepfileInputs and
+// AddCxxTraceInputs decline, and when the source is not among the files.
+// Without a usable trace, also declined under gcc when a .gch the key does not
+// cover sits where an #include could have picked it up, or when a file outside
+// the compiler's own include directories uses __has_include, since gcc's
+// depfile names neither a .gch nor a header that was only probed. The trace
+// sees both.
 RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
                                      const CxxTraceInputs* trace,
                                      const args::CompilerArgs& parsed, const RootMap& roots,
@@ -1169,7 +1203,7 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
     return inputs;
   }
   inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin,
-                               /*find_probes=*/trace == nullptr && !compiler_id.is_clang);
+                               /*find_probes=*/!compiler_id.is_clang);
   if (!inputs.declined.empty()) return inputs;
   // A state lists what it is checked against; one without the source would
   // match whatever is on disk. Compared lexically normalised, since both
@@ -1186,8 +1220,18 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
     return inputs;
   }
   if (trace != nullptr) {
-    AddCxxTraceInputs(*trace, roots, started_ns, memo_dir, &inputs);
-    return inputs;
+    if (auto untraced = FindUntracedFile(inputs.files, roots, *trace)) {
+      VCACHE_LOG("cxx manifest: the trace does not show " + *untraced +
+                 " being read; recording from the depfile");
+    } else {
+      AddCxxTraceInputs(*trace, roots, cwd, started_ns, memo_dir, &inputs);
+      if (inputs.declined.empty()) {
+        VCACHE_LOG("cxx manifest: recorded from the trace: " +
+                   std::to_string(inputs.files.size()) + " files, " +
+                   std::to_string(inputs.absent.size()) + " absent paths");
+      }
+      return inputs;
+    }
   }
   if (compiler_id.is_clang) return inputs;
 
@@ -1598,6 +1642,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     }
   }
 
+  // ld.so ignored the tracer in some process and said so on stderr, which an
+  // entry would replay on every hit.
+  if (!trace_log.empty() &&
+      compiled.stderr_data.find(kPreloadIgnoredMessage) != std::string::npos) {
+    RecordDecision(cache_dir, {Reason::kNoTracer, manifest_tracer});
+    return compiled.exit_code;
+  }
+
   // ---- what the compile read, for the manifest ----------------------------
 
   RecordedInputs manifest_inputs;
@@ -1606,18 +1658,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       manifest_inputs.declined = "the compile writes no -MD dependency file";
     } else {
       const std::optional<CxxTraceInputs> traced =
-          trace_log.empty() ? std::nullopt
-                            : ReadCxxManifestTrace(trace_log, manifest_tracer, *temp_dir,
-                                                   keyed_pchs, parsed, roots, cwd);
+          trace_log.empty()
+              ? std::nullopt
+              : ReadCxxManifestTrace(trace_log, manifest_tracer, *temp_dir, keyed_pchs, parsed,
+                                     compiler_id, roots, cwd, cache_dir);
       manifest_inputs = ReadCxxManifestInputs(manifest_depfile, traced ? &*traced : nullptr,
                                               parsed, roots, compiler_id, cwd, cache_dir,
                                               memo_dir, keyed_pchs, started_ns,
                                               /*scan_incbin=*/derive_key);
-      if (traced && manifest_inputs.declined.empty()) {
-        VCACHE_LOG("cxx manifest: recorded from the trace: " +
-                   std::to_string(manifest_inputs.files.size()) + " files, " +
-                   std::to_string(manifest_inputs.absent.size()) + " absent paths");
-      }
     }
     if (!manifest_inputs.declined.empty()) {
       VCACHE_LOG("cxx manifest: not recording: " + manifest_inputs.declined);

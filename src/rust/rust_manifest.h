@@ -60,10 +60,4 @@ std::optional<std::string> FindRustStateMismatch(const RustManifestState& state,
                                                  const core::RootMap& roots,
                                                  const std::vector<std::string>& path_env_vars);
 
-// Puts `fresh` first, dropping an older state with the same key and anything
-// past the cap. Re-recording a state that matched moves it to the front, so
-// the cap evicts the least recently used.
-std::vector<RustManifestState> RecordRustState(RustManifestState fresh,
-                                               std::vector<RustManifestState> older);
-
 }  // namespace vcache::rust

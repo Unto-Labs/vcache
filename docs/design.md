@@ -118,6 +118,24 @@ The checksum is not paranoia: a silently corrupt object linked into a binary is
 far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
 
+The metadata section is not part of any cache key. A stored compile or link
+appends `max_rss_kb` and `wall_ms`, taken from `wait4` on that process. For a
+gcc or clang driver the figure is the peak of the largest process the driver
+waited for: cc1 or cc1plus, and for an `-flto` link the linker together with
+the LTO jobs it waited for. The value is recorded as reported. macOS counts
+`ru_maxrss` in bytes and Linux in kibibytes; the stored number is kibibytes
+on both. It also includes vcache's own resident set at the fork, which on a
+heavy translation unit was 368,068 KiB through vcache against 368,992 KiB for
+the compiler run directly.
+
+The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
+file holds the last eight observations of one codegen class (operation,
+canonical source or link output, language, and the optimisation and debug
+flags — not the source text and not include paths). `--clear` removes cache
+entries and leaves `costs/` alone, as it leaves the compiler-version memos.
+A failure to write one is logged (`cost: could not record`) and does not fail
+the build. `vcache --show-costs` summarises the records.
+
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,
 which bounds eviction work to 1/256th of the cache — cheap enough to run inline
@@ -202,8 +220,27 @@ separate processes do.
 - The statistics file is updated under `flock(2)` for a few microseconds per
   compilation.
 - Two processes computing the same key simply both compile and both store the
-  same bytes. Adding cross-process locking to prevent that would cost more than
-  the duplicated work.
+  same bytes by default. With `daemon.single_flight` enabled, a compile session
+  holds a memory-only key lease and peers wait within a bounded interval before
+  restoring the stored result or compiling themselves. This can avoid repeated
+  work across concurrent worktrees; it remains off by default.
+- A manifest is re-read just before it is written and merged, so two worktrees
+  that each add a state keep both. The gap that remains is the one Get and the
+  one Put. `VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT` names a fifo; a test write
+  to it releases the process that is waiting to re-read. A path that is not a
+  fifo is ignored, and a fifo with no writer is given up after 60 seconds.
+  `VCACHE_TEST_PAUSE_BOUND_MS` shrinks that wait when a test sets it to a
+  positive number of milliseconds no larger than 60000. Unset, the pause
+  does nothing.
+  `vcache --test-put KEY` reads one blob from stdin and stores it through a
+  running daemon, so a test can put two values of one key while an upload is
+  still in flight. `VCACHE_TEST_MAX_HELD_BYTES` shrinks the daemon's held-blob
+  cap for that same test. Unset, the cap stays 1 GiB.
+  `VCACHE_TEST_REFUSAL_WAIT_MS` shrinks how long a refused re-put waits for
+  the in-flight upload, when set to a positive number of milliseconds no
+  larger than half the client reply timeout. Unset, that wait stays 150
+  seconds. `MOCK_S3_DENY_PUT_MIN_BYTES` makes the test bucket answer 403 for
+  a PUT whose body is at least that many bytes.
 
 ## Parsing choices
 

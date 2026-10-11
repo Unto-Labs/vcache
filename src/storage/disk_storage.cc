@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/cost.h"
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -37,6 +38,13 @@ std::string DiskStorage::ShardDir(const std::string& key) const {
 
 std::string DiskStorage::PathForKey(const std::string& key) const {
   return ShardDir(key) + "/" + key.substr(2);
+}
+
+bool DiskStorage::IsPendingUpload(const std::string& entry_path) const {
+  const std::string name = util::BaseName(entry_path);
+  const std::string shard = util::BaseName(util::DirName(entry_path));
+  if (shard.size() != 2 || name.empty()) return false;
+  return util::FileExists(dir_ + "/daemon/pending/" + shard + name);
 }
 
 bool DiskStorage::Get(const std::string& key, std::string* value) {
@@ -137,9 +145,19 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
               return a.lru_time < b.lru_time;
             });
 
+  // One stat for the whole trim. The journal is the pin list: an entry whose
+  // upload has not finished must not be the one a later store throws away.
+  const bool pending_dir = util::IsDirectory(dir_ + "/daemon/pending");
   size_t removed = 0;
+  size_t kept = 0;
+  uint64_t kept_bytes = 0;
   for (const auto& entry : entries) {
     if (total <= target_bytes) break;
+    if (pending_dir && IsPendingUpload(entry.path)) {
+      ++kept;
+      kept_bytes += entry.size;
+      continue;
+    }
     if (util::RemoveFile(entry.path)) {
       total -= entry.size;
       ++removed;
@@ -160,10 +178,17 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
     VCACHE_LOG("disk: globally evicted " + std::to_string(removed) +
                " entries");
   }
+  if (kept > 0) {
+    VCACHE_LOG("disk: kept " + std::to_string(kept) +
+               " entries pending upload (" + std::to_string(kept_bytes) + " bytes)");
+  }
 }
 
 void DiskStorage::Trim() {
   if (read_only_) return;
+  // Cost files are not cache entries. Put()'s TrimGlobal does not come here,
+  // so a store does not pay for walking costs/.
+  core::PruneStaleCostFiles(dir_);
   // An explicit trim has no hysteresis to preserve: evict whenever the cache
   // is above the target rather than waiting for it to cross max_size_.
   const auto target = static_cast<uint64_t>(max_size_ * kTrimTargetFraction);

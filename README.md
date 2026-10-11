@@ -80,6 +80,11 @@ $ ln -s /path/to/vcache ~/.local/libexec/vcache/rustc
 $ export PATH=~/.local/libexec/vcache:$PATH
 ```
 
+Keep other compiler wrappers' directories (ccache's `/usr/lib64/ccache`,
+for example) off `$PATH`. Each wrapper runs the next same-named compiler on
+`$PATH`, so vcache and such a wrapper would run each other; vcache stops with
+an error after four such hops.
+
 ## Configuring roots
 
 A root is a directory whose location should not affect the cache key. Almost

@@ -69,8 +69,10 @@ int RunPassthrough(const std::vector<std::string>& argv);
 // Environment lookup treating an empty value as unset.
 std::string EnvOr(const char* name, const std::string& fallback);
 
+// `count` is false when this failure was already counted for the same store,
+// so a re-read and the put that follows it do not each add a media error.
 bool ReportCacheMediaErrors(const std::vector<std::string>& errors,
-                            const std::string& cache_dir);
+                            const std::string& cache_dir, bool count = true);
 
 // Runs one compilation. `argv` starts at the compiler. Returns the exit code to
 // propagate. Falls back to executing the compiler unchanged whenever caching is

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/config.h"
@@ -22,6 +23,23 @@
 #include "storage/chain.h"
 
 namespace vcache::rust {
+
+// Hash of `rustc -vV`. The memo that avoids a probe per crate is local; what
+// enters a cache key is only the banner, so two machines still share entries.
+std::string ResolveRustcFingerprint(const std::string& rustc,
+                                    const std::string& cache_dir);
+
+// False when a stored output name could write outside the output directory:
+// empty, a NUL, absolute, or any `..` component. A `.` component is allowed.
+bool IsSafeOutputName(std::string_view name);
+
+bool CaptureOutputs(const std::string& dir, const core::RootMap& roots,
+                    const std::vector<std::string>& path_env_vars,
+                    std::vector<storage::BlobFile>* files);
+
+bool RestoreOutputs(const std::vector<storage::BlobFile>& files, const std::string& out_dir,
+                    const core::RootMap& roots,
+                    const std::vector<std::string>& path_env_vars);
 
 int RunRustCompile(const std::vector<std::string>& argv,
                    const core::Config& config, const core::RootMap& roots,

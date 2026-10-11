@@ -10,8 +10,10 @@
 
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/depfile.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "rust/rust_manifest.h"
 #include "storage/storage.h"
@@ -23,6 +25,35 @@
 namespace fs = std::filesystem;
 
 namespace vcache::rust {
+
+// A relink after a source change often keeps the same byte count. The memo
+// key therefore includes mtime, or the new binary is answered from the
+// previous banner and every later crate hits the old toolchain. mtime stays
+// out of the banner hash: that hash is what other machines share.
+std::string ResolveRustcFingerprint(const std::string& rustc,
+                                    const std::string& cache_dir) {
+  const std::string real = util::RealPath(rustc).value_or(rustc);
+  const uint64_t size = util::FileSize(real).value_or(0);
+  const int64_t mtime = util::FileMtime(real).value_or(0);
+
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("rustc-version-memo-v2");
+  memo_key.UpdateDelimited(real);
+  memo_key.UpdateU64(size);
+  memo_key.UpdateU64(static_cast<uint64_t>(mtime));
+  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
+
+  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
+
+  util::ProcResult probe =
+      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
+  const std::string banner = probe.stdout_data + probe.stderr_data;
+  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
+
+  util::WriteFileAtomic(memo_path, banner);
+  return hash::HashString(banner);
+}
+
 namespace {
 
 using core::Counter;
@@ -41,30 +72,6 @@ int RunPassthrough(const std::vector<std::string>& argv) {
     return 127;
   }
   return result.exit_code;
-}
-
-// Identity of the rustc toolchain. `rustc -vV` reports version, commit hash and
-// host triple, all machine-independent, so entries stay shareable through S3.
-std::string ResolveRustcFingerprint(const std::string& rustc,
-                                    const std::string& cache_dir) {
-  const std::string real = util::RealPath(rustc).value_or(rustc);
-  uint64_t size = util::FileSize(real).value_or(0);
-
-  hash::Hasher memo_key;
-  memo_key.UpdateDelimited("rustc-version-memo-v1");
-  memo_key.UpdateDelimited(real);
-  memo_key.UpdateU64(size);
-  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
-
-  if (auto cached = util::ReadFile(memo_path)) return hash::HashString(*cached);
-
-  util::ProcResult probe =
-      util::Run({rustc, "-vV"}, {.capture_stdout = true, .capture_stderr = true});
-  const std::string banner = probe.stdout_data + probe.stderr_data;
-  if (probe.exit_code != 0 || banner.empty()) return hash::HashString(real);
-
-  util::WriteFileAtomic(memo_path, banner);
-  return hash::HashString(banner);
 }
 
 // What rustc's dep-info says the crate reads.
@@ -238,13 +245,18 @@ std::string ComputeManifestKey(const args::RustcArgs& parsed, const RootMap& roo
 std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
                                             const std::string& manifest_key,
                                             const std::string& cache_dir,
-                                            bool* media_failed) {
+                                            bool* media_failed, bool log_if_absent,
+                                            bool* get_failed) {
   std::vector<RustManifestState> states;
   storage::GetResult got = cache->Get(manifest_key);
-  *media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
+  const bool failed = core::ReportCacheMediaErrors(got.errors, cache_dir);
+  *media_failed |= failed;
+  if (get_failed != nullptr) *get_failed = failed;
   storage::Blob blob;
   if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
-    VCACHE_LOG("rust manifest: none stored");
+    // The store re-reads just before its put. Logging there as well would
+    // say "none stored" twice on the first compile of a key.
+    if (log_if_absent) VCACHE_LOG("rust manifest: none stored");
     return states;
   }
   if (!ParseRustManifest(blob.dep_manifest, &states)) {
@@ -255,14 +267,20 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
 }
 
 void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
-                   const std::vector<RustManifestState>& states,
+                   RustManifestState fresh, const std::vector<RustManifestState>& loaded,
                    const std::string& cache_dir, bool* media_failed) {
+  core::PauseBeforeManifestPut();
+  bool reread_failed = false;
+  const std::vector<RustManifestState> reread =
+      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
+  const std::vector<RustManifestState> states = core::MergeManifestStates(
+      std::move(fresh), reread, loaded, &RustManifestState::key);
   storage::Blob blob;
   blob.dep_manifest = RenderRustManifest(states);
   blob.has_dep_manifest = true;
   blob.meta = "rust dep-info manifest\nstates: " + std::to_string(states.size()) + "\n";
   const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
-  *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
+  *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "rust manifest: stored " + std::to_string(states.size()) + " states"
                         : std::string("rust manifest: could not store"));
 }
@@ -286,6 +304,26 @@ void SubstituteDir(core::DepFile* dep, const std::string& from,
   }
 }
 
+}  // namespace
+
+// A blob name is joined onto the output directory. `..` or an absolute name
+// would write outside it, including a name captured from a symlink whose
+// target is not in the directory.
+bool IsSafeOutputName(std::string_view name) {
+  if (name.empty() || name.find('\0') != std::string_view::npos) return false;
+  if (name.front() == '/') return false;
+  std::size_t begin = 0;
+  while (begin < name.size()) {
+    const std::size_t slash = name.find('/', begin);
+    const std::size_t end = slash == std::string_view::npos ? name.size() : slash;
+    const std::string_view component = name.substr(begin, end - begin);
+    if (component == "..") return false;
+    if (slash == std::string_view::npos) return true;
+    begin = slash + 1;
+  }
+  return true;
+}
+
 // Collects every file produced under `dir` as a blob file set, canonicalising
 // any dependency-info file on the way.
 bool CaptureOutputs(const std::string& dir, const RootMap& roots,
@@ -302,6 +340,7 @@ bool CaptureOutputs(const std::string& dir, const RootMap& roots,
     storage::BlobFile file;
     file.name = fs::relative(entry.path(), fs::path(dir), ec).string();
     if (ec) return false;
+    if (!IsSafeOutputName(file.name)) return false;
 
     // cargo runs build scripts and binary crates directly out of the output
     // directory, so an entry that restores the bytes but not the execute bit
@@ -332,16 +371,26 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
                     const std::string& out_dir, const RootMap& roots,
                     const std::vector<std::string>& path_env_vars) {
   for (const storage::BlobFile& file : files) {
+    if (!IsSafeOutputName(file.name)) {
+      VCACHE_LOG("rust: refusing stored file name '" + file.name + "'");
+      return false;
+    }
+  }
+  for (const storage::BlobFile& file : files) {
     const std::string target = out_dir + "/" + file.name;
-    std::string contents = file.contents;
+    // A dep-info file is rewritten into this checkout. Every other file is
+    // written from the bytes already in the blob.
+    const std::string* bytes = &file.contents;
+    std::string rewritten;
     if (util::EndsWith(file.name, ".d")) {
-      if (auto dep = core::ParseDepFile(contents)) {
+      if (auto dep = core::ParseDepFile(file.contents)) {
         core::RemapDepFile(&*dep, roots, MapDirection::kLocalize, path_env_vars);
         SubstituteDir(&*dep, std::string(kOutDirPlaceholder), out_dir);
-        contents = core::RenderDepFile(*dep);
+        rewritten = core::RenderDepFile(*dep);
+        bytes = &rewritten;
       }
     }
-    if (!util::WriteFileAtomic(target, contents)) {
+    if (!util::WriteFileAtomic(target, *bytes)) {
       VCACHE_LOG("rust: could not write " + target);
       return false;
     }
@@ -359,6 +408,8 @@ bool RestoreOutputs(const std::vector<storage::BlobFile>& files,
   }
   return true;
 }
+
+namespace {
 
 // Names the first path-valued env dep whose local value, which the key left out,
 // still appears in the entry: another checkout must not be served this path.
@@ -471,7 +522,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, config,
                                         *source_digest, *externs);
       VCACHE_LOG("rust manifest key " + manifest_key + " for " + parsed.source);
-      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed);
+      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr);
     }
   }
 
@@ -495,8 +546,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
       core::RecordCounter(cache_dir, HitCounter(got));
       if (i > 0 && !config.read_only) {
-        StoreManifest(cache, manifest_key, RecordRustState(states[i], states),
-                      cache_dir, &media_failed);
+        StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }
       return 0;
     }
@@ -530,11 +580,11 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // Records what this dep-info run found, once its entry is known to exist.
   const auto record_state = [&]() {
     if (manifest_key.empty() || config.read_only) return;
-    StoreManifest(cache, manifest_key, RecordRustState(fresh, states), cache_dir,
-                  &media_failed);
+    StoreManifest(cache, manifest_key, fresh, states, cache_dir, &media_failed);
   };
 
-  if (!config.recache && cache != nullptr) {
+  const auto try_entry_hit = [&]() {
+    if (cache == nullptr) return false;
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
@@ -542,14 +592,26 @@ int RunRustCompile(const std::vector<std::string>& argv,
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
-        return 0;
+        return true;
       }
       VCACHE_LOG("rust: unusable cache entry; recompiling");
     }
-  }
-  core::RecordCounter(cache_dir, Counter::kMiss);
+    return false;
+  };
+  if (!config.recache && try_entry_hit()) return 0;
 
   // ---- miss: compile into a staging directory -----------------------------
+
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
+  if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
+    if (outcome != daemon::LeaseOutcome::kCompile && try_entry_hit()) {
+      session->ReleaseLease(true);
+      return 0;
+    }
+  }
+  core::RecordCounter(cache_dir, Counter::kMiss);
 
   const std::string stage_dir = *temp_dir + "/out";
   if (!util::MakeDirs(stage_dir)) {
@@ -569,7 +631,18 @@ int RunRustCompile(const std::vector<std::string>& argv,
   cmd.push_back(parsed.source);
 
   VCACHE_LOG("rust compile: " + util::Join(cmd, " "));
-  util::ProcResult compiled = util::Run(cmd, {.capture_stderr = true});
+  util::ProcOptions compile_options{.capture_stderr = true};
+  if (session && config.daemon.admission) {
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
+    compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+  } else if (config.daemon.admission && !config.read_only &&
+             config.daemon.mode != core::DaemonMode::kOff) {
+    VCACHE_LOG("reserve: daemon unavailable, running unreserved");
+  }
+  util::ProcResult compiled = util::Run(cmd, compile_options);
+  core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
+                          compiled);
 
   if (compiled.exit_code != 0) {
     if (!compiled.stderr_data.empty()) {
@@ -618,8 +691,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
               "\nroots:\n" + roots.DebugString();
+  core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  if (session) session->ReleaseLease(put.stored);
   media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     core::RecordCounter(cache_dir, Counter::kStored);

@@ -212,7 +212,7 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     return r;
   }
   if (r.output.empty()) {
-    r.uncacheable = core::Reason::kNoLinkOutput;
+    r.uncacheable = core::Reason::kNoOutputFlag;
     return r;
   }
   if (r.output == "/dev/null" || r.output == "-") {

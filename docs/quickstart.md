@@ -106,8 +106,9 @@ silently overriding you. Pass `--vcache-allow-prefix-maps` (or set
 `VCACHE_INCOMING_PREFIX_MAPS=strip`) to let vcache's mapping win.
 
 **Nothing is cached at all.** Check `vcache --show-stats` for a high
-*uncacheable* count — linking, `-E`, `-M`-only dependency passes and multiple
-inputs per invocation all fall through to the compiler by design.
+*uncacheable* count — linking, `-E` and multiple inputs per invocation all fall
+through to the compiler by design (`-M`-only dependency passes are cached through
+the dep-scan manifest).
 
 **You need to know why.** `VCACHE_LOG=stderr` explains every decision for one
 compilation, including the compiler's own error if preprocessing failed:
@@ -132,3 +133,4 @@ debugger at the real sources:
 - [preprocessor-problem.md](preprocessor-problem.md) — why this is needed, with
   measurements
 - [design.md](design.md) — how it is put together
+- [prompts/vcache-friendly-audit.md](prompts/vcache-friendly-audit.md) — an agent prompt to audit your build

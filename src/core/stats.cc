@@ -28,7 +28,7 @@ constexpr const char* kNames[] = {
     "cache hit (disk)", "cache hit (s3)",   "cache miss",
     "uncacheable",      "compile failed",   "entries stored",
     "store failed",     "preprocess failed",
-    "cache media errors",
+    "cache media errors", "manifest hits",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                   static_cast<size_t>(Counter::kCount),
@@ -189,6 +189,13 @@ void RecordCounter(const std::string& cache_dir, Counter counter) {
   WithLockedStats(cache_dir, [counter](Stats* stats) { stats->Add(counter); });
 }
 
+void RecordCounters(const std::string& cache_dir, Counter first, Counter second) {
+  WithLockedStats(cache_dir, [first, second](Stats* stats) {
+    stats->Add(first);
+    stats->Add(second);
+  });
+}
+
 void RecordDecision(const std::string& cache_dir, const Decision& decision) {
   VCACHE_LOG(std::string(OutcomeName(GetReasonInfo(decision.reason).outcome)) +
              ": " + decision.Describe());
@@ -216,13 +223,20 @@ std::string FormatStats(const Stats& stats, const std::string& cache_dir,
 
   std::ostringstream out;
   out << "cache directory     " << cache_dir << "\n";
-  for (size_t i = 0; i < static_cast<size_t>(Counter::kCount); ++i) {
+  const auto print_counter = [&](size_t i) {
     out.width(20);
     out.setf(std::ios::left);
     out << kNames[i];
     out.unsetf(std::ios::left);
     out << stats.values[i] << "\n";
-    if (i == static_cast<size_t>(Counter::kUncacheable)) {
+  };
+  for (size_t i = 0; i < static_cast<size_t>(Counter::kCount); ++i) {
+    // Stored last for older readers, shown beside the hits it is a part of.
+    if (i == static_cast<size_t>(Counter::kManifestHit)) continue;
+    print_counter(i);
+    if (i == static_cast<size_t>(Counter::kHitS3)) {
+      print_counter(static_cast<size_t>(Counter::kManifestHit));
+    } else if (i == static_cast<size_t>(Counter::kUncacheable)) {
       out << FormatReasons(stats, Outcome::kUncacheable);
       // Passthrough has no counter of its own, so it appears only once a
       // reason has been recorded.

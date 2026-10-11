@@ -771,11 +771,15 @@ EOF
   session_suffix() {
     LC_ALL=C grep -aoE 'inc\.[a-z0-9]+\.[a-z0-9]+\.rcgu\.o' "$1" | head -1 | cut -d. -f3
   }
+  # Older rustc (1.75, for one) names the object inc.<cgu>.rcgu.o with no
+  # session suffix; there the two rlibs must simply be identical.
   t1_suffix=$(session_suffix "$WORK/inc-t1/deps/libinc.rlib")
   t4_suffix=$(session_suffix "$WORK/inc-t4/deps/libinc.rlib")
-  if [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
-      LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
-        cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; then
+  if { [[ -z "$t1_suffix" && -z "$t4_suffix" ]] &&
+         cmp -s "$WORK/inc-t4/deps/libinc.rlib" "$WORK/inc-t1/deps/libinc.rlib"; } ||
+     { [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
+         LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
+           cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; }; then
     ok "libinc.rlib compiled in another incremental directory matches apart from the session"
   else
     bad "libinc.rlib compiled in another incremental directory matches apart from the session"

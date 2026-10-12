@@ -225,9 +225,12 @@ bool DiskStorage::Clear() {
     const std::string shard = dir_ + "/" + buf;
     if (util::IsDirectory(shard) && !util::RemoveRecursive(shard)) ok = false;
   }
-  // Re-probed on the next recording that needs it, so it goes with the entries.
-  const std::string sysinc = core::SystemIncludeMemoDir(dir_);
-  if (util::IsDirectory(sysinc) && !util::RemoveRecursive(sysinc)) ok = false;
+  // Re-probed or re-hashed on the next lookup that needs them, so they go with
+  // the entries.
+  for (const std::string& memo :
+       {core::SystemIncludeMemoDir(dir_), hash::FileDigestMemoDir(dir_)}) {
+    if (util::IsDirectory(memo) && !util::RemoveRecursive(memo)) ok = false;
+  }
   return ok;
 }
 

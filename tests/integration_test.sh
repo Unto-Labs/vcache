@@ -4563,6 +4563,21 @@ else
   skipped "--config needs clang"
 fi
 
+# Digests of settled files are memoised under filehash/, which --clear empties
+# along with the entries.
+reset_cache
+mkdir -p "$WORK/memo"
+printf 'int old_header(void);\n' > "$WORK/memo/h.h"
+printf '#include "h.h"\nint m(void) { return 0; }\n' > "$WORK/memo/m.c"
+perl -e 'utime time - 3600, time - 3600, @ARGV' "$WORK/memo/h.h" "$WORK/memo/m.c"
+( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
+( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
+check "settled files' digests are memoised under filehash/" \
+  "$([[ -n "$(ls -A "$VCACHE_DIR/filehash" 2>/dev/null)" ]] && echo yes)" "yes"
+"$VCACHE" --clear >/dev/null
+check "--clear empties filehash/ with the entries" \
+  "$([[ -d "$VCACHE_DIR/filehash" ]] && echo kept || echo removed)" "removed"
+
 # A root given through a symlink localises to that spelling, while the working
 # directory is the resolved one; the state must still find its source.
 ln -s "$WORK/mf-a" "$WORK/mf-alias"

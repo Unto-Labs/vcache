@@ -537,9 +537,11 @@ Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
 per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
 versions read only the leading counters, and drop the reason lines when they
 next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`,
-and the digests of rustc `--extern` files, keyed by device, inode, size, mtime
-and ctime, in `<dir>/filehash/`; `vcache --trim` removes those not rewritten
-for 30 days.
+and the digests of rustc `--extern` files and of the files C/C++ manifest
+states list, keyed by device, inode, size, mtime and ctime, in
+`<dir>/filehash/`; `vcache --trim` removes those not rewritten for 30 days, and
+`vcache --clear` removes them all. They are written without `fsync`: a memo
+lost in a crash costs one re-hash.
 
 ## S3 cache
 
@@ -962,7 +964,7 @@ state and stays on the preprocessor; Boost's config headers are one common
 source, as is any header on `CPATH` or `C_INCLUDE_PATH`, which vcache does not
 count as the compiler's own. The compiler's own directories come from
 `<compiler> -E -v`, run without the `CPATH` family and memoised under
-`<dir>/sysinc/`, which `--trim` prunes like `filehash/` and `--clear` empties.
+`<dir>/sysinc/`, which `--trim` prunes and `--clear` empties, like `filehash/`.
 clang is unaffected: its depfile lists the files `__has_include` probed.
 
 **Precompiled headers.** Neither compiler's depfile names the PCH it loaded,

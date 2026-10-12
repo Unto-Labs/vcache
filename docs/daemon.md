@@ -453,7 +453,7 @@ Feature sets are cumulative:
 | `jobserver_elastic` | on | on | on | on, `jobserver_min_jobs` from `--min-jobs` or the default |
 
 The worktrees are detached at the repository's HEAD under
-`--scratch` (default `/build/$USER/claude-tmp/bench-vcache`) and reused on
+`--scratch` (default `${TMPDIR:-/tmp}/bench-vcache-$USER`) and reused on
 later runs; `--setup` runs once in each new one. Every run gets a fresh store
 under its run directory, its own daemon with `idle_timeout = 0`, and stops
 that daemon at the end, so a daemon serving your usual `VCACHE_DIR` is never
@@ -464,8 +464,9 @@ measures. In the jobserver sets the builds get `MAKEFLAGS` from
 
 Each build sees `VCACHE_ROOTS` mapping its worktree and its
 `CARGO_TARGET_DIR` (`<scratch>/targets/<n>`) to fixed names, so the trees
-share keys. It also sees `RUSTC_WRAPPER=vcache` and `FBG_VCACHE=0`, which
-stops a repository's own vcache setup from moving `VCACHE_DIR`. C and C++
+share keys. It also sees `RUSTC_WRAPPER=vcache` and anything passed with
+`--env NAME=VALUE`, such as a repository's own switch that would otherwise
+move `VCACHE_DIR`. C and C++
 reach vcache only through `--masquerade`, which links the named compilers to
 vcache ahead of `PATH` and drops ccache directories from it.
 
@@ -493,7 +494,7 @@ memory and free and withdrawn tokens each second. The store is emptied with
 ### Results
 
 One `--matrix` run per tree, on a 128-core, 125 GB Linux host, 2026-10-08,
-with vcache 1.3.0 at efd4e11:
+with a build based on vcache 1.3.0 plus this scheduler work:
 
 - **Rust.** A 357-crate workspace, `cargo build --workspace` with an optimised,
   incremental profile, cargo and rustc 1.97.1. Without `-j`, cargo runs 128 jobs.
@@ -593,6 +594,13 @@ Reading each feature:
   126), while MemAvailable stayed above 80 GiB. It reacts to waiting
   reservations, and the default estimates create those. No wall-time effect
   beyond noise.
+
+In this first matrix single-flight made cold builds slower, not faster: Rust
+2 worktrees 102.8 s to 129.9 s, C++ 2 worktrees 61.0 s to 67.1 s. The two
+defects behind that are fixed (below), and the rows re-measured after the
+fixes are faster. They come from one host with an empty store each time, so
+vcache's own defaults keep every scheduler feature off. The table is advice
+for a build environment script, not the shipped configuration.
 
 Recommended defaults for a build environment script:
 

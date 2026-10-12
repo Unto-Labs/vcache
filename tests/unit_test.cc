@@ -3496,6 +3496,9 @@ void TestCompilerBannerMark() {
               "Configured with: ../configure --x absent-deps-2 --y\n"
               "gcc version 16.2.0 (GCC) absent-deps-1\n")),
           "1", "the version line's token is read past a configure line");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "gcc version 16.1.0 (GCC) absent-deps-99999999999\n")),
+          "0", "a version that does not fit an int is not one");
 
   auto scratch = util::MakeTempDir("vcache-banner-");
   Check(scratch.has_value(), "banner scratch dir");

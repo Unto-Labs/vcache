@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -80,7 +81,12 @@ int AbsentDepsVersion(std::string_view banner) {
       const bool bounded = std::isspace(static_cast<unsigned char>(line[at - 1])) &&
                            (end == line.size() ||
                             std::isspace(static_cast<unsigned char>(line[end])));
-      if (end != digits && bounded) return std::atoi(line.c_str() + digits);
+      int version_number = 0;
+      if (end != digits && bounded &&
+          std::from_chars(line.data() + digits, line.data() + end, version_number).ec ==
+              std::errc()) {
+        return version_number;
+      }
       at = digits;
     }
     return 0;

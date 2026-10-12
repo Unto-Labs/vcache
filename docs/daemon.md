@@ -51,7 +51,7 @@ upload_threads = 4      # background S3 uploaders
 | `vcache --stop-daemon` | Wait for pending uploads to finish, then stop it. Prints how many uploaded, failed and were skipped. |
 | `vcache --daemon-status` | Pid, socket, lookups by layer, stores, the upload queue. |
 | `vcache --daemon-foreground` | Run in the foreground, for a service manager or a debugger. |
-| `vcache --jobserver-env` | Print `MAKEFLAGS=-j --jobserver-auth=fifo:<path>` for the running pool, or exit 1. |
+| `vcache --jobserver-env` | Print `MAKEFLAGS=-j --jobserver-auth=fifo:<path>` for the running pool, or exit 1 (no pool, or `make` older than GNU make 4.4). Linux only. |
 
 `--show-stats` also says whether a daemon is running.
 
@@ -140,6 +140,10 @@ daemon's identity.
 
 ## Jobserver mode
 
+Linux only. The daemon counts the pool's free tokens with `FIONREAD`, which
+macOS answers with 0 for a fifo whatever it holds, so elsewhere the pool is
+not started (the daemon log says why) and `--jobserver-env` exits 1.
+
 With `daemon.jobserver` on, the daemon keeps one GNU-make fifo of job slots
 for every build on the machine. A build script exports the line from
 `vcache --jobserver-env`:
@@ -162,7 +166,13 @@ read-write, so a client closing does not look like end-of-file to the
 others.
 
 Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
-fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
+fifo form. Older make does not: GNU make 3.81 ignores the fifo and takes the
+bare `-j` as "no limit", and 4.2 and 4.3 expect the `R,W` pipe form. Either
+would turn a bounded build into an unbounded one, so `--jobserver-env` runs
+`$MAKE --version` (or the first `make` on `PATH`) and exits 1 with a message
+when it is not GNU make 4.4 or newer. Set `MAKE` to the make the build uses,
+or `VCACHE_JOBSERVER_ANY_CLIENT=1` when the line is for another client, such
+as ninja 1.13 or cargo. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
 does not print) and ignores the fifo when its own command line passes `-j`.
 cargo and rustc speak the same protocol through the `jobserver` crate. With
 cargo and rustc 1.97.1, `strace -f` of one `cargo build` of a five-crate
@@ -349,6 +359,11 @@ Measuring.
 
 ## Memory admission
 
+Linux only in effect. Admission reads `/proc/meminfo` and each compiler's
+`/proc/<pid>/status` and `task/*/children`. Elsewhere `MemAvailable` is
+unreadable, so the daemon logs "admission unavailable" once and grants every
+request without waiting, which is the same as admission off.
+
 `daemon.admission` defaults to false and enables admission for that client.
 The daemon serves scheduling requests regardless of the starter's switches.
 After a cache miss, and after acquiring a lease when single-flight is enabled,
@@ -392,6 +407,13 @@ the daemon logs once and retains its last good value, deferring new sampled RSS
 realisation until a fresh memory reading succeeds. With no good reading yet,
 admission is unavailable and requests proceed without waiting for memory.
 
+A compiler or linker that runs under a reservation gets
+`VCACHE_MEMORY_RESERVED=1` in its environment. A vcache it starts in turn,
+such as rustc's linker through masquerade, is already counted in that tree's
+sampled RSS, so it logs "not reserving again" and does not queue. Without
+this, the child counted twice and, behind its own parent in the FIFO, could
+wait out the whole ten-minute bound.
+
 The reported compiler pid is sampled only when visible with the session peer
 as its parent. Otherwise the daemon logs the pid mismatch and treats the whole
 estimate as unrealised for ten seconds, then as realised. This fallback allows
@@ -431,7 +453,7 @@ Feature sets are cumulative:
 | `jobserver_elastic` | on | on | on | on, `jobserver_min_jobs` from `--min-jobs` or the default |
 
 The worktrees are detached at the repository's HEAD under
-`--scratch` (default `/build/$USER/claude-tmp/bench-vcache`) and reused on
+`--scratch` (default `${TMPDIR:-/tmp}/bench-vcache-$USER`) and reused on
 later runs; `--setup` runs once in each new one. Every run gets a fresh store
 under its run directory, its own daemon with `idle_timeout = 0`, and stops
 that daemon at the end, so a daemon serving your usual `VCACHE_DIR` is never
@@ -442,8 +464,9 @@ measures. In the jobserver sets the builds get `MAKEFLAGS` from
 
 Each build sees `VCACHE_ROOTS` mapping its worktree and its
 `CARGO_TARGET_DIR` (`<scratch>/targets/<n>`) to fixed names, so the trees
-share keys. It also sees `RUSTC_WRAPPER=vcache` and `FBG_VCACHE=0`, which
-stops a repository's own vcache setup from moving `VCACHE_DIR`. C and C++
+share keys. It also sees `RUSTC_WRAPPER=vcache` and anything passed with
+`--env NAME=VALUE`, such as a repository's own switch that would otherwise
+move `VCACHE_DIR`. C and C++
 reach vcache only through `--masquerade`, which links the named compilers to
 vcache ahead of `PATH` and drops ccache directories from it.
 
@@ -471,7 +494,7 @@ memory and free and withdrawn tokens each second. The store is emptied with
 ### Results
 
 One `--matrix` run per tree, on a 128-core, 125 GB Linux host, 2026-10-08,
-with vcache 1.3.0 at efd4e11:
+with a build based on vcache 1.3.0 plus this scheduler work:
 
 - **Rust.** A 357-crate workspace, `cargo build --workspace` with an optimised,
   incremental profile, cargo and rustc 1.97.1. Without `-j`, cargo runs 128 jobs.
@@ -571,6 +594,13 @@ Reading each feature:
   126), while MemAvailable stayed above 80 GiB. It reacts to waiting
   reservations, and the default estimates create those. No wall-time effect
   beyond noise.
+
+In this first matrix single-flight made cold builds slower, not faster: Rust
+2 worktrees 102.8 s to 129.9 s, C++ 2 worktrees 61.0 s to 67.1 s. The two
+defects behind that are fixed (below), and the rows re-measured after the
+fixes are faster. They come from one host with an empty store each time, so
+vcache's own defaults keep every scheduler feature off. The table is advice
+for a build environment script, not the shipped configuration.
 
 Recommended defaults for a build environment script:
 

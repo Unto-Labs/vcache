@@ -3,7 +3,9 @@
 #include "storage/disk_storage.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -31,6 +33,18 @@ constexpr int64_t kFileDigestMemoMaxAgeSeconds = 30 * 24 * 3600;
 // Evict down to this fraction of the budget so a shard that is exactly at the
 // limit does not trigger a scan on every single store.
 constexpr double kTrimTargetFraction = 0.8;
+
+// True while a daemon holds <cache>/daemon/lock. The daemon takes it LOCK_EX
+// for its whole life, and flock locks belong to an open file description, so
+// this probe sees it as held from inside the daemon too.
+bool DaemonHoldsLock(const std::string& dir) {
+  const std::string path = dir + "/daemon/lock";
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool held = ::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+  ::close(fd);  // releases the shared lock if the probe took it
+  return held;
+}
 
 }  // namespace
 
@@ -154,7 +168,13 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
 
   // One stat for the whole trim. The journal is the pin list: an entry whose
   // upload has not finished must not be the one a later store throws away.
-  const bool pending_dir = util::IsDirectory(dir_ + "/daemon/pending");
+  // Pins count only while a daemon is alive to send them. A daemon that was
+  // killed, or one that found no writable bucket, leaves its journal behind;
+  // honoured forever, those files would pin their entries past every budget
+  // and evict everything newer instead. The next daemon re-reads the journal
+  // and skips an entry evicted meanwhile.
+  const bool pending_dir =
+      util::IsDirectory(dir_ + "/daemon/pending") && DaemonHoldsLock(dir_);
   size_t removed = 0;
   size_t kept = 0;
   uint64_t kept_bytes = 0;
@@ -230,6 +250,14 @@ bool DiskStorage::Clear() {
   for (const std::string& memo :
        {core::SystemIncludeMemoDir(dir_), hash::FileDigestMemoDir(dir_)}) {
     if (util::IsDirectory(memo) && !util::RemoveRecursive(memo)) ok = false;
+  }
+  // The journal names entries that are now gone. A live daemon owns its queue
+  // and skips them when their turn comes; with none, nothing would ever remove
+  // the files.
+  const std::string journal = dir_ + "/daemon/pending";
+  if (util::IsDirectory(journal) && !DaemonHoldsLock(dir_) &&
+      !util::RemoveRecursive(journal)) {
+    ok = false;
   }
   return ok;
 }

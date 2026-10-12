@@ -11,7 +11,7 @@ import threading
 from http.server import ThreadingHTTPServer
 
 sys.dont_write_bytecode = True
-from daemon_session_test import check, poll_until
+from daemon_session_test import LINUX, check, poll_until, skip
 import mock_s3
 
 
@@ -221,11 +221,17 @@ os.execvp(real, [real] + sys.argv[1:])
     pair("c-stored")
     if shutil.which("rustc"):
         pair("rust-stored", "rust")
-    pair("link-stored", "link")
+    if LINUX:
+        pair("link-stored", "link")
+    else:
+        skip("link-stored: link caching is Linux-only")
     pair("cost-c", recorded_cost=True)
     if shutil.which("rustc"):
         pair("cost-rust", "rust", recorded_cost=True)
-    pair("cost-link", "link", recorded_cost=True)
+    if LINUX:
+        pair("cost-link", "link", recorded_cost=True)
+    else:
+        skip("cost-link: link caching is Linux-only")
     pair("holder-failed", ending="failed")
     pair("holder-gone", ending="gone")
     pair("daemon-shutdown", ending="shutdown")

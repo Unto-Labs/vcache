@@ -666,7 +666,9 @@ session; lookups and stores keep their own connections.
 
 These switches belong to each client. A daemon started by a client with the
 switches off also serves scheduling requests from clients that enable them.
-Admission reserves memory before the actual compile or link. It uses the
+Admission reserves memory before the actual compile or link. It samples
+memory through `/proc`, so it only has an effect on Linux; elsewhere the
+daemon logs "admission unavailable" once and grants every request. It uses the
 largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
 and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
 integer defaults are in kB. Within the daemon lifetime, a matching cost key also
@@ -681,7 +683,9 @@ that make, ninja and cargo share. `daemon.jobserver_jobs`
 because each client already owns one. Unset means the machine's online CPUs.
 0, a negative value, or a value above the platform integer maximum warns and
 does the same. `vcache --jobserver-env` prints the `MAKEFLAGS` line, or
-exits 1 when no pool is running or the path is not a fifo. See
+exits 1 when no pool is running, the path is not a fifo, or `make` is older
+than GNU make 4.4 (`VCACHE_JOBSERVER_ANY_CLIENT=1` skips that check for other
+clients). The pool is Linux only. See
 [daemon.md](daemon.md) for the protocol and the tool versions.
 
 When admission requests wait, the pool withdraws unused shared tokens every
@@ -1100,6 +1104,10 @@ Inspection commands:
 `--clear` deletes cached entries. It leaves `<cache>/costs/` and the
 compiler-version memos in place: those are local records, not results another
 machine would share.
+
+Cost records are written only while `daemon.single_flight` or
+`daemon.admission` is on, and never by a read-only client, so with the
+defaults `--show-costs` has nothing to show.
 
 `--show-costs` prints one row per operation (`compile`, `rustc`, `link`) with
 the number of observations and the median and maximum of `max_rss_kb` and

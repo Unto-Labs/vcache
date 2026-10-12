@@ -78,6 +78,12 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 skipped() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+# GNU make 4.4 is the first to read a fifo named by --jobserver-auth.
+make_reads_fifo_jobserver() {
+  local v
+  v=$(make --version 2>/dev/null | sed -n '1s/^GNU Make \([0-9][0-9.]*\).*/\1/p')
+  [[ -n "$v" && "$(printf '%s\n' 4.4 "$v" | sort -V | head -1)" == "4.4" ]]
+}
 
 # BSD sed -i wants a backup suffix and GNU sed -i must not have one separated
 # from it, so no single spelling works on both -- and getting it wrong makes sed
@@ -1276,6 +1282,19 @@ mkdir -p "$WORK/cost-src"
 cat > "$WORK/cost-src/t.cc" << 'EOF'
 int cost_probe() { return 1; }
 EOF
+# Cost records feed only single-flight and admission. With both off, the
+# default, a miss writes none.
+reset_cache
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "by default a miss writes no cost record" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_READONLY=1 "$VCACHE" g++ -c t.cc -o "$WORK/cost-ro.o" -DREADONLY_COST )
+check "nor does a read-only miss with admission on" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+export VCACHE_DAEMON_SINGLE_FLIGHT=1
 reset_cache
 COST_LOG="$WORK/cost.log"
 rm -f "$COST_LOG"
@@ -1402,6 +1421,7 @@ if [[ "$(uname -s)" == Linux ]]; then
 else
   skipped "link cost records are Linux-only"
 fi
+unset VCACHE_DAEMON_SINGLE_FLIGHT
 
 # --------------------------------------------------------------------------
 section "10. cache management commands"
@@ -2342,10 +2362,26 @@ reset_cache
 check "jobserver is off by default" \
   "$("$VCACHE" --start-daemon >/dev/null && [[ ! -p "$VCACHE_DIR/daemon/jobserver.fifo" ]] && echo yes)" "yes"
 check "--jobserver-env without a pool exits 1" \
-  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 reset_cache
 
+# Older GNU make reads the printed line as an unlimited -j (3.81) or rejects
+# it (4.2, 4.3), so --jobserver-env refuses rather than print it for them.
+mkdir -p "$WORK/js-make"
+printf '#!/bin/sh\necho "GNU Make 4.3"\n' > "$WORK/js-make/make43"
+printf '#!/bin/sh\necho "GNU Make 4.4.1"\n' > "$WORK/js-make/make44"
+chmod +x "$WORK/js-make/make43" "$WORK/js-make/make44"
+js_old=$(MAKE="$WORK/js-make/make43" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env refuses GNU make 4.3" \
+  "$([[ "$js_old" == *"needs GNU make 4.4"* && "$js_old" == *"exit=1" ]] && echo yes)" "yes"
+js_new=$(MAKE="$WORK/js-make/make44" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env accepts GNU make 4.4 and then wants a pool" \
+  "$([[ "$js_new" == *"no jobserver"* && "$js_new" == *"exit=1" ]] && echo yes)" "yes"
+
+if [[ "$(uname -s)" != Linux ]]; then
+  skipped "the fifo jobserver pool is Linux-only"
+else
 export VCACHE_DAEMON_JOBSERVER=1
 export VCACHE_DAEMON_JOBSERVER_JOBS=2
 export VCACHE_DAEMON_IDLE_TIMEOUT=60
@@ -2357,7 +2393,8 @@ check "jobserver tokens total" "$(daemon_stat 'jobserver tokens total')" "2"
 check "jobserver tokens free" "$(daemon_stat 'jobserver tokens free')" "2"
 check "jobserver tokens withdrawn" "$(daemon_stat 'jobserver tokens withdrawn')" "0"
 check "--jobserver-env prints the fifo MAKEFLAGS line" \
-  "$("$VCACHE" --jobserver-env)" "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)" \
+  "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
 
 mkdir -p "$WORK/js"
 cat > "$WORK/js/tick.sh" << 'EOF'
@@ -2402,11 +2439,15 @@ EOF
 js_max() { awk '{ print $2 }' "$WORK/js/count"; }
 # The printed line contains a space. An unquoted $(...) splits it, and env
 # then keeps only MAKEFLAGS=-j. Quoting passes the whole assignment.
-js_flags=$("$VCACHE" --jobserver-env)
-printf '0 0\n' > "$WORK/js/count"
-mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
-check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
-check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+js_flags=$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)
+if make_reads_fifo_jobserver; then
+  printf '0 0\n' > "$WORK/js/count"
+  mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
+  check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
+  check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "GNU make >= 4.4 not installed"
+fi
 
 # PATH ninja on this machine is a wrapper that appends -j, which makes ninja
 # ignore the fifo. The real client is /usr/bin/ninja.
@@ -2461,9 +2502,10 @@ reset_cache
 JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
 rm -f "$JS_FIFO"
 check "--jobserver-env exits 1 when the fifo is missing" \
-  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
+fi
 
 # --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"
@@ -4652,7 +4694,11 @@ if command -v python3 >/dev/null 2>&1; then
     > "$WORK/compile-sessions.report" 2> "$WORK/compile-sessions.errors"
   session_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/compile-sessions.report"
   check "compile session integration driver completes" "$session_test_exit" "0"
   if [[ "$session_test_exit" != 0 ]]; then cat "$WORK/compile-sessions.errors"; fi
@@ -4666,7 +4712,11 @@ if command -v python3 >/dev/null 2>&1; then
     > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
   lease_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/single-flight.report"
   check "single-flight integration driver completes" "$lease_test_exit" "0"
   if [[ "$lease_test_exit" != 0 ]]; then cat "$WORK/single-flight.errors"; fi
@@ -4680,7 +4730,11 @@ if command -v python3 >/dev/null 2>&1; then
     "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
   elastic_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/elastic.report"
   check "elastic jobserver integration driver completes" "$elastic_test_exit" "0"
   if [[ "$elastic_test_exit" != 0 ]]; then cat "$WORK/elastic.errors"; fi
@@ -4694,13 +4748,54 @@ if command -v python3 >/dev/null 2>&1; then
     "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
   admission_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/admission.report"
   check "memory admission integration driver completes" "$admission_test_exit" "0"
   if [[ "$admission_test_exit" != 0 ]]; then cat "$WORK/admission.errors"; fi
 else
   bad "memory admission integration requires python3"
 fi
+
+section "10e. Nested admission"
+# A compiler or linker running under a reservation can start vcache again
+# (rustc's linker through masquerade). The daemon already samples that child
+# as part of the parent's tree, so the child must not queue for memory of its
+# own behind the reservation it is part of.
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+mkdir -p "$WORK/nested"
+printf 'int outer(void) { return 1; }\n' > "$WORK/nested/outer.c"
+printf 'int inner(void) { return 2; }\n' > "$WORK/nested/inner.c"
+cat > "$WORK/nested/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then exec gcc "\$@"; fi
+done
+printf '%s\n' "\${VCACHE_MEMORY_RESERVED:-unset}" > "$WORK/nested/marker"
+VCACHE_LOG="$WORK/nested/inner.log" "$VCACHE" gcc -c "$WORK/nested/inner.c" \
+  -o "$WORK/nested/inner.o"
+exec gcc "\$@"
+EOF
+chmod +x "$WORK/nested/cc"
+( cd "$WORK/nested" && VCACHE_DAEMON=auto VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_DAEMON_IDLE_TIMEOUT=60 VCACHE_COMPILER_CHECK=mtime \
+    VCACHE_LOG="$WORK/nested/outer.log" \
+    "$VCACHE" "$WORK/nested/cc" -c outer.c -o outer.o ) >/dev/null 2>&1
+check "a reserved compiler sees the reservation marker" \
+  "$(cat "$WORK/nested/marker" 2>/dev/null)" "1"
+check "the outer compile reserved memory" \
+  "$([[ "$(grep -c 'reserve: granted' "$WORK/nested/outer.log" 2>/dev/null)" -ge 1 ]] && echo yes)" "yes"
+check "a vcache inside the reservation does not reserve again" \
+  "$(grep -c 'not reserving again' "$WORK/nested/inner.log" 2>/dev/null)" "1"
+check "and sends no reserve request of its own" \
+  "$(grep -c 'reserve: granted' "$WORK/nested/inner.log" 2>/dev/null || true)" "0"
+check "both nested compiles produce objects" \
+  "$([[ -s "$WORK/nested/outer.o" && -s "$WORK/nested/inner.o" ]] && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

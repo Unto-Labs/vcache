@@ -169,6 +169,9 @@ static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) 
 static void emit_at_result(int dirfd, const char *path, int failed,
                            int saved_errno, int written_only) {
   if (failed && saved_errno != ENOENT) return;
+  /* fstatat(fd, "", AT_EMPTY_PATH) and statx alike ask about an open
+     descriptor, not a path: nothing was looked up. */
+  if (path == NULL || *path == '\0') return;
   char resolved[VCACHE_RECORD_MAX];
   if (resolve_at_path(dirfd, path, resolved, sizeof resolved)) {
     emit_open_result(resolved, failed, saved_errno, written_only);
@@ -295,6 +298,156 @@ int stat(const char *path, struct stat *st) {
 
 int lstat(const char *path, struct stat *st) {
   int r = NEXT(lstat)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+/* The stat family under every name a compiler can reach it by. Before glibc
+   2.33 stat, lstat and fstatat were inline wrappers around __xstat, __lxstat
+   and __fxstatat, so a compiler built against an older glibc -- most prebuilt
+   and long-term-support toolchains -- calls only those, and the 64-bit forms
+   where it was built with large-file support. gcc and clang find a missing -I
+   directory with exactly one stat, so a hook missing here loses the absent
+   path that would invalidate a hit once the directory is created. */
+int stat64(const char *path, struct stat64 *st) {
+  int r = NEXT(stat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int lstat64(const char *path, struct stat64 *st) {
+  int r = NEXT(lstat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+  int r = NEXT(fstatat64)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* Declared by no current header; the versioned entry points old binaries
+   link against. glibc 2.33 and later keep them only as compatibility symbols,
+   which an unversioned dlsym may not return; the stat call each one wraps is
+   then the same call, since _STAT_VER is the native layout on every 64-bit
+   Linux target. */
+int __xstat(int ver, const char *path, struct stat *st);
+int __lxstat(int ver, const char *path, struct stat *st);
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags);
+int __xstat64(int ver, const char *path, struct stat64 *st);
+int __lxstat64(int ver, const char *path, struct stat64 *st);
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags);
+
+int __xstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__xstat) ? NEXT(__xstat)(ver, path, st) : NEXT(stat)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__lxstat) ? NEXT(__lxstat)(ver, path, st) : NEXT(lstat)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+  int r = NEXT(__fxstatat) ? NEXT(__fxstatat)(ver, dirfd, path, st, flags)
+                           : NEXT(fstatat)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+int __xstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__xstat64) ? NEXT(__xstat64)(ver, path, st) : NEXT(stat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__lxstat64) ? NEXT(__lxstat64)(ver, path, st) : NEXT(lstat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags) {
+  int r = NEXT(__fxstatat64) ? NEXT(__fxstatat64)(ver, dirfd, path, st, flags)
+                             : NEXT(fstatat64)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* statx is what newer libstdc++ and LLVM reach for. Forward-declared, so the
+   hook builds against a glibc whose headers predate it (2.28) too. */
+struct statx;
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st) {
+  int r = NEXT(statx)(dirfd, path, flags, mask, st);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* What open and openat become under _FORTIFY_SOURCE with a mode-less call. */
+int __open_2(const char *path, int flags);
+int __open64_2(const char *path, int flags);
+int __openat_2(int dirfd, const char *path, int flags);
+int __openat64_2(int dirfd, const char *path, int flags);
+
+int __open_2(const char *path, int flags) {
+  int r = NEXT(__open_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __open64_2(const char *path, int flags) {
+  int r = NEXT(__open64_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat_2(int dirfd, const char *path, int flags) {
+  int r = NEXT(__openat_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat64_2(int dirfd, const char *path, int flags) {
+  int r = NEXT(__openat64_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int euidaccess(const char *path, int mode) {
+  int r = NEXT(euidaccess)(path, mode);
   int saved = errno;
   emit_result(path, r != 0, saved);
   errno = saved;

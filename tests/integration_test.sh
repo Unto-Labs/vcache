@@ -3708,6 +3708,48 @@ check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
 
+# Every name the stat family goes by is traced. A compiler built against glibc
+# before 2.33 calls __xstat and friends, and newer code statx; gcc and clang
+# find a missing -I directory with one such call. The legacy entry points are
+# reached through dlsym, which finds the preloaded tracer first, since glibc
+# 2.33 and later no longer lets a new program link against them. Paths are
+# recorded as the process spelled them.
+cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+int main(void) {
+  struct stat st;
+  struct stat64 st64;
+  struct statx stx;
+  int (*xstat)(int, const char *, struct stat *) = dlsym(RTLD_DEFAULT, "__xstat");
+  int (*lxstat64)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__lxstat64");
+  if (xstat == NULL || lxstat64 == NULL) return 1;
+  if (xstat(1, "absent-xstat", &st) == 0) return 2;
+  if (lxstat64(1, "absent-lxstat64", &st64) == 0) return 3;
+  if (stat64("absent-stat64", &st64) == 0) return 4;
+  if (statx(AT_FDCWD, "absent-statx", 0, STATX_BASIC_STATS, &stx) == 0) return 5;
+  if (xstat(1, "dir/value", &st) != 0) return 6;
+  if (statx(0, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) return 7;
+  return 0;
+}
+STATSEOF
+gcc "$WORK/tracer-openat/stats.c" -o "$WORK/tracer-openat/stats" -ldl
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./stats )
+check "the legacy and statx entry points behave as without the tracer" "$?" "0"
+check "each records the path it found absent" \
+  "$(grep -cE $'^M\t''absent-(xstat|lxstat64|stat64|statx)$' \
+      "$WORK/tracer-openat/trace")" "4"
+check "and what it found" \
+  "$(grep -cx $'R\tdir/value' "$WORK/tracer-openat/trace")" "1"
+check "a stat of a descriptor, with an empty path, is not a lost record" \
+  "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF

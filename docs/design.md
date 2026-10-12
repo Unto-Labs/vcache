@@ -121,6 +121,11 @@ from what is known before the preprocessor runs:
 - `hash_env_vars`, and `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
   `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`, which add include
   directories
+- the variables the driver reads before any header: `SDKROOT`,
+  `DEVELOPER_DIR`, `TOOLCHAINS`, `CCC_OVERRIDE_OPTIONS`, `GCC_EXEC_PREFIX`,
+  `COMPILER_PATH` and every `*_DEPLOYMENT_TARGET`. The preprocessor key takes
+  those that are set as well, since a deployment target or SDK is stamped into
+  a Mach-O object and `CCC_OVERRIDE_OPTIONS` can add `-O2` as easily as `-D`
 - the identity of every precompiled header the command names
 
 A state lists every file the depfile of an earlier compile of that key named,

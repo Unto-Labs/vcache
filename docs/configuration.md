@@ -903,7 +903,10 @@ source's canonical path and its spelling on the command line, the source's
 contents, the whole command line except the output and depfile paths (`-I`,
 `-D` and `-include` included; the paths in include-path flags are
 canonicalised, while `-D` values and `-B` are kept as written), the files named
-by keyed flags, `hash_env_vars`, `CPATH` and its siblings, and each precompiled
+by keyed flags, `hash_env_vars`, `CPATH` and its siblings, the variables the
+driver itself reads (`SDKROOT`, `DEVELOPER_DIR`, `TOOLCHAINS`,
+`CCC_OVERRIDE_OPTIONS`, `GCC_EXEC_PREFIX`, `COMPILER_PATH` and every
+`*_DEPLOYMENT_TARGET`), and each precompiled
 header the command names (below). A state lists every file the depfile of an
 earlier compile named, with its digest, and the key that compile was stored
 under. A lookup re-hashes the files of each state and serves the first that

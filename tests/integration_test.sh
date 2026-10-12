@@ -4471,6 +4471,32 @@ else
   skipped "g++ is not installed, or is clang"
 fi
 
+# The driver reads some variables before any header: an SDK, a deployment
+# target, clang's CCC_OVERRIDE_OPTIONS. Neither key may ignore them.
+if command -v clang >/dev/null 2>&1; then
+  mkdir -p "$WORK/drv"
+  printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
+    > "$WORK/drv/s.c"
+  drv() { ( cd "$WORK/drv" && env "$@" "$VCACHE" clang -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  drv VCACHE_CXX_MANIFEST=0
+  drv VCACHE_CXX_MANIFEST=0 CCC_OVERRIDE_OPTIONS=+-O2
+  check "preprocessor mode: CCC_OVERRIDE_OPTIONS adding -O2 misses" "$(misses)" "2"
+  ( cd "$WORK/drv" && CCC_OVERRIDE_OPTIONS=+-O2 clang -c s.c -o ref.o ) 2>/dev/null
+  check "and the object is the -O2 one" \
+    "$(cmp -s "$WORK/drv/s.o" "$WORK/drv/ref.o" && echo same)" "same"
+  reset_cache
+  drv
+  drv
+  check "manifest mode: a repeat compile hits through the manifest" "$(manifest_hits)" "1"
+  drv CCC_OVERRIDE_OPTIONS=+-DFOO
+  check "manifest mode: CCC_OVERRIDE_OPTIONS adding -DFOO misses" "$(misses)" "2"
+  check "and the object has the code -DFOO enables" \
+    "$(nm "$WORK/drv/s.o" 2>/dev/null | grep -c 'foo')" "1"
+else
+  skipped "clang is not installed"
+fi
+
 # A root given through a symlink localises to that spelling, while the working
 # directory is the resolved one; the state must still find its source.
 ln -s "$WORK/mf-a" "$WORK/mf-alias"

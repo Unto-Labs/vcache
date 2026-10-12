@@ -323,6 +323,15 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     feed(value != nullptr ? value : "");
   }
 
+  // The preprocessed text shows what these did to the headers, but not to code
+  // generation: a deployment target or SDK is stamped into a Mach-O object, and
+  // CCC_OVERRIDE_OPTIONS can add -O2 as easily as -D.
+  for (const auto& [name, value] : DriverEnvironment()) {
+    feed("driver-env");
+    feed(name);
+    feed(value);
+  }
+
   // The preprocessed text carries the full effect of every -I/-D/-include flag
   // and of the source itself. Its linemarkers still hold raw absolute paths --
   // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
@@ -957,6 +966,14 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
     const char* value = std::getenv(name);
     hasher.UpdateDelimited(name);
     hasher.UpdateDelimited(value != nullptr ? "=" + roots.CanonicalizeText(value) : "unset");
+  }
+  // The driver reads these before any header; a manifest hit never runs it, so
+  // a new SDK or deployment target would otherwise go unseen.
+  const auto driver_env = DriverEnvironment();
+  hasher.UpdateU64(driver_env.size());
+  for (const auto& [name, value] : driver_env) {
+    hasher.UpdateDelimited(name);
+    hasher.UpdateDelimited(value);
   }
   hasher.UpdateU64(pch_identities.size());
   for (const std::string& identity : pch_identities) hasher.UpdateDelimited(identity);

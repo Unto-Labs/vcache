@@ -10,6 +10,7 @@
 #include <ctime>
 #include <filesystem>
 #include <set>
+#include <utility>
 
 #include "core/preprocessed.h"
 #include "hash/file_memo.h"
@@ -17,6 +18,8 @@
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
+
+extern char** environ;
 
 namespace vcache::core {
 namespace {
@@ -334,6 +337,26 @@ std::optional<std::string> FindUnkeyedGch(const std::vector<std::string>& dirs,
     if (found) return found;
   }
   return std::nullopt;
+}
+
+std::vector<std::pair<std::string, std::string>> DriverEnvironment() {
+  std::vector<std::pair<std::string, std::string>> set;
+  for (const char* name : kDriverEnvVars) {
+    if (const char* value = std::getenv(name)) set.emplace_back(name, value);
+  }
+  static constexpr std::string_view kDeploymentTarget = "_DEPLOYMENT_TARGET";
+  for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+    const std::string_view text(*entry);
+    const size_t eq = text.find('=');
+    if (eq == std::string_view::npos) continue;
+    const std::string_view name = text.substr(0, eq);
+    if (name.size() > kDeploymentTarget.size() &&
+        name.substr(name.size() - kDeploymentTarget.size()) == kDeploymentTarget) {
+      set.emplace_back(std::string(name), std::string(text.substr(eq + 1)));
+    }
+  }
+  std::sort(set.begin(), set.end());
+  return set;
 }
 
 }  // namespace vcache::core

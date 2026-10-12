@@ -11,8 +11,10 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <string>
 
 #include "core/cost.h"
 #include "daemon/protocol.h"
@@ -49,6 +51,11 @@ uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_
     max_wall_ms = std::max(max_wall_ms.value_or(0), observation.wall_ms);
   }
   return LeaseWaitBoundMs(max_wall_ms);
+}
+
+bool AncestorHoldsReservation() {
+  const char* held = std::getenv(kReservationHeldEnv);
+  return held != nullptr && std::string(held) == "1";
 }
 
 uint64_t MemoryEstimateKb(const core::Config& config, const std::string& cost_key, bool link) {

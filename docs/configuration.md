@@ -63,7 +63,7 @@ incoming_prefix_maps = "error"     # error | strip | keep
 read_only            = false
 hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
-cxx_manifest         = true        # see "cxx_manifest"
+cxx_manifest         = false       # see "cxx_manifest"
 cxx_manifest_trace   = true        # see "cxx_manifest"
 
 [cache.disk]
@@ -92,7 +92,7 @@ timeout        = 30                # seconds
 | `vcache.incoming_prefix_maps` | `VCACHE_INCOMING_PREFIX_MAPS` | `--vcache-incoming-prefix-maps=`, `--vcache-allow-prefix-maps` | `error` |
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
-| `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `true` |
+| `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `false` |
 | `vcache.cxx_manifest_trace` | `VCACHE_CXX_MANIFEST_TRACE` | — | `true` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
@@ -546,9 +546,11 @@ Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
 per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
 versions read only the leading counters, and drop the reason lines when they
 next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`,
-and the digests of rustc `--extern` files, keyed by device, inode, size, mtime
-and ctime, in `<dir>/filehash/`; `vcache --trim` removes those not rewritten
-for 30 days.
+and the digests of rustc `--extern` files and of the files C/C++ manifest
+states list, keyed by device, inode, size, mtime and ctime, in
+`<dir>/filehash/`; `vcache --trim` removes those not rewritten for 30 days, and
+`vcache --clear` removes them all. They are written without `fsync`: a memo
+lost in a crash costs one re-hash.
 
 ## S3 cache
 
@@ -673,7 +675,9 @@ session; lookups and stores keep their own connections.
 
 These switches belong to each client. A daemon started by a client with the
 switches off also serves scheduling requests from clients that enable them.
-Admission reserves memory before the actual compile or link. It uses the
+Admission reserves memory before the actual compile or link. It samples
+memory through `/proc`, so it only has an effect on Linux; elsewhere the
+daemon logs "admission unavailable" once and grants every request. It uses the
 largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
 and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
 integer defaults are in kB. Within the daemon lifetime, a matching cost key also
@@ -688,7 +692,9 @@ that make, ninja and cargo share. `daemon.jobserver_jobs`
 because each client already owns one. Unset means the machine's online CPUs.
 0, a negative value, or a value above the platform integer maximum warns and
 does the same. `vcache --jobserver-env` prints the `MAKEFLAGS` line, or
-exits 1 when no pool is running or the path is not a fifo. See
+exits 1 when no pool is running, the path is not a fifo, or `make` is older
+than GNU make 4.4 (`VCACHE_JOBSERVER_ANY_CLIENT=1` skips that check for other
+clients). The pool is Linux only. See
 [daemon.md](daemon.md) for the protocol and the tool versions.
 
 When admission requests wait, the pool withdraws unused shared tokens every
@@ -901,9 +907,10 @@ Every C or C++ lookup has to know the preprocessed text before it can compute
 the key, and producing it is most of what a hit costs. On `src/daemon/server.cc`
 (about 410 headers) a hit took 69 ms with clang++ and 88 ms with g++ through the
 preprocessor, and 6 ms and 9 ms through the manifest. With
-`cxx_manifest` on (the default), a lookup first asks a **manifest**, as
+`cxx_manifest` on, a lookup first asks a **manifest**, as
 [`dep_scan`](#dep_scan) and [`rust_dep_info`](#rust_dep_info) do. This is
-ccache's depend mode.
+ccache's depend mode. It is **off by default**, because it trades exactness
+for that speed: see "The limitation worth knowing" below before turning it on.
 
 The manifest key covers what is known before the preprocessor runs: the
 compiler and the resolved native target, the roots, the working directory, the
@@ -911,11 +918,15 @@ source's canonical path and its spelling on the command line, the source's
 contents, the whole command line except the output and depfile paths (`-I`,
 `-D` and `-include` included; the paths in include-path flags are
 canonicalised, while `-D` values and `-B` are kept as written), the files named
-by keyed flags, `hash_env_vars`, `CPATH` and its siblings, and each precompiled
-header the command names (below). A state lists the files an earlier compile
-read, with their digests, the paths it probed and did not find, and the key
-that compile was stored under. A lookup re-hashes the files of each state and
-checks its absent paths are still absent, and serves the first state that
+by keyed flags, `hash_env_vars`, `CPATH` and its siblings, the variables the
+driver itself reads (`SDKROOT`, `DEVELOPER_DIR`, `TOOLCHAINS`,
+`CCC_OVERRIDE_OPTIONS`, `GCC_EXEC_PREFIX`, `COMPILER_PATH` and every
+`*_DEPLOYMENT_TARGET`), the contents of any include-path argument that names a
+file rather than a directory (a clang header map, `-I foo.hmap`), and each
+precompiled header the command names (below). A state lists the files an
+earlier compile read, with their digests, the paths it probed and did not find,
+and the key that compile was stored under. A lookup re-hashes the files of each
+state and checks its absent paths are still absent, and serves the first state that
 matches in full; an unchanged file costs a `stat` and a read of its memo,
 because digests are memoised by device, inode, size, mtime and ctime, and an
 absent path one `lstat`. Nothing is trusted on mtime alone. A manifest keeps up
@@ -942,15 +953,15 @@ on stored, and the reverse. A hit logs
 
 | Setting | Meaning |
 | --- | --- |
-| `true` *(default)* | Look up and record manifest states. |
-| `false` | Preprocess on every lookup. Entries are shared with `true`. |
+| `true` | Look up and record manifest states. |
+| `false` *(default)* | Preprocess on every lookup. Entries are shared with `true`. |
 
 ```toml
 [vcache]
-cxx_manifest = false
+cxx_manifest = true
 ```
 ```console
-$ export VCACHE_CXX_MANIFEST=0
+$ export VCACHE_CXX_MANIFEST=1
 ```
 
 `cxx_manifest_trace` (`VCACHE_CXX_MANIFEST_TRACE`) chooses where a state comes
@@ -1050,18 +1061,21 @@ result is stored under a key derived from the manifest key and every recorded
 file's digest, as ccache's depend mode keys every result. Only a manifest
 lookup can find that entry.
 
-**The limitation worth knowing.** A header created inside the compiler's own
-trees but outside its include directories (say `/usr/lib/gcc/<target>/<n>/`
-itself) is not seen: the trace leaves those trees to the compiler
-fingerprint. From the depfile alone the
-limitation is the one `dep_scan` has, and ccache's direct and depend modes
-have: a depfile names the files a compile read, not the paths it probed and did
-not find. Create a header that shadows one earlier on the include path, change
-nothing else, and a lookup can still hit with the old answer. The reverse,
-deleting a header that `__has_include` found but the compile did not read, is
-covered for clang by its depfile and for gcc by the rule above, except inside
-the compiler's own include directories. Set `cxx_manifest = false` to make
-these cases exact.
+**The limitation worth knowing.** It is why `cxx_manifest` is off by default.
+A header created inside the compiler's own trees but outside its include
+directories (say `/usr/lib/gcc/<target>/<n>/` itself) is not seen: the trace
+leaves those trees to the compiler fingerprint. From the depfile alone -- on
+macOS always, on Linux whenever the trace is not used -- the limitation is the
+one `dep_scan` has, and ccache's direct and depend modes have: a depfile names
+the files a compile read, not the paths it probed and did not find. Create a
+header that shadows one earlier on the include path, change nothing else, and a
+lookup can still hit with the old answer and serve a stale object. The same
+holds for a header that `#include_next` or a `-F` framework search would now
+find first, and, under gcc, for a `.gch` created later beside an included
+header. The reverse, deleting a header that `__has_include` found but the
+compile did not read, is covered for clang by its depfile and for gcc by the
+rule above, except inside the compiler's own include directories. Set
+`cxx_manifest = false` to make these cases exact.
 
 ### `rust_dep_info`
 
@@ -1161,6 +1175,10 @@ Inspection commands:
 `--clear` deletes cached entries. It leaves `<cache>/costs/` and the
 compiler-version memos in place: those are local records, not results another
 machine would share.
+
+Cost records are written only while `daemon.single_flight` or
+`daemon.admission` is on, and never by a read-only client, so with the
+defaults `--show-costs` has nothing to show.
 
 `--show-costs` prints one row per operation (`compile`, `rustc`, `link`) with
 the number of observations and the median and maximum of `max_rss_kb` and

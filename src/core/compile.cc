@@ -325,6 +325,15 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     feed(value != nullptr ? value : "");
   }
 
+  // The preprocessed text shows what these did to the headers, but not to code
+  // generation: a deployment target or SDK is stamped into a Mach-O object, and
+  // CCC_OVERRIDE_OPTIONS can add -O2 as easily as -D.
+  for (const auto& [name, value] : DriverEnvironment()) {
+    feed("driver-env");
+    feed(name);
+    feed(value);
+  }
+
   // The preprocessed text carries the full effect of every -I/-D/-include flag
   // and of the source itself. Its linemarkers still hold raw absolute paths --
   // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
@@ -808,7 +817,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   fresh.result_key = result_key;
   fresh.files = std::move(files);
   PauseBeforeManifestPut();
-  storage::GetResult again = cache->Get(key);
+  storage::GetResult again = cache->GetLocal(key);
   const bool reread_failed = ReportCacheMediaErrors(again.errors, cache_dir);
   media_failed |= reread_failed;
   const std::vector<DepManifestEntry> reread = DepManifestEntries(again);
@@ -962,6 +971,19 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
     }
     hasher.UpdateDelimited(*digest);
   }
+  // An include-path argument that names a file is a clang header map, which
+  // remaps include names to paths. The compiler reads it on every include, yet
+  // no depfile names it, so its contents join the key.
+  for (const std::string& dir : CxxIncludeDirs(parsed, cwd)) {
+    if (!util::FileExists(dir) || util::IsDirectory(dir)) continue;
+    const std::optional<std::string> digest = hash::HashFileMemoized(dir, memo_dir);
+    if (!digest) {
+      VCACHE_LOG("cxx manifest: cannot hash header map " + dir);
+      return "";
+    }
+    hasher.UpdateDelimited("header-map");
+    hasher.UpdateDelimited(*digest);
+  }
   for (const std::string& name : config.extra_env_vars) {
     const char* value = std::getenv(name.c_str());
     hasher.UpdateDelimited(name);
@@ -971,6 +993,14 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
     const char* value = std::getenv(name);
     hasher.UpdateDelimited(name);
     hasher.UpdateDelimited(value != nullptr ? "=" + roots.CanonicalizeText(value) : "unset");
+  }
+  // The driver reads these before any header; a manifest hit never runs it, so
+  // a new SDK or deployment target would otherwise go unseen.
+  const auto driver_env = DriverEnvironment();
+  hasher.UpdateU64(driver_env.size());
+  for (const auto& [name, value] : driver_env) {
+    hasher.UpdateDelimited(name);
+    hasher.UpdateDelimited(value);
   }
   hasher.UpdateU64(pch_identities.size());
   for (const std::string& identity : pch_identities) hasher.UpdateDelimited(identity);
@@ -1226,9 +1256,14 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   const auto normal = [](const std::string& path) {
     return std::filesystem::path(path).lexically_normal().string();
   };
+  // Also compared canonically: a root given through a symlink (macOS's /var is
+  // /private/var) localises to the spelling the user wrote, while the working
+  // directory is the resolved one.
   const std::string source = normal(CxxAbsolutePath(cwd, parsed.source));
+  const std::string canonical_source = normal(roots.Canonicalize(source));
   if (std::none_of(inputs.files.begin(), inputs.files.end(), [&](const ManifestFile& file) {
-        return normal(roots.Localize(file.first)) == source;
+        return normal(roots.Localize(file.first)) == source ||
+               normal(file.first) == canonical_source;
       })) {
     inputs.files.clear();
     inputs.declined = "the dependency file does not name the source";
@@ -1593,11 +1628,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     compile_options.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
     compile_options.env.emplace_back("LD_PRELOAD", manifest_tracer);
   }
-  if (session && config.daemon.admission) {
+  if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
+    VCACHE_LOG("reserve: an enclosing vcache holds the reservation; not reserving again");
+  } else if (session && config.daemon.admission) {
     const auto cost_key = ComputeCostKey("compile", parsed.source,
         args::LanguageName(parsed.language), parsed.key_args, roots);
     session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
     compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+    compile_options.env.emplace_back(daemon::kReservationHeldEnv, "1");
   } else if (config.daemon.admission && !config.read_only &&
              config.daemon.mode != DaemonMode::kOff) {
     VCACHE_LOG("reserve: daemon unavailable, running unreserved");
@@ -1605,8 +1643,10 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   util::ProcResult compiled = util::Run(compile_cmd, compile_options);
   // Recorded on a failed compile too: an OOM kill is the sample that matters
   // most, and the cost file is not the cache entry.
-  RecordCompileCost(cache_dir, "compile", parsed.source,
-                    args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
+  if (CostRecordsWanted(config)) {
+    RecordCompileCost(cache_dir, "compile", parsed.source,
+                      args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
+  }
 
   // ld.so's refusal to preload the tracer into some process of the compile is
   // the tracer's doing, not the compiler's: neither printed nor stored, and

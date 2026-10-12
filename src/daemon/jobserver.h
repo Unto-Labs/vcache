@@ -24,6 +24,11 @@ namespace vcache::daemon {
 // it is a jobserver client rather than the owner of a new pool.
 std::string JobserverMakeFlagsLine(const std::string& fifo_path);
 
+// True when `version_text` (the output of `make --version`) is GNU make 4.4
+// or newer. Older makes do not read a fifo from --jobserver-auth: 3.81 ignores
+// it and takes the bare -j as "no limit", and 4.2/4.3 expect a pipe pair.
+bool MakeReadsFifoJobserver(const std::string& version_text);
+
 // Negative values withdraw tokens; positive values restore them.
 int JobserverSignedTokenChange(int total, int free_fifo_bytes, int withdrawn, uint64_t waiting,
                                uint64_t available_kb, int min_jobs, uint64_t default_estimate_kb);
@@ -37,6 +42,8 @@ class JobserverPool {
   ~JobserverPool();
 
   // Creates `path` as a fifo (0600), replacing a stale fifo already there.
+  // Linux only: the pool counts its free tokens with FIONREAD, which macOS
+  // answers with 0 for a fifo whatever it holds.
   // `slots` is the number of jobs the pool admits. The fifo itself receives
   // slots-1 '+' bytes; see the note above. A non-fifo at the path, a path
   // that cannot be created, or a fifo that cannot hold the tokens leaves

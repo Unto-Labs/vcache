@@ -73,8 +73,9 @@ declines rather than guesses. `.incbin` is the case that matters in practice: it
 makes the *assembler* open a file, so neither its name nor its contents are in
 the text, and two compilations can hash identically while owing different
 objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
-profiles, plugins, the randstruct layout seed — are hashed by content instead,
-since there the flag at least names the file.
+profiles, plugins, the randstruct layout seed, and clang's `--config` file,
+which can carry `-O` or `-D` — are hashed by content instead, since there the
+flag at least names the file.
 
 A `-M`/`-MM` dependency scan has no preprocessed text, so its manifest key is
 built from what is known before the scan runs:
@@ -98,7 +99,7 @@ is served only while all of them still match.
 
 The preprocessor key needs the preprocessed text, so a lookup that computes it
 runs the preprocessor, and that is most of what a hit costs. A compile first
-looks up a manifest instead (`cxx_manifest`, on by default). Its key is built
+looks up a manifest instead (`cxx_manifest`, off by default). Its key is built
 from what is known before the preprocessor runs:
 
 - its own key-format version, and the preprocessor key's, since states name
@@ -121,6 +122,13 @@ from what is known before the preprocessor runs:
 - `hash_env_vars`, and `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
   `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`, which add include
   directories
+- the variables the driver reads before any header: `SDKROOT`,
+  `DEVELOPER_DIR`, `TOOLCHAINS`, `CCC_OVERRIDE_OPTIONS`, `GCC_EXEC_PREFIX`,
+  `COMPILER_PATH` and every `*_DEPLOYMENT_TARGET`. The preprocessor key takes
+  those that are set as well, since a deployment target or SDK is stamped into
+  a Mach-O object and `CCC_OVERRIDE_OPTIONS` can add `-O2` as easily as `-D`
+- the contents of an include-path argument that names a file: a clang header
+  map remaps include names on every `#include`, and no depfile names it
 - the identity of every precompiled header the command names
 
 A state lists the files an earlier compile of that key read, with their
@@ -282,6 +290,19 @@ lists a header `__has_include` found in its depfile, and under gcc the
 `__has_include` rule above declines such states. A system header that probes is
 exempt, on the same assumption about the compiler's own include directories.
 
+**The swapped-path race.** A state is declined when a file it lists changed
+after the compile started, judged by that file's own mtime and ctime. A
+symlink retargeted, or a directory renamed, during the compile is not seen
+that way: the file now at the recorded path can be older than the compile
+while being a different file from the one the compiler read. Reproduced with a
+wrapper that ran `ln -sfn v2 inc` right after the compiler read `inc/h.h` from
+`v1`: the state recorded `v2`'s digest against `v1`'s object, and the next
+compile, with `inc` pointing at `v2`, was served the `v1` object. ccache's
+"include file too new" check has the same shape. Closing it would mean
+checking every path component (or the digests the compiler actually read)
+rather than the file alone; it is left open, since it needs the tree to change
+under a running compile.
+
 ## Compiler identity
 
 `VCACHE_COMPILER_CHECK` selects:
@@ -346,7 +367,9 @@ on both. It also includes vcache's own resident set at the fork, which on a
 heavy translation unit was 368,068 KiB through vcache against 368,992 KiB for
 the compiler run directly.
 
-The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
+The same two numbers are kept under `<cache>/costs/`, for misses only and
+only when `daemon.single_flight` or `daemon.admission` is on, the two
+features that read them; a read-only client keeps none. Each
 file holds the last eight observations of one codegen class (operation,
 canonical source or link output, language, and the optimisation and debug
 flags — not the source text and not include paths). `--clear` removes cache

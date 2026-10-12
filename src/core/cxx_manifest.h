@@ -71,6 +71,21 @@ inline constexpr const char* kIncludePathEnvVars[] = {
     "OBJCPLUS_INCLUDE_PATH",
 };
 
+// The variables the compiler driver itself reads that change what it compiles
+// or which tools it runs: the SDK and toolchain selection Apple's drivers take
+// from the environment, clang's CCC_OVERRIDE_OPTIONS (which edits the command
+// line), and gcc's GCC_EXEC_PREFIX and COMPILER_PATH (which choose cc1, as and
+// the headers beside them). Every `*_DEPLOYMENT_TARGET` counts too.
+inline constexpr const char* kDriverEnvVars[] = {
+    "SDKROOT", "DEVELOPER_DIR", "TOOLCHAINS", "CCC_OVERRIDE_OPTIONS",
+    "GCC_EXEC_PREFIX", "COMPILER_PATH",
+};
+
+// Those of the driver variables that are set, as sorted name/value pairs.
+// Unset ones are left out, so a key that feeds this list does not change for an
+// environment that sets none of them.
+std::vector<std::pair<std::string, std::string>> DriverEnvironment();
+
 struct ConsumedPchs {
   // Absolute, in command-line order, without duplicates.
   std::vector<std::string> paths;

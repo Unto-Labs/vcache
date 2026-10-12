@@ -4,6 +4,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <ctime>
 
 #include "hash/hasher.h"
@@ -76,7 +77,14 @@ std::optional<std::string> HashFileMemoizedAt(const std::string& path,
 
   const std::string memo_path = memo_dir + "/" + MemoKey(*before);
   if (auto cached = util::ReadFile(memo_path)) {
-    if (cached->size() == kDigestHexLen) return *cached;
+    // Written without fsync, so a crash can leave it empty or, on some
+    // filesystems, full of NULs; anything but a whole hex digest is a miss.
+    if (cached->size() == kDigestHexLen &&
+        std::all_of(cached->begin(), cached->end(), [](char c) {
+          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) {
+      return *cached;
+    }
   }
 
   auto digest = HashFile(path);
@@ -87,7 +95,9 @@ std::optional<std::string> HashFileMemoizedAt(const std::string& path,
   // A path renamed onto, or a file rewritten, while it was being hashed would
   // otherwise store the new contents' digest under the old identity.
   if (settled && StatIdentity(path) == before) {
-    util::WriteFileAtomic(memo_path, *digest);
+    // Not durable: losing a memo costs one re-hash, while an fsync per header
+    // would land on the first lookup after every checkout.
+    util::WriteFileAtomic(memo_path, *digest, /*durable=*/false);
   }
   return digest;
 }

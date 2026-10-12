@@ -11,10 +11,14 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from daemon_session_test import check, poll_until
+from daemon_session_test import LINUX, check, make_reads_fifo_jobserver, poll_until, skip
 
 
 def run(binary, work, writer, selected):
+    if not LINUX:
+        skip("elastic jobserver: the fifo pool is Linux-only")
+        return
+    fifo_make = make_reads_fifo_jobserver()
     work.mkdir(parents=True, exist_ok=True)
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("VCACHE_")}
@@ -78,6 +82,9 @@ sys.exit(result)
         return path.read_text() if path.exists() else ""
 
     def make_phase(env, case, label, width, processes, descriptors, admission=False, wave=False):
+        if not fifo_make:
+            skip(label + ": needs GNU make 4.4 or newer")
+            return
         folder = case / label
         folder.mkdir()
         (folder / "counter").write_text("0 0 0\n")
@@ -171,6 +178,9 @@ sys.exit(result)
 
     def scenario(label, pressure=True, stopping=False, minimum="2", idle=False, admitted=False):
         if selected and label not in selected:
+            return
+        if admitted and not fifo_make:
+            skip(label + ": needs GNU make 4.4 or newer")
             return
         case = work / label
         case.mkdir()

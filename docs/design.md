@@ -197,12 +197,19 @@ off (`cxx_manifest_trace`), when there is no tracer (no `vcache-fstrace.so`
 beside the binary, `VCACHE_TRACER` naming nothing or something that is not an
 ELF shared object of vcache's own class and machine, a host other than Linux),
 when `LD_PRELOAD` is already set, when no process loaded the tracer, when the
-trace is marked incomplete, does not parse or names no process, when the
-compiler's include directories cannot be listed, and when the trace does not
-show a file the depfile names being read, and when ld.so refused a preload in
-some process of the compile. ld.so's "cannot be preloaded" lines that name the
-tracer are then taken out of the compile's stderr: they come from preloading
-it, and an entry would replay them on every hit. A refusal of any other object
+trace is marked incomplete, does not parse or names no process, when no
+compiler front end (`cc1*`, `clang`) ran under it, when a missing directory on
+the include path is not among its absent paths, when the compiler's include
+directories cannot be listed, when the trace does not show a file the depfile
+names being read, when the tracer's path holds a space or a colon (ld.so splits
+`LD_PRELOAD` there), and when ld.so refused a preload in some process of the
+compile. Only a state from the trace is protected against a header created
+earlier on the include path; one from the depfile alone, which is every state
+on macOS, has the depend-mode hole. ld.so's "cannot be preloaded" lines that name the
+tracer are then taken out of the compile's stderr, each as exactly the span
+ld.so wrote, so a diagnostic another process was printing around it stays
+whole: they come from preloading it, and an entry would replay them on every
+hit. A refusal of any other object
 is the build's own and stays. The entry is stored as usual.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
@@ -308,9 +315,10 @@ output, and a Rust output of 4 MiB or more other than its `.d`, is kept in the
 disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
 (`linkout`, `rustout`), and the entry names it by digest (a `kFile` section for
 link, a `kSidecarFile` section for Rust). Both go through `DiskStorage::PutFile`
-and `GetFile`. A sidecar is created by `CloneFile`, a reflink where the
-filesystem has one, and restored the same way into an exclusive temporary
-beside the output. The hit hashes that clone, not the stored file, and renames
+and `GetFile`. A sidecar is created by `CloneFile`, a reflink (FICLONE) where
+the filesystem has one (Btrfs, XFS with reflink; Linux only), and restored the same way into
+an exclusive temporary beside the output. Elsewhere, macOS included, `CloneFile`
+copies the bytes, so a sidecar hit costs a full copy plus the hash. The hit hashes that clone, not the stored file, and renames
 it into place only if it matches; a Rust hit verifies every sidecar before it
 places anything or forwards diagnostics. The checksum covers only the digest,
 so the hash is what proves the bytes. A Rust sidecar that fails it is removed,
@@ -409,15 +417,15 @@ hit total 0.391 ms
 
 ### Measurements
 
-A clean `cargo build` (dev profile) of sunbird's root workspace on a 128-core
-host, through `build-limited` (30 CPUs): 344 rustc runs, of which a warm build
+A clean `cargo build` (dev profile) of a large Rust workspace on a many-core
+Linux host, limited to 30 CPUs: 344 rustc runs, of which a warm build
 serves 341 from the cache, restoring 4,801 MiB. Store and target directory on
 one XFS filesystem, entries in the page cache, daemon off, `sync` before each
 build. Hit builds are four interleaved samples per binary, median and range;
 the fill is one sample. A summed time adds up every process's line, so with
 builds running in parallel it exceeds the wall time.
 
-| | origin/fbg | fsync kept | no fsync |
+| | before | fsync kept | no fsync |
 |---|---|---|---|
 | warm build, wall | 6.6 s (6.3–7.5) | 6.4 s (5.6–8.7) | 3.6 s (3.3–3.9) |
 | warm build, summed "hit total" | not logged | 42.6 s (36.0–73.0) | 5.7 s (5.1–6.0) |
@@ -427,8 +435,8 @@ builds running in parallel it exceeds the wall time.
 
 "fsync kept" is this change with only its `durable = false` arguments
 reverted. Without the fsync a warm build's restore cost is mostly reading and
-checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
-1,234 MiB restored) showed the same shape in two unsynced samples: summed
+checking entries: 4.5 s of the 5.7 s. A profile without debug info
+(1,234 MiB restored) showed the same shape in two unsynced samples: summed
 "restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
 
 Placing a miss by rename, two synced fills each, interleaved: summed "placed"

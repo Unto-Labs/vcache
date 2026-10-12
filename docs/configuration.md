@@ -537,8 +537,8 @@ and resets counters.
 
 Link outputs, and Rust outputs of 4 MiB or more, are stored beside the entries
 as `<digest>.linkout` and `<digest>.rustout` files in the same shards, and a
-hit clones them (a reflink where the filesystem supports one) and hashes the
-clone before publishing it. They count against `size` like entries. Rust keeps
+hit clones them (a reflink on a Linux filesystem that supports one; a plain
+copy elsewhere, macOS included) and hashes the clone before publishing it. They count against `size` like entries. Rust keeps
 them only when S3 is off; with S3 configured every Rust output stays inside its
 entry.
 
@@ -967,14 +967,32 @@ no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), one
 that is not an ELF shared object of vcache's own class and machine, a host
 other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
 (a statically linked compiler), a trace the tracer marked incomplete or that
-does not parse, or a trace that does not show every file the depfile names
+does not parse, a trace in which no compiler front end (`cc1`, `cc1plus`,
+`clang`) ran -- a launcher such as `ccache gcc` serving a hit of its own reads
+every header but probes nothing -- a missing `-I` directory the trace does not
+show being probed, or a trace that does not show every file the depfile names
 being read: a compiler process that did not load the tracer (another ELF class,
-a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. When
+a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. A
+tracer whose path contains a space or a colon is not preloaded either: ld.so
+splits `LD_PRELOAD` there. When
 ld.so refuses to preload the tracer in some process of the compile, its "cannot
 be preloaded" lines naming the tracer are taken out of the compile's stderr, so
 neither the miss nor a later hit prints them, and the state comes from the
 depfile; the entry is stored as usual. A refusal of any other object is the
 build's own and is kept.
+
+Only a traced compile is protected against a header created earlier on the
+include path than the one the state recorded, the hole ccache's depend mode
+also has: a state from the depfile alone, on macOS always and on Linux whenever
+the trace is not used, lists what was read but not what was looked for. Where
+that matters, keep `cxx_manifest` off there.
+
+The tracer runs inside every process of the compile. A compiler that cannot
+have a library preloaded ahead of its own runtime -- one built with the shared
+AddressSanitizer runtime aborts with "ASan runtime does not come first in
+initial library list" -- fails under it. Set `cxx_manifest_trace = false`
+(`VCACHE_CXX_MANIFEST_TRACE=0`) for such a compiler; its states then come from
+the depfile.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:

@@ -77,10 +77,10 @@ using core::RootMap;
 constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v4";
 constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v2";
 
-// Measured on a sunbird dev build: thresholds of 1, 2 and 4 MiB gave the same
-// warm build, 8 MiB and above a slower one, and the trimmer's walk did not
-// move. 4 MiB takes the gain with the fewest files that can be evicted apart
-// from their entry (docs/design.md, "Restoring outputs").
+// Measured on a large Rust workspace's dev build: thresholds of 1, 2 and 4 MiB
+// gave the same warm build, 8 MiB and above a slower one, and the trimmer's
+// walk did not move. 4 MiB takes the gain with the fewest files that can be
+// evicted apart from their entry (docs/design.md, "Restoring outputs").
 constexpr uint64_t kSidecarMinBytes = 4ull << 20;
 const std::string kSidecarSuffix = "rustout";
 

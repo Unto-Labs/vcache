@@ -962,49 +962,57 @@ from:
 | Setting | Meaning |
 | --- | --- |
 | `true` *(default)* | The depfile and a trace of the compile. |
-| `false` | The depfile alone, with the gcc rules below and the shadowing hole. |
-| either, with a compiler whose `-v` ends in `absent-deps-1` | The depfile and the compiler's own list of what it did not find (below); no trace. |
+| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1`, the depfile and that compiler's own list of what it did not find (below). |
 
 A compiler built with the devtools absent-deps patch (gcc or clang) prints
 `absent-deps-1` after its version and, given `-fabsent-deps=FILE`, writes there
 every path the preprocessor looked for and did not find. Its depfile also names
-a header `__has_include` found and the PCH it read. The recording compile of
-such a compiler gets `-fabsent-deps=<scratch>` beside the `-MD` vcache adds and
-runs without the tracer, whether `cxx_manifest_trace` is on or off, and the log
-says `cxx manifest: recorded from the compiler's absent list: N files, M absent
-paths`. The paths are stored as the trace's are, through the roots and as the
-highest missing ancestor, and the gcc `.gch` and `__has_include` rules below do
-not apply: its depfile names both. A listed path that exists when the state is
-recorded is a compiler fault, and no state is recorded (`not recording: the
-compiler listed <path> as absent but it exists`). A version vcache does not
-know (`absent-deps-2` and up) is traced, with a log line naming it. What only
-the driver reads or probes (clang's `.cfg` files, the GCC installation it
-detects, gcc's `specs`) is in neither the list nor the depfile, and is left to
-the compiler fingerprint; the trace records it.
-`cxx_manifest_absent_deps` (`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) chooses:
+a header `__has_include` found and the PCH it read. The trace stays the first
+source for such a compiler too: it also sees what the driver reads and probes
+on its own (clang's `.cfg` files, the GCC installation it detects, gcc's
+`specs`), which the list does not name and leaves to the compiler fingerprint,
+and on `src/daemon/server.cc` recording from the list was not measurably
+cheaper. The list is the second source: where the compile has no tracer (any
+of the reasons below, `cxx_manifest_trace = false` among them), it gets
+`-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says
+`no tracer at '...'; recording from the compiler's absent list` (or
+`tracing is off; ...`) and then `cxx manifest: recorded from the compiler's
+absent list: N files, M absent paths`. With a tracer the flag is not passed.
+The paths are stored as the trace's are, through the roots and as the highest
+missing ancestor, and the gcc `.gch` and `__has_include` rules below do not
+apply to such a compiler, from any source: its depfile names both. A listed
+path that exists when the state is recorded is a compiler fault, and no state
+is recorded (`not recording: the compiler listed <path> as absent but it
+exists`). A version vcache does not know (`absent-deps-2` and up) is never
+asked for its list, and the log names the version. To compare the two sources,
+set `cxx_manifest_trace = false` for the list and leave it on for the trace.
+`cxx_manifest_absent_deps` (`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list
+off:
 
 | Setting | Meaning |
 | --- | --- |
-| `true` *(default)* | Record a patched compiler's states from its list. |
-| `false` | Trace it like any other compiler, for comparison. |
+| `true` *(default)* | Without a tracer, record a patched compiler's states from its list. |
+| `false` | Without a tracer, record them from the depfile alone, as for any other compiler. |
 
 The caller's own `-fabsent-deps=FILE` is still declined (see
 [Flags that write a second output file](#flags-that-write-a-second-output-file)).
 
-A state comes from the depfile alone, with a `cxx manifest: ... recording from
-the depfile` log line that says why, whenever the trace is not available too:
-no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), one
-that is not an ELF shared object of vcache's own class and machine, a host
-other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
-(a statically linked compiler), a trace the tracer marked incomplete or that
-does not parse, or a trace that does not show every file the depfile names
-being read: a compiler process that did not load the tracer (another ELF class,
-a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. When
-ld.so refuses to preload the tracer in some process of the compile, its "cannot
-be preloaded" lines naming the tracer are taken out of the compile's stderr, so
-neither the miss nor a later hit prints them, and the state comes from the
-depfile; the entry is stored as usual. A refusal of any other object is the
-build's own and is kept.
+A state comes from the depfile alone (or a patched compiler's list), with a
+`cxx manifest: ... recording from the depfile` log line that says why, whenever
+the trace is not available: no `vcache-fstrace.so` beside the binary (or where
+`VCACHE_TRACER` points), one that is not an ELF shared object of vcache's own
+class and machine, a host other than Linux, `LD_PRELOAD` already set, no
+process that loaded the tracer (a statically linked compiler), a trace the
+tracer marked incomplete or that does not parse, or a trace that does not show
+every file the depfile names being read: a compiler process that did not load
+the tracer (another ELF class, a `-B` wrapper that drops `LD_PRELOAD`) recorded
+nothing of what it probed. When ld.so refuses to preload the tracer in some
+process of the compile, its "cannot be preloaded" lines naming the tracer are
+taken out of the compile's stderr, so neither the miss nor a later hit prints
+them, and the state comes from the depfile; the entry is stored as usual. A
+refusal of any other object is the build's own and is kept. A trace found
+unusable only after the compile gives the depfile alone, since the list was not
+asked for.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:
@@ -1014,7 +1022,9 @@ says why:
 - `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` in the environment: gcc
   writes that file from the preprocessor, which a manifest hit does not run.
 - `__DATE__`, `__TIME__` or `__TIMESTAMP__` on the command line, or in a file
-  the depfile names: the digest stays the same while the expansion does not.
+  the depfile names: the digest stays the same while the expansion does not. A
+  `.gch` or `.pch` the depfile names is not scanned: it is not source, and every
+  PCH holds the name `__DATE__`.
 - A file that changed after the compile started, which may not be the version
   the compile read.
 - A file the compiler read, by the trace, that is gone by the time the state

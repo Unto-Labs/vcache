@@ -145,14 +145,14 @@ compile with `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` set: gcc writes
 that dependency file from the preprocessor, which a manifest hit never runs,
 and ignores the variable once `-MD` is on the command line.
 
-A compiler that lists what it did not find is asked for that list instead of
-being traced (below). Any other compile is traced. It runs with
-`vcache-fstrace.so` preloaded, as a link does (the `-E` run for the key does
-not), and the trace adds every file the compiler opened that the depfile does
-not name, and every path it probed and did not find. The depfile stays as the
-base: the trace cannot tell a header from the compiler's own files, which are
-dropped below, and `-MD` costs the compile nothing measurable. Of the trace,
-these are dropped:
+The second is a trace of the same compile. It runs with `vcache-fstrace.so`
+preloaded, as a link does (the `-E` run for the key does not), and the trace
+adds every file the compiler opened that the depfile does not name, and every
+path it probed and did not find. Where there is no tracer, a compiler that
+lists what it did not find is asked for that list instead (below). The depfile
+stays as the base: the trace cannot tell a header from the compiler's own
+files, which are dropped below, and `-MD` costs the compile nothing measurable.
+Of the trace, these are dropped:
 
 - what the link cache drops: `/proc`, `/sys`, the terminal and random devices,
   directory self-references;
@@ -194,19 +194,21 @@ is stored as probed, since resolving it could cross a symlink, and is compared
 with what was read as spelled. Absent paths are canonicalised through the roots
 like files, so a tree at another path checks its own.
 
-For a compiler without the list, the state comes from the depfile alone, and
-the log says why, when tracing is off (`cxx_manifest_trace`), when there is no
-tracer (no `vcache-fstrace.so` beside the binary, `VCACHE_TRACER` naming
-nothing or something that is not an ELF shared object of vcache's own class and
-machine, a host other than Linux), when `LD_PRELOAD` is already set, when no
-process loaded the tracer, when the trace is marked incomplete, does not parse
-or names no process, when the compiler's include directories cannot be listed,
-and when the trace does not show a file the depfile names being read, and when
-ld.so refused a preload in some process of the compile. ld.so's "cannot be
-preloaded" lines that name the tracer are then taken out of the compile's
-stderr: they come from preloading it, and an entry would replay them on every
-hit. A refusal of any other object is the build's own and stays. The entry is
-stored as usual.
+Without a tracer the state comes from the compiler's list when it writes one
+(below), and otherwise from the depfile alone. The log says which and why: when
+tracing is off (`cxx_manifest_trace`), when there is no tracer (no
+`vcache-fstrace.so` beside the binary, `VCACHE_TRACER` naming nothing or
+something that is not an ELF shared object of vcache's own class and machine, a
+host other than Linux), when `LD_PRELOAD` is already set. A trace that turns
+out unusable after the compile gives the depfile alone, since the list was not
+asked for: when no process loaded the tracer, when the trace is marked
+incomplete, does not parse or names no process, when the compiler's include
+directories cannot be listed, and when the trace does not show a file the
+depfile names being read, and when ld.so refused a preload in some process of
+the compile. ld.so's "cannot be preloaded" lines that name the tracer are then
+taken out of the compile's stderr: they come from preloading it, and an entry
+would replay them on every hit. A refusal of any other object is the build's
+own and stays. The entry is stored as usual.
 
 **The compiler's own list.** The devtools gcc and clang carry a patch that ends
 the version line of `-v` with `absent-deps-1`. Given `-fabsent-deps=FILE` such
@@ -214,36 +216,42 @@ a compiler writes there every path the preprocessor looked for and did not
 find: each search directory tried before the one that supplied a header, each
 `__has_include` that found nothing, each `.gch` or `.pch` probed beside a
 header, each include directory that does not exist. Its depfile names a header
-`__has_include` found and every PCH it read. When the banner carries version 1
-(`CompilerId::absent_deps_version`) and `cxx_manifest_absent_deps` is on, the
-recording compile gets `-fabsent-deps=<scratch>/absent` beside the `-MD -MF`
-vcache adds and runs without the tracer; the `-E` run gets neither. The flag is
-vcache's own, like `-MD`, and enters neither key. A version vcache does not
-know is traced, and the log names it; `cxx_manifest_absent_deps = false` traces
-a patched compiler too, for comparison.
+`__has_include` found and every PCH it read. The trace still comes first: it
+also sees what the driver reads and probes on its own, which the list does not
+name, and recording from the list is not measurably cheaper. So when there is
+no tracer for the compile (any reason above, `cxx_manifest_trace` off among
+them), the banner carries version 1 (`CompilerId::absent_deps_version`) and
+`cxx_manifest_absent_deps` is on, the recording compile gets
+`-fabsent-deps=<scratch>/absent` beside the `-MD -MF` vcache adds; with a
+tracer it gets no such flag, and the `-E` run never does. The flag is vcache's
+own, like `-MD`, and enters neither key. A version vcache does not know, or the
+switch off, records from the depfile alone, and the log says why.
+`cxx_manifest_trace = false` with a patched compiler is how to record from the
+list on purpose, to compare it with the trace.
 
 The state's files come from the depfile, less a PCH the manifest key already
 identifies, whose bytes may differ between trees that share one identity. Its
 absent paths come from the list: relative ones joined to the working directory,
-canonicalised through the roots, each stored as its highest missing ancestor,
-with the same noise dropped as from a trace's absent paths: what the link cache
-drops, the scratch directory, the keyed PCHs, and the compiler's own trees
-outside every include directory, found from the driver's prefix. The tracer's
-other rules have nothing to act on: the list names no executable, no shared
-object, no file the compiler read and no probe the driver made along `PATH`.
-The gcc `__has_include` decline and the search for an unkeyed `.gch` do not run
-for such a compiler, traced or not: its depfile names both. What only the
-driver reads or probes is in neither the list nor the depfile: clang's
-configuration files, the GCC installation it detects (`crtbegin.o`,
-`/etc/os-release`), gcc's `specs` and `as`. The trace records those; with the
-list they are left to the compiler fingerprint, as ccache leaves them. With
-`cxx_manifest_trace` off the list is still used, since it costs nothing. A
-listed path that exists when the state is recorded is a fault in the compiler:
-a state holding it would never be served, and the list cannot be trusted to be
-whole, so no state is recorded, and the log says `the compiler listed <path> as
-absent but it exists`. A compile that writes no list records no state either. A
-state holds the same kinds of inputs whichever way it was recorded, so the
-manifest format and its key version are unchanged.
+canonicalised through the roots, each stored as its highest missing ancestor (a
+path spelled through `..`, as clang spells its C++ include directories, is
+stored as spelled and costs one `lstat` on every lookup: 313 of clang's 1202
+for `src/daemon/server.cc`), with the same noise dropped as from a trace's
+absent paths: what the link cache drops, the scratch directory, the keyed PCHs,
+and the compiler's own trees outside every include directory, found from the
+driver's prefix. The tracer's other rules have nothing to act on: the list
+names no executable, no shared object, no file the compiler read and no probe
+the driver made along `PATH`. The gcc `__has_include` decline and the search
+for an unkeyed `.gch` do not run for such a compiler, traced or not: its
+depfile names both. What only the driver reads or probes is in neither the list
+nor the depfile: clang's configuration files, the GCC installation it detects
+(`crtbegin.o`, `/etc/os-release`), gcc's `specs` and `as`. The trace records
+those; with the list they are left to the compiler fingerprint, as ccache
+leaves them. A listed path that exists when the state is recorded is a fault in
+the compiler: a state holding it would never be served, and the list cannot be
+trusted to be whole, so no state is recorded, and the log says `the compiler
+listed <path> as absent but it exists`. A compile that writes no list records
+no state either. A state holds the same kinds of inputs whichever way it was
+recorded, so the manifest format and its key version are unchanged.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -281,18 +289,21 @@ was modified or had its inode changed at or after the moment the compile
 started (it may not be the version the compile read; each file is read before
 it is stat'ed, so an edit between the two still shows), or whose bytes contain
 `__DATE__`, `__TIME__` or `__TIMESTAMP__`: the digest stays the same while the
-expansion changes, which only the preprocessor key would see. A file that later
-gains such a token changes its digest, so the state is checked again when it is
-next written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
-compile off the manifest altogether. A depfile that does not name the source
-declines the state, since a state with nothing to check would always match.
-From the depfile alone under a gcc without the patch, a file outside the
-compiler's own include directories (as `<compiler> -E -v` lists them, memoised
-under `<cache>/sysinc/`) whose bytes use `__has_include` declines it too:
-clang's depfile names a header `__has_include` found and no `#include` read,
-gcc's does not, and the trace sees both. For a derived key, `.incbin` declines
-it as well, since no preprocessed text was checked for it. A declined state
-leaves the entry stored under the preprocessor key as usual.
+expansion changes, which only the preprocessor key would see. A `.gch` or
+`.pch` the depfile names (a patched compiler names the PCH it read) is hashed
+but not scanned: its bytes are not source, and every PCH holds the name
+`__DATE__` among its identifiers. A file that later gains such a token changes
+its digest, so the state is checked again when it is next written. The same
+tokens on the command line (`-DSTAMP=__TIME__`) keep the compile off the
+manifest altogether. A depfile that does not name the source declines the
+state, since a state with nothing to check would always match. From the depfile
+alone under a gcc without the patch, a file outside the compiler's own include
+directories (as `<compiler> -E -v` lists them, memoised under
+`<cache>/sysinc/`) whose bytes use `__has_include` declines it too: clang's
+depfile names a header `__has_include` found and no `#include` read, gcc's does
+not, and the trace sees both. For a derived key, `.incbin` declines it as well,
+since no preprocessed text was checked for it. A declined state leaves the
+entry stored under the preprocessor key as usual.
 
 **Absent paths.** A depfile names the files a compile read, not the paths the
 preprocessor probed and did not find. A header created earlier on the include

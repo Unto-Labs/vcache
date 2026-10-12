@@ -5323,11 +5323,12 @@ section "19b. C/C++ manifest from the compiler's absent-path list"
 
 # The devtools gcc and clang print `absent-deps-1` after the version in -v, and
 # given -fabsent-deps=FILE write there every path the preprocessor looked for
-# and did not find. A state then takes its absent paths from that list, and the
-# compile runs without the tracer. The stub prints that banner around gcc,
-# writes the lines of $STUB_ABSENT where the flag points and drops the flag;
-# $STUB_DEPS_EXTRA joins the depfile, as the patch names there a header that
-# __has_include found.
+# and did not find. The trace still comes first, since it also sees what the
+# driver reads and probes; where there is no tracer, a state takes its absent
+# paths from that list. Most cases here run with VCACHE_TRACER naming nothing.
+# The stub prints that banner around gcc, writes the lines of $STUB_ABSENT
+# where the flag points and drops the flag; $STUB_DEPS_EXTRA joins the
+# depfile, as the patch names there a header __has_include found and a PCH.
 if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   ads="$WORK/mf-absent"
   mkdir -p "$ads"
@@ -5362,8 +5363,10 @@ EOF
   absent_list() { printf '%s\n' "$@" > "$ads/list"; }
   absent_run() {  # $1 dir, $2 log, $3 compiler, then compiler arguments
     local dir=$1 log=$2 cc=$3; shift 3
-    ( cd "$dir" && STUB_ABSENT="$ads/list" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
-        "$VCACHE" "$cc" -O2 "$@" -c main.c -o m.o ) 2>/dev/null
+    local tracer="$ads/no-such-tracer.so"
+    if [[ "${ABSENT_TRACED:-0}" == 1 ]]; then tracer="$TOP/bin/vcache-fstrace.so"; fi
+    ( cd "$dir" && STUB_ABSENT="$ads/list" VCACHE_TRACER="$tracer" VCACHE_MAP_CWD=0 \
+        VCACHE_LOG="$log" "$VCACHE" "$cc" -O2 "$@" -c main.c -o m.o ) 2>/dev/null
   }
   absent_plain() {  # $1 dir, then compiler arguments
     local dir=$1; shift
@@ -5376,6 +5379,23 @@ EOF
     printf '#include "h.h"\nint v = V;\n' > "$1/main.c"
   }
 
+  # With a tracer the trace comes first, and the compiler is not asked for
+  # its list.
+  reset_cache
+  d="$ads/traced"
+  shadow_tree "$d"
+  absent_list first/h.h
+  rm -f "$ads/calls"
+  l=$(mf_log ad-traced)
+  ABSENT_TRACED=1 absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1 with a tracer: the state is recorded from the trace" \
+    "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'absent list' "$l" || true)" \
+    "1/0"
+  check "absent-deps-1 with a tracer: the compile runs under it" \
+    "$(grep -c 'vcache-fstrace\.so|.* -o [^ ]*/out main\.c$' "$ads/calls")" "1"
+  check "absent-deps-1 with a tracer: and is given no -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+
   # A header created earlier on the include path than the one recorded.
   reset_cache
   d="$ads/shadow"
@@ -5383,9 +5403,11 @@ EOF
   absent_list first/h.h
   rm -f "$ads/calls"
   l=$(mf_log ad-shadow1); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
-  check "absent-deps-1: the state is recorded from the compiler's list" \
+  check "absent-deps-1: without a tracer the state is recorded from the compiler's list" \
     "$(grep -cE "cxx manifest: recorded from the compiler's absent list: [0-9]+ files, 1 absent paths" "$l")" "1"
-  check "absent-deps-1: and not from a trace" \
+  check "absent-deps-1: and the log says why" \
+    "$(grep -c "no tracer at '.*'; recording from the compiler's absent list" "$l")" "1"
+  check "absent-deps-1: and not from a trace or the depfile alone" \
     "$(grep -cE 'recorded from the trace|recording from the depfile' "$l" || true)" "0"
   check "absent-deps-1: only the recording compile is given -fabsent-deps=" \
     "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/absent -o [^ ]*/out main\.c$' "$ads/calls")" \
@@ -5447,6 +5469,23 @@ EOF
   l=$(mf_log ad-gch3); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
   check "absent-deps-1: a .gch appearing beside it misses" \
     "$(grep -c 'rejected: .*/h\.h\.gch exists now' "$l")" "1"
+  # The depfile names that .gch, which the key does not cover. It is hashed,
+  # not scanned for time macros: every PCH holds the name __DATE__. That miss
+  # was a preprocessor hit, which records nothing, so the cache starts empty.
+  reset_cache
+  l=$(mf_log ad-gch3b); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: a compile using an unkeyed .gch records a state" \
+    "$(grep -c "recorded from the compiler's absent list" "$l")/$(grep -c 'uses __DATE__' "$l" || true)" \
+    "1/0"
+  STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$(mf_log ad-gch4)" "$ads/gcc-ad1"
+  check "absent-deps-1: and the next compile with that .gch hits" "$(manifest_hits)" "1"
+  printf '#define V 5\n' > "$d/h.h"
+  ( cd "$d" && gcc -O2 -x c-header -c h.h -o h.h.gch )
+  l=$(mf_log ad-gch5); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  absent_plain "$d"
+  check "absent-deps-1: a rebuilt .gch and its header miss" \
+    "$(grep -cE 'rejected: .*/h\.h(\.gch)? changed' "$l")" "1"
+  check "absent-deps-1: and the object follows it" "$(same_object "$d")" "same"
 
   # This compiler's depfile names the PCH it read. One the key identifies is
   # left to the key: its bytes can differ between trees with one identity.
@@ -5507,10 +5546,12 @@ EOF
   absent_list opt.h inc/opt.h
   l=$(mf_log ad-notrace)
   VCACHE_CXX_MANIFEST_TRACE=0 absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
-  check "absent-deps-1: VCACHE_CXX_MANIFEST_TRACE=0 still records from the list" \
+  check "absent-deps-1: VCACHE_CXX_MANIFEST_TRACE=0 records from the list" \
     "$(grep -c "recorded from the compiler's absent list: .*, 2 absent paths" "$l")" "1"
+  check "absent-deps-1: and the log says tracing is off" \
+    "$(grep -c "tracing is off; recording from the compiler's absent list" "$l")" "1"
   check "absent-deps-1: with no depfile-only fallback" \
-    "$(grep -cE 'tracing is off|uses __has_include' "$l" || true)" "0"
+    "$(grep -cE 'recording from the depfile|uses __has_include' "$l" || true)" "0"
   # With neither the list nor the trace, the depfile of this compiler still
   # names a header __has_include found, so gcc's decline does not apply.
   reset_cache
@@ -5521,8 +5562,8 @@ EOF
     "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
     "1/1"
 
-  # The switch off, or a version vcache does not know: the tracer, as for any
-  # other compiler.
+  # Without a tracer, the switch off, a version vcache does not know, or a
+  # compiler without the patch: the depfile alone.
   reset_cache
   rm -f "$ads/calls"
   d="$ads/off"
@@ -5530,8 +5571,8 @@ EOF
   absent_list first/h.h
   l=$(mf_log ad-off)
   VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
-  check "VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 uses the tracer" \
-    "$(grep -c 'absent-deps lists are off; using the tracer' "$l")/$(grep -c 'cxx manifest: recorded from the trace' "$l")" \
+  check "VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 without a tracer records from the depfile" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c "absent-deps lists are off; not asking for the compiler's list" "$l")" \
     "1/1"
   check "the switch off passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
   check "VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 shows in --show-config" \
@@ -5539,10 +5580,15 @@ EOF
   reset_cache
   rm -f "$ads/calls"
   l=$(mf_log ad-v2); absent_run "$d" "$l" "$ads/gcc-ad2" -I first -I second
-  check "absent-deps-2 uses the tracer, and the log names the version" \
-    "$(grep -c 'the compiler reports absent-deps-2, a version this vcache does not read; using the tracer' "$l")/$(grep -c 'cxx manifest: recorded from the trace' "$l")" \
+  check "absent-deps-2 without a tracer records from the depfile, naming the version" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c 'the compiler reports absent-deps-2, a version this vcache does not read; not asking for its list' "$l")" \
     "1/1"
   check "absent-deps-2 passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+  reset_cache
+  l=$(mf_log ad-stock); absent_run "$d" "$l" gcc -I first -I second
+  check "a compiler without the marker and without a tracer records from the depfile" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c -- '-fabsent-deps=' "$l" || true)" \
+    "1/0"
 
   # The caller's own -fabsent-deps= is a second output, and still declined.
   reset_cache
@@ -5556,8 +5602,8 @@ EOF
   for t in xa xb; do shadow_tree "$ads/$t"; done
   absent_tree() {  # $1 tree, $2 log
     absent_list "$ads/$1/first/h.h"
-    ( cd "$ads/$1" && STUB_ABSENT="$ads/list" VCACHE_ROOTS="$ads/$1=proj" VCACHE_LOG="$2" \
-        "$VCACHE" "$ads/gcc-ad1" -O2 -I "$ads/$1/first" -I second -c main.c -o m.o ) \
+    ( cd "$ads/$1" && STUB_ABSENT="$ads/list" VCACHE_TRACER="$ads/no-such-tracer.so" \
+        VCACHE_ROOTS="$ads/$1=proj" VCACHE_LOG="$2" "$VCACHE" "$ads/gcc-ad1" -O2 -I "$ads/$1/first" -I second -c main.c -o m.o ) \
       2>/dev/null
   }
   l=$(mf_log ad-xa1); absent_tree xa "$l"

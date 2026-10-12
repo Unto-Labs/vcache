@@ -245,6 +245,10 @@ std::optional<std::string_view> FindTimeMacro(std::string_view text) {
   return std::nullopt;
 }
 
+bool IsPrecompiledHeaderPath(const std::string& path) {
+  return util::EndsWith(path, ".gch") || util::EndsWith(path, ".pch");
+}
+
 RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
                                    const RootMap& roots, int64_t started_ns,
                                    bool scan_incbin, bool find_probes) {
@@ -265,6 +269,13 @@ RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
       if (*changed >= started_ns) {
         recorded.declined = path + " changed while it was being compiled";
         return recorded;
+      }
+      // A depfile from the absent-deps patch names the PCH the compile read.
+      // Its bytes are not source: every PCH holds the names __DATE__ and
+      // __TIME__ among its identifiers, and none is assembled or probed.
+      if (IsPrecompiledHeaderPath(path)) {
+        recorded.files.emplace_back(roots.Canonicalize(path), hash::HashString(*bytes));
+        continue;
       }
       if (const auto macro = FindTimeMacro(*bytes)) {
         recorded.declined = path + " uses " + std::string(*macro);

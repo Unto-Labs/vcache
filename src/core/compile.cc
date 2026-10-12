@@ -1131,35 +1131,35 @@ std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
   return dirs;
 }
 
-// The tracer to run the recording compile under, or empty, after logging why,
-// when the state is to come from the depfile alone.
-std::string CxxManifestTracer(const Config& config) {
+// The tracer to run the recording compile under, or empty, after logging why
+// and that the state is to come from `fallback` instead.
+std::string CxxManifestTracer(const Config& config, const std::string& fallback) {
 #ifdef __linux__
   if (!config.cxx_manifest_trace) {
-    VCACHE_LOG("cxx manifest: tracing is off; recording from the depfile");
+    VCACHE_LOG("cxx manifest: tracing is off; recording from " + fallback);
     return "";
   }
   const std::string tracer = TracerPath();
   if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0) {
-    VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from the depfile");
+    VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from " + fallback);
     return "";
   }
   if (!TracerLoadsHere(tracer)) {
     VCACHE_LOG("cxx manifest: '" + tracer + "' is not a shared object this binary's loader "
-               "would preload; recording from the depfile");
+               "would preload; recording from " + fallback);
     return "";
   }
   // Replacing it would change what the compile runs with, and adding to it
   // would trace a library loaded before the tracer could see it.
   const char* inherited_preload = std::getenv("LD_PRELOAD");
   if (inherited_preload != nullptr && *inherited_preload != '\0') {
-    VCACHE_LOG("cxx manifest: LD_PRELOAD is set; recording from the depfile");
+    VCACHE_LOG("cxx manifest: LD_PRELOAD is set; recording from " + fallback);
     return "";
   }
   return tracer;
 #else
   (void)config;
-  VCACHE_LOG("cxx manifest: no tracer on this platform; recording from the depfile");
+  VCACHE_LOG("cxx manifest: no tracer on this platform; recording from " + fallback);
   return "";
 #endif
 }
@@ -1229,23 +1229,24 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
 // The version of the absent-deps patch whose -fabsent-deps list vcache reads.
 constexpr int kReadableAbsentDepsVersion = 1;
 
-// True when the recording compile is to write its own list of the paths it
-// probed and did not find, in place of running under the tracer. A compiler
-// without the patch, or the switch off, is traced; so is a patch version this
-// vcache does not know, whose list may mean something else.
-bool RecordsFromAbsentList(const Config& config, const CompilerId& compiler_id) {
-  if (compiler_id.absent_deps_version == 0) return false;
+// True when a recording compile without the tracer can ask the compiler for
+// its own list of the paths it probed and did not find. A patch version this
+// vcache does not know may mean something else by its list.
+bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id) {
+  return compiler_id.absent_deps_version == kReadableAbsentDepsVersion &&
+         config.cxx_manifest_absent_deps;
+}
+
+// Why a compiler with the absent-deps patch is not asked for its list.
+void LogAbsentListUnused(const Config& config, const CompilerId& compiler_id) {
+  if (compiler_id.absent_deps_version == 0) return;
   if (compiler_id.absent_deps_version != kReadableAbsentDepsVersion) {
     VCACHE_LOG("cxx manifest: the compiler reports absent-deps-" +
                std::to_string(compiler_id.absent_deps_version) +
-               ", a version this vcache does not read; using the tracer");
-    return false;
+               ", a version this vcache does not read; not asking for its list");
+  } else if (!config.cxx_manifest_absent_deps) {
+    VCACHE_LOG("cxx manifest: absent-deps lists are off; not asking for the compiler's list");
   }
-  if (!config.cxx_manifest_absent_deps) {
-    VCACHE_LOG("cxx manifest: absent-deps lists are off; using the tracer");
-    return false;
-  }
-  return true;
 }
 
 // The driver as run and as resolved, for CompilerInstallDirs.
@@ -1714,9 +1715,22 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   }
 
   const bool records_manifest = !manifest_depfile.empty() && !config.read_only;
+  // The trace comes first: it also sees what the driver reads and probes on
+  // its own, which the compiler's list does not name. The list stands in for
+  // it where there is no tracer. The -E run stays untraced either way: only
+  // what the real compile opens and probes goes into a state.
+  const bool list_available = CompilerWritesAbsentList(config, compiler_id);
+  const std::string manifest_tracer =
+      records_manifest
+          ? CxxManifestTracer(config, list_available ? "the compiler's absent list"
+                                                     : "the depfile")
+          : "";
+  if (records_manifest && manifest_tracer.empty() && !list_available) {
+    LogAbsentListUnused(config, compiler_id);
+  }
   // Like -MD, the list is vcache's own addition, in neither key.
   const std::string absent_list_path =
-      records_manifest && RecordsFromAbsentList(config, compiler_id) ? *temp_dir + "/absent"
+      records_manifest && manifest_tracer.empty() && list_available ? *temp_dir + "/absent"
                                                                      : "";
   const std::vector<std::string> compile_cmd =
       BuildCompileCommand(parsed, roots, tmp_output, add_md ? manifest_depfile : tmp_depfile,
@@ -1724,10 +1738,6 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
   util::ProcOptions compile_options{.capture_stderr = true};
-  // The -E run stays untraced: only what the real compile opens and probes
-  // goes into a state.
-  const std::string manifest_tracer =
-      records_manifest && absent_list_path.empty() ? CxxManifestTracer(config) : "";
   const std::string trace_log = manifest_tracer.empty() ? "" : *temp_dir + "/trace";
   if (!manifest_tracer.empty()) {
     compile_options.env.emplace_back("VCACHE_TRACE_LOG", trace_log);

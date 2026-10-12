@@ -12,7 +12,8 @@
 // every one of those files still hashes the same and every one of those paths
 // is still absent. The files come from the compile's depfile, as in ccache's
 // depend mode, and, where vcache-fstrace.so can watch the compile, from what
-// it saw the compiler open; the absent paths only from the latter.
+// it saw the compiler open; the absent paths from the same trace, or from the
+// compiler's own -fabsent-deps list when it has the patch that writes one.
 #pragma once
 
 #include <cstdint>
@@ -105,7 +106,8 @@ std::optional<std::string_view> FindTimeMacro(std::string_view text);
 
 struct RecordedInputs {
   std::vector<ManifestFile> files;
-  // Canonical, sorted; only a traced compile records any.
+  // Canonical, sorted; only a traced compile, or one that listed them,
+  // records any.
   std::vector<std::string> absent;
   // Local paths of the files whose bytes use __has_include or
   // __has_include_next, when the caller asked for them.
@@ -203,6 +205,20 @@ std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& fil
 void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const std::string& cwd,
                        int64_t started_ns, const std::string& memo_dir,
                        RecordedInputs* recorded);
+
+// What a compiler's `-fabsent-deps=FILE` list says: the devtools gcc and clang
+// patch writes every path the preprocessor looked for and did not find, one
+// per line, relative ones against the compile's working directory.
+struct CxxAbsentList {
+  // Absolute, spelled as WithoutDotSegments gives them, sorted.
+  std::vector<std::string> paths;
+  // A listed path that exists, as listed. A state holding it would never be
+  // served, and the list it came from cannot be trusted to be whole.
+  std::optional<std::string> existing_path;
+};
+
+// Parses `text`, skipping empty lines, and lstats every path.
+CxxAbsentList ParseCxxAbsentList(const std::string& text, const std::string& cwd);
 
 // The directories a compiler searches for <...> includes with no -I given, as
 // `<compiler> -E -v` lists them, lexically normalised. Empty when the list

@@ -554,6 +554,18 @@ CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceF
   return selected;
 }
 
+CxxAbsentList ParseCxxAbsentList(const std::string& text, const std::string& cwd) {
+  CxxAbsentList list;
+  for (const std::string& line : util::Split(text, '\n', /*skip_empty=*/true)) {
+    const std::string path = CxxAbsolutePath(cwd, line);
+    struct stat st;
+    if (!list.existing_path && ::lstat(path.c_str(), &st) == 0) list.existing_path = path;
+    list.paths.push_back(WithoutDotSegments(path));
+  }
+  list.paths = Sorted(std::move(list.paths));
+  return list;
+}
+
 std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& files,
                                             const RootMap& roots, const CxxTraceInputs& trace) {
   for (const ManifestFile& file : files) {

@@ -65,6 +65,7 @@ hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 cxx_manifest         = true        # see "cxx_manifest"
 cxx_manifest_trace   = true        # see "cxx_manifest"
+cxx_manifest_absent_deps = true    # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -94,6 +95,7 @@ timeout        = 30                # seconds
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
 | `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `true` |
 | `vcache.cxx_manifest_trace` | `VCACHE_CXX_MANIFEST_TRACE` | — | `true` |
+| `vcache.cxx_manifest_absent_deps` | `VCACHE_CXX_MANIFEST_ABSENT_DEPS` | — | `true` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -961,6 +963,33 @@ from:
 | --- | --- |
 | `true` *(default)* | The depfile and a trace of the compile. |
 | `false` | The depfile alone, with the gcc rules below and the shadowing hole. |
+| either, with a compiler whose `-v` ends in `absent-deps-1` | The depfile and the compiler's own list of what it did not find (below); no trace. |
+
+A compiler built with the devtools absent-deps patch (gcc or clang) prints
+`absent-deps-1` after its version and, given `-fabsent-deps=FILE`, writes there
+every path the preprocessor looked for and did not find. Its depfile also names
+a header `__has_include` found and the PCH it read. The recording compile of
+such a compiler gets `-fabsent-deps=<scratch>` beside the `-MD` vcache adds and
+runs without the tracer, whether `cxx_manifest_trace` is on or off, and the log
+says `cxx manifest: recorded from the compiler's absent list: N files, M absent
+paths`. The paths are stored as the trace's are, through the roots and as the
+highest missing ancestor, and the gcc `.gch` and `__has_include` rules below do
+not apply: its depfile names both. A listed path that exists when the state is
+recorded is a compiler fault, and no state is recorded (`not recording: the
+compiler listed <path> as absent but it exists`). A version vcache does not
+know (`absent-deps-2` and up) is traced, with a log line naming it. What only
+the driver reads or probes (clang's `.cfg` files, the GCC installation it
+detects, gcc's `specs`) is in neither the list nor the depfile, and is left to
+the compiler fingerprint; the trace records it.
+`cxx_manifest_absent_deps` (`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) chooses:
+
+| Setting | Meaning |
+| --- | --- |
+| `true` *(default)* | Record a patched compiler's states from its list. |
+| `false` | Trace it like any other compiler, for comparison. |
+
+The caller's own `-fabsent-deps=FILE` is still declined (see
+[Flags that write a second output file](#flags-that-write-a-second-output-file)).
 
 A state comes from the depfile alone, with a `cxx manifest: ... recording from
 the depfile` log line that says why, whenever the trace is not available too:

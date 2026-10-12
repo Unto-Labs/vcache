@@ -5731,6 +5731,42 @@ void TestCxxManifestTrace() {
           dir + "/proj/first/h.h exists now", "one that exists now is named, localised");
 }
 
+void TestCxxAbsentList() {
+  Section("core::cxx manifest absent-deps list");
+
+  auto scratch = util::MakeTempDir("vcache-cxx-absent-");
+  Check(scratch.has_value(), "absent-list scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string proj = *scratch + "/proj";
+  util::MakeDirs(proj + "/inc");
+
+  const core::CxxAbsentList listed =
+      core::ParseCxxAbsentList("first/h.h\n\n" + proj + "/inc/none.h\n./gen/./a.h\n\n", proj);
+  CheckEq(util::Join(listed.paths, " "),
+          proj + "/first/h.h " + proj + "/gen/a.h " + proj + "/inc/none.h",
+          "relative paths are joined to the working directory, . segments go, empty lines "
+          "are skipped, and the paths come back sorted");
+  Check(!listed.existing_path.has_value(), "a list of absent paths names none that exists");
+  Check(core::ParseCxxAbsentList("", proj).paths.empty() &&
+            core::ParseCxxAbsentList("\n\n", proj).paths.empty(),
+        "an empty list, or one of empty lines, names nothing");
+
+  util::WriteFileAtomic(proj + "/inc/h.h", "#pragma once\n");
+  CheckEq(core::ParseCxxAbsentList("first/h.h\ninc/h.h\n", proj).existing_path.value_or(""),
+          proj + "/inc/h.h", "a listed path that exists is reported");
+  CheckEq(core::ParseCxxAbsentList("inc\n", proj).existing_path.value_or(""), proj + "/inc",
+          "so is a directory");
+  std::error_code link_error;
+  std::filesystem::create_symlink("no-such-target", proj + "/dangling.h", link_error);
+  Check(!link_error, "dangling symlink created");
+  CheckEq(core::ParseCxxAbsentList("dangling.h\n", proj).existing_path.value_or(""),
+          proj + "/dangling.h", "and a dangling symlink, which a lookup's lstat would see");
+}
+
 void TestCxxManifest() {
   Section("core::cxx manifest");
 
@@ -6879,6 +6915,7 @@ int main(int argc, char** argv) {
   TestFileDigestMemo();
   TestCxxManifest();
   TestCxxManifestTrace();
+  TestCxxAbsentList();
   TestRustOutputNames();
   TestHashAndScanFile();
   TestUploadGeneration();

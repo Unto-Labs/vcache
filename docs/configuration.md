@@ -1109,8 +1109,9 @@ How the toolchain is identified:
 
 `version` is the default precisely because a shared remote cache is a first-class
 use case and mtimes never agree across machines. An `absent-deps-<n>` token in
-the banner is left out of the hash: a compiler built with that local patch
-produces the stock compiler's objects, so both share entries.
+the banner is hashed with the rest: a compiler built with that local patch
+produces the stock compiler's objects but not its depfiles, so the two do not
+share entries.
 
 ## Logging and diagnostics
 

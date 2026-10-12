@@ -4251,8 +4251,13 @@ l=$(mf_log depenv2)
 DEPENDENCIES_OUTPUT="$WORK/mf-depenv/env.d" mf_compile "$WORK/mf-depenv" "$l"
 check "DEPENDENCIES_OUTPUT keeps to the preprocessor" \
   "$(grep -c 'cxx manifest: DEPENDENCIES_OUTPUT is set' "$l")" "1"
-check "and its dependency file is still written" \
-  "$([[ -s "$WORK/mf-depenv/env.d" ]] && echo written || echo missing)" "written"
+# Only gcc honours the variable; Apple's gcc is clang, which ignores it.
+if cc_is_clang; then
+  skipped "DEPENDENCIES_OUTPUT: gcc is clang here, which does not write it"
+else
+  check "and its dependency file is still written" \
+    "$([[ -s "$WORK/mf-depenv/env.d" ]] && echo written || echo missing)" "written"
+fi
 
 # Read-only: a hit is served from a manifest, and a miss writes none.
 reset_cache
@@ -4389,7 +4394,7 @@ if command -v clang++ >/dev/null 2>&1; then
   check "clang: a .sum newer than the PCH keys it" "$(grep -c 'PCH .*h\.pch is sum' "$l")" "1"
   mf_use_pch "$(mf_log s2)" -I inc
   check "clang: and the manifest hits on it" "$(manifest_hits)" "1"
-  touch -d '1 hour ago' "$pc/h.pch.sum"
+  perl -e 'utime time - 3600, time - 3600, @ARGV' "$pc/h.pch.sum"  # BSD touch has no relative -d
   l=$(mf_log s3); mf_use_pch "$l" -I inc
   check "clang: a .sum older than the PCH is ignored" \
     "$(grep -c 'h\.pch\.sum is older than the PCH' "$l")" "1"

@@ -5356,7 +5356,9 @@ void TestCxxManifest() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string& dir = *scratch;
+  // macOS's TMPDIR ends in '/', which would give "T//vcache-..." paths that a
+  // root deliberately does not match.
+  const std::string dir = fs::path(*scratch).lexically_normal().string();
   const std::string memo_dir = dir + "/memo";
 
   // PCH identity, in order of preference.

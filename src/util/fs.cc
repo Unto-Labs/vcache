@@ -7,8 +7,10 @@
 #if defined(__linux__)
 #include <linux/fs.h>   // FICLONE, used under #ifdef below
 #endif
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -20,6 +22,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include "util/str.h"
 
@@ -60,6 +63,17 @@ mode_t DefaultFileMode() {
     return static_cast<mode_t>(0666 & ~previous);
   }();
   return kMode;
+}
+
+bool AddExecuteBitsUnderUmask(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  const mode_t allowed = DefaultFileMode();
+  mode_t add = 0;
+  if (allowed & S_IRUSR) add |= S_IXUSR;
+  if (allowed & S_IRGRP) add |= S_IXGRP;
+  if (allowed & S_IROTH) add |= S_IXOTH;
+  return ::chmod(path.c_str(), (st.st_mode & 07777) | add) == 0;
 }
 
 namespace {
@@ -163,17 +177,23 @@ std::optional<std::string> ReadFile(const std::string& path) {
   return contents;
 }
 
-bool WriteFileAtomic(const std::string& path, std::string_view contents, bool durable) {
+namespace {
+
+// Opens a new temporary file beside `path`, creating the directory first, for
+// the caller to fill and rename into place. The name is exclusive, so a stale
+// temp or a writer in another PID namespace is never truncated. Returns -1 with
+// errno set on failure.
+int CreateTempBeside(const std::string& path, std::string* tmp_path) {
   const std::string dir = DirName(path);
-  if (!dir.empty() && !MakeDirs(dir)) return false;
+  if (!dir.empty() && !MakeDirs(dir)) return -1;
 
   std::string tmpl = dir.empty() ? std::string(".vcache-tmp-XXXXXX")
                                  : dir + "/.vcache-tmp-XXXXXX";
   std::vector<char> buf(tmpl.begin(), tmpl.end());
   buf.push_back('\0');
-  int fd = ::mkstemp(buf.data());
-  if (fd < 0) return false;
-  const std::string tmp_path(buf.data());
+  const int fd = ::mkostemp(buf.data(), O_CLOEXEC);
+  if (fd < 0) return -1;
+  *tmp_path = buf.data();
 
   // mkstemp always creates at 0600, which is right for a private temp file and
   // wrong for everything vcache goes on to rename into place: a replayed object
@@ -182,10 +202,21 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
   // reads, and breaks the moment they differ -- a container building as root
   // and a CI user hashing the results afterwards is the case that found this.
   if (::fchmod(fd, DefaultFileMode()) != 0) {
+    const int saved_errno = errno;
     ::close(fd);
-    ::unlink(tmp_path.c_str());
-    return false;
+    ::unlink(tmp_path->c_str());
+    errno = saved_errno;
+    return -1;
   }
+  return fd;
+}
+
+}  // namespace
+
+bool WriteFileAtomic(const std::string& path, std::string_view contents, bool durable) {
+  std::string tmp_path;
+  const int fd = CreateTempBeside(path, &tmp_path);
+  if (fd < 0) return false;
 
   // Callers report std::strerror(errno) when this returns false, so every
   // failure path must hand back the errno of the call that actually failed.
@@ -211,7 +242,12 @@ bool WriteFileAtomic(const std::string& path, std::string_view contents, bool du
     saved_errno = errno;
     ok = false;
   }
-  ::close(fd);
+  // Without the fsync, a delayed write error (NFS, a full quota) surfaces only
+  // here, and renaming anyway would publish a short file as a complete one.
+  if (::close(fd) != 0 && ok) {
+    saved_errno = errno;
+    ok = false;
+  }
 
   if (ok && ::rename(tmp_path.c_str(), path.c_str()) != 0) {
     saved_errno = errno;
@@ -241,9 +277,8 @@ bool CloneFile(const std::string& from, const std::string& to) {
   struct stat st;
   if (::fstat(src, &st) != 0) { ::close(src); return false; }
 
-  const std::string tmp = to + ".tmp." + std::to_string(::getpid());
-  const int dst =
-      ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  std::string tmp;
+  const int dst = CreateTempBeside(to, &tmp);
   if (dst < 0) { ::close(src); return false; }
 
   bool ok = false;
@@ -295,7 +330,6 @@ bool CloneFile(const std::string& from, const std::string& to) {
     }
   }
 
-  if (ok) ok = ::fchmod(dst, DefaultFileMode()) == 0;
   if (::close(dst) != 0) ok = false;
   ::close(src);
   if (!ok || ::rename(tmp.c_str(), to.c_str()) != 0) {
@@ -354,14 +388,133 @@ std::string CurrentDir() {
   return std::string(buf);
 }
 
-std::optional<std::string> MakeTempDir(const std::string& prefix) {
-  const char* base = std::getenv("TMPDIR");
-  std::string dir = (base != nullptr && *base != '\0') ? base : "/tmp";
+namespace {
+
+std::optional<std::string> MakeTempDirUnder(const std::string& dir, const std::string& prefix) {
   std::string tmpl = dir + "/" + prefix + "XXXXXX";
   std::vector<char> buf(tmpl.begin(), tmpl.end());
   buf.push_back('\0');
   if (::mkdtemp(buf.data()) == nullptr) return std::nullopt;
   return std::string(buf.data());
+}
+
+std::string ScratchRoot(const std::string& cache_dir) { return cache_dir + "/tmp"; }
+
+// A dead owner's compiler can outlive it by a little when only vcache was killed.
+constexpr int64_t kDeadOwnerScratchGraceSeconds = 10 * 60;
+constexpr size_t kScratchTagLength = 8;
+constexpr size_t kScratchRandomLength = 6;
+
+// Names the pid namespace and the boot a pid belongs to. A sweep in another
+// container sharing the store, or after a reboot, cannot ask the kernel about an
+// owner pid from here, and a tag mismatch sends it back to the age rule.
+std::string ScratchOwnerTag() {
+  char pid_ns[64];
+  const ssize_t pid_ns_length = ::readlink("/proc/self/ns/pid", pid_ns, sizeof(pid_ns));
+  const auto boot_id = ReadFile("/proc/sys/kernel/random/boot_id");
+  if (pid_ns_length <= 0 || !boot_id || boot_id->empty()) return "";
+  uint32_t fnv1a = 2166136261u;
+  for (const char c : std::string(pid_ns, static_cast<size_t>(pid_ns_length)) + *boot_id) {
+    fnv1a = (fnv1a ^ static_cast<unsigned char>(c)) * 16777619u;
+  }
+  char tag[kScratchTagLength + 1];
+  std::snprintf(tag, sizeof(tag), "%08x", fnv1a);
+  return tag;
+}
+
+struct ScratchOwner {
+  pid_t pid;
+  std::string tag;
+};
+
+// Parses `<prefix><pid>.<tag>-XXXXXX`; an older `<prefix>XXXXXX` name yields nothing.
+std::optional<ScratchOwner> ParseScratchOwner(const std::string& name) {
+  if (name.size() < kScratchTagLength + kScratchRandomLength + 4) return std::nullopt;
+  const size_t tag_end = name.size() - kScratchRandomLength - 1;
+  const size_t tag_begin = tag_end - kScratchTagLength;
+  if (name[tag_end] != '-' || name[tag_begin - 1] != '.') return std::nullopt;
+  const size_t pid_end = tag_begin - 1;
+  size_t pid_begin = pid_end;
+  while (pid_begin > 0 && name[pid_begin - 1] >= '0' && name[pid_begin - 1] <= '9') --pid_begin;
+  if (pid_begin == pid_end || pid_end - pid_begin > 9) return std::nullopt;
+  const auto pid = static_cast<pid_t>(std::stol(name.substr(pid_begin, pid_end - pid_begin)));
+  if (pid <= 0) return std::nullopt;
+  return ScratchOwner{pid, name.substr(tag_begin, kScratchTagLength)};
+}
+
+bool ProcessAlive(pid_t pid) { return ::kill(pid, 0) == 0 || errno == EPERM; }
+
+// The owner of a scratch directory holds an exclusive flock on this file for as
+// long as it runs. A pid and tag only answer "alive?" inside one pid namespace on
+// one boot; a lock answers it on macOS, across containers sharing the cache and,
+// where the filesystem maps flock to network locks, across hosts.
+constexpr const char* kScratchLockName = ".vcache-owner";
+
+// Opens and locks `<dir>/.vcache-owner`. The descriptor stays open, and the lock
+// held, until this process exits; close-on-exec keeps it out of the compiler.
+void HoldScratchLock(const std::string& dir) {
+  const std::string path = dir + "/" + kScratchLockName;
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) return;
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) ::close(fd);
+}
+
+enum class ScratchLock { kNone, kHeld, kFree };
+
+ScratchLock ProbeScratchLock(const std::string& dir) {
+  const std::string path = dir + "/" + kScratchLockName;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) return ScratchLock::kNone;
+  const bool held = ::flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+  ::close(fd);
+  return held ? ScratchLock::kHeld : ScratchLock::kFree;
+}
+
+}  // namespace
+
+std::optional<std::string> MakeTempDir(const std::string& prefix) {
+  const char* base = std::getenv("TMPDIR");
+  return MakeTempDirUnder((base != nullptr && *base != '\0') ? base : "/tmp", prefix);
+}
+
+std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix) {
+  const std::string tag = ScratchOwnerTag();
+  const std::string owned_prefix =
+      tag.empty() ? prefix : prefix + std::to_string(::getpid()) + "." + tag + "-";
+  if (!cache_dir.empty() && MakeDirs(ScratchRoot(cache_dir))) {
+    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), owned_prefix)) {
+      HoldScratchLock(*dir);
+      return dir;
+    }
+  }
+  return MakeTempDir(owned_prefix);
+}
+
+size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds) {
+  std::error_code ec;
+  fs::directory_iterator it(ScratchRoot(cache_dir), ec);
+  if (ec) return 0;
+  const int64_t now = static_cast<int64_t>(::time(nullptr));
+  const std::string own_tag = ScratchOwnerTag();
+  size_t removed = 0;
+  for (const auto& entry : it) {
+    struct stat st{};
+    if (::lstat(entry.path().c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+    // A running compile does not touch its directory's mtime while the compiler
+    // rewrites files in it, so age alone cannot tell a long compile from a dead one.
+    const ScratchLock lock = ProbeScratchLock(entry.path().string());
+    if (lock == ScratchLock::kHeld) continue;
+    const auto owner = ParseScratchOwner(entry.path().filename().string());
+    const bool owner_visible = owner && !own_tag.empty() && owner->tag == own_tag;
+    if (lock == ScratchLock::kNone && owner_visible && ProcessAlive(owner->pid)) continue;
+    // A free lock proves the owner gone wherever it ran; without one, only an
+    // owner this process can see is known to be dead.
+    const bool owner_dead = lock == ScratchLock::kFree || owner_visible;
+    const int64_t limit_seconds = owner_dead ? kDeadOwnerScratchGraceSeconds : max_age_seconds;
+    if (now - static_cast<int64_t>(st.st_mtime) <= limit_seconds) continue;
+    if (RemoveRecursive(entry.path().string())) ++removed;
+  }
+  return removed;
 }
 
 bool RemoveRecursive(const std::string& path) {

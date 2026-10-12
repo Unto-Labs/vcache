@@ -616,7 +616,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
 
   // ---- miss: run the scan for real ----------------------------------------
 
-  auto temp_dir = util::MakeTempDir("vcache-dep-");
+  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-dep-");
   if (!temp_dir) {
     RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);
@@ -845,7 +845,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                util::Join(parsed.native_flags, " "));
   }
 
-  auto temp_dir = util::MakeTempDir("vcache-");
+  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-");
   if (!temp_dir) {
     RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);

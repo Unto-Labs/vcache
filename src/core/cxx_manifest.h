@@ -192,6 +192,25 @@ CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceF
 std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& files,
                                             const RootMap& roots, const CxxTraceInputs& trace);
 
+// True for the executable of a compiler front end, the process that runs the
+// preprocessor: gcc's cc1 family, or clang (clang, clang++, clang-18, ...),
+// which preprocesses in its own -cc1 process.
+bool IsCompilerFrontEnd(const std::string& executable);
+
+// True when some process of the trace is a compiler front end. Without one the
+// include search did not run under the tracer -- `ccache gcc` serving a hit of
+// its own reads every header and writes the depfile, but probes nothing -- so
+// the trace has no absent paths to offer however complete its reads look.
+bool TraceShowsFrontEnd(const TraceRecords& records);
+
+// The first of `include_dirs` (absolute) that does not exist and that no
+// traced process was seen probing, or nullopt. gcc and clang stat every
+// directory on the include path once; a missing one absent from the trace means
+// the tracer missed the call that looked, and with it the path whose creation
+// would make a later hit stale.
+std::optional<std::string> FindUnprobedIncludeDir(const std::vector<std::string>& include_dirs,
+                                                  const TraceRecords& records);
+
 // Adds to `recorded` every file of `trace` it does not list yet, by digest,
 // and every absent path, as the highest of its ancestors that does not exist
 // either, stopping at `cwd` and at every root. Declines, emptying `recorded`,

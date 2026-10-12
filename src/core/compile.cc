@@ -1158,6 +1158,16 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
     VCACHE_LOG("cxx manifest: the trace names no process; recording from the depfile");
     return std::nullopt;
   }
+  if (!TraceShowsFrontEnd(records)) {
+    VCACHE_LOG("cxx manifest: no compiler front end ran under the tracer; recording from the "
+               "depfile");
+    return std::nullopt;
+  }
+  if (auto unprobed = FindUnprobedIncludeDir(CxxIncludeDirs(parsed, cwd), records)) {
+    VCACHE_LOG("cxx manifest: the trace does not show the missing include directory " +
+               *unprobed + " being probed; recording from the depfile");
+    return std::nullopt;
+  }
   std::vector<std::string> include_dirs = SystemIncludeDirs(parsed, compiler_id, cache_dir);
   if (include_dirs.empty()) {
     VCACHE_LOG("cxx manifest: the compiler's include directories are unknown; recording from "

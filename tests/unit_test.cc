@@ -5643,6 +5643,36 @@ void TestCxxManifestTrace() {
               .value_or(""),
           dir + "/proj/b.h", "a file the trace never read is named, localised");
 
+  // Which process ran the preprocessor.
+  Check(core::IsCompilerFrontEnd("/usr/libexec/gcc/x86_64-linux-gnu/13/cc1") &&
+            core::IsCompilerFrontEnd("/usr/lib/gcc/x/13/cc1plus") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang") &&
+            core::IsCompilerFrontEnd("/usr/bin/clang++") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang-18") &&
+            core::IsCompilerFrontEnd("/opt/bin/clang++-18.1"),
+        "cc1, cc1plus and clang under its versioned names are front ends");
+  Check(!core::IsCompilerFrontEnd("/usr/bin/ccache") && !core::IsCompilerFrontEnd("/usr/bin/gcc") &&
+            !core::IsCompilerFrontEnd("/usr/bin/as") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-tidy") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clangd") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-"),
+        "a wrapper, a driver, the assembler and clang's other tools are not");
+  core::TraceRecords wrapped;
+  wrapped.tools = {"/usr/bin/ccache", "/bin/sh"};
+  Check(!core::TraceShowsFrontEnd(wrapped), "a trace of ccache serving a hit shows no front end");
+  wrapped.tools.push_back("/usr/libexec/gcc/x/13/cc1");
+  Check(core::TraceShowsFrontEnd(wrapped), "one where cc1 ran does");
+
+  // A missing include directory the trace never saw probed.
+  util::MakeDirs(dir + "/inc-there");
+  core::TraceRecords probes;
+  probes.absent = {dir + "/./gen", dir + "/inc-there/x.h"};
+  Check(!core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen/"}, probes).has_value(),
+        "an existing include directory, and a missing one the trace saw probed, pass");
+  CheckEq(core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen", dir + "/later"}, probes)
+              .value_or(""),
+          dir + "/later", "a missing include directory no process probed is named");
+
   // Recording the selection beside a depfile's files.
   util::MakeDirs(dir + "/proj/inc");
   util::MakeDirs(dir + "/out");

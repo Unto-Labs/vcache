@@ -4961,6 +4961,100 @@ EOF
     "$(grep -c 'preprocessor skipped' "$l")/$(grep -c "no-such-lib.so" "$tl/ownwrap2.err")" "1/1"
 fi
 
+# The guards on whose trace a state may come from. Linux-only, as the tracer is.
+if [[ "$(uname -s)" == Linux ]]; then
+# A tracer path ld.so would split at a space or colon is not preloaded: every
+# piece would be refused on stderr under a name nothing could recognise.
+reset_cache
+mkdir -p "$tl/with space"
+cp "$(dirname "$VCACHE")/vcache-fstrace.so" "$tl/with space/vcache-fstrace.so"
+l=$(mf_log trace-space)
+( cd "$tl" && VCACHE_TRACER="$tl/with space/vcache-fstrace.so" VCACHE_MAP_CWD=0 \
+    VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/space.err"
+check "a tracer path with a space is not preloaded" \
+  "$(grep -c 'split the tracer.s path .* at a space or colon; recording from the depfile' "$l")" "1"
+check "and the compile prints no loader message" \
+  "$(grep -c 'cannot be preloaded' "$tl/space.err" || true)" "0"
+
+# A trace in which no compiler front end ran cannot show the include search,
+# however completely it shows the headers being read: a launcher serving a hit
+# of its own (ccache gcc) reads every header and writes the depfile, and
+# probes nothing. This "launcher" runs gcc untraced, then reads under the
+# tracer every file the depfile names, as such a hit does. Before the check,
+# its trace was used and a header created in first/ got a stale hit.
+reset_cache
+lw="$WORK/mf-launcher"
+mkdir -p "$lw/bin" "$lw/first" "$lw/second"
+printf '#define V 2\n' > "$lw/second/h.h"
+printf '#include "h.h"\nint v = V;\n' > "$lw/main.c"
+cat > "$lw/bin/gcc" <<'LAUNCHEOF'
+#!/bin/sh
+case " $* " in *" -E "*) exec gcc "$@" ;; esac
+env -u LD_PRELOAD gcc "$@" || exit $?
+mf=; prev=
+for a in "$@"; do [ "$prev" = -MF ] && mf=$a; prev=$a; done
+[ -n "$mf" ] || exit 0
+files=$(sed -e 's/^[^:]*://' -e 's/\\$//' "$mf")
+[ -n "$files" ] && cat $files > /dev/null < /dev/null
+exit 0
+LAUNCHEOF
+chmod +x "$lw/bin/gcc"
+mf_launcher() {  # $1 log
+  ( cd "$lw" && VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+      "$VCACHE" "$lw/bin/gcc" -O2 -I first -I second -c main.c -o m.o ) 2>/dev/null
+}
+l=$(mf_log launcher1); mf_launcher "$l"
+check "a trace where no compiler front end ran is not used" \
+  "$(grep -c 'no compiler front end ran under the tracer; recording from the depfile' "$l")" "1"
+check "and no state comes from it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+
+# gcc and clang stat each directory on the include path once. A front end that
+# loaded the tracer and read every file, yet left a missing -I directory out of
+# the trace, means the tracer missed the call that looked; the trace is not used.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  pb="$WORK/mf-unprobed"
+  mkdir -p "$pb/wrap" "$pb/second"
+  printf '#define V 2\n' > "$pb/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$pb/main.c"
+  cat > "$pb/cc1.c" <<'CC1EOF'
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* Named cc1, so the trace shows a front end. Reads the files in FAKE_READS
+   under the tracer, then runs the real cc1 without it, so nothing it probes
+   reaches the trace. */
+int main(int argc, char **argv) {
+  (void)argc;
+  char *reads = strdup(getenv("FAKE_READS"));
+  for (char *p = strtok(reads, ":"); p != NULL; p = strtok(NULL, ":")) {
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) close(fd);
+  }
+  unsetenv("LD_PRELOAD");
+  execv(getenv("REAL_CC1"), argv);
+  return 127;
+}
+CC1EOF
+  gcc -O2 "$pb/cc1.c" -o "$pb/wrap/cc1"
+  l=$(mf_log unprobed1)
+  ( cd "$pb" && REAL_CC1="$(gcc -print-prog-name=cc1)" FAKE_READS="main.c:second/h.h" \
+      VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" gcc -B "$pb/wrap/" -O2 -I gen -I second -c main.c -o m.o ) 2>/dev/null
+  check "a missing -I directory the trace never saw probed keeps the state off the trace" \
+    "$(grep -c "does not show the missing include directory $pb/gen being probed" "$l")" "1"
+  check "and no state comes from it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+  # The real tracer does see gcc probe it.
+  reset_cache
+  l=$(mf_log unprobed2)
+  ( cd "$pb" && VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" gcc -O2 -I gen -I second -c main.c -o m.o ) 2>/dev/null
+  check "under the real tracer the missing directory is in the trace" \
+    "$(grep -c 'recorded from the trace' "$l")" "1"
+fi
+fi
+
 # A compiler process that did not load the tracer records nothing, so the
 # trace says nothing about what it probed. Here cc1 runs behind a wrapper that
 # drops LD_PRELOAD; the depfile path, with its gcc declines, applies.
@@ -4979,8 +5073,10 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
         "$VCACHE" gcc -B "$ut/wrap/" -O2 -I inc -c main.c -o m.o ) 2>/dev/null
   }
   l=$(mf_log untraced1); mf_untraced "$l"
-  check "gcc: a trace that never saw the preprocessor read falls back to the depfile" \
-    "$(grep -c 'the trace does not show .*main\.c being read; recording from the depfile' "$l")" "1"
+  # The wrapper is a shell script, so the trace shows no front end either, and
+  # that is the reason given first.
+  check "gcc: a trace that never saw the preprocessor run falls back to the depfile" \
+    "$(grep -c 'no compiler front end ran under the tracer; recording from the depfile' "$l")" "1"
   check "gcc: where __has_include declines the state" \
     "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
   mf_untraced "$(mf_log untraced2)"

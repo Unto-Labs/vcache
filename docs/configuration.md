@@ -62,6 +62,7 @@ cwd_name             = "cwd"
 incoming_prefix_maps = "error"     # error | strip | keep
 read_only            = false
 hash_env_vars        = []
+rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 
 [cache.disk]
 enabled = true
@@ -89,9 +90,11 @@ timeout        = 30                # seconds
 | `vcache.incoming_prefix_maps` | `VCACHE_INCOMING_PREFIX_MAPS` | `--vcache-incoming-prefix-maps=`, `--vcache-allow-prefix-maps` | `error` |
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
+| `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
 | `vcache.hash_env_vars` | `VCACHE_HASH_ENV_VARS` | — | none |
+| `vcache.rust_path_env_vars` | `VCACHE_RUST_PATH_ENV_VARS` | — | none |
 | `cache.disk.enabled` | `VCACHE_DISK` | — | `true` |
 | `cache.disk.dir` | `VCACHE_DIR` | — | `$XDG_CACHE_HOME/vcache`, else `~/.cache/vcache` |
 | `cache.disk.size` | `VCACHE_CACHE_SIZE` | — | `10G` |
@@ -523,8 +526,10 @@ it.
 `vcache --trim` sweeps every shard on demand; `vcache --clear` empties the cache
 and resets counters.
 
-Statistics live in `<dir>/stats` and are updated under `flock(2)`. Memoised
-compiler fingerprints live in `<dir>/compilers/`.
+Statistics live in `<dir>/stats` and are updated under `flock(2)`: one counter
+per line, then one `reason<TAB>name<TAB>count` line per non-zero reason. Older
+versions read only the leading counters, and drop the reason lines when they
+next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`.
 
 ## S3 cache
 
@@ -664,6 +669,15 @@ target, if any; the sorted set of canonical root targets; codegen-affecting
 flags with paths canonicalised; the preprocessed source text with linemarker
 paths canonicalised; and any variables named in `hash_env_vars`.
 
+For Rust, the sources rustc's `--emit=dep-info` lists stand in for the
+preprocessed text. The same output names every variable the crate read through
+`env!` or `option_env!` (its `# env-dep:` lines), and each goes into the key as
+its name plus its raw value, or a marker for unset. Values are not
+canonicalised, because rustc does not remap them and a path such as `OUT_DIR`
+may end up in the artifact, so a crate that reads a path-valued variable hits
+only where that value is the same, unless the variable is named in
+`rust_path_env_vars`.
+
 **Deliberately not in the key:**
 
 - `-I`, `-D`, `-U`, `-include`, `-isystem` and friends. Their entire effect is
@@ -707,6 +721,38 @@ hash_env_vars = ["SOURCE_DATE_EPOCH"]
 ```console
 $ export VCACHE_HASH_ENV_VARS=SOURCE_DATE_EPOCH,BUILD_FLAVOUR   # comma-separated
 ```
+
+### `rust_path_env_vars`
+
+cargo sets `OUT_DIR` for every crate with a build script to a directory inside
+that checkout's target directory, and the usual crate reads it only to
+`include!` generated code. Keyed raw, every such crate misses in every other
+checkout. Naming the variable here keys its value canonicalised through the
+roots, so with the target directory under a root the crate hits elsewhere:
+
+```toml
+[vcache]
+rust_path_env_vars = ["OUT_DIR"]
+```
+```console
+$ export VCACHE_RUST_PATH_ENV_VARS=OUT_DIR   # comma-separated
+```
+
+The value is canonicalised wherever it is compared: in the key, in the Rust
+manifest, and in the `# env-dep:` line of the cached dep-info. A hit writes that
+line back with the variable's current value, spelled exactly as cargo set it, so
+cargo does not see a changed variable and rebuild. A value outside every root is
+keyed as it is.
+
+List only variables that crates use to locate files, as `include!` uses
+`OUT_DIR`. A crate can still bake the value into its artifact, as
+`const DIR: &str = env!("OUT_DIR")` does. After each compile vcache searches every
+output and rustc's diagnostics for the local value verbatim, and if it is there
+the entry is not stored; `--show-stats` counts those runs as `env path in output`.
+That search is a heuristic. It does not see a value the crate derives from the
+path (`env!("OUT_DIR").len()`, a hash of it) or one stored compressed, as in
+dylib and proc-macro metadata, and such an entry would serve one checkout's path
+to another.
 
 ### `native_target`
 
@@ -765,10 +811,14 @@ text, and for a `-M` run the preprocessor *is* the work. Measured on one
 Preprocessing to save preprocessing is a losing trade, so these are cached
 against a **manifest** instead. The key covers the command line — including
 `-I`, `-D` and friends verbatim, since there is no preprocessed text to stand in
-for them — plus the compiler, the resolved native target, and the source's
-contents. The entry stores every file the scan read with its digest, and a hit
-is served only once all of them still hash the same. Nothing is trusted on
-mtime.
+for them — plus the compiler, the resolved native target, the roots, any
+`hash_env_vars`, and the source's canonical path and contents. Paths are
+canonicalised through the roots, so per-checkout roots, or the same relative
+path under each checkout's mapped working directory, still share an entry.
+Identical sources at different canonical paths do not, since their includes
+resolve to different files. The entry stores every file the scan read with its
+digest, and a hit is served only once all of them still hash the same. Nothing
+is trusted on mtime.
 
 One manifest holds up to eight remembered header states, so alternating between
 two branches keeps hitting rather than overwriting one state with the other.
@@ -792,6 +842,58 @@ in the key. It is specifically *creating a file that shadows an existing one*
 that this mode cannot see, which is the same trade ccache's direct mode makes.
 `-MG`, which lets a dependency name a file that does not exist yet, is not
 cached at all for the same reason.
+
+### `rust_dep_info`
+
+A Rust lookup has to know which files the crate reads before it can compute the
+key, and the only way to ask is `rustc --emit=dep-info`. That run expands every
+macro, so on a macro-heavy crate it costs seconds: for asupersync 0.4.2 it was
+7.3 s per hit, against a 108 s compile. Once everything is cached, those runs
+are most of what is left of a warm Rust build.
+
+By default vcache answers from a **manifest** instead, the same way
+[`dep_scan`](#dep_scan) does. The manifest key covers what is known before
+rustc runs: the toolchain, the roots, the key flags, `--emit`, the crate root's
+canonical path and contents, the names of the `--extern` crates, and any
+`hash_env_vars`. The manifest remembers up to eight states, one per dep-info
+run. Each holds the files that run listed with their digests, the variables
+the crate read (with their raw values or unset), the digest of each `--extern`
+dependency, and the full key those inputs produced. A lookup re-hashes the
+files of each state, compares the variables and extern digests with this
+invocation, and uses the first state that matches in full. Nothing is trusted
+on mtime. A rebuilt dependency adds a state rather than a second manifest, and
+a state that matches moves to the front, so the eight kept are the ones
+used most recently.
+
+Any mismatch, a missing manifest, or a state whose entry is gone falls back to
+the dep-info run, which then records its state. A manifest hit counts as an
+ordinary cache hit.
+
+Measured on `syn` 2 with `features = ["full"]`, the vcache side of a hit,
+including restoring the rlib, went from 166 ms to 53 ms.
+
+| Mode | Meaning |
+| --- | --- |
+| `manifest` *(default)* | Skip the dep-info run when a remembered state still matches. |
+| `always` | Run dep-info on every lookup, and leave the manifest alone. |
+
+```toml
+[vcache]
+rust_dep_info = "always"
+```
+```console
+$ export VCACHE_RUST_DEP_INFO=always
+```
+
+**The limitation worth knowing.** It is the same one `dep_scan` has. A state
+records the files a dep-info run *did* read, so it cannot notice a file that
+was not there at the time. Create a file that changes how a module resolves,
+such as `helper.rs` beside a recorded `helper/mod.rs` (which rustc rejects as
+ambiguous), or one that a proc macro finds by listing a directory, change
+nothing else, and a lookup can still hit with the old answer. Editing a
+`mod` or `include_str!` line does not have this problem, because the crate root
+is in the manifest key and every other source is re-hashed. Changing a flag or
+an extern does not either. Set `always` to make that case exact.
 
 ### `VCACHE_COMPILER_CHECK`
 
@@ -826,10 +928,21 @@ Inspection commands:
 | --- | --- |
 | `vcache --show-config` | The fully resolved configuration, plus any warnings |
 | `vcache --show-roots` | The root mapping for the current directory |
-| `vcache --show-stats` | Counters, hit rate, cache size |
+| `vcache --show-stats` | Counters, why runs were not cached, hit rate, cache size |
 | `vcache --zero-stats` | Reset counters |
 | `vcache --clear` | Delete all entries |
 | `vcache --trim` | Evict until under the size limit |
+
+`--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
+indented under each, plus a *passthrough* row for runs that fell back to the
+compiler after a local failure such as a missing temp directory. A reason is
+shown once it is non-zero, under the same name its `VCACHE_LOG` line uses:
+
+```
+uncacheable         2
+  link                1
+  preprocess only     1
+```
 
 ## Value formats
 
@@ -848,6 +961,7 @@ alone. In TOML, use real booleans.
 | --- | --- | --- |
 | `VCACHE_ROOTS` | `:` (like `PATH`) | array of strings |
 | `VCACHE_HASH_ENV_VARS` | `,` | array of strings |
+| `VCACHE_RUST_PATH_ENV_VARS` | `,` | array of strings |
 
 **Paths** expand a leading `~/` using `$HOME`.
 
@@ -860,7 +974,7 @@ A build always makes progress.
 input from stdin; no recognised source language; plain `.s` assembly (`.S` is
 cacheable, since it is preprocessed); output to `/dev/null` or `-`;
 an `.incbin` directive anywhere in the preprocessed text (see below);
-`-save-temps`, `-fsyntax-only`,
+`-save-temps`, `-fsyntax-only`, `-fpch-preprocess`,
 `-specs=`, `-frepo`, `-fmodules`, PGO flags (`-fprofile-generate`,
 `-fprofile-use`, `-fprofile-instr-use`, `-fauto-profile`),
 `-fsanitize-blacklist=`; malformed or deeply nested `@response-files`.
@@ -878,6 +992,16 @@ an explicit `-o`; more than one input file; input from stdin.
 Additionally, `incoming_prefix_maps = "keep"` makes any affected compilation
 uncacheable, and any internal failure (preprocessing error, temp-directory
 failure, unreadable output) falls back to a plain compiler run.
+
+`-C incremental=DIR` is cached. cargo passes it to every workspace crate in a
+profile with incremental on, pointing into the target directory, so DIR is kept
+out of the key the way `--out-dir` is and two target directories share entries.
+Whether incremental is on stays in the key: it raises rustc's default
+codegen-unit count, which changes the objects, so an incremental and a
+non-incremental build of one crate get separate entries. An entry holds the
+`--emit` artifacts only, never rustc's session state. A miss leaves that state
+in DIR as usual; a hit leaves DIR untouched, so the first edit to that crate
+after a hit compiles it from scratch once.
 
 ## Worked examples
 

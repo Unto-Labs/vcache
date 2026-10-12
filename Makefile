@@ -77,8 +77,10 @@ TCMALLOC_A  := $(TP)/gperftools/build/libtcmalloc_minimal.a \
 
 # libcurl headers only: the library itself is dlopen'd at runtime, so it is not
 # a link-time dependency. See src/storage/curl_api.h for why. Multiarch puts the
-# headers outside the default include path on Debian/Ubuntu.
-CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+# headers outside the default include path on Debian/Ubuntu. Where they are not
+# installed at all, the probe below falls back to third-party/curl.
+PKG_CONFIG  ?= pkg-config
+CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 
 # ---- BLAKE3 architecture selection ------------------------------------------
 #
@@ -126,12 +128,34 @@ INCLUDES := -I$(SRC) -I$(BOOST_INC) -I$(BLAKE3_DIR) -I$(TOMLPP_INC) $(CURL_CFLAG
 # Both features are recent, so detect rather than assume: -gz=zstd needs a gcc
 # built with zstd support (13+) and binutils 2.40+, and LTO needs a working
 # linker plugin. A toolchain without them still builds, just larger.
+#
+# The static C++ runtime is probed too: distributions ship libstdc++.a as a
+# separate package (libstdc++-static on Fedora and RHEL) that most hosts lack,
+# and without it the link fails with "cannot find -lstdc++".
+#
+# So are curl's headers. pkg-config's silence proves nothing -- it prints no
+# flags for headers already on the default path, and a host can have the
+# headers without libcurl.pc -- so ask the compiler.
 
 PROBE_SRC := $(shell mktemp --suffix=.cc 2>/dev/null || echo /tmp/vcache-probe.cc)
 $(shell echo 'int main(){return 0;}' > $(PROBE_SRC))
 
 HAVE_GZ_ZSTD := $(shell $(CXX) -ggdb3 -gz=zstd -c $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
 HAVE_LTO     := $(shell $(CXX) -flto=auto -O2 $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
+ifneq ($(HOST_OS),Darwin)
+HAVE_STATIC_RT := $(shell $(CXX) -static-libstdc++ -static-libgcc $(PROBE_SRC) -o /dev/null \
+                    >/dev/null 2>&1 && echo 1)
+endif
+HAVE_CURL_H  := $(shell $(CXX) $(CURL_CFLAGS) -include curl/curl.h -fsyntax-only $(PROBE_SRC) \
+                  >/dev/null 2>&1 && echo 1)
+
+ifneq ($(HAVE_CURL_H),1)
+  # Only the types and constants vcache uses, which is all a dlopen'd libcurl
+  # needs at compile time. Nothing else is lost: S3 still works wherever the
+  # shared library is installed at runtime.
+  INCLUDES += -I$(TP)/curl/include
+  $(info vcache: curl/curl.h not found, using the subset in third-party/curl)
+endif
 
 # ---- optimisation, debug info and LTO ---------------------------------------
 
@@ -186,7 +210,9 @@ ASFLAGS  := -g $(DEBUG_FMT)
 
 # Static where practical, as the plan asks. Only libc, libm and the loader are
 # dynamic; libm comes in via tcmalloc's use of log2. libcurl is not linked at
-# all -- it is dlopen'd only when an S3 layer is constructed.
+# all -- it is dlopen'd only when an S3 layer is constructed. Where the probe
+# finds no static libstdc++, libstdc++ and libgcc_s are dynamic too: two more
+# DT_NEEDED entries is a better outcome than no binary.
 #
 # LTO flags must be repeated at link time, and the optimisation level with them,
 # since that is when code generation actually happens.
@@ -203,7 +229,14 @@ ifeq ($(HOST_OS),Darwin)
 LDFLAGS  := -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) -Wl,-dead_strip
 LDLIBS   := $(TCMALLOC_A)
 else
-LDFLAGS  := -static-libstdc++ -static-libgcc -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) \
+ifeq ($(HAVE_STATIC_RT),1)
+STATIC_RT := -static-libstdc++ -static-libgcc
+$(info vcache: linking libstdc++ and libgcc statically)
+else
+STATIC_RT :=
+$(info vcache: no static libstdc++ found, linking libstdc++ dynamically)
+endif
+LDFLAGS  := $(STATIC_RT) -pthread $(OPT) $(LTO) $(DEBUG_FMT_LD) \
             -Wl,--gc-sections -Wl,--as-needed -Wl,-O1
 # -ldl is a no-op on glibc 2.34+, where dlopen moved into libc; --as-needed drops
 # it from DT_NEEDED. Kept for older glibc, which needs it for dlopen.
@@ -222,6 +255,7 @@ VCACHE_SRCS := \
   $(SRC)/core/roots.cc \
   $(SRC)/core/config.cc \
   $(SRC)/core/depfile.cc \
+  $(SRC)/core/manifest.cc \
   $(SRC)/core/preprocessed.cc \
   $(SRC)/core/stats.cc \
   $(SRC)/core/compile.cc \
@@ -231,6 +265,7 @@ VCACHE_SRCS := \
   $(SRC)/args/link_args.cc \
   $(SRC)/args/rustc_args.cc \
   $(SRC)/rust/rust_compile.cc \
+  $(SRC)/rust/rust_manifest.cc \
   $(SRC)/storage/disk_storage.cc \
   $(SRC)/storage/s3_storage.cc \
   $(SRC)/storage/chain.cc \
@@ -301,6 +336,7 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 
 test: $(BINDIR)/vcache_test $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test
+	@CXX="$(CXX)" CURL_CFLAGS="$(CURL_CFLAGS)" $(TOP)/tests/curl_abi_check.sh
 	@$(TOP)/tests/integration_test.sh
 
 # Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and

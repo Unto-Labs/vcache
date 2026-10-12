@@ -19,6 +19,7 @@ src/
     compile.*          the C/C++ pipeline
     config.*           TOML + environment configuration
     stats.*            persistent counters
+    reason.h           why a run was not cached: log text and stats key
   rust/
     rust_compile.*     the Rust pipeline
   storage/
@@ -44,6 +45,9 @@ Included:
 - codegen-affecting flags, with any embedded paths canonicalised
 - the preprocessed text, with linemarker paths canonicalised
 - explicitly configured environment variables
+- for Rust, each variable the dep-info reports the crate read through `env!` or
+  `option_env!`, with its raw value or an unset marker. Raw because rustc does
+  not remap env values, so a path-valued one may be baked into the artifact
 
 Deliberately excluded, and why each matters:
 
@@ -68,6 +72,23 @@ the text, and two compilations can hash identically while owing different
 objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
 profiles, plugins, the randstruct layout seed — are hashed by content instead,
 since there the flag at least names the file.
+
+A `-M`/`-MM` dependency scan has no preprocessed text, so its manifest key is
+built from what is known before the scan runs:
+
+- its own key-format version
+- compiler identity and the resolved native target
+- the sorted set of canonical root targets
+- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim
+  and every path canonicalised
+- the source's **canonical path** and its contents. The path matters because
+  headers are found relative to the source: identical sources reached by
+  different canonical paths read different files, and a state recorded for one
+  would still verify for the other
+- explicitly configured environment variables
+
+Each state under that key lists the files the scan read with their digests, and
+is served only while all of them still match.
 
 ## Compiler identity
 
@@ -140,12 +161,15 @@ constructor and reached through a resolved function-pointer table
 vendored in `hash/sha256.cc`, since SigV4 needed exactly three OpenSSL
 functions. The result is four `ldd` entries and 3.0 ms of startup.
 
-Two details worth knowing if you touch this code. `curl/typecheck-gcc.h`
+Three details worth knowing if you touch this code. `curl/typecheck-gcc.h`
 redefines `curl_easy_setopt` and `curl_easy_getinfo` as macros, which would
 rewrite calls made through function pointers, so `curl_api.h` defines
-`CURL_DISABLE_TYPECHECK` before including the header. And the loader tries
-several sonames (`libcurl.so.4`, `libcurl-gnutls.so.4`, ...) because Debian and
-Ubuntu ship TLS-backend-specific builds under different names.
+`CURL_DISABLE_TYPECHECK` before including the header. The loader tries several
+sonames (`libcurl.so.4`, `libcurl-gnutls.so.4`, ...) because Debian and Ubuntu
+ship TLS-backend-specific builds under different names. And on a host without
+curl's headers the build uses `third-party/curl` instead, which declares only
+the types and constants vcache uses, so a new `CURLOPT_` has to be added there
+as well.
 
 The vendored SHA-256 is not a general-purpose crypto primitive and makes no
 constant-time claims: it signs outbound requests with a key the process already
@@ -217,11 +241,26 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   of work rather than a switch. This is the main remaining performance win, and
   the key derivation is already factored to accommodate it: the manifest path
   would replace step 4 of the pipeline and reuse everything else, including
-  linemarker-free canonical paths for the recorded include set.
+  linemarker-free canonical paths for the recorded include set. The Rust side
+  already has its equivalent: a manifest of earlier `--emit=dep-info` runs,
+  verified by re-hashing every recorded file, lets a hit skip that run (see
+  `rust_dep_info` in `configuration.md`).
 - **Linking is not cached**, matching ccache and sccache.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
-- **clang** is handled by the same code path as gcc and the flag tables cover
-  both, but the measurements in `preprocessor-problem.md` were taken on gcc
-  13.3.0 only; clang was not installed on the development machine.
+- **Precompiled headers** are covered by the integration tests for clang
+  (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
+  Both hit across directories because `-E` expands the header text, so the key
+  covers the header although the PCH bytes never enter it. gcc's
+  `-fpch-preprocess` swaps that text for a pragma naming the `.gch`, so it is
+  declined.
+- **How a PCH was built is not in the key.** clang accepts a PCH that defines a
+  macro the compile does not, and gcc uses a `.gch` it never checks against an
+  edited header; in both cases the expanded text describes a different
+  compilation from the one that ran. Build PCHs with the flags and headers of
+  the compiles that use them, as build systems do. A stale `.gch` stores an
+  object under the edited header's key. With an S3 tier that entry is shared
+  with every other host and stays until it expires, so clearing the local cache
+  does not remove it. clang's `-fno-validate-pch`, which removes the one check
+  that catches a stale PCH, is declined.
 - **GCS** is not implemented. The `Storage` interface is where it would go.

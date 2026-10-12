@@ -16,6 +16,7 @@
 #include <map>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,13 +25,16 @@
 #include "core/link_trace.h"
 #include "args/link_args.h"
 #include "args/rustc_args.h"
+#include "core/compile.h"
 #include "core/config.h"
 #include "core/depfile.h"
 #include "core/preprocessed.h"
 #include "core/roots.h"
+#include "core/stats.h"
 #include "daemon/protocol.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
+#include "rust/rust_manifest.h"
 #include "storage/chain.h"
 #include "storage/disk_storage.h"
 #include "storage/s3_storage.h"
@@ -90,7 +94,7 @@ void TestLinkArgs() {
   Section("args::ParseLink");
 
   auto plain = args::ParseLink({"gcc", "a.o", "b.o", "-o", "app"});
-  Check(plain.is_link && plain.uncacheable.empty(), "a plain link is cacheable");
+  Check(plain.is_link && !plain.uncacheable, "a plain link is cacheable");
   CheckEq(plain.output, "app", "output is found");
   Check(plain.inputs.size() == 2, "both objects are inputs");
 
@@ -104,16 +108,16 @@ void TestLinkArgs() {
   // Declines, each for a reason that would otherwise be a wrong answer.
   auto uuid = args::ParseLink(
       {"gcc", "a.o", "-Wl,--build-id=uuid", "-o", "app"});
-  Check(uuid.is_link && !uuid.uncacheable.empty(),
+  Check(uuid.is_link && uuid.uncacheable.has_value(),
         "--build-id=uuid is declined");
   auto mixed = args::ParseLink({"gcc", "a.o", "b.c", "-o", "app"});
-  Check(mixed.is_link && !mixed.uncacheable.empty(),
+  Check(mixed.is_link && mixed.uncacheable.has_value(),
         "compile-and-link is declined");
   auto devnull = args::ParseLink({"gcc", "a.o", "-o", "/dev/null"});
-  Check(devnull.is_link && !devnull.uncacheable.empty(),
+  Check(devnull.is_link && devnull.uncacheable.has_value(),
         "output to /dev/null is declined");
   auto noout = args::ParseLink({"gcc", "a.o"});
-  Check(noout.is_link && !noout.uncacheable.empty(), "no -o is declined");
+  Check(noout.is_link && noout.uncacheable.has_value(), "no -o is declined");
 
   // Second outputs have to be captured, or a hit returns the binary and
   // silently leaves the companion file missing.
@@ -137,7 +141,7 @@ void TestLinkArgs() {
         "-Xlinker -Map captures its forwarded output");
   auto xlinker_uuid = args::ParseLink(
       {"gcc", "a.o", "-Xlinker", "--build-id=uuid", "-o", "app"});
-  Check(xlinker_uuid.is_link && !xlinker_uuid.uncacheable.empty(),
+  Check(xlinker_uuid.is_link && xlinker_uuid.uncacheable.has_value(),
         "-Xlinker --build-id=uuid is declined");
 
   // Scripts are inputs whose contents matter.
@@ -536,6 +540,112 @@ void TestDepFile() {
     CheckEq(core::RenderDepFile(*rt), core::RenderDepFile(original),
             "canonicalise/localise round-trips exactly");
   }
+
+  // rustc ends its dep-info with the environment variables the crate read.
+  const std::string rustc_style =
+      "out/demo.d: src/lib.rs src/helper.rs\n"
+      "\n"
+      "src/lib.rs:\n"
+      "\n"
+      "# env-dep:DEMO_UNSET\n"
+      "# env-dep:CARGO_PKG_VERSION=0.4.2\n"
+      "# env-dep:DEMO_ARGS=a=b c\n";
+  auto rs = core::ParseDepFile(rustc_style);
+  Check(rs.has_value(), "parses rustc dep-info with env-dep lines");
+  if (rs) {
+    std::vector<std::string> prereqs;
+    for (const core::DepRule& rule : rs->rules) {
+      prereqs.insert(prereqs.end(), rule.prerequisites.begin(), rule.prerequisites.end());
+    }
+    CheckEq(util::Join(prereqs, " "), "src/lib.rs src/helper.rs",
+            "env-dep lines contribute no prerequisites");
+    Check(rs->rules.size() == 2, "env-dep lines are not rules");
+  }
+}
+
+void TestDepFileEnvDeps() {
+  Section("core::depfile env-dep");
+
+  const std::string text =
+      "out/demo.d: src/lib.rs\n"
+      "\n"
+      "# env-dep:DEMO_UNSET\n"
+      "# env-dep:CARGO_PKG_VERSION=0.4.2\n"
+      "# env-dep:DEMO_ARGS=a=b c:d\n"
+      "# env-dep:DEMO_EMPTY=\n";
+  auto dep = core::ParseDepFile(text);
+  Check(dep.has_value(), "parses");
+  if (!dep) return;
+  Check(dep->env_deps.size() == 4, "four env deps, in file order");
+  if (dep->env_deps.size() != 4) return;
+  CheckEq(dep->env_deps[0].name, "DEMO_UNSET", "unset: name");
+  Check(!dep->env_deps[0].value.has_value(), "unset: no value");
+  CheckEq(dep->env_deps[1].name, "CARGO_PKG_VERSION", "set: name");
+  CheckEq(dep->env_deps[1].value.value_or("<none>"), "0.4.2", "set: value");
+  CheckEq(dep->env_deps[2].name, "DEMO_ARGS", "value splits at the first '='");
+  CheckEq(dep->env_deps[2].value.value_or("<none>"), "a=b c:d",
+          "value keeps later '=', spaces and ':' verbatim");
+  Check(dep->env_deps[3].value.has_value() && dep->env_deps[3].value->empty(),
+        "empty value is set, not unset");
+  Check(dep->rules.size() == 1 && dep->rules[0].prerequisites.size() == 1,
+        "sources exclude env deps");
+
+  // cargo reads the env-dep lines back from the restored file to decide when
+  // the crate is stale, so they must survive a round trip byte for byte.
+  CheckEq(core::RenderDepFile(*dep), text, "env-dep lines render verbatim");
+  core::RootMap roots = MakeRoots({"/home/u/proj=proj"});
+  auto pathy = core::ParseDepFile("a.d: /home/u/proj/a.rs\n\n# env-dep:OUT_DIR=/home/u/proj/out\n");
+  Check(pathy.has_value(), "parses a path-valued env dep");
+  if (pathy) {
+    core::RemapDepFile(&*pathy, roots, core::MapDirection::kCanonicalize);
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/home/u/proj/out", "remapping leaves env values raw");
+    core::RemapDepFile(&*pathy, roots, core::MapDirection::kCanonicalize, {"OUT_DIR"});
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/vcache/proj/out", "a listed path env value is canonicalised");
+    core::RemapDepFile(&*pathy, MakeRoots({"/work/b=proj"}), core::MapDirection::kLocalize,
+                       {"OUT_DIR"});
+    CheckEq(pathy->env_deps.empty() ? "" : pathy->env_deps[0].value.value_or(""),
+            "/work/b/out", "a listed path env value is localised on restore");
+  }
+
+  // cargo compares the restored env-dep value with its own OUT_DIR as a string,
+  // so a root reached through two spellings must restore the one cargo uses.
+  auto scratch = util::MakeTempDir("vcache-depfile-");
+  Check(scratch.has_value(), "depfile scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string resolved_tree = base + "/resolved-tree";
+  const std::string alias_tree = base + "/l";
+  util::MakeDirs(resolved_tree + "/out");
+  std::error_code link_ec;
+  fs::create_directory_symlink(resolved_tree, alias_tree, link_ec);
+  Check(!link_ec, "alias symlink created");
+  const core::RootMap aliased = MakeRoots({alias_tree + "=proj"});
+  auto localized_out_dir = [&](const char* current) {
+    if (current == nullptr) {
+      ::unsetenv("OUT_DIR");
+    } else {
+      ::setenv("OUT_DIR", current, 1);
+    }
+    auto dep = core::ParseDepFile("a.d: /vcache/proj/a.rs\n\n# env-dep:OUT_DIR=/vcache/proj/out\n");
+    if (!dep || dep->env_deps.empty()) return std::string("unparsed");
+    core::RemapDepFile(&*dep, aliased, core::MapDirection::kLocalize, {"OUT_DIR"});
+    ::unsetenv("OUT_DIR");
+    return dep->env_deps[0].value.value_or("unset");
+  };
+  CheckEq(localized_out_dir((resolved_tree + "/out").c_str()), resolved_tree + "/out",
+          "the resolved spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir((alias_tree + "/out").c_str()), alias_tree + "/out",
+          "the alias spelling of OUT_DIR is restored as cargo set it");
+  CheckEq(localized_out_dir("/elsewhere/out"), aliased.Localize("/vcache/proj/out"),
+          "an OUT_DIR of another tree does not replace the stored value");
+  CheckEq(localized_out_dir(nullptr), aliased.Localize("/vcache/proj/out"),
+          "an unset OUT_DIR restores through the roots");
 }
 
 void TestPreprocessedNormalization() {
@@ -1351,6 +1461,37 @@ void TestCompilerArgs() {
         "-save-temps is uncacheable");
   Check(!args::Parse({"g++", "-c", "a.s", "-o", "a.o"}).cacheable(),
         "plain assembly is uncacheable");
+
+  // Precompiled headers. Under -fpch-preprocess the preprocessed text names the
+  // .gch instead of expanding the header, so it no longer stands in for it.
+  {
+    const auto pch_pp = args::Parse(
+        {"g++", "-c", "-fpch-preprocess", "-include", "h.h", "a.cc", "-o", "a.o"});
+    Check(!pch_pp.cacheable(), "-fpch-preprocess is uncacheable");
+    CheckEq(pch_pp.uncacheable ? pch_pp.uncacheable->Describe() : "",
+            "unsupported flag: -fpch-preprocess", "and the reason names the flag");
+
+    // clang re-emits the PCH's header text under -E, so these stay cacheable.
+    const auto driver_pch =
+        args::Parse({"clang++", "-c", "-include-pch", "h.pch", "a.cc", "-o", "a.o"});
+    Check(driver_pch.cacheable(), "-include-pch is cacheable");
+    CheckEq(driver_pch.source, "a.cc", "-include-pch's value is not a source file");
+    const auto cc1_pch = args::Parse({"clang++", "-c", "-Xclang", "-include-pch",
+                                      "-Xclang", "h.pch", "a.cc", "-o", "a.o"});
+    Check(cc1_pch.cacheable(), "-Xclang -include-pch -Xclang h.pch is cacheable");
+
+    // An unvalidated PCH may predate an edit to the header the key now covers.
+    const auto driver_unvalidated = args::Parse(
+        {"clang++", "-c", "-fno-validate-pch", "-include-pch", "h.pch", "a.cc", "-o", "a.o"});
+    CheckEq(driver_unvalidated.uncacheable ? driver_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-fno-validate-pch is declined");
+    const auto cc1_unvalidated =
+        args::Parse({"clang++", "-c", "-Xclang", "-fno-validate-pch", "-include-pch", "h.pch",
+                     "a.cc", "-o", "a.o"});
+    CheckEq(cc1_unvalidated.uncacheable ? cc1_unvalidated.uncacheable->Describe() : "",
+            "unsupported flag: -fno-validate-pch", "-Xclang -fno-validate-pch is declined");
+    CheckEq(cc1_unvalidated.source, "a.cc", "-Xclang's value is not a source file");
+  }
   Check(args::Parse({"gcc", "-c", "a.S", "-o", "a.o"}).cacheable(),
         "preprocessed assembly is cacheable");
   Check(!args::Parse({"g++", "-c", "a.cc", "-o", "/dev/null"}).cacheable(),
@@ -1481,6 +1622,47 @@ void TestRustcArgs() {
                                   "-Cdebuginfo=2", "src/main.rs"});
   Check(joined.cacheable(), "parses joined -C form");
 
+  auto has_pair = [](const std::vector<std::string>& args, const std::string& opt,
+                     const std::string& value) {
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+      if (args[i] == opt && args[i + 1] == value) return true;
+    }
+    return false;
+  };
+  auto mentions = [](const std::vector<std::string>& args, const std::string& text) {
+    for (const std::string& arg : args) {
+      if (arg.find(text) != std::string::npos) return true;
+    }
+    return false;
+  };
+  // cargo points -C incremental into the target directory, which differs
+  // between checkouts.
+  const std::vector<std::pair<std::string, std::vector<std::string>>> incremental_spellings = {
+      {"separate", {"-C", "incremental=/a/b"}},
+      {"joined", {"-Cincremental=/a/b"}},
+      {"long separate", {"--codegen", "incremental=/a/b"}},
+      {"long joined", {"--codegen=incremental=/a/b"}}};
+  for (const auto& [form, spelling] : incremental_spellings) {
+    std::vector<std::string> argv = {"rustc", "--emit=link", "--out-dir", "o",
+                                     "-C", "opt-level=3"};
+    argv.insert(argv.end(), spelling.begin(), spelling.end());
+    argv.push_back("src/lib.rs");
+    auto inc = args::ParseRustc(argv);
+    Check(inc.cacheable(), form + " -C incremental is cacheable");
+    Check(has_pair(inc.base_args, "-C", "incremental=/a/b"),
+          form + " -C incremental reaches rustc");
+    Check(!mentions(inc.key_args, "/a/b"),
+          form + " -C incremental directory stays out of the key");
+    Check(has_pair(inc.key_args, "-C", "incremental"),
+          form + " -C incremental still marks the key as incremental");
+    Check(has_pair(inc.key_args, "-C", "opt-level=3"),
+          form + " -C incremental leaves other -C options in the key");
+    Check(!mentions(inc.dep_info_args, "incremental"),
+          form + " -C incremental is left off the dep-info run");
+    Check(has_pair(inc.dep_info_args, "-C", "opt-level=3"),
+          form + " -C incremental leaves other -C options on the dep-info run");
+  }
+
   Check(!args::ParseRustc({"rustc", "--emit=link", "src/lib.rs"}).cacheable(),
         "no --out-dir is uncacheable");
   Check(!args::ParseRustc({"rustc", "--out-dir", "o", "src/lib.rs"}).cacheable(),
@@ -1494,6 +1676,218 @@ void TestRustcArgs() {
 
   Check(args::LooksLikeRustc("/home/u/.cargo/bin/rustc"), "recognises rustc by path");
   Check(!args::LooksLikeRustc("/usr/bin/g++"), "does not mistake g++ for rustc");
+}
+
+// A 64-character key whose last digit is `i`, for ordering assertions.
+std::string StateKey(int i) {
+  return std::string(hash::kDigestHexLen - 1, '0') + "0123456789abcdef"[i];
+}
+
+void TestDepScanKeyArgs() {
+  Section("core::DepScanKeyArgs");
+
+  const auto key_args = [](const std::vector<std::string>& argv,
+                           const core::RootMap& roots) {
+    return util::Join(core::DepScanKeyArgs(args::Parse(argv), roots,
+                                           /*keep_link_args=*/false),
+                      "\n");
+  };
+
+  const core::RootMap no_roots = MakeRoots({});
+  CheckEq(key_args({"gcc", "-MM", "a/main.c"}, no_roots),
+          key_args({"gcc", "-MM", "a/main.c"}, no_roots),
+          "the same source path gives the same key material");
+  Check(key_args({"gcc", "-MM", "a/main.c"}, no_roots) !=
+            key_args({"gcc", "-MM", "b/main.c"}, no_roots),
+        "different relative source paths give different key material");
+  Check(key_args({"gcc", "-M", "/home/u/a/main.c"}, no_roots) !=
+            key_args({"gcc", "-M", "/home/u/b/main.c"}, no_roots),
+        "different absolute source paths give different key material");
+
+  const core::RootMap one_root = MakeRoots({"/home/u=proj"});
+  Check(key_args({"gcc", "-M", "/home/u/a/main.c"}, one_root) !=
+            key_args({"gcc", "-M", "/home/u/b/main.c"}, one_root),
+        "two sources under one root stay apart");
+
+  // Per-checkout roots name both copies by one canonical path, so they share.
+  CheckEq(key_args({"gcc", "-M", "/home/u/a/main.c"}, MakeRoots({"/home/u/a=proj"})),
+          key_args({"gcc", "-M", "/home/u/b/main.c"}, MakeRoots({"/home/u/b=proj"})),
+          "per-checkout roots give one canonical source path");
+
+  CheckEq(key_args({"gcc", "-MM", "main.c", "-MF", "a.d"}, no_roots),
+          key_args({"gcc", "-MM", "main.c", "-MF", "b.d"}, no_roots),
+          "where the answer goes is not key material");
+}
+
+void TestRustManifest() {
+  Section("rust::manifest");
+
+  auto scratch = util::MakeTempDir("vcache-rust-manifest-");
+  Check(scratch.has_value(), "scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  // Root specs are symlink-resolved and Canonicalize matches the spelling as
+  // given, so every test path is built from the resolved scratch directory.
+  const std::string base = util::RealPath(*scratch).value_or(*scratch);
+  const std::string root = base + "/a";
+  const std::string other_root = base + "/b";
+  for (const std::string& tree : {root, other_root}) {
+    util::MakeDirs(tree + "/src");
+    util::WriteFileAtomic(tree + "/src/lib.rs", "mod helper;\n");
+    util::WriteFileAtomic(tree + "/src/helper.rs", "pub fn v() -> u32 { 1 }\n");
+  }
+  const core::RootMap roots = MakeRoots({root + "=crate"});
+
+  rust::RustManifestState state;
+  state.key = StateKey(1);
+  for (const char* rel : {"/src/lib.rs", "/src/helper.rs"}) {
+    state.files.emplace_back(roots.Canonicalize(root + rel),
+                             hash::HashFile(root + rel).value_or(""));
+  }
+  state.env_deps = {{"VCACHE_UT_SET", "a\\\\b"},
+                    {"VCACHE_UT_UNSET", std::nullopt},
+                    {"VCACHE_UT_EMPTY", ""}};
+  state.externs = {{"proc_macro", ""}, {"syn", hash::HashString("libsyn")}};
+  CheckEq(state.files[0].first, "/vcache/crate/src/lib.rs", "files are recorded canonically");
+
+  rust::RustManifestState spaced;
+  spaced.key = StateKey(2);
+  spaced.files.emplace_back("/vcache/crate/src/a b.rs", hash::HashString("x"));
+
+  // ---- serialise / parse ----
+  const std::string text = rust::RenderRustManifest({state, spaced});
+  std::vector<rust::RustManifestState> parsed;
+  Check(rust::ParseRustManifest(text, &parsed), "manifest parses back");
+  CheckEq(rust::RenderRustManifest(parsed), text, "manifest round-trips exactly");
+  Check(parsed.size() == 2 && parsed[0].key == state.key &&
+            parsed[0].files == state.files && parsed[0].externs.size() == 2 &&
+            parsed[0].externs[0].digest.empty() &&
+            parsed[0].externs[1].digest == state.externs[1].digest,
+        "files and extern digests survive the round trip");
+  Check(parsed.size() == 2 && parsed[0].env_deps.size() == 3 &&
+            parsed[0].env_deps[0].value == std::optional<std::string>("a\\\\b") &&
+            !parsed[0].env_deps[1].value.has_value() &&
+            parsed[0].env_deps[2].value == std::optional<std::string>(""),
+        "set, unset and empty env values stay distinct");
+  Check(parsed.size() == 2 && parsed[1].files.size() == 1 &&
+            parsed[1].files[0].first == "/vcache/crate/src/a b.rs",
+        "a path containing a space survives");
+
+  const std::string header = "vcache-rustmanifest-1\n";
+  const std::vector<std::pair<std::string, std::string>> malformed = {
+      {"vcache-rustmanifest-0\n", "a different header"},
+      {header + "F " + hash::HashString("x") + " /a.rs\n", "a file before any state"},
+      {header + "state abc\n", "a short key"},
+      {header + "state " + StateKey(1) + "\nF abc /a.rs\n", "a short file digest"},
+      {header + "state " + StateKey(1) + "\nE =x\n", "an env line without a name"},
+      {header + "state " + StateKey(1) + "\nQ x\n", "an unknown record"},
+  };
+  for (const auto& [bad_text, what] : malformed) {
+    std::vector<rust::RustManifestState> ignored;
+    Check(!rust::ParseRustManifest(bad_text, &ignored), "rejects " + what);
+  }
+
+  CheckEq(rust::EscapeEnvDepValue("a\\b\nc\rd=e"), "a\\\\b\\nc\\rd=e",
+          "env values are escaped the way rustc writes them");
+
+  // ---- matching ----
+  ::setenv("VCACHE_UT_SET", "a\\b", 1);
+  ::unsetenv("VCACHE_UT_UNSET");
+  ::setenv("VCACHE_UT_EMPTY", "", 1);
+  auto mismatch = [&](const std::vector<rust::RustExtern>& externs,
+                      const core::RootMap& with_roots) {
+    return rust::FindRustStateMismatch(state, externs, with_roots, {}).value_or("");
+  };
+  CheckEq(mismatch(state.externs, roots), "", "an unchanged state matches");
+  CheckEq(mismatch(state.externs, MakeRoots({other_root + "=crate"})), "",
+          "the same state matches from another checkout");
+
+  util::WriteFileAtomic(root + "/src/helper.rs", "pub fn v() -> u32 { 2 }\n");
+  CheckEq(mismatch(state.externs, roots), root + "/src/helper.rs changed",
+          "a changed source rejects the state");
+  util::WriteFileAtomic(root + "/src/helper.rs", "pub fn v() -> u32 { 1 }\n");
+  CheckEq(mismatch(state.externs, roots), "", "reverting the source matches again");
+  std::error_code ec;
+  fs::rename(root + "/src/helper.rs", root + "/helper.rs.away", ec);
+  CheckEq(mismatch(state.externs, roots), root + "/src/helper.rs is gone",
+          "a deleted source rejects the state");
+  fs::rename(root + "/helper.rs.away", root + "/src/helper.rs", ec);
+
+  ::setenv("VCACHE_UT_SET", "a\\c", 1);
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_SET is 'a\\\\c', was 'a\\\\b'",
+          "a changed env value rejects the state");
+  ::setenv("VCACHE_UT_SET", "a\\b", 1);
+  ::setenv("VCACHE_UT_UNSET", "x", 1);
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_UNSET is 'x', was unset",
+          "setting an unset variable rejects the state");
+  ::unsetenv("VCACHE_UT_UNSET");
+  ::unsetenv("VCACHE_UT_EMPTY");
+  CheckEq(mismatch(state.externs, roots), "env VCACHE_UT_EMPTY is unset, was ''",
+          "unsetting an empty variable rejects the state");
+  ::setenv("VCACHE_UT_EMPTY", "", 1);
+
+  std::vector<rust::RustExtern> rebuilt = state.externs;
+  rebuilt[1].digest = hash::HashString("libsyn rebuilt");
+  CheckEq(mismatch(rebuilt, roots), "extern syn changed",
+          "a changed extern digest rejects the state");
+  std::vector<rust::RustExtern> extra = state.externs;
+  extra.push_back({"quote", hash::HashString("libquote")});
+  CheckEq(mismatch(extra, roots), "the --extern set differs",
+          "a different extern set rejects the state");
+  CheckEq(mismatch(state.externs, roots), "", "the restored inputs match again");
+
+  // ---- path-valued env deps ----
+  const std::vector<std::string> out_dir_only = {"OUT_DIR"};
+  const core::RootMap other_roots = MakeRoots({other_root + "=crate"});
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", root + "/out", out_dir_only, roots)
+              .value_or("unset"),
+          "/vcache/crate/out", "a listed path env dep is keyed canonically");
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", root + "/out", {}, roots).value_or("unset"),
+          root + "/out", "an unlisted env dep is keyed raw");
+  CheckEq(rust::KeyedEnvDepValue("OUT_DIR", std::nullopt, out_dir_only, roots)
+              .value_or("unset"),
+          "unset", "an unset listed env dep stays unset");
+  rust::RustManifestState with_out_dir = state;
+  with_out_dir.env_deps.push_back(
+      {"OUT_DIR", rust::KeyedEnvDepValue("OUT_DIR", root + "/out", out_dir_only, roots)});
+  ::setenv("OUT_DIR", (other_root + "/out").c_str(), 1);
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, out_dir_only)
+              .value_or(""),
+          "", "a listed OUT_DIR matches from another checkout");
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, {})
+              .value_or(""),
+          "env OUT_DIR is '" + other_root + "/out', was '/vcache/crate/out'",
+          "an unlisted OUT_DIR is compared raw");
+  ::setenv("OUT_DIR", "/elsewhere/out", 1);
+  CheckEq(rust::FindRustStateMismatch(with_out_dir, state.externs, other_roots, out_dir_only)
+              .value_or(""),
+          "env OUT_DIR is '/elsewhere/out', was '/vcache/crate/out'",
+          "a listed OUT_DIR outside every root still rejects the state");
+  ::unsetenv("OUT_DIR");
+
+  // ---- the cap ----
+  std::vector<rust::RustManifestState> states;
+  for (int i = 0; i < 10; ++i) {
+    rust::RustManifestState fresh;
+    fresh.key = StateKey(i);
+    states = rust::RecordRustState(std::move(fresh), std::move(states));
+  }
+  auto order = [&]() {
+    std::string out;
+    for (const rust::RustManifestState& s : states) out += s.key.back();
+    return out;
+  };
+  CheckEq(order(), "98765432", "eight states, newest first, oldest dropped");
+  states = rust::RecordRustState(states[4], states);
+  CheckEq(order(), "59876432", "re-recording a state moves it to the front once");
+  rust::RustManifestState newest;
+  newest.key = StateKey(10);
+  states = rust::RecordRustState(std::move(newest), std::move(states));
+  CheckEq(order(), "a5987643", "the least recently used state is the one evicted");
 }
 
 void TestSigV4() {
@@ -2002,10 +2396,121 @@ void TestWriteErrnoIsPreserved() {
   fs::remove_all(dir);
 }
 
+void TestStats() {
+  Section("core::Stats reasons");
+  using core::Counter;
+  using core::Reason;
+
+  const std::string old_format = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+  const core::Stats old_stats = core::ParseStats(old_format);
+  Check(old_stats.Get(Counter::kHitDisk) == 1 && old_stats.Get(Counter::kUncacheable) == 4 &&
+            old_stats.Get(Counter::kCacheMediaError) == 9,
+        "a nine-line file from an older version parses positionally");
+  Check(old_stats.reasons.empty(), "and has no reasons");
+  CheckEq(core::RenderStats(old_stats), old_format, "and renders back byte for byte");
+
+  core::Stats stats;
+  stats.Add(Counter::kMiss, 5);
+  stats.AddReason(Reason::kPreprocessOnly);
+  stats.AddReason(Reason::kPreprocessOnly);
+  stats.AddReason(Reason::kNotCompileOnly);
+  stats.AddReason(Reason::kNoRustDepInfo);
+  stats.AddReason(Reason::kNoTempDir);
+  Check(stats.Get(Counter::kUncacheable) == 3,
+        "an uncacheable reason also counts towards uncacheable");
+  Check(stats.Get(Counter::kPreprocessFailed) == 1,
+        "a preprocess reason also counts towards preprocess failed");
+  Check(stats.GetReason(Reason::kNoTempDir) == 1 && stats.GetReason(Reason::kIncbin) == 0,
+        "a passthrough reason is counted on its own");
+  const std::string rendered = core::RenderStats(stats);
+  CheckEq(rendered,
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n"
+          "reason\tlink\t1\n"
+          "reason\tno rust dep-info\t1\n"
+          "reason\tno temp dir\t1\n"
+          "reason\tpreprocess only\t2\n",
+          "reason lines follow the nine positional counters");
+  const core::Stats reparsed = core::ParseStats(rendered);
+  Check(reparsed.reasons == stats.reasons &&
+            std::equal(std::begin(reparsed.values), std::end(reparsed.values),
+                       std::begin(stats.values)),
+        "ParseStats reads back what RenderStats wrote");
+
+  const core::Stats extended = core::ParseStats(old_format +
+                                                "reason\tlink\t4\n"
+                                                "histogram 1 2 3\n"
+                                                "\n"
+                                                "42\n"
+                                                "reason\tfrom a newer version\t6\n");
+  Check(extended.Get(Counter::kUncacheable) == 4 && extended.Get(Counter::kCacheMediaError) == 9,
+        "unknown trailing lines leave the positional counters alone");
+  Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
+        "unknown trailing lines are ignored");
+  CheckEq(core::RenderStats(extended),
+          old_format + "reason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          "a reason this version does not know is carried through");
+
+  const core::Stats damaged = core::ParseStats(old_format +
+                                               "reason\tlink\tx1\n"
+                                               "reason\tlink\t7x\n"
+                                               "reason\tlink\t-3\n"
+                                               "reason\tlink\t\n"
+                                               "reason\tlink\n"
+                                               "reason\tlink\t1\textra\n"
+                                               "reason\t\t1\n"
+                                               "reason\tlink\t99999999999999999999999\n"
+                                               "reason\tpreprocess only\t2\n");
+  Check(damaged.GetReason(Reason::kNotCompileOnly) == 0,
+        "a reason line with a bad count is ignored");
+  Check(damaged.GetReason(Reason::kPreprocessOnly) == 2 && damaged.reasons.size() == 1,
+        "and the lines after it still parse");
+  Check(damaged.Get(Counter::kUncacheable) == 4, "and the counters are untouched");
+
+  const std::string shown = core::FormatStats(stats, "/c", 0, 1);
+  Check(shown.find("uncacheable         3\n"
+                   "  preprocess only     2\n"
+                   "  link                1\n"
+                   "passthrough         1\n"
+                   "  no temp dir         1\n"
+                   "compile failed      0\n") != std::string::npos,
+        "--show-stats lists reasons under their counter, largest first");
+  Check(shown.find("preprocess failed   1\n"
+                   "  no rust dep-info    1\n"
+                   "cache media errors  0\n") != std::string::npos,
+        "preprocess failures are broken down too");
+  const std::string plain = core::FormatStats(core::Stats{}, "/c", 0, 1);
+  Check(plain.find("passthrough") == std::string::npos && plain.find("\n  ") == std::string::npos,
+        "--show-stats adds nothing while every reason is zero");
+
+  TempCacheDir dir;
+  core::RecordDecision(dir.path(), Reason::kNotCompileOnly);
+  core::RecordDecision(dir.path(), {Reason::kUnsupportedFlag, "-save-temps"});
+  core::RecordCounter(dir.path(), Counter::kMiss);
+  const core::Stats recorded = core::ReadStats(dir.path());
+  Check(recorded.Get(Counter::kUncacheable) == 2 && recorded.Get(Counter::kMiss) == 1 &&
+            recorded.GetReason(Reason::kNotCompileOnly) == 1 &&
+            recorded.GetReason(Reason::kUnsupportedFlag) == 1,
+        "RecordDecision persists the reason and its counter");
+  Check(core::ZeroStats(dir.path()) && core::ReadStats(dir.path()).reasons.empty(),
+        "--zero-stats clears the reasons");
+
+  CheckEq(core::Decision(Reason::kUnsupportedFlag, "-MG").Describe(), "unsupported flag: -MG",
+          "the logged text starts with the reason's table name");
+  Check(args::Parse({"g++", "-E", "a.cc"}).uncacheable->reason == Reason::kPreprocessOnly,
+        "-E is declined as preprocess only");
+  Check(args::Parse({"cc", "a.o", "-o", "a"}).uncacheable->reason == Reason::kNotCompileOnly,
+        "a link through the compile path is declined as link");
+  Check(args::ParseRustc({"rustc", "--emit=link", "a.rs"}).uncacheable->reason == Reason::kNoOutDir,
+        "rustc without --out-dir is declined as no --out-dir");
+  Check(args::ParseLink({"cc", "a.o"}).uncacheable->reason == Reason::kNoLinkOutput,
+        "a link without -o is declined as no -o");
+}
+
 int main() {
   TestStringUtils();
   TestRootMap();
   TestDepFile();
+  TestDepFileEnvDeps();
   TestPreprocessedNormalization();
   TestBlob();
   TestCacheChain();
@@ -2016,6 +2521,7 @@ int main() {
   TestLinkArgs();
   TestCompilerArgs();
   TestClangArgs();
+  TestDepScanKeyArgs();
   TestRustcArgs();
   TestSigV4();
   TestS3ResponseParsing();
@@ -2031,6 +2537,9 @@ int main() {
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
+  TestStats();
+  // Writes files too.
+  TestRustManifest();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

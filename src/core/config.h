@@ -89,6 +89,18 @@ enum class DepScanPolicy {
 bool ParseDepScanPolicy(std::string_view name, DepScanPolicy* out);
 const char* DepScanPolicyName(DepScanPolicy policy);
 
+// When a Rust lookup runs rustc --emit=dep-info to learn the crate's sources.
+enum class RustDepInfoPolicy {
+  // Only when no remembered state from an earlier run still matches. A hit
+  // costs one hash per source file instead of a macro-expanding rustc run.
+  kManifest,
+  // On every lookup, which is exact but costs the expansion even on a hit.
+  kAlways,
+};
+
+bool ParseRustDepInfoPolicy(std::string_view name, RustDepInfoPolicy* out);
+const char* RustDepInfoPolicyName(RustDepInfoPolicy policy);
+
 // Whether a compile talks to the cache daemon (see daemon/server.h).
 enum class DaemonMode {
   // Every compile opens its own cache layers. The behaviour before the daemon
@@ -145,6 +157,8 @@ struct Config {
 
   DepScanPolicy dep_scan_policy = DepScanPolicy::kManifest;
 
+  RustDepInfoPolicy rust_dep_info_policy = RustDepInfoPolicy::kManifest;
+
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store
   bool recache = false;    // ignore hits, recompile and overwrite
@@ -165,6 +179,12 @@ struct Config {
   // Extra environment variable names to mix into the cache key, for builds
   // where a variable affects codegen (SOURCE_DATE_EPOCH, for example).
   std::vector<std::string> extra_env_vars;
+
+  // Variables a Rust crate reads through env! whose values are paths, such as
+  // OUT_DIR. Their values join the key canonicalised, so a crate that only
+  // include!s from one hits across checkouts. Opt-in: a crate may bake the
+  // value into its artifact, and then the entry is not stored.
+  std::vector<std::string> rust_path_env_vars;
 
   // Path the config was loaded from, for --show-config. Empty if defaults only.
   std::string loaded_from;

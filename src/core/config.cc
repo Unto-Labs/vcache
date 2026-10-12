@@ -179,6 +179,10 @@ void ApplyTomlFile(const std::string& path, Config* config) {
          TomlStringArray(*vc, "hash_env_vars", &config->warnings)) {
       config->extra_env_vars.push_back(std::move(name));
     }
+    for (std::string& name :
+         TomlStringArray(*vc, "rust_path_env_vars", &config->warnings)) {
+      config->rust_path_env_vars.push_back(std::move(name));
+    }
     if (auto v = TomlString(*vc, "incoming_prefix_maps")) {
       if (!ParseIncomingMapPolicy(*v, &config->incoming_map_policy)) {
         config->warnings.push_back(
@@ -196,6 +200,12 @@ void ApplyTomlFile(const std::string& path, Config* config) {
       if (!ParseDepScanPolicy(*v, &config->dep_scan_policy)) {
         config->warnings.push_back("vcache.dep_scan: unknown policy '" + *v +
                                    "' (expected manifest or uncacheable)");
+      }
+    }
+    if (auto v = TomlString(*vc, "rust_dep_info")) {
+      if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
+        config->warnings.push_back("vcache.rust_dep_info: unknown policy '" + *v +
+                                   "' (expected manifest or always)");
       }
     }
   }
@@ -262,6 +272,11 @@ void ApplyEnvironment(Config* config) {
       config->extra_env_vars.push_back(util::TrimWhitespace(name));
     }
   }
+  if (auto v = Env("VCACHE_RUST_PATH_ENV_VARS")) {
+    for (std::string& name : util::Split(*v, ',', /*skip_empty=*/true)) {
+      config->rust_path_env_vars.push_back(util::TrimWhitespace(name));
+    }
+  }
 
   config->disabled = EnvBool("VCACHE_DISABLE", config->disabled);
   config->read_only = EnvBool("VCACHE_READONLY", config->read_only);
@@ -322,6 +337,13 @@ void ApplyEnvironment(Config* config) {
                                  "' (expected manifest or uncacheable)");
     }
   }
+
+  if (auto v = Env("VCACHE_RUST_DEP_INFO")) {
+    if (!ParseRustDepInfoPolicy(*v, &config->rust_dep_info_policy)) {
+      config->warnings.push_back("VCACHE_RUST_DEP_INFO: unknown policy '" + *v +
+                                 "' (expected manifest or always)");
+    }
+  }
 }
 
 }  // namespace
@@ -366,6 +388,18 @@ const char* DepScanPolicyName(DepScanPolicy policy) {
   return "manifest";
 }
 
+bool ParseRustDepInfoPolicy(std::string_view name, RustDepInfoPolicy* out) {
+  if (name == "manifest") {
+    *out = RustDepInfoPolicy::kManifest;
+    return true;
+  }
+  if (name == "always") {
+    *out = RustDepInfoPolicy::kAlways;
+    return true;
+  }
+  return false;
+}
+
 bool ParseDaemonMode(std::string_view name, DaemonMode* out) {
   if (name == "off" || name == "0" || name == "false") {
     *out = DaemonMode::kOff;
@@ -380,6 +414,14 @@ bool ParseDaemonMode(std::string_view name, DaemonMode* out) {
     return true;
   }
   return false;
+}
+
+const char* RustDepInfoPolicyName(RustDepInfoPolicy policy) {
+  switch (policy) {
+    case RustDepInfoPolicy::kManifest: return "manifest";
+    case RustDepInfoPolicy::kAlways: return "always";
+  }
+  return "manifest";
 }
 
 const char* DaemonModeName(DaemonMode mode) {
@@ -462,12 +504,17 @@ std::string DescribeConfig(const Config& config) {
   out << "native target:    " << NativeTargetPolicyName(config.native_target_policy)
       << "\n";
   out << "dependency scans: " << DepScanPolicyName(config.dep_scan_policy) << "\n";
+  out << "rust dep-info:    " << RustDepInfoPolicyName(config.rust_dep_info_policy)
+      << "\n";
   out << "read only:        " << (config.read_only ? "yes" : "no") << "\n";
   out << "error on media failure: "
       << (config.error_on_cache_media_failure ? "yes" : "no") << "\n";
   out << "disabled:         " << (config.disabled ? "yes" : "no") << "\n";
   if (!config.extra_env_vars.empty()) {
     out << "hashed env vars:  " << util::Join(config.extra_env_vars, ", ") << "\n";
+  }
+  if (!config.rust_path_env_vars.empty()) {
+    out << "rust path env:    " << util::Join(config.rust_path_env_vars, ", ") << "\n";
   }
   for (const std::string& w : config.warnings) out << "warning: " << w << "\n";
   return out.str();

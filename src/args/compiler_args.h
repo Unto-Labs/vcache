@@ -21,6 +21,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/reason.h"
+
 namespace vcache::args {
 
 enum class Language {
@@ -110,8 +112,8 @@ struct CompilerArgs {
   // gcc rejects -MP or -MF without -M/-MM, which would break every -E run.
   std::vector<std::string> dep_args;
 
-  // Set when the invocation cannot be cached; holds a human-readable reason.
-  std::optional<std::string> uncacheable;
+  // Set when the invocation cannot be cached, with the reason.
+  std::optional<core::Decision> uncacheable;
 
   bool cacheable() const { return !uncacheable.has_value(); }
 };

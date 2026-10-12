@@ -375,7 +375,7 @@ int main(int argc, char** argv) {
           "Vendored components under third-party/ keep their own licences:\n"
           "BLAKE3 (Apache 2.0 with LLVM exception), toml++ (MIT), Boost "
           "(BSL-1.0),\n"
-          "gperftools (BSD 3-clause).\n",
+          "gperftools (BSD 3-clause), the curl.h subset (curl licence).\n",
           kVersion);
       return 0;
     }

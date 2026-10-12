@@ -5,7 +5,9 @@
 // Structure mirrors the C/C++ path, but the "what did this compilation read"
 // step is different: instead of preprocessing, vcache asks rustc for
 // `--emit=dep-info` and hashes every file it names, plus the contents of each
-// --extern dependency.
+// --extern dependency. That run expands every macro, so a lookup first tries
+// the manifest of earlier runs (rust_manifest.h) and only asks rustc when no
+// remembered state still matches.
 //
 // Outputs are captured by compiling into a temporary directory and recording
 // everything that appears there, which avoids having to model rustc's naming

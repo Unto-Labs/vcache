@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "args/rustc_args.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 #include "core/roots.h"
@@ -22,7 +23,7 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
       "-A",           "-D",           "-F",             "--cfg",
       "--check-cfg",  "--error-format", "--json",       "--color",
       "--sysroot",    "--explain",    "-o",             "--print",
-      "--cap-lints",  "--remap-path-scope",
+      "--cap-lints",  "--remap-path-scope", "--codegen",
   };
   return *kSet;
 }
@@ -32,6 +33,12 @@ const std::unordered_set<std::string>& SeparateValueOptions() {
 // deliberately kept out of the cache key.
 bool IsSearchPathOption(const std::string& opt) {
   return opt == "-L" || opt == "--sysroot" || opt == "--out-dir";
+}
+
+// -C incremental=DIR names where rustc keeps session state, which like a search
+// path moves with the target directory; only whether it is on changes codegen.
+bool IsIncrementalDir(const std::string& opt, const std::string& value) {
+  return opt == "-C" && StartsWith(value, "incremental=");
 }
 
 // Splits "-Cdebuginfo=2" or "--emit=link" into option and value.
@@ -67,13 +74,14 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
   RustcArgs result;
   result.argv = argv;
   if (argv.empty()) {
-    result.uncacheable = "empty command line";
+    result.uncacheable = core::Reason::kEmptyCommandLine;
     return result;
   }
   result.compiler = argv[0];
 
   std::vector<std::string> inputs;
   bool saw_explicit_output = false;
+  std::vector<size_t> incremental_positions;  // into base_args
 
   for (size_t i = 1; i < argv.size(); ++i) {
     const std::string& arg = argv[i];
@@ -83,7 +91,7 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       continue;
     }
     if (arg == "-") {
-      result.uncacheable = "reads source from stdin";
+      result.uncacheable = core::Reason::kSourceFromStdin;
       return result;
     }
 
@@ -110,6 +118,8 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       result.key_args.push_back(arg);
       continue;
     }
+    // One spelling, so the key and the -C incremental check see both as one.
+    if (opt == "--codegen") opt = "-C";
 
     // Options vcache manages itself, kept out of base_args.
     if (opt == "--out-dir") {
@@ -145,6 +155,15 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       continue;
     }
 
+    if (IsIncrementalDir(opt, value)) {
+      incremental_positions.push_back(result.base_args.size());
+      result.base_args.push_back(opt);
+      result.base_args.push_back(value);
+      result.key_args.push_back(opt);
+      result.key_args.push_back("incremental");
+      continue;
+    }
+
     if (opt == "--crate-name") result.crate_name = value;
 
     result.base_args.push_back(opt);
@@ -155,12 +174,21 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
     }
   }
 
+  for (size_t i = 0; i < result.base_args.size(); ++i) {
+    if (std::find(incremental_positions.begin(), incremental_positions.end(), i) !=
+        incremental_positions.end()) {
+      ++i;
+      continue;
+    }
+    result.dep_info_args.push_back(result.base_args[i]);
+  }
+
   if (inputs.empty()) {
-    result.uncacheable = "no input file";
+    result.uncacheable = core::Reason::kNoInputFile;
     return result;
   }
   if (inputs.size() > 1) {
-    result.uncacheable = "multiple input files";
+    result.uncacheable = core::Reason::kMultipleInputs;
     return result;
   }
   result.source = inputs[0];
@@ -168,21 +196,21 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
   if (result.out_dir.empty()) {
     // Without --out-dir rustc writes into the cwd under names derived from the
     // crate, which vcache cannot capture reliably.
-    result.uncacheable = "no --out-dir";
+    result.uncacheable = core::Reason::kNoOutDir;
     return result;
   }
   if (saw_explicit_output) {
-    result.uncacheable = "explicit -o is not supported";
+    result.uncacheable = core::Reason::kExplicitOutput;
     return result;
   }
   if (result.emit_kinds.empty()) {
-    result.uncacheable = "no --emit; cannot predict outputs";
+    result.uncacheable = core::Reason::kNoEmit;
     return result;
   }
   for (const std::string& kind : result.emit_kinds) {
     // `--emit=asm=path` style targets write outside --out-dir.
     if (kind.find('=') != std::string::npos) {
-      result.uncacheable = "--emit with an explicit path is not supported";
+      result.uncacheable = core::Decision(core::Reason::kEmitWithPath, kind);
       return result;
     }
   }

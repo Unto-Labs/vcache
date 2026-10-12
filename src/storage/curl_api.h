@@ -14,7 +14,9 @@
 // libc, libm and the loader.
 //
 // The header is still used at compile time for the CURL types and CURLOPT_
-// constants; only the link-time dependency is removed.
+// constants; only the link-time dependency is removed. Where curl's headers are
+// not installed, the Makefile supplies third-party/curl, which declares exactly
+// what this file and s3_storage.cc use.
 #pragma once
 
 #include <string>

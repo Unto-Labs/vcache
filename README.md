@@ -52,11 +52,12 @@ is a hit at all when a ccache hit would not have been.
 
 ## Quick start
 
-Prerequisites: a C++20 compiler, `make`, `curl`, and **libcurl development
-headers** — `libcurl4-openssl-dev` on Debian/Ubuntu, `libcurl-devel` on Fedora
-and RHEL, already present in the macOS SDK. vcache loads libcurl at runtime with
-`dlopen`, so the shared library is only needed if you use the S3 layer, but
-`curl/curl.h` is required to build either way.
+Prerequisites: a C++20 compiler, `make` and `curl`. vcache loads libcurl at
+runtime with `dlopen`, so the shared library is only needed if you use the S3
+layer. libcurl's development headers (`libcurl4-openssl-dev` on Debian/Ubuntu,
+`libcurl-devel` on Fedora and RHEL, already present in the macOS SDK) are used
+when installed; without them the build falls back to the few declarations it
+needs, vendored in `third-party/curl`.
 
 ```console
 $ ./third-party/fetch.sh     # builds tcmalloc (one time)
@@ -183,7 +184,7 @@ new S3 connection each; see [docs/daemon.md](docs/daemon.md).
 
 | Command | Effect |
 | --- | --- |
-| `vcache --show-stats` | hit/miss counters and cache size |
+| `vcache --show-stats` | hit/miss counters, why runs were not cached, and cache size |
 | `vcache --zero-stats` | reset counters |
 | `vcache --clear` | delete all entries |
 | `vcache --trim` | evict until under the size limit |
@@ -215,7 +216,9 @@ warm page cache, median of three):
 
 A vcache hit is ~19× faster than compiling, and ~8× slower than a ccache hit,
 because vcache always runs the preprocessor while ccache's direct mode skips it
-by hashing the source plus a stored manifest of includes.
+by hashing the source plus a stored manifest of includes. A precompiled header
+does not shorten that step: its header is expanded on every lookup, though that
+is small next to the rest of a large translation unit.
 
 The trade is deliberate: vcache competes on **hit rate**, not per-hit latency. A
 ccache hit is faster, but only when ccache hits at all — move the checkout and it
@@ -246,13 +249,18 @@ request. Two changes removed them:
 
 Process startup went from 6.1 ms to 3.0 ms as a result.
 
+A toolchain without the static libstdc++ archive (`libstdc++-static` on Fedora
+and RHEL) gets a dynamically linked libstdc++ instead, which adds
+`libstdc++.so.6` and `libgcc_s.so.1` to the list above.
+
 ## What is not cached
 
 Linking, `-E`-only runs, `-MG`, multiple inputs in one invocation,
 `-save-temps`, PGO flags, `.incbin` (the assembler reads a file the preprocessed
 text never mentions), and `rustc` without `--out-dir`/`--emit`. All of these
 fall through to the compiler unchanged, so a build always makes progress.
-`vcache --show-stats` counts them as *uncacheable*.
+`vcache --show-stats` counts them as *uncacheable*, broken down by the rule that
+declined each.
 
 Two things that look like they belong on that list but are cached:
 
@@ -282,6 +290,13 @@ Two things that look like they belong on that list but are cached:
 
 Rust follows the same shape, with `--emit=dep-info` standing in for
 preprocessing and `--extern` dependencies hashed by content rather than path.
+The variables that dep-info says the crate read through `env!`/`option_env!` go
+into the key with their raw values, so an unset or path-free variable still hits
+across directories.
+Dep-info expands every macro, so a lookup first checks a manifest of earlier
+dep-info runs, re-hashing the files each one recorded, and runs rustc only when
+none still matches — see
+[`rust_dep_info`](docs/configuration.md#rust_dep_info).
 
 `docs/preprocessor-problem.md` records the measurements this design rests on,
 including the two compiler behaviours that make the naive approach fail.
@@ -291,6 +306,10 @@ including the two compiler behaviours that make the naive approach fail.
 Release builds use `-O3 -ggdb3`, LTO, and zstd-compressed debug info. Both LTO
 and `-gz=zstd` are probed for at configure time, so a toolchain without them
 still builds — just larger. `make BUILD=debug` gives `-O0 -ggdb3` with no LTO.
+`-static-libstdc++ -static-libgcc` is probed the same way, and `make` prints
+which of static or dynamic libstdc++ it chose. So is `curl/curl.h`: without it,
+`make` says so and builds against `third-party/curl`, and S3 works as before
+wherever libcurl is installed at runtime.
 
 Effect on the shipped binary, which keeps full `-ggdb3` debug info throughout:
 
@@ -321,7 +340,8 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
   exactly what Spirit X3 opens. `make boost-subset` regenerates it against a
   full Boost tree if an include ever reaches further. Only gperftools is
   downloaded at setup time; everything else is committed.
-- Statically linked apart from libc and libcurl.
+- Statically linked apart from libc and libcurl, and libstdc++ where the
+  toolchain has no static archive of it.
 - Cache entries carry a BLAKE3 checksum; a corrupt entry reads as a miss rather
   than yielding a bad object.
 
@@ -331,11 +351,11 @@ units, full line tables, and 27,909 macro definitions from `-ggdb3`.
 $ make test
 ```
 
-364 unit assertions and 235 integration assertions, covering cross-directory
+451 unit assertions and 309 integration assertions, covering cross-directory
 hits, out-of-tree builds, dependency-file replay, diagnostics replay,
 uncacheable fallback, masquerade mode, Rust, cache management, `-march=native`
-resolution, dependency-scan manifests, kbuild-shaped `-Wp,` command lines,
-`.incbin`, and the S3 layer against a mock object store. SigV4 is checked
+resolution, dependency-scan and Rust dep-info manifests, kbuild-shaped `-Wp,`
+command lines, `.incbin`, and the S3 layer against a mock object store. SigV4 is checked
 against AWS's documented signing-key vector and an independent reference
 implementation.
 
@@ -375,9 +395,10 @@ carries that licence text verbatim:
 | BLAKE3 1.5.4 | Apache 2.0 with LLVM exception | [third-party/blake3/LICENSE_A2](third-party/blake3/LICENSE_A2) |
 | toml++ 3.4.0 | MIT | [third-party/tomlplusplus/LICENSE](third-party/tomlplusplus/LICENSE) |
 | Boost 1.86.0 subset | Boost Software License 1.0 | [third-party/boost/LICENSE](third-party/boost/LICENSE) |
+| curl 8.14.1 `curl.h` subset | curl licence | [third-party/curl/COPYING](third-party/curl/COPYING) |
 | gperftools 2.16 | BSD 3-clause | fetched at build time, not committed; licence ships in the tarball |
 
-All four are permissive and impose no term Apache 2.0 does not already
+All five are permissive and impose no term Apache 2.0 does not already
 accommodate, which is what the combination requires: their notice-retention
 obligations sit comfortably inside Apache 2.0's own attribution rules, and the
 combined binary ships under Apache 2.0 with the vendored notices intact.

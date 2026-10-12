@@ -24,6 +24,27 @@ def check(condition, message):
     print(("PASS|" if condition else "FAIL|") + message, flush=True)
 
 
+def skip(message):
+    print("SKIP|" + message, flush=True)
+
+
+# Link caching, RSS sampling and the fifo jobserver pool are Linux-only.
+LINUX = sys.platform.startswith("linux")
+
+
+def make_reads_fifo_jobserver():
+    """True when `make` is GNU make 4.4 or newer, the first to read a fifo
+    named by --jobserver-auth."""
+    try:
+        version = subprocess.run(["make", "--version"], capture_output=True,
+                                 text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    import re
+    found = re.match(r"GNU Make ([0-9]+)\.([0-9]+)", version)
+    return bool(found) and (int(found.group(1)), int(found.group(2))) >= (4, 4)
+
+
 def run(binary, work):
     work.mkdir(parents=True, exist_ok=True)
     source = work / "session.c"

@@ -90,6 +90,11 @@ void Check(bool condition, const std::string& what) {
   }
 }
 
+// For checks of a Linux-only mechanism on another platform.
+[[maybe_unused]] void Skipped(const std::string& what) {
+  std::printf("  \033[33mSKIP\033[0m %s\n", what.c_str());
+}
+
 bool Contains(const std::vector<std::string>& haystack, const std::string& needle) {
   return std::find(haystack.begin(), haystack.end(), needle) != haystack.end();
 }
@@ -5168,7 +5173,26 @@ void TestJobserver() {
   CheckEq(daemon::JobserverMakeFlagsLine("/tmp/vcache-jobserver.fifo"),
           "MAKEFLAGS=-j --jobserver-auth=fifo:/tmp/vcache-jobserver.fifo\n",
           "--jobserver-env output format");
+  Check(daemon::MakeReadsFifoJobserver("GNU Make 4.4.1\nBuilt for x86_64\n") &&
+            daemon::MakeReadsFifoJobserver("GNU Make 5.0\n"),
+        "GNU make 4.4 and newer read a fifo jobserver");
+  Check(!daemon::MakeReadsFifoJobserver("GNU Make 4.3\n") &&
+            !daemon::MakeReadsFifoJobserver("GNU Make 3.81\n") &&
+            !daemon::MakeReadsFifoJobserver("bmake 20240711\n") &&
+            !daemon::MakeReadsFifoJobserver(""),
+        "older GNU make and other makes do not");
 
+#if !defined(__linux__)
+  {
+    TempCacheDir dir;
+    std::string why;
+    Check(!daemon::JobserverPool::Open(dir.path() + "/jobserver.fifo", 3, &why) &&
+              why.find("Linux") != std::string::npos,
+          "the fifo pool refuses to open off Linux (" + why + ")");
+  }
+  Skipped("fifo jobserver pool: Linux-only (FIONREAD does not count a fifo here)");
+  return;
+#endif
   TempCacheDir dir;
   const std::string path = dir.path() + "/jobserver.fifo";
   ::mkfifo(path.c_str(), 0600);
@@ -5294,6 +5318,7 @@ void TestElasticJobserver() {
           row.name);
   }
   TempCacheDir dir;
+#if defined(__linux__)
   std::string error;
   auto pool = daemon::JobserverPool::Open(dir.path() + "/elastic.fifo", 4, &error);
   Check(pool && pool->Withdraw(2) == 2 && pool->withdrawn() == 2 && pool->fifo_bytes() == 1,
@@ -5396,6 +5421,9 @@ void TestElasticJobserver() {
   }
   if (blocked_fd >= 0) ::close(blocked_fd);
   ::close(completed[0]);
+#else
+  Skipped("elastic fifo pool: Linux-only");
+#endif
   std::map<std::string, std::optional<std::string>> saved;
   for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_JOBSERVER_MIN_JOBS"}) {
     const char* value = ::getenv(name.c_str());

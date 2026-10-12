@@ -51,7 +51,7 @@ upload_threads = 4      # background S3 uploaders
 | `vcache --stop-daemon` | Wait for pending uploads to finish, then stop it. Prints how many uploaded, failed and were skipped. |
 | `vcache --daemon-status` | Pid, socket, lookups by layer, stores, the upload queue. |
 | `vcache --daemon-foreground` | Run in the foreground, for a service manager or a debugger. |
-| `vcache --jobserver-env` | Print `MAKEFLAGS=-j --jobserver-auth=fifo:<path>` for the running pool, or exit 1. |
+| `vcache --jobserver-env` | Print `MAKEFLAGS=-j --jobserver-auth=fifo:<path>` for the running pool, or exit 1 (no pool, or `make` older than GNU make 4.4). Linux only. |
 
 `--show-stats` also says whether a daemon is running.
 
@@ -140,6 +140,10 @@ daemon's identity.
 
 ## Jobserver mode
 
+Linux only. The daemon counts the pool's free tokens with `FIONREAD`, which
+macOS answers with 0 for a fifo whatever it holds, so elsewhere the pool is
+not started (the daemon log says why) and `--jobserver-env` exits 1.
+
 With `daemon.jobserver` on, the daemon keeps one GNU-make fifo of job slots
 for every build on the machine. A build script exports the line from
 `vcache --jobserver-env`:
@@ -162,7 +166,13 @@ read-write, so a client closing does not look like end-of-file to the
 others.
 
 Versions that follow this line: GNU make 4.4.1 and ninja 1.13.2, and only the
-fifo form. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
+fifo form. Older make does not: GNU make 3.81 ignores the fifo and takes the
+bare `-j` as "no limit", and 4.2 and 4.3 expect the `R,W` pipe form. Either
+would turn a bounded build into an unbounded one, so `--jobserver-env` runs
+`$MAKE --version` (or the first `make` on `PATH`) and exits 1 with a message
+when it is not GNU make 4.4 or newer. Set `MAKE` to the make the build uses,
+or `VCACHE_JOBSERVER_ANY_CLIENT=1` when the line is for another client, such
+as ninja 1.13 or cargo. ninja ignores `--jobserver-auth=R,W` (the pipe form this daemon
 does not print) and ignores the fifo when its own command line passes `-j`.
 cargo and rustc speak the same protocol through the `jobserver` crate. With
 cargo and rustc 1.97.1, `strace -f` of one `cargo build` of a five-crate

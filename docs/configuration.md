@@ -674,7 +674,9 @@ that make, ninja and cargo share. `daemon.jobserver_jobs`
 because each client already owns one. Unset means the machine's online CPUs.
 0, a negative value, or a value above the platform integer maximum warns and
 does the same. `vcache --jobserver-env` prints the `MAKEFLAGS` line, or
-exits 1 when no pool is running or the path is not a fifo. See
+exits 1 when no pool is running, the path is not a fifo, or `make` is older
+than GNU make 4.4 (`VCACHE_JOBSERVER_ANY_CLIENT=1` skips that check for other
+clients). The pool is Linux only. See
 [daemon.md](daemon.md) for the protocol and the tool versions.
 
 When admission requests wait, the pool withdraws unused shared tokens every

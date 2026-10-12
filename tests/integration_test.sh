@@ -12,6 +12,10 @@ set -uo pipefail
 TOP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VCACHE="$TOP/bin/vcache"
 
+# A compiler wrapper's directory on PATH (ccache, sccache) would sit between
+# the masquerade link and the real compiler; the suite tests vcache alone.
+PATH=$(tr ':' '\n' <<<"$PATH" | grep -vE '/s?ccache(/|$)' | paste -sd: -)
+
 # $TMPDIR ends in a slash on macOS, which would make every path here carry a
 # doubled separator -- ".../T//vcache-it-XXXX/..." -- and vcache deliberately
 # does not match such a spelling against a root (see RootMap::Canonicalize).
@@ -20,7 +24,49 @@ VCACHE="$TOP/bin/vcache"
 TMPBASE="${TMPDIR:-/tmp}"
 while [[ "$TMPBASE" == */ && "$TMPBASE" != "/" ]]; do TMPBASE="${TMPBASE%/}"; done
 WORK="$(mktemp -d "$TMPBASE/vcache-it-XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# A slow PUT dies on SIGTERM when the disposition is the default. The flight
+# mock is not stopped by its own case: the next start is what signals it, and
+# only if that pid is still the one the shell holds. A parent that ignores
+# SIGTERM hands the mock that disposition, so the signal does nothing and
+# wait sits on the pid until the suite is abandoned. The exit path used to
+# remove the work directory and leave the process.
+work_mocks() {
+  pgrep -af "[m]ock_s3.py" 2>/dev/null | grep -F -- "$WORK/" || true
+}
+stop_s3() {
+  if [[ -z "${S3PID:-}" ]]; then
+    return
+  fi
+  if kill -0 "$S3PID" 2>/dev/null; then
+    kill -TERM "$S3PID" 2>/dev/null || true
+    local n=0
+    while kill -0 "$S3PID" 2>/dev/null; do
+      if (( n >= 20 )); then
+        kill -KILL "$S3PID" 2>/dev/null || true
+        break
+      fi
+      sleep 0.05
+      n=$((n + 1))
+    done
+  fi
+  wait "$S3PID" 2>/dev/null || true
+  S3PID=
+}
+reap_work_mocks() {
+  local line pid
+  while IFS= read -r line; do
+    pid=${line%% *}
+    [[ -n "$pid" ]] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done < <(work_mocks)
+}
+check_mocks_gone() {
+  local left
+  left=$(work_mocks | wc -l | tr -d ' ')
+  check "no mock from this run is still up" "$left" "0"
+}
+trap 'reap_work_mocks; rm -rf "$WORK"' EXIT
 
 PASS=0
 FAIL=0
@@ -29,6 +75,12 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 skipped() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+# GNU make 4.4 is the first to read a fifo named by --jobserver-auth.
+make_reads_fifo_jobserver() {
+  local v
+  v=$(make --version 2>/dev/null | sed -n '1s/^GNU Make \([0-9][0-9.]*\).*/\1/p')
+  [[ -n "$v" && "$(printf '%s\n' 4.4 "$v" | sort -V | head -1)" == "4.4" ]]
+}
 
 # BSD sed -i wants a backup suffix and GNU sed -i must not have one separated
 # from it, so no single spelling works on both -- and getting it wrong makes sed
@@ -44,6 +96,32 @@ sed_inplace() {
 # Some expectations differ between the two and are not about vcache being wrong.
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+# Releases a manifest-pause fifo. The write happens only when the compile is
+# actually waiting; otherwise that process is stopped. The write is bounded
+# because opening a fifo with no reader blocks.
+release_pause_fifo() {  # $1 fifo, $2 pid, $3 waiting (1 or 0)
+  local fifo=$1 pid=$2 waiting=$3
+  if [[ "$waiting" != 1 ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return
+  fi
+  printf x > "$fifo" &
+  local wpid=$!
+  local n=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    if (( n >= 50 )); then
+      kill "$wpid" 2>/dev/null || true
+      wait "$wpid" 2>/dev/null || true
+      bad "pause fifo write timed out"
+      return
+    fi
+    sleep 0.05
+    n=$((n + 1))
+  done
+  wait "$wpid" 2>/dev/null || true
+}
 
 export VCACHE_DIR="$WORK/cache"
 
@@ -514,6 +592,32 @@ check "masquerade compile is a miss" "$(misses)" "1"
     g++ -g -O2 -c -I include src/lib.cc -o "$WORK/m2.o" ) 2>/dev/null
 check "masquerade hits across checkouts" "$(hits)" "1"
 
+# A wrapper that runs the next other same-named binary on PATH, as ccache does,
+# placed after the masquerade link: vcache and it run each other. The wrapper
+# gives up by itself after 20 hops so a regression fails rather than hangs.
+mkdir -p "$WORK/wrapper"
+cat > "$WORK/wrapper/g++" <<'EOF'
+#!/usr/bin/env bash
+hops=$(( ${WRAPPER_HOPS:-0} + 1 ))
+(( hops > 20 )) && exit 99
+export WRAPPER_HOPS=$hops
+self=$(realpath "$0")
+IFS=: read -ra dirs <<<"$PATH"
+for dir in "${dirs[@]}"; do
+  candidate="$dir/g++"
+  [[ -x $candidate && $(realpath "$candidate") != "$self" ]] && exec "$candidate" "$@"
+done
+exit 127
+EOF
+chmod +x "$WORK/wrapper/g++"
+loop_err=$( cd "$WORK/checkout-a" && PATH="$WORK/bin:$WORK/wrapper:$PATH" \
+    VCACHE_ROOTS="$WORK/checkout-a=proj" \
+    g++ -g -O2 -c -I include src/lib.cc -o "$WORK/m3.o" 2>&1 >/dev/null )
+loop_rc=$?
+check "a wrapper that runs vcache again stops the masquerade" "$loop_rc" "127"
+check "the refusal names the loop" \
+  "$(grep -q 'led back to vcache 4 times' <<<"$loop_err" && echo yes)" "yes"
+
 # --------------------------------------------------------------------------
 section "9. Rust"
 
@@ -587,6 +691,179 @@ EOF
   fi
 else
   printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
+section "9e. Rust: a rustc rebuilt in place is a new toolchain"
+
+# `rustc -vV` is memoised. A relink often keeps the same byte count, so a memo
+# keyed only by path and size answers the new binary from the old banner.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  real_rustc=$(command -v rustc)
+  banner=$("$real_rustc" -vV)
+  mkdir -p "$WORK/rustc-swap/bin"
+  write_fake_rustc() {  # $1 = dest, $2 = release value
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf '%s\n' 'if [ "$1" = "-vV" ]; then'
+      printf '%s\n' "cat <<'END'"
+      printf '%s\n' "$banner" | sed "s/^release: .*/release: $2/"
+      printf '%s\n' 'END'
+      printf '%s\n' 'exit 0'
+      printf '%s\n' 'fi'
+      printf 'exec %q "$@"\n' "$real_rustc"
+    } > "$1"
+    chmod +x "$1"
+  }
+  write_fake_rustc "$WORK/rustc-swap/rustc-a" "9.9.1"
+  write_fake_rustc "$WORK/rustc-swap/rustc-b" "9.9.2"
+  size_a=$(wc -c < "$WORK/rustc-swap/rustc-a" | tr -d ' ')
+  size_b=$(wc -c < "$WORK/rustc-swap/rustc-b" | tr -d ' ')
+  check "the two fake rustc scripts are the same size" "$size_a" "$size_b"
+  if cmp -s "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/rustc-b"; then
+    bad "the two fake rustc scripts differ"
+  else
+    ok "the two fake rustc scripts differ"
+  fi
+  cp "$WORK/rustc-swap/rustc-a" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+
+  swap_log="$WORK/rustc-swap.log"
+  : > "$swap_log"
+  swap_compile() {
+    ( cd "$WORK/rust-a" && VCACHE_ROOTS="$WORK/rust-a=crate" VCACHE_LOG="$swap_log" \
+        "$VCACHE" "$WORK/rustc-swap/bin/rustc" --crate-name demo --crate-type lib \
+        -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rust-a/out" src/lib.rs ) \
+        >/dev/null
+  }
+  swap_compile
+  check "the first swapped rustc compile misses" "$(misses)" "1"
+  key_before=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | head -1)
+  swap_compile
+  check "the same rustc hits" "$(hits)" "1"
+
+  cp "$WORK/rustc-swap/rustc-b" "$WORK/rustc-swap/bin/rustc"
+  chmod +x "$WORK/rustc-swap/bin/rustc"
+  touch -d '+2 seconds' "$WORK/rustc-swap/bin/rustc"
+  swap_compile
+  check "a rebuilt rustc misses" "$(misses)" "2"
+  key_after=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$swap_log" | tail -1)
+  if [[ -n "$key_before" && "$key_before" != "$key_after" ]]; then
+    ok "a rebuilt rustc logs a different rust key"
+  else
+    bad "a rebuilt rustc logs a different rust key (before ${key_before:-missing}, after ${key_after:-missing})"
+  fi
+
+  # Same banner at two paths with different mtimes. The cache key is the
+  # banner, so the second checkout hits. mtime stays in the local memo.
+  reset_cache
+  for tree in rustc-share-a rustc-share-b; do
+    mkdir -p "$WORK/$tree/src"
+    cat > "$WORK/$tree/src/lib.rs" <<'EOF'
+mod helper;
+pub fn location() -> &'static str { file!() }
+pub fn value() -> u32 { helper::value() }
+EOF
+    cat > "$WORK/$tree/src/helper.rs" <<'EOF'
+pub fn value() -> u32 { 42 }
+EOF
+    cp "$WORK/rustc-swap/rustc-a" "$WORK/$tree/rustc"
+    chmod +x "$WORK/$tree/rustc"
+  done
+  touch -d '2020-01-01 00:00:00' "$WORK/rustc-share-a/rustc"
+  touch -d '2024-06-01 00:00:00' "$WORK/rustc-share-b/rustc"
+  ( cd "$WORK/rustc-share-a" && VCACHE_ROOTS="$WORK/rustc-share-a=crate" \
+      "$VCACHE" "$WORK/rustc-share-a/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-a/out" src/lib.rs ) \
+      >/dev/null
+  check "the first copy of one rustc banner misses" "$(misses)" "1"
+  ( cd "$WORK/rustc-share-b" && VCACHE_ROOTS="$WORK/rustc-share-b=crate" \
+      "$VCACHE" "$WORK/rustc-share-b/rustc" --crate-name demo --crate-type lib \
+      -C debuginfo=2 --emit=dep-info,link --out-dir "$WORK/rustc-share-b/out" src/lib.rs ) \
+      >/dev/null
+  check "two rustc copies with one banner share an entry" "$(hits)" "1"
+fi
+
+# --------------------------------------------------------------------------
+section "9f. Concurrent manifest stores keep both states"
+
+# Two worktrees load the same manifest, each adds its own state, and the
+# second store must not drop the first. The fifo holds one of them still
+# until the other has stored.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  reset_cache
+  man_tree() {  # $1 dir, $2 helper return value
+    mkdir -p "$1/src"
+    cat > "$1/src/lib.rs" << 'EOF'
+mod helper;
+pub fn v() -> u32 { helper::v() }
+EOF
+    printf 'pub fn v() -> u32 { %s }\n' "$2" > "$1/src/helper.rs"
+  }
+  man_tree "$WORK/man-a" 1
+  man_tree "$WORK/man-b" 2
+  man_tree "$WORK/man-c" 3
+  man_compile() {  # $1 dir, $2 log (may be empty)
+    # An expanded VAR=value is a command word, not an assignment, so the log
+    # path has to be a literal prefix when it is set.
+    if [[ -n "$2" ]]; then
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" VCACHE_LOG="$2" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    else
+      ( cd "$1" && VCACHE_ROOTS="$1=crate" \
+          "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+          --emit=dep-info,link --out-dir "$1/out" src/lib.rs ) >/dev/null
+    fi
+  }
+  man_compile "$WORK/man-a" ""
+  check "the first manifest version misses" "$(misses)" "1"
+  fifo="$WORK/manifest-pause.fifo"
+  mkfifo "$fifo"
+  blog="$WORK/man-b-pause.log"
+  rm -f "$blog"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog" \
+      VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null &
+  bpid=$!
+  waiting=0
+  for _ in $(seq 1 200); do
+    if grep -q 'manifest: waiting before put' "$blog" 2>/dev/null; then waiting=1; break; fi
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the second manifest store waits" "$waiting" "1"
+  if [[ "$waiting" == 1 ]]; then
+    man_compile "$WORK/man-c" ""
+  fi
+  release_pause_fifo "$fifo" "$bpid" "$waiting"
+  for _ in $(seq 1 200); do
+    if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  wait "$bpid" || true
+  blog2="$WORK/man-b-hit.log"
+  rm -f "$blog2"
+  ( cd "$WORK/man-b" && VCACHE_ROOTS="$WORK/man-b=crate" VCACHE_LOG="$blog2" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-b/out" src/lib.rs ) >/dev/null
+  check "version 2 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog2" || true)" "1"
+  check "version 2 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog2" || true)" "0"
+  blog3="$WORK/man-c-hit.log"
+  rm -f "$blog3"
+  ( cd "$WORK/man-c" && VCACHE_ROOTS="$WORK/man-c=crate" VCACHE_LOG="$blog3" \
+      "$VCACHE" rustc --crate-name manmerge --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/man-c/out" src/lib.rs ) >/dev/null
+  check "version 3 hits through the manifest" \
+    "$(grep -c 'rust manifest hit' "$blog3" || true)" "1"
+  check "version 3 does not run dep-info" "$(grep -c 'rust dep-info:' "$blog3" || true)" "0"
 fi
 
 # --------------------------------------------------------------------------
@@ -824,6 +1101,7 @@ EOF
 
   rust_man rust-man-a
   check "first manifest-mode compile is a miss" "$(misses)" "1"
+  check "a first compile logs none stored once" "$(logged 'rust manifest: none stored')" "1"
   check "a miss asks rustc for dep-info" "$(dep_info_runs)" "1"
   check "the miss records one state" "$(logged 'rust manifest: stored 1 states')" "1"
   cp "$WORK/rust-man-a/out/libman.rlib" "$WORK/rust-man-a.rlib"
@@ -876,6 +1154,154 @@ EOF
 else
   skipped "rustc not installed"
 fi
+
+# --------------------------------------------------------------------------
+section "9d. Cost records"
+
+mkdir -p "$WORK/cost-src"
+cat > "$WORK/cost-src/t.cc" << 'EOF'
+int cost_probe() { return 1; }
+EOF
+# Cost records feed only single-flight and admission. With both off, the
+# default, a miss writes none.
+reset_cache
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "by default a miss writes no cost record" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_READONLY=1 "$VCACHE" g++ -c t.cc -o "$WORK/cost-ro.o" -DREADONLY_COST )
+check "nor does a read-only miss with admission on" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+export VCACHE_DAEMON_SINGLE_FLIGHT=1
+reset_cache
+COST_LOG="$WORK/cost.log"
+rm -f "$COST_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "cost compile is a miss" "$(misses)" "1"
+
+cost_key=$(sed -n 's/.*\] key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$COST_LOG" | head -1)
+cost_entry="$VCACHE_DIR/${cost_key:0:2}/${cost_key:2}"
+cost_rss=$(grep -a -o 'max_rss_kb: [0-9][0-9]*' "$cost_entry" 2>/dev/null | head -1 | awk '{print $2}')
+if [[ -n "${cost_rss:-}" && "$cost_rss" -gt 0 ]]; then
+  ok "blob meta carries max_rss_kb > 0"
+else
+  bad "blob meta carries max_rss_kb > 0 (key=${cost_key:-missing} rss=${cost_rss:-missing})"
+fi
+if grep -a -q 'wall_ms: [0-9]' "$cost_entry" 2>/dev/null; then
+  ok "blob meta carries wall_ms"
+else
+  bad "blob meta carries wall_ms"
+fi
+
+cost_show=$("$VCACHE" --show-costs)
+if printf '%s\n' "$cost_show" | grep -q '^compile records 1 '; then
+  ok "--show-costs lists the compile with records 1"
+else
+  bad "--show-costs lists the compile with records 1"
+  printf '%s\n' "$cost_show" | sed 's/^/         /'
+fi
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "exactly one cost: compile line on a miss" "$cost_lines" "1"
+cost_any=$(grep -c 'cost: ' "$COST_LOG" || true)
+check "the preprocess probe is not recorded as a cost" "$cost_any" "1"
+
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_LOG" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "the second cost compile hits" "$(hits)" "1"
+cost_lines=$(grep -c 'cost: compile' "$COST_LOG" || true)
+check "a hit adds no cost line" "$cost_lines" "1"
+
+cat > "$WORK/cost-src/bad.cc" << 'EOF'
+int broken() { return
+EOF
+COST_FAIL_LOG="$WORK/cost-fail.log"
+rm -f "$COST_FAIL_LOG"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_LOG="$COST_FAIL_LOG" \
+    "$VCACHE" g++ -c bad.cc -o "$WORK/cost-bad.o" ) >/dev/null 2>&1 || true
+cost_fail=$(grep -c 'cost: compile .* exit=' "$COST_FAIL_LOG" || true)
+check "a failed compile is still recorded, with its exit" "$cost_fail" "1"
+cost_fail_any=$(grep -c 'cost: ' "$COST_FAIL_LOG" || true)
+check "a failed compile records exactly one cost line" "$cost_fail_any" "1"
+
+mkdir -p "$WORK/cost-die"
+gxx=$(command -v g++)
+cat > "$WORK/cost-die/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then
+    exec $gxx "\$@"
+  fi
+done
+kill -ABRT \$\$
+EOF
+chmod +x "$WORK/cost-die/cc"
+cat > "$WORK/cost-die/t.cc" << 'EOF'
+int live() { return 1; }
+EOF
+COST_SIG_LOG="$WORK/cost-signal.log"
+rm -f "$COST_SIG_LOG"
+( cd "$WORK/cost-die" && VCACHE_COMPILER_CHECK=mtime VCACHE_ROOTS="$WORK/cost-die=proj" \
+    VCACHE_LOG="$COST_SIG_LOG" \
+    "$VCACHE" "$WORK/cost-die/cc" -c t.cc -o "$WORK/cost-die.o" ) >/dev/null 2>&1 || true
+cost_sig=$(grep -c 'cost: compile .* exit=' "$COST_SIG_LOG" || true)
+check "a compiler killed by a signal is still recorded, with its exit" "$cost_sig" "1"
+
+if command -v rustc >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/cost-rust/src"
+  cat > "$WORK/cost-rust/src/lib.rs" << 'EOF'
+pub fn cost_rust() -> u32 { 1 }
+EOF
+  RLOG="$WORK/cost-rust.log"
+  rm -f "$RLOG"
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rustc miss logs exactly one cost: rustc line" \
+    "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the rust dep-info run is not a cost record" \
+    "$(grep -c 'cost: ' "$RLOG" || true)" "1"
+  check "the rust miss did run dep-info" \
+    "$(grep -c 'rust dep-info:' "$RLOG" || true)" "1"
+  rkey=$(sed -n 's/.*\] rust key \([0-9a-f][0-9a-f]*\) for .*/\1/p' "$RLOG" | head -1)
+  rentry="$VCACHE_DIR/${rkey:0:2}/${rkey:2}"
+  if grep -a -q 'max_rss_kb: [0-9]' "$rentry" 2>/dev/null; then
+    ok "a rustc blob meta carries max_rss_kb"
+  else
+    bad "a rustc blob meta carries max_rss_kb"
+  fi
+  ( cd "$WORK/cost-rust" && VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  ( cd "$WORK/cost-rust" && VCACHE_RUST_DEP_INFO=always \
+      VCACHE_ROOTS="$WORK/cost-rust=crate" VCACHE_LOG="$RLOG" \
+      "$VCACHE" rustc --crate-name costrust --crate-type lib \
+      --emit=dep-info,link --out-dir "$WORK/cost-rust/out" src/lib.rs ) >/dev/null
+  check "a rust key hit adds no cost line" "$(grep -c 'cost: rustc' "$RLOG" || true)" "1"
+  check "the always policy hits on the rust key" "$(hits)" "2"
+else
+  skipped "rustc not installed"
+fi
+
+if [[ "$(uname -s)" == Linux ]]; then
+  reset_cache
+  mkdir -p "$WORK/cost-link"
+  printf 'int main(void){return 0;}\n' > "$WORK/cost-link/main.c"
+  gcc -c "$WORK/cost-link/main.c" -o "$WORK/cost-link/main.o"
+  LLOG="$WORK/cost-link.log"
+  rm -f "$LLOG"
+  ( cd "$WORK/cost-link" && VCACHE_LINK_CACHE=1 VCACHE_ROOTS="$WORK/cost-link=proj" \
+      VCACHE_LOG="$LLOG" "$VCACHE" gcc main.o -o main )
+  check "a link logs exactly one cost: link line" \
+    "$(grep -c 'cost: link' "$LLOG" || true)" "1"
+else
+  skipped "link cost records are Linux-only"
+fi
+unset VCACHE_DAEMON_SINGLE_FLIGHT
 
 # --------------------------------------------------------------------------
 section "10. cache management commands"
@@ -1042,7 +1468,7 @@ BACKDATE
   done
   check "three distinct entries stored" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "3"
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   MOCK_S3_PAGE_SIZE=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1074,7 +1500,7 @@ except Exception: sys.exit(1)
   fi
 
   # An unreachable remote must degrade to a miss, never break the build.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   rm -rf "$VCACHE_DIR"
   ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
       "$VCACHE" g++ -O0 -c -I include src/lib.cc -o "$WORK/s4.o" ) 2>/dev/null
@@ -1126,6 +1552,7 @@ except Exception: sys.exit(1)
   #
   # Restart the mock as a bucket that denies both the listing and any missing
   # object, which is how real S3 behaves without s3:ListBucket.
+  stop_s3
   MOCK_S3_NO_LISTBUCKET=1 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1175,7 +1602,7 @@ TOML
   # With ListBucket available, a 403 on the object means something really is
   # wrong, and must be reported rather than filed as a miss. Deleting the
   # object directory makes every GET a miss; the listing still succeeds.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1196,7 +1623,7 @@ except Exception: sys.exit(1)
     ok "a bucket that does grant ListBucket produces no warning"
   fi
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
 
   # A bucket shedding load answers 503 SlowDown. That is not a failed store,
   # it is a store to try again: without a retry the entry is lost, the compile
@@ -1228,7 +1655,7 @@ except Exception: sys.exit(1)
   check "and the retried store is readable from s3 afterwards" \
         "$("$VCACHE" --show-stats | awk '/^cache hit \(s3\)[[:space:]]/ { print $NF }')" "1"
 
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
 
   # A compile that genuinely fails must keep reporting the compiler's status,
   # not vcache's, even with the flag on and s3 down.
@@ -1239,6 +1666,7 @@ except Exception: sys.exit(1)
   check "a compiler error still wins over the cache status" "$([[ $? -ne 0 && $? -ne 90 ]] && echo yes)" "yes"
   check "object still produced with s3 down" "$([[ -s "$WORK/s4.o" ]] && echo yes)" "yes"
 
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION
 else
@@ -1288,7 +1716,11 @@ check "its state directory is private" \
 
 export VCACHE_DAEMON=on
 compile_a "$WORK/d1.o"
-compile_b "$WORK/d2.o"
+DLOG="$WORK/daemon-disk-hit.log"
+rm -f "$DLOG"
+( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" VCACHE_LOG="$DLOG" \
+    "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/d2.o" ) 2>/dev/null
+check "a disk hit logs hit on disk" "$(grep -c 'hit on disk' "$DLOG" || true)" "1"
 check "a compile through the daemon misses, then" "$(misses)" "1"
 check "the other checkout hits through the daemon" "$(hits)" "1"
 check "the daemon served both lookups" "$(daemon_stat 'lookups')" "2"
@@ -1364,6 +1796,7 @@ export VCACHE_DAEMON=on
 if command -v python3 >/dev/null 2>&1; then
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/daemon-s3"
+  stop_s3
   python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
@@ -1420,7 +1853,7 @@ except Exception: sys.exit(1)
   # Uploads are asynchronous, so a failed one cannot fail the compile that
   # stored it. --stop-daemon is where it surfaces, and where the strict flag
   # turns it into an exit status.
-  kill "$S3PID" 2>/dev/null; wait "$S3PID" 2>/dev/null
+  stop_s3
   reset_cache
   "$VCACHE" --start-daemon >/dev/null
   compile_a "$WORK/ds3.o"
@@ -1430,6 +1863,7 @@ except Exception: sys.exit(1)
   check "--stop-daemon reports the failed upload" "$?" "90"
   check "and says so" "$(grep -c 'failed 1' "$WORK/stop.out")" "1"
 
+  check_mocks_gone
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
         VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION
 else
@@ -1437,6 +1871,514 @@ else
 fi
 "$VCACHE" --stop-daemon >/dev/null 2>&1
 unset VCACHE_DAEMON VCACHE_DAEMON_IDLE_TIMEOUT
+
+# --------------------------------------------------------------------------
+section "11c. A held blob is a memory hit"
+
+# With the disk layer off, a store waits in the upload queue. The next lookup
+# is served from that queue. The client logs the layer and still counts a
+# disk hit: the stats file's positional lines are a format other tools read.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "held-hit test: python3 not installed"
+else
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/held-s3"
+  stop_s3
+  MOCK_S3_LATENCY_MS=3000 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_DISK=0
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  ( cd "$WORK/checkout-a" && VCACHE_ROOTS="$WORK/checkout-a=proj" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/held1.o" ) 2>/dev/null
+  check "the held-blob compile misses" "$(misses)" "1"
+  HLOG="$WORK/held-hit.log"
+  rm -f "$HLOG"
+  ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" VCACHE_LOG="$HLOG" \
+      "$VCACHE" g++ -O2 -c -I include src/lib.cc -o "$WORK/held2.o" ) 2>/dev/null
+  check "a held hit logs hit on memory" "$(grep -c 'hit on memory' "$HLOG" || true)" "1"
+  check "a held hit counts as a disk hit" "$(hits)" "1"
+  check "the daemon counts a memory hit" "$(daemon_stat 'hit (memory)')" "1"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  stop_s3
+  check_mocks_gone
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_DISK VCACHE_DAEMON
+fi
+
+# --------------------------------------------------------------------------
+section "11b2. A second store during an upload is the one S3 keeps"
+
+# Two stores of one key, the second while the first upload is still in the
+# mock's latency. The bucket must end on the second value.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "rewrite upload test: python3 not installed"
+else
+  reset_cache
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/rewrite-s3"
+  stop_s3
+  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  rewrite_key=22222222222222222222222222222222
+  printf 'manifest-v1' | "$VCACHE" --test-put "$rewrite_key"
+  printf 'manifest-v2' | "$VCACHE" --test-put "$rewrite_key"
+  check "a merged re-put is not a second queued upload" \
+    "$(daemon_stat 'uploads queued')" "1"
+  "$VCACHE" --stop-daemon >/dev/null
+  rewrite_obj="$S3DIR/${rewrite_key:0:2}__${rewrite_key:2}"
+  check "the bucket object is the second store" "$(cat "$rewrite_obj" 2>/dev/null)" "manifest-v2"
+  stop_s3
+
+  # One upload thread, so a slow put stays in flight or queued on purpose.
+  # A small body sleeps longer and is written when that sleep ends, so the
+  # last completion is the value left in the bucket.
+  stop_s3
+  export VCACHE_DISK=0
+  export VCACHE_TEST_MAX_HELD_BYTES=10
+  export VCACHE_DAEMON_UPLOAD_THREADS=1
+  export MOCK_S3_LATENCY_MS=200
+  export MOCK_S3_APPLY_AFTER_LATENCY=1
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  export MOCK_S3_SLOW_UNDER_EXTRA_MS=1500
+
+  upload_identity() {
+    "$VCACHE" --daemon-status 2>/dev/null | awk '
+      $1=="uploads" && $2=="queued" {q=$NF}
+      $1=="completed" {c=$NF}
+      $1=="bytes" {seen_bytes=1}
+      $1=="failed" && seen_bytes {f=$NF}
+      $1=="skipped" {s=$NF}
+      $1=="pending" {p=$NF}
+      $1=="uploads" && $2=="superseded" {u=$NF}
+      END {
+        sum = c+0 + f+0 + s+0 + p+0 + u+0
+        if (q+0 == sum) print "yes"
+        else print q "!=" sum
+      }'
+  }
+  start_order_s3() {  # $1 storage dir
+    stop_s3
+    S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+    S3DIR="$1"
+    python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+    S3PID=$!
+    for _ in $(seq 1 50); do
+      python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+      sleep 0.05
+    done
+    export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+    reset_cache
+    "$VCACHE" --start-daemon >/dev/null
+  }
+  wait_started() {  # $1 path
+    local saw=0
+    for _ in $(seq 1 100); do
+      if [[ -f "$1" ]]; then saw=1; break; fi
+      sleep 0.05
+    done
+    echo "$saw"
+  }
+
+  # The worker is busy with the blocker, so the first victim value is queued.
+  start_order_s3 "$WORK/refuse-queued-s3"
+  blocker_key=11111111111111111111111111111111
+  queued_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  printf 'bbbb' | "$VCACHE" --test-put "$blocker_key"
+  blocker_obj="$S3DIR/${blocker_key:0:2}__${blocker_key:2}.started"
+  check "the blocker upload is in flight" "$(wait_started "$blocker_obj")" "1"
+  printf 'v1v1' | "$VCACHE" --test-put "$queued_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$queued_key"
+  check "a drained queued refusal keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  queued_obj="$S3DIR/${queued_key:0:2}__${queued_key:2}"
+  check "a refused re-put of a queued value leaves the newer value in s3" \
+    "$(cat "$queued_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  stop_s3
+
+  # Nothing else is queued, so the victim's own upload is the one in flight.
+  start_order_s3 "$WORK/refuse-flight-s3"
+  flight_key=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  printf 'v1v1' | "$VCACHE" --test-put "$flight_key"
+  flight_obj="$S3DIR/${flight_key:0:2}__${flight_key:2}"
+  check "the victim upload is in flight" "$(wait_started "$flight_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$flight_key" &
+  flight_put=$!
+  flight_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then flight_marked=1; break; fi
+    if ! kill -0 "$flight_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "a refused in-flight re-put is marked superseded" "$flight_marked" "1"
+  wait "$flight_put"
+  check "a drained in-flight refusal keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a refused re-put of an in-flight value leaves the newer value in s3" \
+    "$(cat "$flight_obj" 2>/dev/null)" "V2VALUE-0123456789"
+
+  # V2 is refused while V1 is in flight, then V3 is accepted. V2 must not
+  # upload after V3.
+  start_order_s3 "$WORK/refuse-overtake-s3"
+  overtake_key=cccccccccccccccccccccccccccccccc
+  printf 'v1v1' | "$VCACHE" --test-put "$overtake_key"
+  overtake_obj="$S3DIR/${overtake_key:0:2}__${overtake_key:2}"
+  check "the overtaken upload is in flight" "$(wait_started "$overtake_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$overtake_key" &
+  overtake_put=$!
+  overtake_marked=0
+  for _ in $(seq 1 40); do
+    if [[ "$(daemon_stat 'uploads superseded')" == "1" ]]; then overtake_marked=1; break; fi
+    if ! kill -0 "$overtake_put" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "the overtaken refusal is waiting" "$overtake_marked" "1"
+  printf 'v3v3' | "$VCACHE" --test-put "$overtake_key"
+  wait "$overtake_put"
+  overtake_drained=0
+  for _ in $(seq 1 120); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then overtake_drained=1; break; fi
+    sleep 0.05
+  done
+  check "the overtaken uploads have drained" "$overtake_drained" "1"
+  check "an overtaken refusal is not uploaded" "$(daemon_stat 'completed')" "2"
+  check "a drained overtake keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a newer accepted store is what s3 keeps" \
+    "$(cat "$overtake_obj" 2>/dev/null)" "v3v3"
+  stop_s3
+
+  # V1's put fails three times while V2 is refused against that flight. The
+  # drop is a skip, and V2's put is the one that lands.
+  export MOCK_S3_TRANSIENT_PUT_FAILURES=3
+  start_order_s3 "$WORK/refuse-retry-s3"
+  retry_key=dddddddddddddddddddddddddddddddd
+  printf 'v1v1' | "$VCACHE" --test-put "$retry_key"
+  retry_obj="$S3DIR/${retry_key:0:2}__${retry_key:2}"
+  check "the superseded retry upload has started" "$(wait_started "$retry_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$retry_key"
+  check "a superseded retry keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a superseded retry leaves the newer value in s3" \
+    "$(cat "$retry_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  stop_s3
+  unset MOCK_S3_TRANSIENT_PUT_FAILURES
+
+  # Both stores miss the held cap, so each would upload on its own. The first
+  # is the slow body. The second must wait for that flight and land last.
+  export MOCK_S3_SLOW_UNDER_BYTES=20
+  start_order_s3 "$WORK/refuse-sync-s3"
+  sync_key=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  sync_obj="$S3DIR/${sync_key:0:2}__${sync_key:2}"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$sync_key" &
+  sync_put=$!
+  check "the first refused upload has started" "$(wait_started "$sync_obj.started")" "1"
+  printf 'V3VALUE-0123456789-later' | "$VCACHE" --test-put "$sync_key"
+  wait "$sync_put"
+  check "ordered synchronous uploads keep the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a later refused upload is what s3 keeps" \
+    "$(cat "$sync_obj" 2>/dev/null)" "V3VALUE-0123456789-later"
+  stop_s3
+
+  # The refused put is the large body, so the mock answers 403 and records
+  # no error. The identity has to count that as failed.
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  export MOCK_S3_DENY_PUT_MIN_BYTES=10
+  start_order_s3 "$WORK/refuse-deny-s3"
+  deny_blocker=11111111111111111111111111111111
+  deny_key=ffffffffffffffffffffffffffffffff
+  printf 'bbbb' | "$VCACHE" --test-put "$deny_blocker"
+  deny_started="$S3DIR/${deny_blocker:0:2}__${deny_blocker:2}.started"
+  check "the deny-case blocker upload is in flight" "$(wait_started "$deny_started")" "1"
+  printf 'v1v1' | "$VCACHE" --test-put "$deny_key"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$deny_key"
+  check "a denied synchronous put keeps the upload identity" "$(upload_identity)" "yes"
+  "$VCACHE" --stop-daemon >/dev/null
+  stop_s3
+  unset MOCK_S3_DENY_PUT_MIN_BYTES
+
+  # The wait is shorter than the slow put, so the refused store finds that
+  # flight still running. It has to wait for it, then upload.
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    "$VCACHE" --daemon-status >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  export VCACHE_TEST_REFUSAL_WAIT_MS=200
+  export VCACHE_LOG="$WORK/refusal-wait.log"
+  rm -f "$WORK/refusal-wait.log"
+  export MOCK_S3_SLOW_UNDER_BYTES=10
+  start_order_s3 "$WORK/refuse-wait-s3"
+  wait_key=abababababababababababababababab
+  printf 'v1v1' | "$VCACHE" --test-put "$wait_key"
+  wait_obj="$S3DIR/${wait_key:0:2}__${wait_key:2}"
+  check "the short-wait upload is in flight" "$(wait_started "$wait_obj.started")" "1"
+  printf 'V2VALUE-0123456789' | "$VCACHE" --test-put "$wait_key"
+  retries=$(grep -c 'still in flight' "$WORK/refusal-wait.log" || true)
+  check "the short wait retried while the flight was up" \
+    "$([[ "$retries" -ge 1 ]] && echo yes)" "yes"
+  # pending ignores a superseded flight, so stop is what waits for that put
+  # to finish writing. Reading before then sees the fast body.
+  "$VCACHE" --stop-daemon >/dev/null
+  check "a refused put waits out the flight it found" \
+    "$(cat "$wait_obj" 2>/dev/null)" "V2VALUE-0123456789"
+  stop_s3
+  unset VCACHE_TEST_REFUSAL_WAIT_MS VCACHE_LOG
+  check_mocks_gone
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_DAEMON VCACHE_DISK VCACHE_TEST_MAX_HELD_BYTES \
+        VCACHE_DAEMON_UPLOAD_THREADS MOCK_S3_LATENCY_MS \
+        MOCK_S3_APPLY_AFTER_LATENCY MOCK_S3_SLOW_UNDER_BYTES \
+        MOCK_S3_SLOW_UNDER_EXTRA_MS
+fi
+
+# --------------------------------------------------------------------------
+section "11. Daemon uploads survive eviction"
+
+# A later compile must not evict an entry whose upload is still journalled.
+# The mock answers slowly so the journal is still there when the cache trims.
+if ! command -v python3 >/dev/null 2>&1; then
+  skipped "upload eviction test: python3 not installed"
+else
+  reset_cache
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/evict-s3"
+  stop_s3
+  MOCK_S3_LATENCY_MS=300 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+  export AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+  export VCACHE_S3_BUCKET=testbucket
+  export VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+  export VCACHE_S3_PATH_STYLE=1
+  export VCACHE_S3_REGION=us-east-1
+  export VCACHE_CACHE_SIZE=16K
+  export VCACHE_DAEMON=on
+  "$VCACHE" --start-daemon >/dev/null
+  mkdir -p "$WORK/evict-src"
+  for n in 1 2 3 4 5; do
+    printf 'int evict_%d(void){return %d;}\n' "$n" "$n" > "$WORK/evict-src/f$n.c"
+    ( cd "$WORK/evict-src" && VCACHE_ROOTS="$WORK/evict-src=proj" \
+        "$VCACHE" gcc -c "f$n.c" -o "$WORK/evict$n.o" ) >/dev/null
+  done
+  for _ in $(seq 1 80); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then break; fi
+    sleep 0.1
+  done
+  check "eviction does not skip an upload" "$(daemon_stat 'skipped')" "0"
+  "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+  check "the bucket received all five compiles" \
+    "$(find "$S3DIR" -type f | wc -l | tr -d ' ')" "5"
+  stop_s3
+  check_mocks_gone
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY VCACHE_S3_BUCKET \
+        VCACHE_S3_ENDPOINT VCACHE_S3_PATH_STYLE VCACHE_S3_REGION \
+        VCACHE_CACHE_SIZE VCACHE_DAEMON
+fi
+
+# --------------------------------------------------------------------------
+section "10d. Jobserver"
+
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+check "jobserver is off by default" \
+  "$("$VCACHE" --start-daemon >/dev/null && [[ ! -p "$VCACHE_DIR/daemon/jobserver.fifo" ]] && echo yes)" "yes"
+check "--jobserver-env without a pool exits 1" \
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+
+# Older GNU make reads the printed line as an unlimited -j (3.81) or rejects
+# it (4.2, 4.3), so --jobserver-env refuses rather than print it for them.
+mkdir -p "$WORK/js-make"
+printf '#!/bin/sh\necho "GNU Make 4.3"\n' > "$WORK/js-make/make43"
+printf '#!/bin/sh\necho "GNU Make 4.4.1"\n' > "$WORK/js-make/make44"
+chmod +x "$WORK/js-make/make43" "$WORK/js-make/make44"
+js_old=$(MAKE="$WORK/js-make/make43" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env refuses GNU make 4.3" \
+  "$([[ "$js_old" == *"needs GNU make 4.4"* && "$js_old" == *"exit=1" ]] && echo yes)" "yes"
+js_new=$(MAKE="$WORK/js-make/make44" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env accepts GNU make 4.4 and then wants a pool" \
+  "$([[ "$js_new" == *"no jobserver"* && "$js_new" == *"exit=1" ]] && echo yes)" "yes"
+
+if [[ "$(uname -s)" != Linux ]]; then
+  skipped "the fifo jobserver pool is Linux-only"
+else
+export VCACHE_DAEMON_JOBSERVER=1
+export VCACHE_DAEMON_JOBSERVER_JOBS=2
+export VCACHE_DAEMON_IDLE_TIMEOUT=60
+check "a jobserver daemon starts" \
+  "$("$VCACHE" --start-daemon | grep -c 'daemon started')" "1"
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+check "the jobserver fifo exists" "$([[ -p "$JS_FIFO" ]] && echo yes)" "yes"
+check "jobserver tokens total" "$(daemon_stat 'jobserver tokens total')" "2"
+check "jobserver tokens free" "$(daemon_stat 'jobserver tokens free')" "2"
+check "jobserver tokens withdrawn" "$(daemon_stat 'jobserver tokens withdrawn')" "0"
+check "--jobserver-env prints the fifo MAKEFLAGS line" \
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)" \
+  "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
+
+mkdir -p "$WORK/js"
+cat > "$WORK/js/tick.sh" << 'EOF'
+#!/bin/sh
+file=$1
+exec 9>>"$file.lock"
+flock 9
+cur=0; max=0
+if read -r cur max < "$file"; then :; fi
+cur=$((cur + 1))
+if [ "$cur" -gt "$max" ]; then max=$cur; fi
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+sleep 1
+flock 9
+cur=0; max=0
+read -r cur max < "$file"
+cur=$((cur - 1))
+printf '%s %s\n' "$cur" "$max" > "$file"
+flock -u 9
+EOF
+chmod +x "$WORK/js/tick.sh"
+cat > "$WORK/js/Makefile" << 'EOF'
+.PHONY: all t1 t2 t3 t4 t5 t6
+all: t1 t2 t3 t4 t5 t6
+t1 t2 t3 t4 t5 t6:
+	sh tick.sh count
+EOF
+cat > "$WORK/js/build.ninja" << 'EOF'
+rule tick
+  command = sh tick.sh count
+build t1: tick
+build t2: tick
+build t3: tick
+build t4: tick
+build t5: tick
+build t6: tick
+build all: phony t1 t2 t3 t4 t5 t6
+default all
+EOF
+
+js_max() { awk '{ print $2 }' "$WORK/js/count"; }
+# The printed line contains a space. An unquoted $(...) splits it, and env
+# then keeps only MAKEFLAGS=-j. Quoting passes the whole assignment.
+js_flags=$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)
+if make_reads_fifo_jobserver; then
+  printf '0 0\n' > "$WORK/js/count"
+  mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
+  check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
+  check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "GNU make >= 4.4 not installed"
+fi
+
+# PATH ninja on this machine is a wrapper that appends -j, which makes ninja
+# ignore the fifo. The real client is /usr/bin/ninja.
+ninja_bin=/usr/bin/ninja
+if [[ -x "$ninja_bin" ]] && \
+   [[ "$(printf '%s\n' 1.13 "$("$ninja_bin" --version)" | sort -V | head -1)" == "1.13" ]]; then
+  printf '0 0\n' > "$WORK/js/count"
+  nj_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" "$3" >/dev/null' _ \
+    "$WORK/js" "$js_flags" "$ninja_bin")
+  check "ninja under the jobserver finishes" "$([[ "$nj_out" != *timeout* ]] && echo yes)" "yes"
+  check "ninja under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "ninja >= 1.13 not installed"
+fi
+
+printf '0 0\n' > "$WORK/js/count"
+( cd "$WORK/js" && env -u MAKEFLAGS make -j6 ) >/dev/null
+check "make -j6 without the jobserver runs 6 wide" "$(js_max)" "6"
+
+"$VCACHE" --stop-daemon >/dev/null
+check "stopping the daemon removes the fifo" "$([[ ! -p "$JS_FIFO" ]] && echo yes)" "yes"
+
+# A token held past one idle timeout must not retire the daemon. The second
+# timeout is what retires a pool whose client has gone away with a token.
+reset_cache
+VCACHE_DAEMON_IDLE_TIMEOUT=3 "$VCACHE" --start-daemon >/dev/null
+JS_READY=$(date +%s)
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+JS_PID=$(daemon_pid)
+(
+  exec 3<>"$JS_FIFO"
+  IFS= read -r -n 1 -u 3
+  sleep 8
+  printf '+' >&3
+) &
+JS_HOLDER=$!
+held=0
+for _ in $(seq 1 30); do
+  if [[ "$(daemon_stat 'jobserver tokens free')" == "1" ]]; then held=1; break; fi
+  sleep 0.1
+done
+check "a client holds one jobserver token" "$held" "1"
+while (( $(date +%s) < JS_READY + 4 )); do sleep 0.2; done
+check "the daemon stays up while a token is out past one idle timeout" \
+  "$(kill -0 "$JS_PID" 2>/dev/null && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+kill "$JS_HOLDER" 2>/dev/null || true
+wait "$JS_HOLDER" 2>/dev/null || true
+
+reset_cache
+"$VCACHE" --start-daemon >/dev/null
+JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
+rm -f "$JS_FIFO"
+check "--jobserver-env exits 1 when the fifo is missing" \
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
+fi
 
 # --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"
@@ -1736,6 +2678,68 @@ for mode in "-MM" "-M -MP"; do
   check_depsrc_answer "$mode: and the restored paths name this checkout" \
     "$WORK/depsrc/d" "$WORK/pc-d.d" "${mflags[@]}" "$WORK/depsrc/d/main.c"
 done
+
+# --------------------------------------------------------------------------
+section "14b. Concurrent dep-scan stores keep both states"
+
+# Same source, different headers, one canonical root. The paused store must
+# keep the state the other checkout wrote while it waited.
+reset_cache
+ds_tree() {  # $1 dir, $2 header value
+  mkdir -p "$1"
+  printf '#include "x.h"\nint v = V;\n' > "$1/main.c"
+  printf '#define V %s\n' "$2" > "$1/x.h"
+}
+ds_tree "$WORK/ds-a" 1
+ds_tree "$WORK/ds-b" 2
+ds_tree "$WORK/ds-c" 3
+ds_scan() {  # $1 dir, $2 log (may be empty)
+  if [[ -n "${2:-}" ]]; then
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" VCACHE_LOG="$2" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  else
+    ( cd "$1" && VCACHE_ROOTS="$1=proj" \
+        "$VCACHE" gcc -M -MP main.c -o "$1/out.d" ) >/dev/null
+  fi
+}
+ds_scan "$WORK/ds-a" ""
+check "the first dep-scan version misses" "$(misses)" "1"
+fifo="$WORK/depscan-pause.fifo"
+mkfifo "$fifo"
+dblog="$WORK/ds-b-pause.log"
+rm -f "$dblog"
+( cd "$WORK/ds-b" && VCACHE_ROOTS="$WORK/ds-b=proj" VCACHE_LOG="$dblog" \
+    VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT="$fifo" \
+    "$VCACHE" gcc -M -MP main.c -o "$WORK/ds-b/out.d" ) >/dev/null &
+dbpid=$!
+dwaiting=0
+for _ in $(seq 1 200); do
+  if grep -q 'manifest: waiting before put' "$dblog" 2>/dev/null; then dwaiting=1; break; fi
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+check "the second dep-scan store waits" "$dwaiting" "1"
+if [[ "$dwaiting" == 1 ]]; then
+  ds_scan "$WORK/ds-c" ""
+fi
+release_pause_fifo "$fifo" "$dbpid" "$dwaiting"
+for _ in $(seq 1 200); do
+  if ! kill -0 "$dbpid" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+wait "$dbpid" || true
+dblog2="$WORK/ds-b-hit.log"
+rm -f "$dblog2"
+ds_scan "$WORK/ds-b" "$dblog2"
+check "header 2 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog2" || true)" "1"
+check "header 2 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog2" || true)" "0"
+dblog3="$WORK/ds-c-hit.log"
+rm -f "$dblog3"
+ds_scan "$WORK/ds-c" "$dblog3"
+check "header 3 hits through the dep-scan manifest" \
+  "$(grep -c 'dep scan hit' "$dblog3" || true)" "1"
+check "header 3 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog3" || true)" "0"
 
 # --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"
@@ -2709,6 +3713,115 @@ check "followed by one reason line per reason" \
   "$((expected_uncacheable))"
 "$VCACHE" --zero-stats >/dev/null
 check "--zero-stats clears the reasons" "$("$VCACHE" --show-stats | grep -c '^  ' || true)" "0"
+
+section "10a. Compile sessions"
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$TOP/tests/daemon_session_test.py" "$VCACHE" "$WORK/compile-sessions" \
+    > "$WORK/compile-sessions.report" 2> "$WORK/compile-sessions.errors"
+  session_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
+  done < "$WORK/compile-sessions.report"
+  check "compile session integration driver completes" "$session_test_exit" "0"
+  if [[ "$session_test_exit" != 0 ]]; then cat "$WORK/compile-sessions.errors"; fi
+else
+  bad "compile session integration requires python3"
+fi
+
+section "10b. Single-flight"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+    > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
+  lease_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
+  done < "$WORK/single-flight.report"
+  check "single-flight integration driver completes" "$lease_test_exit" "0"
+  if [[ "$lease_test_exit" != 0 ]]; then cat "$WORK/single-flight.errors"; fi
+else
+  bad "single-flight integration requires python3"
+fi
+
+section "10d. Elastic jobserver"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
+    "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
+  elastic_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
+  done < "$WORK/elastic.report"
+  check "elastic jobserver integration driver completes" "$elastic_test_exit" "0"
+  if [[ "$elastic_test_exit" != 0 ]]; then cat "$WORK/elastic.errors"; fi
+else
+  bad "elastic jobserver integration requires python3"
+fi
+
+section "10c. Memory admission"
+if command -v python3 >/dev/null 2>&1; then
+  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+    "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
+  admission_test_exit=$?
+  while IFS='|' read -r outcome message; do
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
+  done < "$WORK/admission.report"
+  check "memory admission integration driver completes" "$admission_test_exit" "0"
+  if [[ "$admission_test_exit" != 0 ]]; then cat "$WORK/admission.errors"; fi
+else
+  bad "memory admission integration requires python3"
+fi
+
+section "10e. Nested admission"
+# A compiler or linker running under a reservation can start vcache again
+# (rustc's linker through masquerade). The daemon already samples that child
+# as part of the parent's tree, so the child must not queue for memory of its
+# own behind the reservation it is part of.
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+mkdir -p "$WORK/nested"
+printf 'int outer(void) { return 1; }\n' > "$WORK/nested/outer.c"
+printf 'int inner(void) { return 2; }\n' > "$WORK/nested/inner.c"
+cat > "$WORK/nested/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then exec gcc "\$@"; fi
+done
+printf '%s\n' "\${VCACHE_MEMORY_RESERVED:-unset}" > "$WORK/nested/marker"
+VCACHE_LOG="$WORK/nested/inner.log" "$VCACHE" gcc -c "$WORK/nested/inner.c" \
+  -o "$WORK/nested/inner.o"
+exec gcc "\$@"
+EOF
+chmod +x "$WORK/nested/cc"
+( cd "$WORK/nested" && VCACHE_DAEMON=auto VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_DAEMON_IDLE_TIMEOUT=60 VCACHE_COMPILER_CHECK=mtime \
+    VCACHE_LOG="$WORK/nested/outer.log" \
+    "$VCACHE" "$WORK/nested/cc" -c outer.c -o outer.o ) >/dev/null 2>&1
+check "a reserved compiler sees the reservation marker" \
+  "$(cat "$WORK/nested/marker" 2>/dev/null)" "1"
+check "the outer compile reserved memory" \
+  "$([[ "$(grep -c 'reserve: granted' "$WORK/nested/outer.log" 2>/dev/null)" -ge 1 ]] && echo yes)" "yes"
+check "a vcache inside the reservation does not reserve again" \
+  "$(grep -c 'not reserving again' "$WORK/nested/inner.log" 2>/dev/null)" "1"
+check "and sends no reserve request of its own" \
+  "$(grep -c 'reserve: granted' "$WORK/nested/inner.log" 2>/dev/null || true)" "0"
+check "both nested compiles produce objects" \
+  "$([[ -s "$WORK/nested/outer.o" && -s "$WORK/nested/inner.o" ]] && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

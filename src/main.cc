@@ -6,6 +6,7 @@
 //   vcache g++ -c foo.cc -o foo.o     explicit prefix
 //   ln -s vcache g++; g++ -c foo.cc   masquerade via a symlink on $PATH
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -18,11 +19,13 @@
 #include "args/compiler_args.h"
 #include "args/rustc_args.h"
 #include "core/compile.h"
+#include "core/cost.h"
 #include "core/link.h"
 #include "core/config.h"
 #include "core/roots.h"
 #include "core/stats.h"
 #include "daemon/client.h"
+#include "daemon/jobserver.h"
 #include "daemon/protocol.h"
 #include "daemon/server.h"
 #include "rust/rust_compile.h"
@@ -38,6 +41,20 @@ namespace {
 
 constexpr const char* kVersion = "vcache 1.3.0";
 
+// Masquerade hops through vcache within one compiler's process chain. A real
+// chain is short (rustc running a masqueraded linker is two); a cycle is not.
+constexpr const char* kMasqueradeDepthEnv = "VCACHE_MASQUERADE_DEPTH";
+constexpr long kMaxMasqueradeDepth = 4;
+
+long MasqueradeDepthFromEnv() {
+  const char* text = std::getenv(kMasqueradeDepthEnv);
+  if (text == nullptr) return 0;
+  char* end = nullptr;
+  const long depth = std::strtol(text, &end, 10);
+  if (end == text || *end != '\0' || depth < 0) return 0;
+  return depth;
+}
+
 void PrintUsage() {
   std::printf(
       "%s -- compilation cache for C, C++ and Rust\n"
@@ -50,6 +67,7 @@ void PrintUsage() {
       "  -h, --help            show this help\n"
       "  -V, --version         show the version\n"
       "  -s, --show-stats      show cache statistics\n"
+      "      --show-costs      show compile and link memory and wall time\n"
       "  -z, --zero-stats      reset statistics counters\n"
       "  -C, --clear           delete all cached entries\n"
       "      --show-config     show the effective configuration\n"
@@ -68,6 +86,9 @@ void PrintUsage() {
       "      --daemon-foreground\n"
       "                        run the daemon in the foreground (systemd,\n"
       "                        launchd, debugging)\n"
+      "      --jobserver-env   print MAKEFLAGS for the daemon's jobserver\n"
+      "                        (Linux, GNU make 4.4+), or exit 1 when it\n"
+      "                        has no pool or make is older\n"
       "\n"
       "Root mapping (the point of vcache):\n"
       "  --vcache-root=PATH[=TARGET]   repeatable; may also be given as\n"
@@ -96,7 +117,8 @@ void PrintUsage() {
       "  VCACHE_S3_PREFIX, VCACHE_S3_ENDPOINT, VCACHE_S3_TTL_DAYS,\n"
       "  VCACHE_S3_CACHE_SIZE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,\n"
       "  VCACHE_DAEMON (off|on|auto), VCACHE_DAEMON_IDLE_TIMEOUT,\n"
-      "  VCACHE_DAEMON_UPLOAD_THREADS, VCACHE_DAEMON_SOCKET\n"
+      "  VCACHE_DAEMON_UPLOAD_THREADS, VCACHE_DAEMON_SOCKET,\n"
+      "  VCACHE_DAEMON_JOBSERVER, VCACHE_DAEMON_JOBSERVER_JOBS\n"
       "\n"
       "Config file: $VCACHE_CONFIG, ~/.config/vcache/config.toml, or\n"
       "             /etc/vcache/config.toml\n"
@@ -211,6 +233,86 @@ int StopDaemon(const vcache::core::Config& config) {
   return 0;
 }
 
+// The make the printed line is for: $MAKE when a build set it, else the first
+// `make` on PATH.
+std::string MakeForJobserver() {
+  const char* named = std::getenv("MAKE");
+  std::string make = named != nullptr && *named != '\0' ? named : "make";
+  if (make.find('/') == std::string::npos) {
+    if (auto found = vcache::util::FindInPath(make, "")) make = *found;
+  }
+  return make;
+}
+
+int JobserverEnv(const vcache::core::Config& config) {
+  // The line only works for a client that reads a fifo jobserver. Older GNU
+  // make takes the bare -j as "no limit" (3.81) or rejects the auth string
+  // (4.2, 4.3), which would turn a bounded build into an unbounded one.
+  // VCACHE_JOBSERVER_ANY_CLIENT=1 skips the check for other clients, such as
+  // ninja 1.13 or cargo, or a make this process cannot find.
+  const char* any_client = std::getenv("VCACHE_JOBSERVER_ANY_CLIENT");
+  if (any_client == nullptr || std::string(any_client) != "1") {
+    const std::string make = MakeForJobserver();
+    vcache::util::ProcOptions options;
+    options.capture_stdout = true;
+    options.capture_stderr = true;
+    const auto result = vcache::util::Run({make, "--version"}, options);
+    if (result.exit_code != 0 ||
+        !vcache::daemon::MakeReadsFifoJobserver(result.stdout_data)) {
+      const std::string first_line =
+          result.stdout_data.substr(0, result.stdout_data.find('\n'));
+      ::fprintf(stderr,
+                "vcache: --jobserver-env needs GNU make 4.4 or newer, which reads a fifo "
+                "jobserver; %s is %s. Set MAKE to a newer make, or "
+                "VCACHE_JOBSERVER_ANY_CLIENT=1 for another client.\n",
+                make.c_str(), first_line.empty() ? "not runnable" : first_line.c_str());
+      return 1;
+    }
+  }
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  std::string text;
+  if (client == nullptr || !client->Status(&text) ||
+      text.find("jobserver tokens total") == std::string::npos) {
+    ::fprintf(stderr, "vcache: no jobserver (%s)\n",
+              client == nullptr ? why.c_str() : "the daemon has no pool");
+    return 1;
+  }
+  const std::string path = vcache::daemon::StateDir(config) + "/jobserver.fifo";
+  struct stat st {};
+  if (::lstat(path.c_str(), &st) != 0 || !S_ISFIFO(st.st_mode)) {
+    ::fprintf(stderr, "vcache: no jobserver (the fifo is gone)\n");
+    return 1;
+  }
+  const std::string line = vcache::daemon::JobserverMakeFlagsLine(path);
+  std::fputs(line.c_str(), stdout);
+  return 0;
+}
+
+// Reads one blob from stdin and stores it through the running daemon. The
+// integration tests use it to put two values of one key faster than a compile.
+int TestDaemonPut(const vcache::core::Config& config, const std::string& key) {
+  std::string value;
+  char buf[8192];
+  while (true) {
+    const size_t n = std::fread(buf, 1, sizeof(buf), stdin);
+    if (n > 0) value.append(buf, n);
+    if (n < sizeof(buf)) break;
+  }
+  std::string why;
+  auto client = vcache::daemon::DaemonClient::Connect(config, &why);
+  if (client == nullptr) {
+    ::fprintf(stderr, "vcache: %s\n", why.c_str());
+    return 1;
+  }
+  vcache::storage::PutResult result;
+  if (!client->Put(key, value, &result) || !result.stored) {
+    ::fprintf(stderr, "vcache: test put was not stored\n");
+    return 1;
+  }
+  return 0;
+}
+
 int DaemonStatus(const vcache::core::Config& config) {
   std::string why;
   auto client = vcache::daemon::DaemonClient::Connect(config, &why);
@@ -318,6 +420,12 @@ int ShowStats(const vcache::core::Config& config) {
   return 0;
 }
 
+int ShowCosts(const vcache::core::Config& config) {
+  const std::string text = vcache::core::FormatCosts(config.disk.dir);
+  std::fputs(text.c_str(), stdout);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -354,6 +462,19 @@ int main(int argc, char** argv) {
       ::fprintf(stderr, "vcache: cannot find a real %s on PATH\n", self_base.c_str());
       return 127;
     }
+    // A wrapper such as ccache also runs the first other same-named binary on
+    // PATH. With its directory after this symlink's, the two run each other
+    // without end, so count the hops and stop.
+    const long masquerade_depth = MasqueradeDepthFromEnv();
+    if (masquerade_depth >= kMaxMasqueradeDepth) {
+      ::fprintf(stderr,
+                "vcache: masquerading as %s led back to vcache %ld times; %s on PATH "
+                "runs vcache again. Take its directory off PATH or put the real "
+                "compiler before it.\n",
+                self_base.c_str(), masquerade_depth, real->c_str());
+      return 127;
+    }
+    ::setenv(kMasqueradeDepthEnv, std::to_string(masquerade_depth + 1).c_str(), 1);
     command.push_back(*real);
     for (int i = 1; i < argc; ++i) command.push_back(argv[i]);
   } else {
@@ -380,6 +501,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (first == "-s" || first == "--show-stats") return ShowStats(config);
+    if (first == "--show-costs") return ShowCosts(config);
     if (first == "-z" || first == "--zero-stats") {
       return vcache::core::ZeroStats(config.disk.dir) ? 0 : 1;
     }
@@ -394,7 +516,15 @@ int main(int argc, char** argv) {
     if (first == "--start-daemon") return StartDaemon(config);
     if (first == "--stop-daemon") return StopDaemon(config);
     if (first == "--daemon-status") return DaemonStatus(config);
+    if (first == "--test-put") {
+      if (argc < 3) {
+        ::fprintf(stderr, "vcache: --test-put needs a key\n");
+        return 1;
+      }
+      return TestDaemonPut(config, argv[2]);
+    }
     if (first == "--daemon-foreground") return RunDaemonForeground(config);
+    if (first == "--jobserver-env") return JobserverEnv(config);
     if (first == "--show-config") {
       std::fputs(vcache::core::DescribeConfig(config).c_str(), stdout);
       return 0;

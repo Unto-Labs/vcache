@@ -118,6 +118,11 @@ const char* DaemonModeName(DaemonMode mode);
 
 struct DaemonConfig {
   DaemonMode mode = DaemonMode::kOff;
+  bool single_flight = false;
+  bool admission = false;
+  uint64_t default_compile_kb = 2097152;
+  uint64_t default_link_kb = 4194304;
+  uint64_t jobserver_min_jobs = 2;
 
   // The daemon exits, after draining its upload queue, once it has had no
   // client for this long. Zero keeps it running until told to stop. The
@@ -131,6 +136,13 @@ struct DaemonConfig {
   // Unix socket path. Empty derives one from the cache directory, so two
   // caches never share a daemon by accident.
   std::string socket;
+
+  // Fixed GNU-make fifo of job slots for every build on this machine.
+  // Off until a build script exports the line from --jobserver-env.
+  // jobserver_jobs == 0 means "online CPUs"; an explicit 0, a negative
+  // value, or a value above INT_MAX is a warning and the same default.
+  bool jobserver = false;
+  int jobserver_jobs = 0;
 };
 
 struct Config {

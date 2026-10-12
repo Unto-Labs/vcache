@@ -25,6 +25,7 @@ original single-threaded HTTP/1.0 server the tests were written against.
 
 import hashlib
 import os
+import signal
 import socket
 import sys
 import time
@@ -60,7 +61,9 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(HANDSHAKE_S)
 
     def end_headers(self):
-        if LATENCY_S:
+        # A put that applies after its latency has already slept, and must not
+        # sleep again here or the completion order would not match the write.
+        if LATENCY_S and not getattr(self, "_latency_applied", False):
             time.sleep(LATENCY_S)
         super().end_headers()
 
@@ -197,6 +200,22 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         if not self._check_headers(body):
             return
+        # 403 is a miss with no error string. A refused synchronous put must
+        # still count as a failed upload.
+        deny_min = int(os.environ.get("MOCK_S3_DENY_PUT_MIN_BYTES", "0") or "0")
+        if deny_min and len(body) >= deny_min:
+            self.send_error(403, "AccessDenied")
+            return
+        path = self._object_path()
+        if path is None:
+            self.send_error(400, "bad key")
+            return
+        # A refused re-put has to see that this attempt started, including
+        # when the attempt answers 503 and never writes the object.
+        apply_after = os.environ.get("MOCK_S3_APPLY_AFTER_LATENCY") == "1"
+        if apply_after:
+            with open(path + ".started", "w", encoding="ascii"):
+                pass
         # MOCK_S3_TRANSIENT_PUT_FAILURES=N makes the first N PUTs answer 503
         # SlowDown, which is what a real bucket does when it is shedding load
         # rather than rejecting the request. Counted per object so a test can
@@ -215,10 +234,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-        path = self._object_path()
-        if path is None:
-            self.send_error(400, "bad key")
-            return
+        # The object appears when the request finishes, not when it arrives, so
+        # a slow upload that started first can still be the value left behind.
+        if apply_after:
+            delay = LATENCY_S
+            slow_under = int(os.environ.get("MOCK_S3_SLOW_UNDER_BYTES", "0") or "0")
+            slow_extra = int(os.environ.get("MOCK_S3_SLOW_UNDER_EXTRA_MS", "0") or "0")
+            if slow_under and len(body) < slow_under:
+                delay += slow_extra / 1000.0
+            if delay:
+                time.sleep(delay)
+            self._latency_applied = True
         with open(path, "wb") as f:
             f.write(body)
         self.send_response(200)
@@ -227,6 +253,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # A parent that ignores SIGTERM hands that disposition to this process.
+    # kill then does nothing, and the suite's wait sits on the pid.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
     global STORAGE
     port = int(sys.argv[1])
     STORAGE = sys.argv[2]

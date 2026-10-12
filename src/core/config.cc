@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/config.h"
 
+#include <climits>
+#include <cerrno>
 #include <cstdlib>
 #include <sstream>
 
@@ -148,6 +150,27 @@ void ApplyTomlFile(const std::string& path, Config* config) {
   }
 
   if (auto d = root["daemon"].as_table()) {
+    if (auto v = TomlBool(*d, "single_flight")) config->daemon.single_flight = *v;
+    if (auto v = TomlBool(*d, "admission")) config->daemon.admission = *v;
+    if (auto v = TomlInt(*d, "default_compile_kb")) {
+      if (*v > 0) config->daemon.default_compile_kb = static_cast<uint64_t>(*v);
+    }
+    if (auto v = TomlInt(*d, "default_link_kb")) {
+      if (*v > 0) config->daemon.default_link_kb = static_cast<uint64_t>(*v);
+    }
+    if (auto v = TomlInt(*d, "jobserver_min_jobs")) {
+      if (*v > 0) {
+        config->daemon.jobserver_min_jobs = static_cast<uint64_t>(*v);
+      } else {
+        config->warnings.push_back("daemon.jobserver_min_jobs: " + std::to_string(*v) +
+            " is not a positive job count; keeping " +
+            std::to_string(config->daemon.jobserver_min_jobs));
+      }
+    } else if (d->contains("jobserver_min_jobs")) {
+      config->warnings.push_back(
+          "daemon.jobserver_min_jobs: expected a positive job count; keeping " +
+          std::to_string(config->daemon.jobserver_min_jobs));
+    }
     if (auto v = TomlString(*d, "mode")) {
       if (!ParseDaemonMode(*v, &config->daemon.mode)) {
         config->warnings.push_back("daemon.mode: unknown mode '" + *v +
@@ -162,6 +185,17 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     }
     if (auto v = TomlString(*d, "socket")) {
       config->daemon.socket = util::ExpandTilde(*v);
+    }
+    if (auto v = TomlBool(*d, "jobserver")) config->daemon.jobserver = *v;
+    if (auto v = TomlInt(*d, "jobserver_jobs")) {
+      if (*v > 0 && *v <= static_cast<int64_t>(INT_MAX)) {
+        config->daemon.jobserver_jobs = static_cast<int>(*v);
+      } else {
+        config->warnings.push_back(
+            "daemon.jobserver_jobs: " + std::to_string(*v) +
+            " is not a pool size; using online CPUs");
+        config->daemon.jobserver_jobs = 0;
+      }
     }
   }
 
@@ -330,6 +364,42 @@ void ApplyEnvironment(Config* config) {
   if (auto v = Env("VCACHE_DAEMON_SOCKET")) {
     config->daemon.socket = util::ExpandTilde(*v);
   }
+  config->daemon.single_flight =
+      EnvBool("VCACHE_DAEMON_SINGLE_FLIGHT", config->daemon.single_flight);
+  config->daemon.admission = EnvBool("VCACHE_DAEMON_ADMISSION", config->daemon.admission);
+  for (const auto& [name, destination] : {
+      std::pair{"VCACHE_DAEMON_DEFAULT_COMPILE_KB", &config->daemon.default_compile_kb},
+      std::pair{"VCACHE_DAEMON_DEFAULT_LINK_KB", &config->daemon.default_link_kb},
+      std::pair{"VCACHE_DAEMON_JOBSERVER_MIN_JOBS", &config->daemon.jobserver_min_jobs}}) {
+    if (auto value = Env(name)) {
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long long parsed = std::strtoull(value->c_str(), &end, 10);
+      if (!value->empty() && value->front() != '-' && end != value->c_str() &&
+          *end == '\0' && parsed > 0 && errno != ERANGE) {
+        *destination = parsed;
+      } else if (destination == &config->daemon.jobserver_min_jobs) {
+        config->warnings.push_back(std::string(name) + ": expected a positive job count, got '" +
+            *value + "'; keeping " + std::to_string(*destination));
+      }
+    }
+  }
+  config->daemon.jobserver = EnvBool("VCACHE_DAEMON_JOBSERVER", config->daemon.jobserver);
+  if (auto v = Env("VCACHE_DAEMON_JOBSERVER_JOBS")) {
+    char* end = nullptr;
+    const long n = std::strtol(v->c_str(), &end, 10);
+    if (end == v->c_str() || *end != '\0') {
+      config->warnings.push_back(
+          "VCACHE_DAEMON_JOBSERVER_JOBS: expected a job count, got '" + *v + "'");
+    } else if (n <= 0 || n > INT_MAX) {
+      config->warnings.push_back(
+          "VCACHE_DAEMON_JOBSERVER_JOBS: " + *v +
+          " is not a pool size; using online CPUs");
+      config->daemon.jobserver_jobs = 0;
+    } else {
+      config->daemon.jobserver_jobs = static_cast<int>(n);
+    }
+  }
 
   if (auto v = Env("VCACHE_DEP_SCAN")) {
     if (!ParseDepScanPolicy(*v, &config->dep_scan_policy)) {
@@ -485,6 +555,10 @@ std::string DescribeConfig(const Config& config) {
   }
   out << "daemon:           " << DaemonModeName(config.daemon.mode) << "\n";
   if (config.daemon.mode != DaemonMode::kOff) {
+    out << "  single flight:  " << (config.daemon.single_flight ? "on" : "off") << "\n";
+    out << "  admission:      " << (config.daemon.admission ? "on" : "off") << "\n";
+    out << "  compile kB:     " << config.daemon.default_compile_kb << "\n";
+    out << "  link kB:        " << config.daemon.default_link_kb << "\n";
     out << "  idle timeout:   ";
     if (config.daemon.idle_timeout_seconds > 0) {
       out << config.daemon.idle_timeout_seconds << " s\n";
@@ -494,6 +568,14 @@ std::string DescribeConfig(const Config& config) {
     out << "  upload threads: " << config.daemon.upload_threads << "\n";
     if (!config.daemon.socket.empty()) {
       out << "  socket:         " << config.daemon.socket << "\n";
+    }
+    out << "  jobserver:      " << (config.daemon.jobserver ? "on" : "off") << "\n";
+    if (config.daemon.jobserver) {
+      out << "  jobserver jobs: "
+          << (config.daemon.jobserver_jobs > 0 ? std::to_string(config.daemon.jobserver_jobs)
+                                               : "online CPUs")
+          << "\n";
+      out << "  jobserver min:  " << config.daemon.jobserver_min_jobs << "\n";
     }
   }
   out << "roots:            "

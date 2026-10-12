@@ -113,6 +113,11 @@ timeout        = 30                # seconds
 | `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | — | `900` |
 | `daemon.upload_threads` | `VCACHE_DAEMON_UPLOAD_THREADS` | — | `4` |
 | `daemon.socket` | `VCACHE_DAEMON_SOCKET` | — | `<cache dir>/daemon/sock` |
+| `daemon.single_flight` | `VCACHE_DAEMON_SINGLE_FLIGHT` | — | `false` |
+| `daemon.admission` | `VCACHE_DAEMON_ADMISSION` | — | `false` |
+| `daemon.default_compile_kb` | `VCACHE_DAEMON_DEFAULT_COMPILE_KB` | — | `2097152` |
+| `daemon.default_link_kb` | `VCACHE_DAEMON_DEFAULT_LINK_KB` | — | `4194304` |
+| `daemon.jobserver_min_jobs` | `VCACHE_DAEMON_JOBSERVER_MIN_JOBS` | — | `2` |
 | — | `AWS_ACCESS_KEY_ID` | — | — |
 | — | `AWS_SECRET_ACCESS_KEY` | — | — |
 | — | `AWS_SESSION_TOKEN` | — | — |
@@ -647,6 +652,43 @@ A client that differs is refused and runs in-process. Because uploads are
 asynchronous, `--error-on-cache-media-failure` reports a failed upload when
 `vcache --stop-daemon` runs, not during the compile.
 
+`daemon.single_flight` and `daemon.admission` default to false. Enabling either
+opens one compile session on each cache miss; read-only clients and daemon-off
+invocations skip it. Scheduling operations build on this protocol version 2
+session; lookups and stores keep their own connections.
+
+These switches belong to each client. A daemon started by a client with the
+switches off also serves scheduling requests from clients that enable them.
+Admission reserves memory before the actual compile or link. It samples
+memory through `/proc`, so it only has an effect on Linux; elsewhere the
+daemon logs "admission unavailable" once and grants every request. It uses the
+largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
+and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
+integer defaults are in kB. Within the daemon lifetime, a matching cost key also
+uses at least the observed peak sum of the live compiler tree's RSS. This can
+exceed the largest descendant peak recorded by `wait4` in the cost file.
+A wait lasts at most ten minutes, enforced by the server; reaching that
+bound or losing the daemon runs the compiler unreserved and logs the decision.
+
+`daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots
+that make, ninja and cargo share. `daemon.jobserver_jobs`
+(`VCACHE_DAEMON_JOBSERVER_JOBS`) is total slots N; the fifo holds N-1 tokens
+because each client already owns one. Unset means the machine's online CPUs.
+0, a negative value, or a value above the platform integer maximum warns and
+does the same. `vcache --jobserver-env` prints the `MAKEFLAGS` line, or
+exits 1 when no pool is running, the path is not a fifo, or `make` is older
+than GNU make 4.4 (`VCACHE_JOBSERVER_ANY_CLIENT=1` skips that check for other
+clients). The pool is Linux only. See
+[daemon.md](daemon.md) for the protocol and the tool versions.
+
+When admission requests wait, the pool withdraws unused shared tokens every
+500 ms, down to `daemon.jobserver_min_jobs`. A floor larger than the pool is
+clamped to its size with a warning. An invalid floor warns and retains the
+configured positive value. After the queue drains and available memory exceeds
+both default estimates, it restores one token per tick. With no
+admission requests the pool stays fixed. Each top-level build has an implicit
+slot, so concurrent builds can run `N-1 + builds` jobs before withdrawals.
+
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.
 
@@ -920,7 +962,11 @@ $ VCACHE_LOG=/tmp/vcache.log make -j16
 Each line carries a timestamp and pid, so a parallel build stays readable when
 many processes append to one file. Every cache decision is logged — the
 preprocessing command, the computed key, hit or miss and from which layer, the
-compile command, and the compiler's own stderr when preprocessing fails.
+compile command, and the compiler's own stderr when preprocessing fails. A
+compile or link that actually ran (a miss, including one that failed or was
+killed) also logs `cost:` with its peak RSS, wall time and cost key. Hits do
+not. A cost file that could not be written logs `cost: could not record` and
+the build continues.
 
 Inspection commands:
 
@@ -929,9 +975,23 @@ Inspection commands:
 | `vcache --show-config` | The fully resolved configuration, plus any warnings |
 | `vcache --show-roots` | The root mapping for the current directory |
 | `vcache --show-stats` | Counters, why runs were not cached, hit rate, cache size |
+| `vcache --show-costs` | Per-operation memory and wall time, and the largest cost keys |
 | `vcache --zero-stats` | Reset counters |
 | `vcache --clear` | Delete all entries |
 | `vcache --trim` | Evict until under the size limit |
+
+`--clear` deletes cached entries. It leaves `<cache>/costs/` and the
+compiler-version memos in place: those are local records, not results another
+machine would share.
+
+Cost records are written only while `daemon.single_flight` or
+`daemon.admission` is on, and never by a read-only client, so with the
+defaults `--show-costs` has nothing to show.
+
+`--show-costs` prints one row per operation (`compile`, `rustc`, `link`) with
+the number of observations and the median and maximum of `max_rss_kb` and
+`wall_ms`, then up to ten cost keys with the largest peak and their canonical
+source path.
 
 `--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
 indented under each, plus a *passthrough* row for runs that fell back to the

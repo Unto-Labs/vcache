@@ -140,10 +140,4 @@ std::optional<std::string> FindRustStateMismatch(const RustManifestState& state,
   return core::FindStaleManifestFile(state.files, roots);
 }
 
-std::vector<RustManifestState> RecordRustState(RustManifestState fresh,
-                                               std::vector<RustManifestState> older) {
-  return core::PrependManifestState(std::move(fresh), std::move(older),
-                                    &RustManifestState::key);
-}
-
 }  // namespace vcache::rust

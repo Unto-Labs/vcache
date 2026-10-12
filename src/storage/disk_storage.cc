@@ -3,7 +3,9 @@
 #include "storage/disk_storage.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -12,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/cost.h"
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
@@ -25,6 +28,18 @@ constexpr int kShardCount = 256;
 // limit does not trigger a scan on every single store.
 constexpr double kTrimTargetFraction = 0.8;
 
+// True while a daemon holds <cache>/daemon/lock. The daemon takes it LOCK_EX
+// for its whole life, and flock locks belong to an open file description, so
+// this probe sees it as held from inside the daemon too.
+bool DaemonHoldsLock(const std::string& dir) {
+  const std::string path = dir + "/daemon/lock";
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool held = ::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+  ::close(fd);  // releases the shared lock if the probe took it
+  return held;
+}
+
 }  // namespace
 
 DiskStorage::DiskStorage(std::string dir, uint64_t max_size, bool read_only)
@@ -37,6 +52,13 @@ std::string DiskStorage::ShardDir(const std::string& key) const {
 
 std::string DiskStorage::PathForKey(const std::string& key) const {
   return ShardDir(key) + "/" + key.substr(2);
+}
+
+bool DiskStorage::IsPendingUpload(const std::string& entry_path) const {
+  const std::string name = util::BaseName(entry_path);
+  const std::string shard = util::BaseName(util::DirName(entry_path));
+  if (shard.size() != 2 || name.empty()) return false;
+  return util::FileExists(dir_ + "/daemon/pending/" + shard + name);
 }
 
 bool DiskStorage::Get(const std::string& key, std::string* value) {
@@ -137,9 +159,25 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
               return a.lru_time < b.lru_time;
             });
 
+  // One stat for the whole trim. The journal is the pin list: an entry whose
+  // upload has not finished must not be the one a later store throws away.
+  // Pins count only while a daemon is alive to send them. A daemon that was
+  // killed, or one that found no writable bucket, leaves its journal behind;
+  // honoured forever, those files would pin their entries past every budget
+  // and evict everything newer instead. The next daemon re-reads the journal
+  // and skips an entry evicted meanwhile.
+  const bool pending_dir =
+      util::IsDirectory(dir_ + "/daemon/pending") && DaemonHoldsLock(dir_);
   size_t removed = 0;
+  size_t kept = 0;
+  uint64_t kept_bytes = 0;
   for (const auto& entry : entries) {
     if (total <= target_bytes) break;
+    if (pending_dir && IsPendingUpload(entry.path)) {
+      ++kept;
+      kept_bytes += entry.size;
+      continue;
+    }
     if (util::RemoveFile(entry.path)) {
       total -= entry.size;
       ++removed;
@@ -160,10 +198,17 @@ void DiskStorage::TrimGlobal(uint64_t high_water, uint64_t target_bytes) {
     VCACHE_LOG("disk: globally evicted " + std::to_string(removed) +
                " entries");
   }
+  if (kept > 0) {
+    VCACHE_LOG("disk: kept " + std::to_string(kept) +
+               " entries pending upload (" + std::to_string(kept_bytes) + " bytes)");
+  }
 }
 
 void DiskStorage::Trim() {
   if (read_only_) return;
+  // Cost files are not cache entries. Put()'s TrimGlobal does not come here,
+  // so a store does not pay for walking costs/.
+  core::PruneStaleCostFiles(dir_);
   // An explicit trim has no hysteresis to preserve: evict whenever the cache
   // is above the target rather than waiting for it to cross max_size_.
   const auto target = static_cast<uint64_t>(max_size_ * kTrimTargetFraction);
@@ -178,6 +223,14 @@ bool DiskStorage::Clear() {
     std::snprintf(buf, sizeof(buf), "%02x", i);
     const std::string shard = dir_ + "/" + buf;
     if (util::IsDirectory(shard) && !util::RemoveRecursive(shard)) ok = false;
+  }
+  // The journal names entries that are now gone. A live daemon owns its queue
+  // and skips them when their turn comes; with none, nothing would ever remove
+  // the files.
+  const std::string journal = dir_ + "/daemon/pending";
+  if (util::IsDirectory(journal) && !DaemonHoldsLock(dir_) &&
+      !util::RemoveRecursive(journal)) {
+    ok = false;
   }
   return ok;
 }

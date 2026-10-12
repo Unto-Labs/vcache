@@ -5547,14 +5547,15 @@ EOF
     "$(grep -c "tracing is off; recording from the compiler's absent list" "$l")" "1"
   check "absent-deps-1: with no depfile-only fallback" \
     "$(grep -cE 'recording from the depfile|uses __has_include' "$l" || true)" "0"
-  # With neither the list nor the trace, the depfile of this compiler still
-  # names a header __has_include found, so gcc's decline does not apply.
+  # With neither the list nor the trace, the depfile alone cannot show a probe
+  # that found nothing, though this compiler's names a header one found: gcc's
+  # __has_include decline stays.
   reset_cache
   l=$(mf_log ad-depfile-only)
   VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 \
     absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
-  check "absent-deps-1: from the depfile alone, __has_include does not decline the state" \
-    "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+  check "absent-deps-1: from the depfile alone, __has_include declines the state" \
+    "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" \
     "1/1"
 
   # Without a tracer, the switch off, a version vcache does not know, or a

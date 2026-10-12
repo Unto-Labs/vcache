@@ -972,27 +972,28 @@ source for such a compiler too: it also sees what the driver reads and probes
 on its own (clang's `.cfg` files, the GCC installation it detects, gcc's
 `specs`), which the list does not name and leaves to the compiler fingerprint,
 and on `src/daemon/server.cc` recording from the list was not measurably
-cheaper. The list is the second source: where the compile has no tracer (any
-of the reasons below, `cxx_manifest_trace = false` among them), it gets
-`-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says
-`no tracer at '...'; recording from the compiler's absent list` (or
-`tracing is off; ...`) and then `cxx manifest: recorded from the compiler's
-absent list: N files, M absent paths`. With a tracer the flag is not passed.
-The paths are stored as the trace's are, through the roots and as the highest
-missing ancestor, and the gcc `.gch` and `__has_include` rules below do not
-apply to such a compiler, from any source: its depfile names both. A listed
-path that exists when the state is recorded is a compiler fault, and no state
-is recorded (`not recording: the compiler listed <path> as absent but it
-exists`). A version vcache does not know (`absent-deps-2` and up) is never
-asked for its list, and the log names the version. To compare the two sources,
-set `cxx_manifest_trace = false` for the list and leave it on for the trace.
-`cxx_manifest_absent_deps` (`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list
-off:
+cheaper. The list is the second source: where the compile has no tracer (any of
+the reasons below, `cxx_manifest_trace = false` among them), it gets
+`-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says `no
+tracer at '...'; recording from the compiler's absent list` (or `tracing is
+off; ...`) and then `cxx manifest: recorded from the compiler's absent list: N
+files, M absent paths`. With a tracer the flag is not passed. The paths are
+stored as the trace's are, through the roots and as the highest missing
+ancestor, and the gcc `.gch` and `__has_include` rules below do not apply to a
+state from the list, which holds the probes. From the depfile alone they apply
+to a patched compiler too: its depfile names a header `__has_include` found,
+but not a probe that found nothing. A listed path that exists when the state is
+recorded is a compiler fault, and no state is recorded (`not recording: the
+compiler listed <path> as absent but it exists`). A version vcache does not
+know (`absent-deps-2` and up) is never asked for its list, and the log names
+the version. To compare the two sources, set `cxx_manifest_trace = false` for
+the list and leave it on for the trace. `cxx_manifest_absent_deps`
+(`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list off:
 
 | Setting | Meaning |
 | --- | --- |
 | `true` *(default)* | Without a tracer, record a patched compiler's states from its list. |
-| `false` | Without a tracer, record them from the depfile alone, as for any other compiler. |
+| `false` | Without a tracer, record them from the depfile alone, with the gcc rules below. |
 
 The caller's own `-fabsent-deps=FILE` is still declined (see
 [Flags that write a second output file](#flags-that-write-a-second-output-file)).

@@ -1226,21 +1226,22 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
   return SelectCxxTraceInputs(records, filter);
 }
 
-// The version of the absent-deps patch whose -fabsent-deps list vcache reads.
-constexpr int kReadableAbsentDepsVersion = 1;
+// The version of the absent-deps patch whose -fabsent-deps list and depfile
+// vcache knows the meaning of.
+constexpr int kKnownAbsentDepsVersion = 1;
 
 // True when a recording compile without the tracer can ask the compiler for
 // its own list of the paths it probed and did not find. A patch version this
 // vcache does not know may mean something else by its list.
 bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id) {
-  return compiler_id.absent_deps_version == kReadableAbsentDepsVersion &&
+  return compiler_id.absent_deps_version == kKnownAbsentDepsVersion &&
          config.cxx_manifest_absent_deps;
 }
 
 // Why a compiler with the absent-deps patch is not asked for its list.
 void LogAbsentListUnused(const Config& config, const CompilerId& compiler_id) {
   if (compiler_id.absent_deps_version == 0) return;
-  if (compiler_id.absent_deps_version != kReadableAbsentDepsVersion) {
+  if (compiler_id.absent_deps_version != kKnownAbsentDepsVersion) {
     VCACHE_LOG("cxx manifest: the compiler reports absent-deps-" +
                std::to_string(compiler_id.absent_deps_version) +
                ", a version this vcache does not read; not asking for its list");
@@ -1311,9 +1312,11 @@ std::optional<CxxTraceInputs> ReadCxxAbsentList(const std::string& list_path,
 // key does not cover sits where an #include could have picked it up, or when a
 // file outside the compiler's own include directories uses __has_include,
 // since gcc's depfile names neither a .gch nor a header that was only probed.
-// The trace sees both, and so does the depfile of a compiler with the
-// absent-deps patch, which also names a PCH the key identifies; that one is
-// left out.
+// The trace sees both; the compiler's list sees the probes, and returns before
+// these declines. A patched compiler's depfile also names a PCH the key
+// identifies; that one is left out. Its naming a header __has_include found
+// does not stand in for a probe that found nothing, so from the depfile alone
+// the declines stay.
 RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
                                      const CxxTraceInputs* trace,
                                      const CxxTraceInputs* absent_list,
@@ -1333,8 +1336,7 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   const auto normal = [](const std::string& path) {
     return std::filesystem::path(path).lexically_normal().string();
   };
-  const bool patched_depfile = compiler_id.absent_deps_version >= 1;
-  if (patched_depfile && !keyed_pchs.empty()) {
+  if (compiler_id.absent_deps_version == kKnownAbsentDepsVersion && !keyed_pchs.empty()) {
     // The key identifies a PCH in a way that holds across trees whose PCH
     // bytes differ; hashing the bytes as well would keep the state to one tree.
     std::vector<std::string> keyed;
@@ -1347,7 +1349,7 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
     }
   }
   inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin,
-                               /*find_probes=*/!compiler_id.is_clang && !patched_depfile);
+                               /*find_probes=*/!compiler_id.is_clang);
   if (!inputs.declined.empty()) return inputs;
   // A state lists what it is checked against; one without the source would
   // match whatever is on disk. Compared lexically normalised, since both
@@ -1383,7 +1385,7 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
       return inputs;
     }
   }
-  if (compiler_id.is_clang || patched_depfile) return inputs;
+  if (compiler_id.is_clang) return inputs;
 
   if (!inputs.probing_files.empty()) {
     const std::vector<std::string> system_dirs =

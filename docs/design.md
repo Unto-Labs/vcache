@@ -241,17 +241,19 @@ and the compiler's own trees outside every include directory, found from the
 driver's prefix. The tracer's other rules have nothing to act on: the list
 names no executable, no shared object, no file the compiler read and no probe
 the driver made along `PATH`. The gcc `__has_include` decline and the search
-for an unkeyed `.gch` do not run for such a compiler, traced or not: its
-depfile names both. What only the driver reads or probes is in neither the list
-nor the depfile: clang's configuration files, the GCC installation it detects
-(`crtbegin.o`, `/etc/os-release`), gcc's `specs` and `as`. The trace records
-those; with the list they are left to the compiler fingerprint, as ccache
-leaves them. A listed path that exists when the state is recorded is a fault in
-the compiler: a state holding it would never be served, and the list cannot be
-trusted to be whole, so no state is recorded, and the log says `the compiler
-listed <path> as absent but it exists`. A compile that writes no list records
-no state either. A state holds the same kinds of inputs whichever way it was
-recorded, so the manifest format and its key version are unchanged.
+for an unkeyed `.gch` do not run for a state from the list, which holds the
+probes; from the depfile alone they do, for a patched compiler too: its depfile
+names a header `__has_include` found, but not a probe that found nothing. What
+only the driver reads or probes is in neither the list nor the depfile: clang's
+configuration files, the GCC installation it detects (`crtbegin.o`,
+`/etc/os-release`), gcc's `specs` and `as`. The trace records those; with the
+list they are left to the compiler fingerprint, as ccache leaves them. A listed
+path that exists when the state is recorded is a fault in the compiler: a state
+holding it would never be served, and the list cannot be trusted to be whole,
+so no state is recorded, and the log says `the compiler listed <path> as absent
+but it exists`. A compile that writes no list records no state either. A state
+holds the same kinds of inputs whichever way it was recorded, so the manifest
+format and its key version are unchanged.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -281,7 +283,7 @@ describes an earlier build. A directory of `.gch` files is declined. gcc also
 uses `H.gch` for a plain `#include "H"`, again listing neither. The trace sees
 gcc open the `.gch`, and probe for one that is not there yet; a patched gcc
 names the one it read in its depfile and the one it probed in its list. From
-the depfile alone, under a gcc without the patch a state is not recorded while
+the depfile alone, under gcc a state is not recorded while
 any directory an `#include` could search holds a `.gch` the key does not cover.
 
 **What declines a state.** A file the depfile names that cannot be read, that
@@ -298,13 +300,14 @@ token changes its digest, so the state is checked again when it is next
 written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
 compile off the manifest altogether. A depfile that does not name the source
 declines the state, since a state with nothing to check would always match.
-From the depfile alone under a gcc without the patch, a file outside the
-compiler's own include directories (as `<compiler> -E -v` lists them, memoised
-under `<cache>/sysinc/`) whose bytes use `__has_include` declines it too:
-clang's depfile names a header `__has_include` found and no `#include` read,
-gcc's does not, and the trace sees both. For a derived key, `.incbin` declines
-it as well, since no preprocessed text was checked for it. A declined state
-leaves the entry stored under the preprocessor key as usual.
+From the depfile alone under gcc, a file outside the compiler's own include
+directories (as `<compiler> -E -v` lists them, memoised under
+`<cache>/sysinc/`) whose bytes use `__has_include` declines it too: clang's
+depfile names a header `__has_include` found and no `#include` read, gcc's does
+not (a patched gcc's does, but no depfile names a probe that found nothing),
+and the trace sees both. For a derived key, `.incbin` declines it as well,
+since no preprocessed text was checked for it. A declined state leaves the
+entry stored under the preprocessor key as usual.
 
 **Absent paths.** A depfile names the files a compile read, not the paths the
 preprocessor probed and did not find. A header created earlier on the include

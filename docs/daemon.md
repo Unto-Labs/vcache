@@ -359,6 +359,11 @@ Measuring.
 
 ## Memory admission
 
+Linux only in effect. Admission reads `/proc/meminfo` and each compiler's
+`/proc/<pid>/status` and `task/*/children`. Elsewhere `MemAvailable` is
+unreadable, so the daemon logs "admission unavailable" once and grants every
+request without waiting, which is the same as admission off.
+
 `daemon.admission` defaults to false and enables admission for that client.
 The daemon serves scheduling requests regardless of the starter's switches.
 After a cache miss, and after acquiring a lease when single-flight is enabled,

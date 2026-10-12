@@ -879,9 +879,11 @@ void TestReadFile() {
 
   Check(!util::ReadFile(*scratch + "/missing").has_value(), "a missing path reads as nullopt");
 
+#if defined(__linux__)
   const auto status = util::ReadFile("/proc/self/status");
   Check(status.has_value() && !status->empty() && status->rfind("Name:", 0) == 0,
         "/proc/self/status is non-empty and starts with Name:");
+#endif
 }
 
 void TestBlob() {
@@ -2321,6 +2323,7 @@ void TestMemoryAdmission() {
               LeaseStat(server, "memory reserved", 2097152),
           "a zero estimate uses the default compile cost");
   }
+#if defined(__linux__)
   {
     SessionDaemon server(0, false, false, 50000);
     LeasePeer first(server), second(server);
@@ -2369,6 +2372,9 @@ void TestMemoryAdmission() {
           "RSS above the estimate contributes zero unrealised memory to the next grant");
     first.StopCompiler();
   }
+#else
+  Skipped("realised-RSS admission: Linux-only (samples /proc)");
+#endif
   {
     SessionDaemon server(0, false, false, 1024);
     LeasePeer holder(server), queued(server);
@@ -2464,7 +2470,7 @@ void TestMemoryAdmission() {
   }
 }
 
-void TestAdmissionProcessTree() {
+[[maybe_unused]] void TestAdmissionProcessTree() {
   Section("daemon::admission process tree");
   SessionDaemon server(0, false, false, 90000, {}, true);
   LeasePeer holder(server), queued(server);
@@ -2604,10 +2610,14 @@ void TestAdmissionReview() {
     Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) ==
               std::string::npos, "steady RSS sampling does not write per-tick log lines");
     holder.Close();
+#if defined(__linux__)
     Check(PollUntil([&] {
       return util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) !=
              std::string::npos;
     }, 1000), "reservation release logs the process-tree RSS peak");
+#else
+    Skipped("the process-tree RSS peak: Linux-only (samples /proc)");
+#endif
     if (gate >= 0) ::close(gate);
   }
   {
@@ -2698,7 +2708,7 @@ void TestAdmissionReview() {
   }
 }
 
-void TestAdmissionBoundsAndTreePeaks() {
+[[maybe_unused]] void TestAdmissionBoundsAndTreePeaks() {
   Section("daemon::admission bounds and tree peaks");
   const auto memory_reserved = [](const SessionDaemon& server) {
     const auto status = server.Status();
@@ -5622,10 +5632,15 @@ int main(int argc, char** argv) {
   TestHeldHitLayer();
   TestJobserver();
   TestElasticJobserver();
+#if defined(__linux__)
+  // Both sample a compiler's process tree through /proc.
   TestAdmissionProcessTree();
+#endif
   TestAdmissionReview();
   TestManifestPause();
+#if defined(__linux__)
   TestAdmissionBoundsAndTreePeaks();
+#endif
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

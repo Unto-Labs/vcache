@@ -136,6 +136,9 @@ os.execvp('gcc', ['gcc'] + sys.argv[1:])
         for operation in ("failed", "link", "rust"):
             if operation == "rust" and not shutil.which("rustc"):
                 continue
+            if operation == "link" and not LINUX:
+                skip("link: compile sessions for a link need link caching, which is Linux-only")
+                continue
             log_path = work / (operation + ".log")
             operation_env = environment | {"VCACHE_DAEMON_SINGLE_FLIGHT": "1",
                                            "VCACHE_LOG": str(log_path)}

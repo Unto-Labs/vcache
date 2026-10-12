@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-from daemon_session_test import check, poll_until
+from daemon_session_test import LINUX, check, poll_until, skip
 
 
 def run(binary, work, writer, selected):
@@ -185,7 +185,10 @@ os.execvp(real, [real] + sys.argv[1:])
                 check(len(granted) == (1 if same_key else 2) and
                       all(int(fields[0]) == estimate_kb for fields in granted),
                       label + ": grant logs include estimate, wait and memory arithmetic")
-                check(" rss " in contents(log), label + ": compiler RSS sampling is logged")
+                if LINUX:
+                    check(" rss " in contents(log), label + ": compiler RSS sampling is logged")
+                else:
+                    skip(label + ": compiler RSS sampling is Linux-only")
             else:
                 check("reserve: " not in contents(log),
                       label + ": feature off or read-only emits no reserve requests")
@@ -207,14 +210,20 @@ os.execvp(real, [real] + sys.argv[1:])
     pair("c-queued")
     if shutil.which("rustc"):
         pair("rust-queued", "rust")
-    pair("link-queued", "link")
+    if LINUX:
+        pair("link-queued", "link")
+    else:
+        skip("link-queued: link caching is Linux-only")
     pair("shutdown", ending="shutdown")
     pair("refused", ending="refused")
     pair("off", settings={"VCACHE_DAEMON_ADMISSION": "0", "VCACHE_DAEMON_SINGLE_FLIGHT": "1"})
     pair("readonly", settings={"VCACHE_READONLY": "1"})
     pair("lease-first", same_key=True, settings={"VCACHE_DAEMON_SINGLE_FLIGHT": "1"})
     pair("default-compile", seeded=False)
-    pair("default-link", "link", seeded=False)
+    if LINUX:
+        pair("default-link", "link", seeded=False)
+    else:
+        skip("default-link: link caching is Linux-only")
     pair("daemon-off", settings={"VCACHE_DAEMON": "off"})
 
 

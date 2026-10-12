@@ -659,7 +659,9 @@ session; lookups and stores keep their own connections.
 
 These switches belong to each client. A daemon started by a client with the
 switches off also serves scheduling requests from clients that enable them.
-Admission reserves memory before the actual compile or link. It uses the
+Admission reserves memory before the actual compile or link. It samples
+memory through `/proc`, so it only has an effect on Linux; elsewhere the
+daemon logs "admission unavailable" once and grants every request. It uses the
 largest recorded RSS for the cost key, or `daemon.default_compile_kb` (2 GiB)
 and `daemon.default_link_kb` (4 GiB) when no usable record exists. These positive
 integer defaults are in kB. Within the daemon lifetime, a matching cost key also

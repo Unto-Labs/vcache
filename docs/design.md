@@ -214,6 +214,19 @@ deleting it would still hit with the object built while it existed; the
 that probes is exempt, on the assumption that the compiler's own include
 directories change only with the toolchain or the distribution.
 
+**The swapped-path race.** A state is declined when a file it lists changed
+after the compile started, judged by that file's own mtime and ctime. A
+symlink retargeted, or a directory renamed, during the compile is not seen
+that way: the file now at the recorded path can be older than the compile
+while being a different file from the one the compiler read. Reproduced with a
+wrapper that ran `ln -sfn v2 inc` right after the compiler read `inc/h.h` from
+`v1`: the state recorded `v2`'s digest against `v1`'s object, and the next
+compile, with `inc` pointing at `v2`, was served the `v1` object. ccache's
+"include file too new" check has the same shape. Closing it would mean
+checking every path component (or the digests the compiler actually read)
+rather than the file alone; it is left open, since it needs the tree to change
+under a running compile.
+
 ## Compiler identity
 
 `VCACHE_COMPILER_CHECK` selects:

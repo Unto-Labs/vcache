@@ -58,18 +58,32 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
 }
 
+// The patch prints its token after the version, on the line that reports it.
+// Elsewhere in the banner the same text can be part of a configure flag or a
+// path, and says nothing about the driver.
 int AbsentDepsVersion(std::string_view banner) {
+  static constexpr std::string_view kVersionWord = "version ";
   static constexpr std::string_view kMark = "absent-deps-";
-  size_t at = 0;
-  while ((at = banner.find(kMark, at)) != std::string_view::npos) {
-    const size_t digits = at + kMark.size();
-    size_t end = digits;
-    while (end < banner.size() && std::isdigit(static_cast<unsigned char>(banner[end]))) ++end;
-    const bool bounded =
-        (at == 0 || std::isspace(static_cast<unsigned char>(banner[at - 1]))) &&
-        (end == banner.size() || std::isspace(static_cast<unsigned char>(banner[end])));
-    if (end != digits && bounded) return std::atoi(std::string(banner.substr(digits)).c_str());
-    at = digits;
+  for (const std::string& line : util::Split(banner, '\n', /*skip_empty=*/true)) {
+    if (util::StartsWith(line, "Configured with:")) continue;
+    const size_t version = line.find(kVersionWord);
+    const size_t number = version + kVersionWord.size();
+    if (version == std::string::npos || number == line.size() ||
+        !std::isdigit(static_cast<unsigned char>(line[number]))) {
+      continue;
+    }
+    size_t at = number;
+    while ((at = line.find(kMark, at)) != std::string::npos) {
+      const size_t digits = at + kMark.size();
+      size_t end = digits;
+      while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end]))) ++end;
+      const bool bounded = std::isspace(static_cast<unsigned char>(line[at - 1])) &&
+                           (end == line.size() ||
+                            std::isspace(static_cast<unsigned char>(line[end])));
+      if (end != digits && bounded) return std::atoi(line.c_str() + digits);
+      at = digits;
+    }
+    return 0;
   }
   return 0;
 }

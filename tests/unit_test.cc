@@ -3486,6 +3486,16 @@ void TestCompilerBannerMark() {
           "a stock banner has version 0");
   CheckEq(std::to_string(core::AbsentDepsVersion("absent-deps-x absent-deps-1y\n")), "0",
           "a token without a bounded number is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "Found CUDA installation: /usr/local/cuda, version \n"
+              "InstalledDir: /opt/absent-deps-3 /bin\n"
+              "gcc version 16.1.0 (GCC)\n")),
+          "0", "a token off the version line is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "gcc version 16.2.0 (GCC) absent-deps-1\n")),
+          "1", "the version line's token is read past a configure line");
 
   auto scratch = util::MakeTempDir("vcache-banner-");
   Check(scratch.has_value(), "banner scratch dir");

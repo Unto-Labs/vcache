@@ -4452,6 +4452,17 @@ else
   skipped "g++ is not installed, or is clang"
 fi
 
+# A root given through a symlink localises to that spelling, while the working
+# directory is the resolved one; the state must still find its source.
+ln -s "$WORK/mf-a" "$WORK/mf-alias"
+reset_cache
+l=$(mf_log alias)
+( cd "$WORK/mf-a" && VCACHE_ROOTS="$WORK/mf-alias=proj" VCACHE_LOG="$l" \
+    "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
+check "a root given through a symlink still records a state" \
+  "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+rm -f "$WORK/mf-alias"
+
 # --------------------------------------------------------------------------
 section "--show-stats breaks decisions down by reason"
 

@@ -1098,9 +1098,14 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   const auto normal = [](const std::string& path) {
     return std::filesystem::path(path).lexically_normal().string();
   };
+  // Also compared canonically: a root given through a symlink (macOS's /var is
+  // /private/var) localises to the spelling the user wrote, while the working
+  // directory is the resolved one.
   const std::string source = normal(CxxAbsolutePath(cwd, parsed.source));
+  const std::string canonical_source = normal(roots.Canonicalize(source));
   if (std::none_of(inputs.files.begin(), inputs.files.end(), [&](const ManifestFile& file) {
-        return normal(roots.Localize(file.first)) == source;
+        return normal(roots.Localize(file.first)) == source ||
+               normal(file.first) == canonical_source;
       })) {
     inputs.files.clear();
     inputs.declined = "the dependency file does not name the source";

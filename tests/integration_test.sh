@@ -915,8 +915,10 @@ section "9i. Rust: a miss is placed by rename"
 # Reading rustc's output back and writing it again cost as much as the fsync
 # on a large rlib. A rename moves the file rustc wrote. The .d still goes
 # through memory, since it names the stage dir.
-if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
-  skipped "needs rustc and Linux"
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
 else
   # --show-stats leaves out a reason that never happened.
   unplaceable() { local n; n=$(stat_of "output unplaceable"); echo "${n:-0}"; }
@@ -934,11 +936,11 @@ else
 
   reset_cache
   write_altering_rustc "$WORK/rename-rustc/rustc" \
-    "stat -c %i libdemo.rlib > $(printf %q "$WORK/rename-staged-inode")"
+    "{ stat -c %i libdemo.rlib 2>/dev/null || stat -f %i libdemo.rlib; } > $(printf %q "$WORK/rename-staged-inode")"
   rename_compile rename-a "$WORK/rename-rustc/rustc"
   check "the renamed miss stores its entry" "$(misses) $(unplaceable)" "1 0"
   check "the placed rlib is the file rustc wrote, not a copy" \
-    "$(stat -c %i "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
+    "$(inode_of "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
   check "the .d names this output directory" \
     "$(grep -c "^$WORK/rename-a/out/libdemo.rlib:" "$WORK/rename-a/out/demo.d")" "1"
   check "the .d names neither the stage dir nor the placeholder" \
@@ -948,6 +950,10 @@ else
   check "and restores the same rlib" \
     "$(cmp -s "$WORK/rename-a/out/libdemo.rlib" "$WORK/rename-b/out/libdemo.rlib" && echo same)" "same"
 
+  # The shims below interpose rename with LD_PRELOAD, which is Linux-only.
+  if [[ "$(uname -s)" != Linux ]]; then
+    skipped "EXDEV placement: the rename shim needs LD_PRELOAD (Linux)"
+  else
   # The scratch dir falls back to $TMPDIR when the cache's cannot be made, and
   # $TMPDIR is often tmpfs. A shim makes every rename from outside the output
   # directory into it fail with EXDEV, as a rename across filesystems does.
@@ -1000,16 +1006,18 @@ XDEVEOF
     "$(misses) $(unplaceable)" "1 0"
   check "and is 0700" "$(file_mode "$WORK/rename-xdev-bin/out/xdevbin")" "700"
   check "and runs" "$("$WORK/rename-xdev-bin/out/xdevbin" >/dev/null 2>&1 && echo ran)" "ran"
+  fi
 fi
 
 # --------------------------------------------------------------------------
 section "9j. Rust: large outputs are sidecars, restored by clone"
 
 # An output of 4 MiB or more is kept beside the entry as <digest>.rustout and
-# cloned on a hit, so its bytes never pass through the entry or memory. The
-# entry's checksum then covers only the digest, so every hit hashes the clone.
-if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
-  skipped "needs rustc and Linux"
+# cloned on a hit (copied where the filesystem cannot clone), so its bytes
+# never pass through the entry or memory. The entry's checksum then covers only
+# the digest, so every hit hashes the clone.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
 else
   sidecar_files() {
     find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*.rustout" \
@@ -1017,7 +1025,8 @@ else
   }
   largest_entry_bytes() {
     find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
-      ! -name '*.rustout' -printf '%s\n' 2>/dev/null | sort -n | tail -1
+      ! -name '*.rustout' -exec wc -c {} + 2>/dev/null | awk '$2 != "total" { print $1 }' |
+      sort -n | tail -1
   }
   reason_count() { local n; n=$(stat_of "$1"); echo "${n:-0}"; }
   # 2 MiB of non-zero static data makes a 6 MiB rlib (object, embedded bitcode
@@ -1058,7 +1067,7 @@ else
   check "and restores the same rlib" \
     "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-b/out/libbig.rlib" && echo same)" "same"
   check "as a file of its own, not a link to the sidecar" \
-    "$([[ $(stat -c %i "$WORK/side-b/out/libbig.rlib") != $(stat -c %i "$stored") ]] && echo own)" "own"
+    "$([[ $(inode_of "$WORK/side-b/out/libbig.rlib") != $(inode_of "$stored") ]] && echo own)" "own"
   check "the hit replays the warning once" "$(warnings_in side-b)" "1"
   check "the hit's .d is localised" \
     "$(grep -c "^$WORK/side-b/out/libbig.rlib:" "$WORK/side-b/out/big.d")" "1"
@@ -1067,11 +1076,11 @@ else
 
   # Eviction is oldest-mtime-first over every file in the shards, and a hit
   # refreshes only what it reads: the sidecar must be refreshed by the hit.
-  touch -d @946684800 "$stored"
+  perl -e 'utime 946684800, 946684800, @ARGV' "$stored"  # BSD touch has no -d @
   sidecar_compile side-c rustc dep-info,link
   check "a hit on an aged sidecar" "$(hits)" "2"
   check "refreshes the sidecar's mtime" \
-    "$([[ $(stat -c %Y "$stored") -gt 946684800 ]] && echo yes)" "yes"
+    "$([[ $(mtime_of "$stored") -gt 946684800 ]] && echo yes)" "yes"
 
   # A sidecar evicted on its own: the hit fails before anything reaches cargo,
   # and the compile replays its own diagnostics only.
@@ -1115,7 +1124,7 @@ else
     VCACHE_S3_ENDPOINT=http://127.0.0.1:9 VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
     VCACHE_S3_NO_CREDENTIALS=1
   check "with S3 configured the large rlib stays inline" \
-    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 5242880 ]] && echo inline)" "0 inline"
+    "$(sidecar_files) $([[ $(largest_entry_bytes) -ge 4194304 ]] && echo inline)" "0 inline"
 
   # A cargo-made OUT_DIR baked into a large output, split across the scan's
   # 1 MiB reads, must keep the entry out of the store. The build still gets
@@ -1143,6 +1152,9 @@ else
     "placed"
   check "and forwards its diagnostics" "$(warnings_in side-leak)" "1"
 
+  if [[ "$(uname -s)" != Linux ]]; then
+    skipped "a partly placed sidecar set: the rename shim needs LD_PRELOAD (Linux)"
+  else
   # A rename that fails after another sidecar was already placed leaves a
   # partial set: no other manifest state or entry may be tried, only a compile
   # repairs every name. A shim fails the second rename into the output dir.
@@ -1187,6 +1199,7 @@ SECONDEOF
     "$(cmp -s "$WORK/side-part-a/out/libbig.rlib" "$WORK/side-part-b/out/libbig.rlib" && cmp -s "$WORK/side-second.bin" "$WORK/side-part-b/out/second.bin" && echo whole)" \
     "whole"
   check "with the warning forwarded once" "$(warnings_in side-part-b)" "1"
+  fi
 
   # Under umask 077 the restored binary must be 0700, as the linker made it.
   reset_cache
@@ -4731,6 +4744,11 @@ else
   skipped "__has_include: gcc is not installed, or is clang"
 fi
 
+# Everything from here to the end of the refused-tracer checks needs the
+# compile tracer, which is Linux-only. Elsewhere a state comes from the depfile
+# alone and, as in ccache's depend mode, cannot see a header created earlier on
+# the include path (docs/design.md says so).
+if [[ "$(uname -s)" == Linux ]]; then
 # The shadowing hole: a header created earlier on the include path than the
 # one a state recorded. A depfile names only what was read; the trace records
 # the paths probed and not found, and a lookup checks each is still absent.
@@ -4880,13 +4898,16 @@ check "a tracer that is not a shared object is not preloaded" \
 ( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/notelf-hit.err"
 check "and neither the miss nor the hit prints a loader message" \
   "$(cat "$tl/notelf-miss.err" "$tl/notelf-hit.err" | grep -c 'cannot be preloaded' || true)" "0"
+else
+  skipped "absent include paths and the compile trace: the tracer is Linux-only"
+fi
 
 # A compile in which ld.so refused to preload the tracer in some process is
 # cached as usual, from the depfile, without the refusal: it is the tracer's
 # doing, and a hit must not replay it. A PCH built that way still gets its
 # .vcache-key. No cc1 of another ELF class is at hand, so the wrapper prints
 # ld.so's exact refusal line naming the tracer it was given, then runs cc1.
-if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+if [[ "$(uname -s)" == Linux ]] && command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   mkdir -p "$tl/badwrap"
   cat > "$tl/badwrap/cc1" <<EOF
@@ -5013,6 +5034,8 @@ else
   skipped "/usr/local/include: gcc is missing or is clang, or unshare -rm is not allowed"
 fi
 
+# Absent paths come only from the compile trace, which is Linux-only.
+if [[ "$(uname -s)" == Linux ]]; then
 # The walk from an absent path up to the highest missing directory stops at a
 # root: above it, the path would name this tree's location, and a tree whose
 # generated-header root exists would check this tree's instead.
@@ -5057,6 +5080,9 @@ check "a header created in a PATH directory the include probed misses" \
   "$(grep -c 'rejected: .*tools/cfg\.h exists now' "$l")" "1"
 check "and the object uses it" \
   "$(cmp -s "$WORK/mf-pathdir/m.o" "$WORK/mf-pathdir/plain.o" && echo same)" "same"
+else
+  skipped "absent-path walks and PATH probes: the tracer is Linux-only"
+fi
 
 # gcc writes a dependency file named by DEPENDENCIES_OUTPUT during the -E run
 # and ignores the variable once -MD is on the command line.

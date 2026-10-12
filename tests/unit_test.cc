@@ -5547,7 +5547,9 @@ void TestCxxManifestTrace() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string& dir = *scratch;
+  // macOS's TMPDIR ends in '/', and a path with a doubled separator is not one
+  // a root, or the trace, would ever spell.
+  const std::string dir = core::WithoutDotSegments(*scratch);
 
   // The compiler's own trees, from the executables that ran, wherever they are.
   const std::string gcc14_trees =

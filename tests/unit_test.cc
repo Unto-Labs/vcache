@@ -4,6 +4,7 @@
 // build to plain make, as the plan asks.
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/file.h>
@@ -91,6 +92,11 @@ void Check(bool condition, const std::string& what) {
     ++g_fail;
     std::printf("  \033[31mFAIL\033[0m %s\n", what.c_str());
   }
+}
+
+// For checks of a Linux-only mechanism on another platform.
+[[maybe_unused]] void Skipped(const std::string& what) {
+  std::printf("  \033[33mSKIP\033[0m %s\n", what.c_str());
 }
 
 bool Contains(const std::vector<std::string>& haystack, const std::string& needle) {
@@ -991,9 +997,11 @@ void TestReadFile() {
 
   Check(!util::ReadFile(*scratch + "/missing").has_value(), "a missing path reads as nullopt");
 
+#if defined(__linux__)
   const auto status = util::ReadFile("/proc/self/status");
   Check(status.has_value() && !status->empty() && status->rfind("Name:", 0) == 0,
         "/proc/self/status is non-empty and starts with Name:");
+#endif
 }
 
 void TestBlob() {
@@ -2433,6 +2441,7 @@ void TestMemoryAdmission() {
               LeaseStat(server, "memory reserved", 2097152),
           "a zero estimate uses the default compile cost");
   }
+#if defined(__linux__)
   {
     SessionDaemon server(0, false, false, 50000);
     LeasePeer first(server), second(server);
@@ -2481,6 +2490,9 @@ void TestMemoryAdmission() {
           "RSS above the estimate contributes zero unrealised memory to the next grant");
     first.StopCompiler();
   }
+#else
+  Skipped("realised-RSS admission: Linux-only (samples /proc)");
+#endif
   {
     SessionDaemon server(0, false, false, 1024);
     LeasePeer holder(server), queued(server);
@@ -2576,7 +2588,7 @@ void TestMemoryAdmission() {
   }
 }
 
-void TestAdmissionProcessTree() {
+[[maybe_unused]] void TestAdmissionProcessTree() {
   Section("daemon::admission process tree");
   SessionDaemon server(0, false, false, 90000, {}, true);
   LeasePeer holder(server), queued(server);
@@ -2716,10 +2728,14 @@ void TestAdmissionReview() {
     Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) ==
               std::string::npos, "steady RSS sampling does not write per-tick log lines");
     holder.Close();
+#if defined(__linux__)
     Check(PollUntil([&] {
       return util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) !=
              std::string::npos;
     }, 1000), "reservation release logs the process-tree RSS peak");
+#else
+    Skipped("the process-tree RSS peak: Linux-only (samples /proc)");
+#endif
     if (gate >= 0) ::close(gate);
   }
   {
@@ -2810,7 +2826,7 @@ void TestAdmissionReview() {
   }
 }
 
-void TestAdmissionBoundsAndTreePeaks() {
+[[maybe_unused]] void TestAdmissionBoundsAndTreePeaks() {
   Section("daemon::admission bounds and tree peaks");
   const auto memory_reserved = [](const SessionDaemon& server) {
     const auto status = server.Status();
@@ -4080,6 +4096,20 @@ size_t CountFiles(const std::string& dir) {
   return util::ListFilesRecursive(dir).size();
 }
 
+// Stands in for a running daemon: holds <cache>/daemon/lock the way it does.
+struct HeldDaemonLock {
+  int fd = -1;
+  explicit HeldDaemonLock(const std::string& cache) {
+    util::MakeDirs(cache + "/daemon");
+    fd = ::open((cache + "/daemon/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+  ~HeldDaemonLock() { if (fd >= 0) ::close(fd); }
+};
+
 void TestDiskTrimPins() {
   Section("storage::disk trim");
 
@@ -4096,10 +4126,44 @@ void TestDiskTrimPins() {
     Age(EntryPath(tmp.path(), k2), 50);
     util::MakeDirs(tmp.path() + "/daemon/pending");
     util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(daemon.fd >= 0, "the test holds the daemon lock");
     Check(disk.Put(k3, payload), "the store that crosses the budget succeeds");
     Check(util::FileExists(EntryPath(tmp.path(), k1)), "a pending upload is not evicted");
     Check(!util::FileExists(EntryPath(tmp.path(), k2)), "an unpinned older entry is evicted");
     Check(util::FileExists(EntryPath(tmp.path(), k3)), "the new entry stays");
+  }
+  {
+    // A daemon that was killed leaves its journal and its lock file, but no
+    // lock. Its pins must not outlive it, or they keep their entries past the
+    // budget and every newer entry is evicted instead.
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "the dead-daemon case stores two entries");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k2, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/lock", "");
+    Check(disk.Put(k3, payload), "the store over a dead daemon's journal succeeds");
+    Check(!util::FileExists(EntryPath(tmp.path(), k1)),
+          "a dead daemon's journal does not pin the oldest entry");
+    Check(util::FileExists(EntryPath(tmp.path(), k3)), "and the new entry stays");
+    Check(disk.Clear(), "--clear succeeds with a dead daemon's journal");
+    Check(!util::IsDirectory(tmp.path() + "/daemon/pending"),
+          "--clear drops a dead daemon's journal");
+  }
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload), "the live-daemon clear stores an entry");
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(disk.Clear(), "--clear succeeds under a live daemon");
+    Check(util::FileExists(tmp.path() + "/daemon/pending/" + k1),
+          "--clear leaves a live daemon's journal to the daemon");
   }
   {
     TempCacheDir tmp;
@@ -4121,6 +4185,7 @@ void TestDiskTrimPins() {
       util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + key, "");
     }
     storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    HeldDaemonLock daemon(tmp.path());
     const pid_t pid = ::fork();
     Check(pid >= 0, "the all-pinned trim can be watched");
     if (pid == 0) {
@@ -4726,6 +4791,17 @@ void TestRunRusage() {
 
 void TestCost() {
   Section("core::cost");
+  {
+    core::Config wanted;
+    Check(!core::CostRecordsWanted(wanted), "no cost records with single-flight and admission off");
+    wanted.daemon.single_flight = true;
+    Check(core::CostRecordsWanted(wanted), "single-flight wants cost records");
+    wanted.daemon.single_flight = false;
+    wanted.daemon.admission = true;
+    Check(core::CostRecordsWanted(wanted), "admission wants cost records");
+    wanted.read_only = true;
+    Check(!core::CostRecordsWanted(wanted), "a read-only client records no cost");
+  }
 
   TempCacheDir tree_a;
   TempCacheDir tree_b;
@@ -5374,7 +5450,26 @@ void TestJobserver() {
   CheckEq(daemon::JobserverMakeFlagsLine("/tmp/vcache-jobserver.fifo"),
           "MAKEFLAGS=-j --jobserver-auth=fifo:/tmp/vcache-jobserver.fifo\n",
           "--jobserver-env output format");
+  Check(daemon::MakeReadsFifoJobserver("GNU Make 4.4.1\nBuilt for x86_64\n") &&
+            daemon::MakeReadsFifoJobserver("GNU Make 5.0\n"),
+        "GNU make 4.4 and newer read a fifo jobserver");
+  Check(!daemon::MakeReadsFifoJobserver("GNU Make 4.3\n") &&
+            !daemon::MakeReadsFifoJobserver("GNU Make 3.81\n") &&
+            !daemon::MakeReadsFifoJobserver("bmake 20240711\n") &&
+            !daemon::MakeReadsFifoJobserver(""),
+        "older GNU make and other makes do not");
 
+#if !defined(__linux__)
+  {
+    TempCacheDir dir;
+    std::string why;
+    Check(!daemon::JobserverPool::Open(dir.path() + "/jobserver.fifo", 3, &why) &&
+              why.find("Linux") != std::string::npos,
+          "the fifo pool refuses to open off Linux (" + why + ")");
+  }
+  Skipped("fifo jobserver pool: Linux-only (FIONREAD does not count a fifo here)");
+  return;
+#endif
   TempCacheDir dir;
   const std::string path = dir.path() + "/jobserver.fifo";
   ::mkfifo(path.c_str(), 0600);
@@ -5500,6 +5595,7 @@ void TestElasticJobserver() {
           row.name);
   }
   TempCacheDir dir;
+#if defined(__linux__)
   std::string error;
   auto pool = daemon::JobserverPool::Open(dir.path() + "/elastic.fifo", 4, &error);
   Check(pool && pool->Withdraw(2) == 2 && pool->withdrawn() == 2 && pool->fifo_bytes() == 1,
@@ -5602,6 +5698,9 @@ void TestElasticJobserver() {
   }
   if (blocked_fd >= 0) ::close(blocked_fd);
   ::close(completed[0]);
+#else
+  Skipped("elastic fifo pool: Linux-only");
+#endif
   std::map<std::string, std::optional<std::string>> saved;
   for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_JOBSERVER_MIN_JOBS"}) {
     const char* value = ::getenv(name.c_str());
@@ -5803,10 +5902,15 @@ int main(int argc, char** argv) {
   TestHeldHitLayer();
   TestJobserver();
   TestElasticJobserver();
+#if defined(__linux__)
+  // Both sample a compiler's process tree through /proc.
   TestAdmissionProcessTree();
+#endif
   TestAdmissionReview();
   TestManifestPause();
+#if defined(__linux__)
   TestAdmissionBoundsAndTreePeaks();
+#endif
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

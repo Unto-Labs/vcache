@@ -87,6 +87,24 @@ void OnTerminate(int) {
 // Keys become file names under the cache and journal directories, so anything
 // but a plain hex digest is refused before it can name a path. Every key vcache
 // derives is one.
+// The pid of the process at the other end of a Unix socket, or 0 when the
+// platform cannot say. Lease and session checks that compare pids are skipped
+// for 0, so an unknown peer is trusted rather than refused.
+pid_t PeerPid(int fd) {
+#if defined(__linux__)
+  struct ucred credentials;
+  socklen_t size = sizeof(credentials);
+  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) == 0) {
+    return credentials.pid;
+  }
+#elif defined(LOCAL_PEERPID)
+  pid_t pid = 0;
+  socklen_t size = sizeof(pid);
+  if (::getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0) return pid;
+#endif
+  return 0;
+}
+
 bool ValidKey(const std::string& key) {
   if (key.size() < 3 || key.size() > 128) return false;
   for (char c : key) {
@@ -1589,14 +1607,7 @@ void Server::Serve(int fd) {
   bool ok = RecvFrame(fd, &request) && HandleHello(request, &reply);
   SendFrame(fd, reply);
   bool first_request = true;
-  pid_t peer_pid = 0;
-#if defined(__linux__)
-  struct ucred peer_credentials;
-  socklen_t peer_size = sizeof(peer_credentials);
-  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer_credentials, &peer_size) == 0) {
-    peer_pid = peer_credentials.pid;
-  }
-#endif
+  const pid_t peer_pid = PeerPid(fd);
   std::shared_ptr<CompileSession> compile_session;
 
   while (ok && RecvFrame(fd, &request)) {
@@ -1621,13 +1632,7 @@ void Server::Serve(int fd) {
     switch (static_cast<Op>(op)) {
       case Op::kSessionOpen: {
         std::lock_guard<std::mutex> lock(mutex_);
-        pid_t client_pid = 0;
-#if defined(__linux__)
-        struct ucred credentials;
-        socklen_t credentials_size = sizeof(credentials);
-        if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials,
-                         &credentials_size) == 0) client_pid = credentials.pid;
-#endif
+        const pid_t client_pid = peer_pid;
         bool pid_already_open = false;
         for (const auto& [session_fd, session] : sessions_) {
           if (client_pid > 0 && session->client_pid == client_pid) pid_already_open = true;

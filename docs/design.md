@@ -128,7 +128,9 @@ on both. It also includes vcache's own resident set at the fork, which on a
 heavy translation unit was 368,068 KiB through vcache against 368,992 KiB for
 the compiler run directly.
 
-The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
+The same two numbers are kept under `<cache>/costs/`, for misses only and
+only when `daemon.single_flight` or `daemon.admission` is on, the two
+features that read them; a read-only client keeps none. Each
 file holds the last eight observations of one codegen class (operation,
 canonical source or link output, language, and the optimisation and debug
 flags — not the source text and not include paths). `--clear` removes cache

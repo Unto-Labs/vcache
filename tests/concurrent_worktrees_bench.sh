@@ -23,7 +23,9 @@
 #   --jobs N             jobserver pool size (default: nproc)
 #   --min-jobs N         elastic floor, daemon.jobserver_min_jobs (default: the daemon's)
 #   --masquerade NAMES   compiler names linked to vcache ahead of PATH, e.g. "gcc g++ cc c++"
-#   --scratch DIR        worktrees, runs and stores (default /build/$USER/claude-tmp/bench-vcache)
+#   --scratch DIR        worktrees, runs and stores (default ${TMPDIR:-/tmp}/bench-vcache-$USER)
+#   --env NAME=VALUE     also export this into every build, e.g. a repository's own
+#                        switch that would otherwise point vcache elsewhere; repeatable
 #   --vcache PATH        the binary under test (default ../bin/vcache)
 #   --cache-dir DIR      VCACHE_DIR to use (default: a fresh store in each run directory)
 #   --tsv FILE           append each summary row here (matrix default <scratch>/results.tsv)
@@ -39,8 +41,9 @@
 #
 # Each build sees VCACHE_DIR, its own VCACHE_LOG, VCACHE_ROOTS mapping its
 # worktree and its CARGO_TARGET_DIR (<scratch>/targets/<n>) to fixed names,
-# RUSTC_WRAPPER=vcache, and FBG_VCACHE=0 / SUNBIRD_VCACHE=0 so a repository's
-# own vcache-env.sh leaves those alone instead of pointing at the user's store.
+# RUSTC_WRAPPER=vcache, and anything given with --env -- for instance a
+# repository's own switch that would otherwise point VCACHE_DIR at the user's
+# store.
 #
 # Cold runs start from an empty store. Warm runs first build worktree 1 alone
 # with the daemon off, clean, and then measure. Every run leaves its logs, a
@@ -61,7 +64,8 @@ TEMPERATURE="cold"
 JOBS=""
 MIN_JOBS=""
 MASQUERADE=""
-SCRATCH="/build/${USER:-$(id -un)}/claude-tmp/bench-vcache"
+SCRATCH="${TMPDIR:-/tmp}/bench-vcache-${USER:-$(id -un)}"
+EXTRA_ENV=()
 VCACHE="$TOP/bin/vcache"
 CACHE_DIR=""
 TSV=""
@@ -81,6 +85,7 @@ while (( $# )); do
     --min-jobs)    MIN_JOBS="$2"; shift 2 ;;
     --masquerade)  MASQUERADE="$2"; shift 2 ;;
     --scratch)     SCRATCH="$2"; shift 2 ;;
+    --env)         EXTRA_ENV+=("$2"); shift 2 ;;
     --vcache)      VCACHE="$2"; shift 2 ;;
     --cache-dir)   CACHE_DIR="$2"; shift 2 ;;
     --tsv)         TSV="$2"; shift 2 ;;
@@ -262,7 +267,10 @@ run_one() (
   export VCACHE_CACHE_SIZE="${VCACHE_CACHE_SIZE:-100G}"
   export VCACHE_RUST_PATH_ENV_VARS="${VCACHE_RUST_PATH_ENV_VARS:-OUT_DIR}"
   export RUSTC_WRAPPER="$VCACHE"
-  export FBG_VCACHE=0 SUNBIRD_VCACHE=0
+  local assignment
+  for assignment in "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}"; do
+    export "$assignment"
+  done
   export PATH="$BUILD_PATH"
   unset VCACHE_LOG VCACHE_DAEMON_SOCKET VCACHE_DAEMON_SINGLE_FLIGHT VCACHE_DAEMON_ADMISSION \
         VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_JOBSERVER_MIN_JOBS

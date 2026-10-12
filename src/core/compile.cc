@@ -1230,12 +1230,25 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
 // vcache knows the meaning of.
 constexpr int kKnownAbsentDepsVersion = 1;
 
+// True when clang is told to resolve relative paths against another
+// directory than the one it runs in. The relative paths in its list would then
+// be joined to the wrong directory.
+bool SetsWorkingDirectory(const args::CompilerArgs& parsed) {
+  for (const std::string& arg : parsed.argv) {
+    for (const std::string_view flag : {"-working-directory", "--working-directory"}) {
+      if (arg == flag || util::StartsWith(arg, std::string(flag) + "=")) return true;
+    }
+  }
+  return false;
+}
+
 // True when a recording compile without the tracer can ask the compiler for
 // its own list of the paths it probed and did not find. A patch version this
 // vcache does not know may mean something else by its list.
-bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id) {
+bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id,
+                              const args::CompilerArgs& parsed) {
   return compiler_id.absent_deps_version == kKnownAbsentDepsVersion &&
-         config.cxx_manifest_absent_deps;
+         config.cxx_manifest_absent_deps && !SetsWorkingDirectory(parsed);
 }
 
 // Why a compiler with the absent-deps patch is not asked for its list.
@@ -1247,6 +1260,8 @@ void LogAbsentListUnused(const Config& config, const CompilerId& compiler_id) {
                ", a version this vcache does not read; not asking for its list");
   } else if (!config.cxx_manifest_absent_deps) {
     VCACHE_LOG("cxx manifest: absent-deps lists are off; not asking for the compiler's list");
+  } else {
+    VCACHE_LOG("cxx manifest: -working-directory is set; not asking for the compiler's list");
   }
 }
 
@@ -1721,7 +1736,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // its own, which the compiler's list does not name. The list stands in for
   // it where there is no tracer. The -E run stays untraced either way: only
   // what the real compile opens and probes goes into a state.
-  const bool list_available = CompilerWritesAbsentList(config, compiler_id);
+  const bool list_available = CompilerWritesAbsentList(config, compiler_id, parsed);
   const std::string manifest_tracer =
       records_manifest
           ? CxxManifestTracer(config, list_available ? "the compiler's absent list"

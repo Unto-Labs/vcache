@@ -224,10 +224,12 @@ them), the banner carries version 1 (`CompilerId::absent_deps_version`) and
 `cxx_manifest_absent_deps` is on, the recording compile gets
 `-fabsent-deps=<scratch>/absent` beside the `-MD -MF` vcache adds; with a
 tracer it gets no such flag, and the `-E` run never does. The flag is vcache's
-own, like `-MD`, and enters neither key. A version vcache does not know, or the
-switch off, records from the depfile alone, and the log says why.
-`cxx_manifest_trace = false` with a patched compiler is how to record from the
-list on purpose, to compare it with the trace.
+own, like `-MD`, and enters neither key. A version vcache does not know, the
+switch off, or clang's `-working-directory` (the list's relative paths are
+relative to that directory, not to where the compiler runs) records from the
+depfile alone, and the log says why. `cxx_manifest_trace = false` with a
+patched compiler is how to record from the list on purpose, to compare it with
+the trace.
 
 The state's files come from the depfile, less a PCH the manifest key already
 identifies, whose bytes may differ between trees that share one identity. Its

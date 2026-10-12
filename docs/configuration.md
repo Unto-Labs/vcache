@@ -986,8 +986,9 @@ but not a probe that found nothing. A listed path that exists when the state is
 recorded is a compiler fault, and no state is recorded (`not recording: the
 compiler listed <path> as absent but it exists`). A version vcache does not
 know (`absent-deps-2` and up) is never asked for its list, and the log names
-the version. To compare the two sources, set `cxx_manifest_trace = false` for
-the list and leave it on for the trace. `cxx_manifest_absent_deps`
+the version; nor is clang under `-working-directory`, whose list is relative to
+that directory. To compare the two sources, set `cxx_manifest_trace = false`
+for the list and leave it on for the trace. `cxx_manifest_absent_deps`
 (`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list off:
 
 | Setting | Meaning |

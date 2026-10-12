@@ -5619,6 +5619,77 @@ else
   skipped "absent-deps lists: gcc is not installed, or is clang"
 fi
 
+# The same through a clang-style stub: the banner is clang's, and the list
+# spells a probe relative to the working directory, through `..` where the
+# include path does.
+if command -v clang >/dev/null 2>&1; then
+  adc="$WORK/mf-absent-clang"
+  mkdir -p "$adc"
+  cat > "$adc/clang-ad1" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  clang -v 2>&1 | sed 's/^\(clang version .*\)\$/\1 absent-deps-1/' >&2
+  exit 0
+fi
+printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$adc/calls"
+for a do
+  shift
+  case "\$a" in
+    -fabsent-deps=*) cat "\${STUB_ABSENT:-/dev/null}" > "\${a#-fabsent-deps=}"; continue ;;
+  esac
+  set -- "\$@" "\$a"
+done
+exec clang "\$@"
+EOF
+  chmod +x "$adc/clang-ad1"
+  clang_absent_run() {  # $1 cwd, $2 log, then compiler arguments
+    local dir=$1 log=$2; shift 2
+    ( cd "$dir" && STUB_ABSENT="$adc/list" VCACHE_TRACER="$adc/no-such-tracer.so" \
+        VCACHE_MAP_CWD=0 VCACHE_LOG="$log" "$VCACHE" "$adc/clang-ad1" -O2 "$@" ) 2>/dev/null
+  }
+
+  # Shadowing, from a build directory with `..` include paths.
+  reset_cache
+  d="$adc/shadow"
+  mkdir -p "$d/build" "$d/first" "$d/second"
+  printf '#define V 2\n' > "$d/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  printf '../first/h.h\n' > "$adc/list"
+  l=$(mf_log adc-shadow1)
+  clang_absent_run "$d/build" "$l" -I ../first -I ../second -c ../main.c -o m.o
+  check "clang absent-deps-1: the state is recorded from the compiler's list" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  clang_absent_run "$d/build" "$(mf_log adc-shadow2)" -I ../first -I ../second -c ../main.c -o m.o
+  check "clang absent-deps-1: the next compile hits through the manifest" "$(manifest_hits)" "1"
+  printf '#define V 1\n' > "$d/first/h.h"
+  : > "$adc/list"
+  l=$(mf_log adc-shadow3)
+  clang_absent_run "$d/build" "$l" -I ../first -I ../second -c ../main.c -o m.o
+  ( cd "$d/build" && clang -O2 -I ../first -I ../second -c ../main.c -o plain.o ) 2>/dev/null
+  check "clang absent-deps-1: a header created at a probe spelled through .. misses" \
+    "$(grep -c 'rejected: .*build/\.\./first/h\.h exists now' "$l")" "1"
+  check "clang absent-deps-1: and the object uses it" \
+    "$(cmp -s "$d/build/m.o" "$d/build/plain.o" && echo same || echo differs)" "same"
+
+  # Under -working-directory, clang's relative probes are relative to that
+  # directory, not to where it runs, so its list is not asked for.
+  reset_cache
+  rm -f "$adc/calls"
+  d="$adc/wd"
+  mkdir -p "$d/build" "$d/second"
+  printf '#define V 2\n' > "$d/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  printf 'first/h.h\n' > "$adc/list"
+  l=$(mf_log adc-wd)
+  clang_absent_run "$d/build" "$l" "-working-directory=$d" -I first -I "$d/second" \
+    -c "$d/main.c" -o m.o
+  check "clang absent-deps-1: -working-directory does not ask for the list" \
+    "$(grep -c "working-directory is set; not asking for the compiler's list" "$l")/$(grep -c -- '-fabsent-deps=' "$adc/calls" || true)" \
+    "1/0"
+else
+  skipped "absent-deps lists through a clang-style stub: clang is not installed"
+fi
+
 # --------------------------------------------------------------------------
 section "--show-stats breaks decisions down by reason"
 

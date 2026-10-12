@@ -98,7 +98,7 @@ is served only while all of them still match.
 
 The preprocessor key needs the preprocessed text, so a lookup that computes it
 runs the preprocessor, and that is most of what a hit costs. A compile first
-looks up a manifest instead (`cxx_manifest`, on by default). Its key is built
+looks up a manifest instead (`cxx_manifest`, off by default). Its key is built
 from what is known before the preprocessor runs:
 
 - its own key-format version, and the preprocessor key's, since states name

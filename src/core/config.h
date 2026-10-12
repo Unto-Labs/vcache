@@ -173,8 +173,10 @@ struct Config {
 
   // Look a C or C++ compile up in a manifest of the files an earlier compile
   // read before running the preprocessor, and record one on a miss. Off, every
-  // lookup preprocesses. Both modes store under the same keys.
-  bool cxx_manifest = true;
+  // lookup preprocesses. Both modes store under the same keys. Opt-in: a
+  // manifest built from a depfile cannot see a header created later earlier on
+  // the include path, which the preprocessor would have found.
+  bool cxx_manifest = false;
 
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store

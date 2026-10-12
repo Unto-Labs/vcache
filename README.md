@@ -302,8 +302,9 @@ Three things that look like they belong on that list but are cached:
    dependency file into local paths.
 7. On a miss, compile into a temporary directory, place the artifacts, and store.
 
-Steps 4 and 5 cost a preprocessor run on every lookup, so a C or C++ lookup
-first checks a manifest, as ccache's depend mode does. It is keyed on the
+Steps 4 and 5 cost a preprocessor run on every lookup, so with `cxx_manifest`
+on (it is off by default) a C or C++ lookup first checks a manifest, as
+ccache's depend mode does. It is keyed on the
 source, the whole command line (`-I` and `-D` included), the compiler, the
 roots and any precompiled header the command names, and each state in it lists
 the files an earlier compile's depfile named, with their digests, and the key
@@ -311,7 +312,9 @@ that compile stored under. When every file of a state still hashes the same,
 that key is looked up and the preprocessor never runs. The key is the ordinary
 preprocessor key, so trees with the manifest on and off share entries. A miss
 records its state from the compile's own `-MD` output, which vcache requests
-when the build did not. See
+when the build did not. The trade is exactness: a depfile names the headers a
+compile read, not the paths it probed, so a header created later earlier on the
+include path is not seen and a stale object can be served. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

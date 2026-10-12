@@ -3188,8 +3188,9 @@ done
 ( cd "$WORK/a-considerably-longer-cc-two" && \
   "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 check "an in-tree compiler hits across checkouts" "$(hits)" "1"
-# The entry and its C/C++ manifest: two compiler identities would store four.
-check "and only one entry was stored" "$(disk_entries)" "2"
+# One entry, and no manifest: that mode is off by default. Two compiler
+# identities would store two.
+check "and only one entry was stored" "$(disk_entries)" "1"
 check "and the objects are byte-identical" \
   "$(cmp -s "$WORK/cc-one/lib.o" "$WORK/a-considerably-longer-cc-two/lib.o" \
      && echo same)" "same"
@@ -3931,6 +3932,24 @@ fi
 # --------------------------------------------------------------------------
 section "19. C/C++ manifest mode"
 
+check "manifest mode is off by default" \
+  "$(env -u VCACHE_CXX_MANIFEST "$VCACHE" --show-config | grep -c 'c/c++ manifest: *off')" "1"
+# By default a header created earlier on the include path is seen: the
+# preprocessor runs on every lookup.
+reset_cache
+mkdir -p "$WORK/mf-shadow/a" "$WORK/mf-shadow/b"
+printf 'int from_b(void);\n' > "$WORK/mf-shadow/b/h.h"
+printf '#include "h.h"\nint s(void) { return 0; }\n' > "$WORK/mf-shadow/s.c"
+( cd "$WORK/mf-shadow" && env -u VCACHE_CXX_MANIFEST "$VCACHE" gcc -O2 -Ia -Ib -c s.c -o s.o ) 2>/dev/null
+printf '#define SHADOWED 1\nint from_a(void) { return SHADOWED; }\n' > "$WORK/mf-shadow/a/h.h"
+( cd "$WORK/mf-shadow" && env -u VCACHE_CXX_MANIFEST "$VCACHE" gcc -O2 -Ia -Ib -c s.c -o s.o ) 2>/dev/null
+check "by default a header created earlier on the include path misses" "$(misses)" "2"
+check "and the object has the new header's code" \
+  "$(nm "$WORK/mf-shadow/s.o" 2>/dev/null | grep -c 'from_a')" "1"
+
+# It is opt-in; this section turns it on.
+export VCACHE_CXX_MANIFEST=1
+
 # A compile first looks up a manifest keyed on what is known before the
 # preprocessor runs. A state whose recorded files all still hash the same names
 # the result key, and the preprocessor never runs.
@@ -4462,6 +4481,8 @@ l=$(mf_log alias)
 check "a root given through a symlink still records a state" \
   "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
 rm -f "$WORK/mf-alias"
+
+unset VCACHE_CXX_MANIFEST
 
 # --------------------------------------------------------------------------
 section "--show-stats breaks decisions down by reason"

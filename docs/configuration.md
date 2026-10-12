@@ -63,7 +63,7 @@ incoming_prefix_maps = "error"     # error | strip | keep
 read_only            = false
 hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
-cxx_manifest         = true        # see "cxx_manifest"
+cxx_manifest         = false       # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -91,7 +91,7 @@ timeout        = 30                # seconds
 | `vcache.incoming_prefix_maps` | `VCACHE_INCOMING_PREFIX_MAPS` | `--vcache-incoming-prefix-maps=`, `--vcache-allow-prefix-maps` | `error` |
 | `vcache.native_target` | `VCACHE_NATIVE_TARGET` | — | `resolve` |
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
-| `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `true` |
+| `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `false` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -892,9 +892,10 @@ Every C or C++ lookup has to know the preprocessed text before it can compute
 the key, and producing it is most of what a hit costs. On `src/daemon/server.cc`
 (about 410 headers) a hit took 69 ms with clang++ and 88 ms with g++ through the
 preprocessor, and 6 ms and 9 ms through the manifest. With
-`cxx_manifest` on (the default), a lookup first asks a **manifest**, as
+`cxx_manifest` on, a lookup first asks a **manifest**, as
 [`dep_scan`](#dep_scan) and [`rust_dep_info`](#rust_dep_info) do. This is
-ccache's depend mode.
+ccache's depend mode. It is **off by default**, because it trades exactness
+for that speed: see "The limitation worth knowing" below before turning it on.
 
 The manifest key covers what is known before the preprocessor runs: the
 compiler and the resolved native target, the roots, the working directory, the
@@ -921,15 +922,15 @@ on stored, and the reverse. A hit logs
 
 | Setting | Meaning |
 | --- | --- |
-| `true` *(default)* | Look up and record manifest states. |
-| `false` | Preprocess on every lookup. Entries are shared with `true`. |
+| `true` | Look up and record manifest states. |
+| `false` *(default)* | Preprocess on every lookup. Entries are shared with `true`. |
 
 ```toml
 [vcache]
-cxx_manifest = false
+cxx_manifest = true
 ```
 ```console
-$ export VCACHE_CXX_MANIFEST=0
+$ export VCACHE_CXX_MANIFEST=1
 ```
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
@@ -983,10 +984,13 @@ file's digest, as ccache's depend mode keys every result. Only a manifest
 lookup can find that entry.
 
 **The limitation worth knowing.** It is the one `dep_scan` has, and ccache's
-direct and depend modes have. A depfile names the files a compile read, not the
-paths it probed and did not find. Create a header that shadows one earlier on
-the include path, change nothing else, and a lookup can still hit with the old
-answer. The reverse, deleting a header that `__has_include` found but the
+direct and depend modes have, and it is why `cxx_manifest` is off by default. A
+depfile names the files a compile read, not the paths it probed and did not
+find. Create a header that shadows one earlier on the include path, change
+nothing else, and a lookup can still hit with the old answer and serve a stale
+object. The same holds for a header that `#include_next` or a `-F` framework
+search would now find first, and, under gcc, for a `.gch` created later beside
+an included header. The reverse, deleting a header that `__has_include` found but the
 compile did not read, is covered for clang by its depfile and for gcc by the
 rule above, except inside the compiler's own include directories. Set
 `cxx_manifest = false` to make these cases exact.

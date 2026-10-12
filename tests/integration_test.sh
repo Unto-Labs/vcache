@@ -3706,6 +3706,26 @@ check "the patched compiler's dependency scan misses on the stock one" \
   "$(hits)/$(misses)" "0/2"
 check "and its output names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.M")" "1"
 
+# The banner is hashed as printed. A token that starts a line must not take the
+# line break with it: these two banners then read the same.
+reset_cache
+for cc in split joined; do
+  if [ $cc = split ]; then
+    banner='mycc version 1.0\nabsent-deps-1 Thread model: posix'
+  else
+    banner='mycc version 1.0 Thread model: posix'
+  fi
+  cat > "$ad/$cc-cc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then printf '$banner\n' >&2; exit 0; fi
+exec gcc "\$@"
+EOF
+  chmod +x "$ad/$cc-cc"
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" "$VCACHE" "$ad/$cc-cc" -O2 -c s.c -o s.o ) 2>/dev/null
+done
+check "banners that differ only in a line break do not share entries" \
+  "$(hits)/$(misses)" "0/2"
+
 # --------------------------------------------------------------------------
 section "link caching"
 

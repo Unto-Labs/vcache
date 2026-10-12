@@ -3814,6 +3814,7 @@ void TestClangArgs() {
       {{"-gen-cdb-fragment-path", "/tmp/cdb"}, "-gen-cdb-fragment-path"},
       {{"-gsplit-dwarf"}, "-gsplit-dwarf (.dwo)"},
       {{"-gsplit-dwarf=split"}, "-gsplit-dwarf=split (.dwo)"},
+      {{"-fabsent-deps=a.absent"}, "-fabsent-deps=FILE (the paths probed and not found)"},
   };
   for (const Case& c : side_outputs) {
     std::vector<std::string> argv = {"clang", "-c", "a.c", "-o", "a.o"};

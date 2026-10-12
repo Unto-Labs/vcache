@@ -369,6 +369,7 @@ uncacheable reason:
 | `-MJ FILE` | compilation-database fragment |
 | `-serialize-diagnostics FILE` | `.dia` |
 | `-gen-cdb-fragment-path DIR` | cdb fragments |
+| `-fabsent-deps=FILE` (devtools gcc and clang patch) | paths probed and not found |
 
 `-gsplit-dwarf=single` is deliberately **not** in that list: it keeps the debug
 sections inside the object, so there is no companion file and nothing to lose.

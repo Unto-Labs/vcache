@@ -407,6 +407,13 @@ the daemon logs once and retains its last good value, deferring new sampled RSS
 realisation until a fresh memory reading succeeds. With no good reading yet,
 admission is unavailable and requests proceed without waiting for memory.
 
+A compiler or linker that runs under a reservation gets
+`VCACHE_MEMORY_RESERVED=1` in its environment. A vcache it starts in turn,
+such as rustc's linker through masquerade, is already counted in that tree's
+sampled RSS, so it logs "not reserving again" and does not queue. Without
+this, the child counted twice and, behind its own parent in the FIFO, could
+wait out the whole ten-minute bound.
+
 The reported compiler pid is sampled only when visible with the session peer
 as its parent. Otherwise the daemon logs the pid mismatch and treats the whole
 estimate as unrealised for ten seconds, then as realised. This fallback allows

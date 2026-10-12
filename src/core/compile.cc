@@ -942,11 +942,14 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
   util::ProcOptions compile_options{.capture_stderr = true};
-  if (session && config.daemon.admission) {
+  if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
+    VCACHE_LOG("reserve: an enclosing vcache holds the reservation; not reserving again");
+  } else if (session && config.daemon.admission) {
     const auto cost_key = ComputeCostKey("compile", parsed.source,
         args::LanguageName(parsed.language), parsed.key_args, roots);
     session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
     compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+    compile_options.env.emplace_back(daemon::kReservationHeldEnv, "1");
   } else if (config.daemon.admission && !config.read_only &&
              config.daemon.mode != DaemonMode::kOff) {
     VCACHE_LOG("reserve: daemon unavailable, running unreserved");

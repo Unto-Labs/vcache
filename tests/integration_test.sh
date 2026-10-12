@@ -3786,6 +3786,43 @@ else
   bad "memory admission integration requires python3"
 fi
 
+section "10e. Nested admission"
+# A compiler or linker running under a reservation can start vcache again
+# (rustc's linker through masquerade). The daemon already samples that child
+# as part of the parent's tree, so the child must not queue for memory of its
+# own behind the reservation it is part of.
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+mkdir -p "$WORK/nested"
+printf 'int outer(void) { return 1; }\n' > "$WORK/nested/outer.c"
+printf 'int inner(void) { return 2; }\n' > "$WORK/nested/inner.c"
+cat > "$WORK/nested/cc" << EOF
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ]; then exec gcc "\$@"; fi
+done
+printf '%s\n' "\${VCACHE_MEMORY_RESERVED:-unset}" > "$WORK/nested/marker"
+VCACHE_LOG="$WORK/nested/inner.log" "$VCACHE" gcc -c "$WORK/nested/inner.c" \
+  -o "$WORK/nested/inner.o"
+exec gcc "\$@"
+EOF
+chmod +x "$WORK/nested/cc"
+( cd "$WORK/nested" && VCACHE_DAEMON=auto VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_DAEMON_IDLE_TIMEOUT=60 VCACHE_COMPILER_CHECK=mtime \
+    VCACHE_LOG="$WORK/nested/outer.log" \
+    "$VCACHE" "$WORK/nested/cc" -c outer.c -o outer.o ) >/dev/null 2>&1
+check "a reserved compiler sees the reservation marker" \
+  "$(cat "$WORK/nested/marker" 2>/dev/null)" "1"
+check "the outer compile reserved memory" \
+  "$([[ "$(grep -c 'reserve: granted' "$WORK/nested/outer.log" 2>/dev/null)" -ge 1 ]] && echo yes)" "yes"
+check "a vcache inside the reservation does not reserve again" \
+  "$(grep -c 'not reserving again' "$WORK/nested/inner.log" 2>/dev/null)" "1"
+check "and sends no reserve request of its own" \
+  "$(grep -c 'reserve: granted' "$WORK/nested/inner.log" 2>/dev/null || true)" "0"
+check "both nested compiles produce objects" \
+  "$([[ -s "$WORK/nested/outer.o" && -s "$WORK/nested/inner.o" ]] && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

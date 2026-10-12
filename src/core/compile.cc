@@ -1096,6 +1096,11 @@ std::string CxxManifestTracer(const Config& config) {
     VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from the depfile");
     return "";
   }
+  if (!TracerPathPreloadable(tracer)) {
+    VCACHE_LOG("cxx manifest: ld.so would split the tracer's path '" + tracer +
+               "' at a space or colon; recording from the depfile");
+    return "";
+  }
   if (!TracerLoadsHere(tracer)) {
     VCACHE_LOG("cxx manifest: '" + tracer + "' is not a shared object this binary's loader "
                "would preload; recording from the depfile");

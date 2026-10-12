@@ -283,7 +283,9 @@ void TestLinkTraceClassification() {
   Check(core::TraceMarkedIncomplete(log), "the marker beside it makes it incomplete");
   util::RemoveFile(log + ".incomplete");
 
-  // Only a shared object ld.so would load into this binary is preloaded.
+  // Only a shared object ld.so would load into this binary is preloaded. ELF
+  // only: on macOS the tracer is never used, and libc is a Mach-O dylib.
+#ifdef __linux__
   Dl_info libc_info{};
   const bool found_libc =
       ::dladdr(::dlsym(RTLD_DEFAULT, "getpid"), &libc_info) != 0 && libc_info.dli_fname;
@@ -303,8 +305,9 @@ void TestLinkTraceClassification() {
     util::WriteFileAtomic(dir + "/exec.so", executable);
     Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
   }
+#endif
 
-  // ld.so's refusals are taken out of a traced compile's stderr, line by line.
+  // ld.so's refusals are taken out of a traced compile's stderr, span by span.
   bool refused = false;
   const std::string other_refusal =
       "ERROR: ld.so: object '/b/wrap.so' from LD_PRELOAD cannot be preloaded "
@@ -322,6 +325,24 @@ void TestLinkTraceClassification() {
           "a.c:1: warning: x\n" + other_refusal,
           "stderr with no refusal of the tracer is untouched");
   Check(!refused, "and reports none");
+  // Another process wrote the refusal into the middle of a diagnostic.
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:3:5: error: ERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS32 (x)): ignored.\n'f' undeclared\n",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:3:5: error: 'f' undeclared\n",
+          "a refusal inside a diagnostic goes, and the diagnostic stays whole");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals(
+              "x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD cannot be "
+              "preloaded: ignored.\ny",
+              "/v/vcache-fstrace.so", &refused),
+          "x\ny", "an older glibc's refusal, with no reason, goes too");
+  Check(core::TracerPathPreloadable("/opt/vcache/bin/vcache-fstrace.so"),
+        "a tracer path without a space or colon is preloadable");
+  Check(!core::TracerPathPreloadable("/home/J Smith/bin/vcache-fstrace.so") &&
+            !core::TracerPathPreloadable("/opt/a:b/vcache-fstrace.so"),
+        "one ld.so would split at a space or colon is not");
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");

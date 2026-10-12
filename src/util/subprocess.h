@@ -39,6 +39,8 @@ struct ProcOptions {
   // its log path to reach the linker's whole process tree without vcache's own
   // environment being modified, which would leak into anything else it runs.
   std::vector<std::pair<std::string, std::string>> env;
+  // Variables to remove in the child only, before `env` is applied.
+  std::vector<std::string> unset_env;
   std::function<void(int)> on_spawn;
 };
 

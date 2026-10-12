@@ -32,9 +32,12 @@ using ManifestFile = std::pair<std::string, std::string>;
 constexpr size_t kMaxManifestStates = 8;
 
 // Returns nullopt while every file, read at its localised path, still hashes to
-// its recorded digest; otherwise says which file is gone or changed.
+// its recorded digest; otherwise says which file is gone or changed. With a
+// `memo_dir`, a file whose identity is unchanged since its digest was memoised
+// there costs one stat instead of a read.
 std::optional<std::string> FindStaleManifestFile(const std::vector<ManifestFile>& files,
-                                                 const RootMap& roots);
+                                                 const RootMap& roots,
+                                                 const std::string& memo_dir = {});
 
 // "<hex digest> <canonical path>". The digest comes first so a path containing
 // spaces still parses by taking the rest of the line.

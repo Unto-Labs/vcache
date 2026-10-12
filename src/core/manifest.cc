@@ -11,16 +11,19 @@
 #include <chrono>
 #include <cstdlib>
 
+#include "hash/file_memo.h"
 #include "hash/hasher.h"
 #include "util/log.h"
 
 namespace vcache::core {
 
 std::optional<std::string> FindStaleManifestFile(const std::vector<ManifestFile>& files,
-                                                 const RootMap& roots) {
+                                                 const RootMap& roots,
+                                                 const std::string& memo_dir) {
   for (const auto& [canonical_path, digest] : files) {
     const std::string local = roots.Localize(canonical_path);
-    auto actual = hash::HashFile(local);
+    auto actual =
+        memo_dir.empty() ? hash::HashFile(local) : hash::HashFileMemoized(local, memo_dir);
     if (!actual) return local + " is gone";
     if (*actual != digest) return local + " changed";
   }

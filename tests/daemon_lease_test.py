@@ -19,9 +19,12 @@ def run(binary, work, selected=None):
     work.mkdir(parents=True, exist_ok=True)
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("VCACHE_")}
+    # These cases count lookups, leases and gated S3 GETs of one compile each;
+    # the C/C++ manifest would add a lookup and a GET to every one, and its own
+    # daemon case lives in the integration suite.
     environment.update(VCACHE_DAEMON="auto", VCACHE_DAEMON_SINGLE_FLIGHT="1",
                        VCACHE_DAEMON_IDLE_TIMEOUT="0", VCACHE_COMPILER_CHECK="none",
-                       VCACHE_RUST_DEP_INFO="manifest")
+                       VCACHE_RUST_DEP_INFO="manifest", VCACHE_CXX_MANIFEST="0")
     compiler_text = """#!/usr/bin/env python3
 import fcntl, os, select, sys
 real = os.path.basename(sys.argv[0])

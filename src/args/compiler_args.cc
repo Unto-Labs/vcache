@@ -146,6 +146,9 @@ std::optional<std::string> KeyedFileFlagValue(std::string_view arg) {
       // other would give a kernel whose structs disagree about their own
       // layout, with nothing on the command line to show it.
       "-frandomize-layout-seed-file=",
+      // clang reads more command-line options out of this file, -O and -D
+      // included.
+      "--config=",
   };
   for (std::string_view p : kPrefixes) {
     if (StartsWith(arg, p)) return std::string(arg.substr(p.size()));
@@ -242,6 +245,8 @@ Language LanguageFromXFlag(const std::string& value) {
   if (value == "objective-c++") return Language::kObjCxx;
   if (value == "assembler-with-cpp") return Language::kAssemblerWithCpp;
   if (value == "assembler") return Language::kAssembler;
+  if (value == "c-header") return Language::kCHeader;
+  if (value == "c++-header") return Language::kCxxHeader;
   return Language::kUnknown;
 }
 
@@ -302,6 +307,8 @@ std::string LanguageName(Language lang) {
     case Language::kObjCxx: return "objective-c++";
     case Language::kAssemblerWithCpp: return "assembler-with-cpp";
     case Language::kAssembler: return "assembler";
+    case Language::kCHeader: return "c-header";
+    case Language::kCxxHeader: return "c++-header";
     case Language::kUnknown: break;
   }
   return "unknown";
@@ -552,6 +559,15 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       if (!keyed_file->empty()) result.key_files.push_back(*keyed_file);
       continue;
     }
+    if (arg == "--config" && i + 1 < result.argv.size()) {
+      const std::string& file = result.argv[++i];
+      result.base_args.push_back(arg);
+      result.base_args.push_back(file);
+      result.key_args.push_back(arg);
+      result.key_args.push_back(file);
+      result.key_files.push_back(file);
+      continue;
+    }
 
     // Flags whose effect vcache cannot reproduce from a stored object.
     //
@@ -575,6 +591,17 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       pending_uncacheable.emplace_back(core::Reason::kUnsupportedFlag, arg);
       result.base_args.push_back(arg);
       continue;
+    }
+    if (arg == "-Xclang" && i + 1 < result.argv.size() &&
+        result.argv[i + 1] == "-emit-pch") {
+      result.xclang_emit_pch = true;
+      result.key_args.push_back(arg);
+      result.key_args.push_back(result.argv[++i]);
+      continue;
+    }
+    if (arg == "-Xclang" && i + 1 < result.argv.size() &&
+        result.argv[i + 1] == "-fno-pch-timestamp") {
+      result.pch_timestamp_disabled = true;
     }
     if (arg == "-Xclang" && i + 1 < result.argv.size() &&
         result.argv[i + 1] == "-fno-validate-pch") {
@@ -661,6 +688,9 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
 
   result.language = explicit_x.empty() ? LanguageFromExtension(result.source)
                                        : LanguageFromXFlag(explicit_x);
+  result.produces_pch = result.xclang_emit_pch ||
+                        result.language == Language::kCHeader ||
+                        result.language == Language::kCxxHeader;
 
   if (result.preprocess_only) {
     result.uncacheable = core::Reason::kPreprocessOnly;
@@ -700,6 +730,20 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
     return result;
   }
 
+  if (result.produces_pch) {
+    // Only -c builds a PCH; what a header under -S writes is left to the
+    // compiler.
+    if (!result.compile_only) {
+      result.uncacheable = core::Decision(core::Reason::kUnsupportedFlag, "-S");
+      return result;
+    }
+    // gcc names the default <source>.gch and clang <source>.pch, and the parse
+    // does not know which driver this is.
+    if (result.output.empty()) {
+      result.uncacheable = core::Decision(core::Reason::kNoOutputFlag, result.source);
+      return result;
+    }
+  }
   if (result.output.empty()) {
     result.output =
         DefaultOutputFor(result.source, result.compile_only, result.assemble_only);

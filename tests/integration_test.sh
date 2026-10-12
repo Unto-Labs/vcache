@@ -3658,6 +3658,55 @@ check "a same-size rebuilt compiler is not served from the old memo" \
 check "and it did not report a hit" "$(hits)" "0"
 
 # --------------------------------------------------------------------------
+section "a compiler with the absent-deps patch does not share the stock entries"
+# The devtools gcc and clang print `absent-deps-<n>` after the version in -v.
+# Their objects are the stock compiler's, but their dependency output is not:
+# it names the PCH a compile read. The stub patches the stock output the same
+# way, so an entry served across the two would replay the stock depfile.
+reset_cache
+ad="$WORK/absent-deps"
+mkdir -p "$ad"
+printf 'int f(void) { return 1; }\n' > "$ad/s.c"
+cat > "$ad/patched-gcc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  gcc -v 2>&1 | sed 's/^\(gcc version .*\)\$/\1 absent-deps-1/' >&2
+  exit 0
+fi
+scan=; prev=; deps=
+for a in "\$@"; do
+  case "\$a" in -M|-MM) scan=1 ;; esac
+  if [ "\$prev" = -MF ]; then deps="\$deps \$a"; fi
+  prev=\$a
+done
+if [ -n "\$scan" ]; then
+  prev=
+  for a in "\$@"; do [ "\$prev" = -o ] && deps="\$deps \$a"; prev=\$a; done
+fi
+gcc "\$@" || exit \$?
+for d in \$deps; do [ -f "\$d" ] && sed -i '1s|: |: $ad/pch.h.gch |' "\$d"; done
+exit 0
+EOF
+chmod +x "$ad/patched-gcc"
+ad_compile() {  # $1 compiler, $2 depfile
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" \
+      "$VCACHE" "$1" -O2 -MD -MF "$2" -c s.c -o s.o ) 2>/dev/null
+}
+ad_compile gcc stock.d
+ad_compile "$ad/patched-gcc" patched.d
+check "the patched compiler misses on the stock entry" "$(hits)/$(misses)" "0/2"
+check "and its depfile names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.d")" "1"
+reset_cache
+ad_scan() {  # $1 compiler, $2 output
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" "$VCACHE" "$1" -M s.c -o "$2" ) 2>/dev/null
+}
+ad_scan gcc stock.M
+ad_scan "$ad/patched-gcc" patched.M
+check "the patched compiler's dependency scan misses on the stock one" \
+  "$(hits)/$(misses)" "0/2"
+check "and its output names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.M")" "1"
+
+# --------------------------------------------------------------------------
 section "link caching"
 
 # Linux only. The tracer that discovers a link's input set needs LD_PRELOAD

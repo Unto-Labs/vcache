@@ -3476,21 +3476,29 @@ void TestSha256() {
 }
 
 void TestCompilerBannerMark() {
-  Section("compiler banner: the absent-deps token stays out of the fingerprint");
-  int version = -1;
-  CheckEq(core::BannerWithoutAbsentDepsMark("gcc version 16.1.0 (GCC) absent-deps-1\n", &version),
-          "gcc version 16.1.0 (GCC)\n", "gcc's token is removed with its space");
-  CheckEq(std::to_string(version), "1", "and its version is read");
-  CheckEq(core::BannerWithoutAbsentDepsMark(
-              "clang version 22.1.8 (repo b65aa9b) absent-deps-12\nTarget: x86_64\n", &version),
-          "clang version 22.1.8 (repo b65aa9b)\nTarget: x86_64\n", "clang's token is removed");
-  CheckEq(std::to_string(version), "12", "with a two-digit version");
-  CheckEq(core::BannerWithoutAbsentDepsMark("gcc version 16.1.0 (GCC)\n", &version),
-          "gcc version 16.1.0 (GCC)\n", "a stock banner is unchanged");
-  CheckEq(std::to_string(version), "0", "and has version 0");
-  CheckEq(core::BannerWithoutAbsentDepsMark("absent-deps-x absent-deps-1y\n", &version),
-          "absent-deps-x absent-deps-1y\n", "a token without a bounded number is not one");
-  CheckEq(std::to_string(version), "0", "so the version stays 0");
+  Section("compiler banner: the absent-deps token is read and fingerprinted");
+  CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC) absent-deps-1\n")),
+          "1", "gcc's token gives its version");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "clang version 22.1.8 (repo b65aa9b) absent-deps-12\nTarget: x86_64\n")),
+          "12", "clang's two-digit version");
+  CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC)\n")), "0",
+          "a stock banner has version 0");
+  CheckEq(std::to_string(core::AbsentDepsVersion("absent-deps-x absent-deps-1y\n")), "0",
+          "a token without a bounded number is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "Found CUDA installation: /usr/local/cuda, version \n"
+              "InstalledDir: /opt/absent-deps-3 /bin\n"
+              "gcc version 16.1.0 (GCC)\n")),
+          "0", "a token off the version line is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "gcc version 16.2.0 (GCC) absent-deps-1\n")),
+          "1", "the version line's token is read past a configure line");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "gcc version 16.1.0 (GCC) absent-deps-99999999999\n")),
+          "0", "a version that does not fit an int is not one");
 
   auto scratch = util::MakeTempDir("vcache-banner-");
   Check(scratch.has_value(), "banner scratch dir");
@@ -3513,13 +3521,21 @@ void TestCompilerBannerMark() {
   const core::CompilerId stock_id = core::ResolveCompilerId(stock, "version", cache_dir, roots);
   const core::CompilerId patched_id = core::ResolveCompilerId(patched, "version", cache_dir, roots);
   Check(!stock_id.fingerprint.empty(), "the stock stub has a fingerprint");
-  CheckEq(patched_id.fingerprint, stock_id.fingerprint,
-          "the patched stub shares the stock fingerprint");
+  Check(patched_id.fingerprint != stock_id.fingerprint,
+        "the patched stub does not share the stock fingerprint");
   CheckEq(std::to_string(stock_id.absent_deps_version), "0", "stock: no absent-deps version");
   CheckEq(std::to_string(patched_id.absent_deps_version), "1", "patched: absent-deps version 1");
   const core::CompilerId memoised = core::ResolveCompilerId(patched, "version", cache_dir, roots);
-  CheckEq(memoised.fingerprint, stock_id.fingerprint, "and so does the memoised answer");
+  CheckEq(memoised.fingerprint, patched_id.fingerprint, "the memoised answer is the same");
   CheckEq(std::to_string(memoised.absent_deps_version), "1", "which keeps the version");
+  for (const char* mode : {"mtime", "content"}) {
+    const core::CompilerId by_mode = core::ResolveCompilerId(patched, mode, cache_dir, roots);
+    CheckEq(std::to_string(by_mode.absent_deps_version), "1",
+            std::string("the ") + mode + " check reads the version too");
+    CheckEq(std::to_string(core::ResolveCompilerId(stock, mode, cache_dir, roots)
+                               .absent_deps_version),
+            "0", std::string("and gives the stock stub none under ") + mode);
+  }
 }
 
 void TestCompilerArgs() {
@@ -3819,6 +3835,7 @@ void TestClangArgs() {
       {{"-gen-cdb-fragment-path", "/tmp/cdb"}, "-gen-cdb-fragment-path"},
       {{"-gsplit-dwarf"}, "-gsplit-dwarf (.dwo)"},
       {{"-gsplit-dwarf=split"}, "-gsplit-dwarf=split (.dwo)"},
+      {{"-fabsent-deps=a.absent"}, "-fabsent-deps=FILE (the paths probed and not found)"},
   };
   for (const Case& c : side_outputs) {
     std::vector<std::string> argv = {"clang", "-c", "a.c", "-o", "a.o"};

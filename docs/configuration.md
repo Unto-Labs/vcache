@@ -369,6 +369,7 @@ uncacheable reason:
 | `-MJ FILE` | compilation-database fragment |
 | `-serialize-diagnostics FILE` | `.dia` |
 | `-gen-cdb-fragment-path DIR` | cdb fragments |
+| `-fabsent-deps=FILE` (devtools gcc and clang patch) | paths probed and not found |
 
 `-gsplit-dwarf=single` is deliberately **not** in that list: it keeps the debug
 sections inside the object, so there is no companion file and nothing to lose.
@@ -1105,12 +1106,14 @@ How the toolchain is identified:
 | --- | --- |
 | `version` *(default)* | Hash of `<compiler> -v` output — version, target triple, configure flags. Machine-independent, so entries are shareable through S3. Memoised in the cache directory, so the extra process runs once per toolchain, not once per compilation. |
 | `content` | Hash the compiler driver binary. Differs between machines even for identical toolchains. |
-| `mtime` | Path, size and mtime only -- no probe, no banner. Fastest, least safe. |
+| `mtime` | Path, size and mtime only. Fastest, least safe. |
 
 `version` is the default precisely because a shared remote cache is a first-class
 use case and mtimes never agree across machines. An `absent-deps-<n>` token in
-the banner is left out of the hash: a compiler built with that local patch
-produces the stock compiler's objects, so both share entries.
+the banner is hashed with the rest: a compiler built with that local patch
+produces the stock compiler's objects but not its depfiles, so the two do not
+share entries. `content` and `mtime` still run `-v`, memoised the same way, to read that
+token's version, but do not hash the banner.
 
 ## Logging and diagnostics
 

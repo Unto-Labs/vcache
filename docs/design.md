@@ -283,13 +283,17 @@ exempt, on the same assumption about the compiler's own include directories.
   entries are shareable through S3. The result is memoised in the cache
   directory keyed by the binary's path, size and mtime, so the extra process
   runs once per toolchain version rather than once per compilation. Paths under
-  a configured root are canonicalised out of the banner before it is hashed, and
-  so is an `absent-deps-<n>` token: a compiler built with that local patch (it
-  reports the paths it looked for and did not find) produces the objects the
-  stock compiler produces, so the two share entries.
+  a configured root are canonicalised out of the banner before it is hashed. An
+  `absent-deps-<n>` token stays in: a compiler built with that local patch (it
+  reports the paths it looked for and did not find) produces the stock
+  compiler's objects but names the PCH it read in its depfile, so the two do
+  not share entries.
 - `content` — hash the driver binary. Machine-specific in practice.
 - `mtime` — canonicalised path, size and mtime only. Fastest, least safe across
   machines.
+
+`content` and `mtime` still read the memoised banner for the `absent-deps-<n>`
+version, without hashing it.
 
 `version` is the default specifically because a shared remote cache is a first-
 class use case, and mtime differs across machines for identical toolchains.

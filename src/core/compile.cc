@@ -6,9 +6,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,7 +38,7 @@ namespace {
 
 // Bumped whenever the key derivation or blob layout changes, so old entries are
 // ignored rather than misinterpreted.
-constexpr std::string_view kCacheKeyVersion = "vcache-key-v2";
+constexpr std::string_view kCacheKeyVersion = "vcache-key-v3";
 constexpr std::string_view kPchIdentityVersion = "vcache-pch-identity-v1";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
@@ -57,28 +60,39 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
 }
 
-std::string BannerWithoutAbsentDepsMark(std::string_view banner,
-                                        int* absent_deps_version) {
+// The patch prints its token after the version, on the line that reports it.
+// Elsewhere in the banner the same text can be part of a configure flag or a
+// path, and says nothing about the driver.
+int AbsentDepsVersion(std::string_view banner) {
+  static constexpr std::string_view kVersionWord = "version ";
   static constexpr std::string_view kMark = "absent-deps-";
-  std::string text(banner);
-  *absent_deps_version = 0;
-  size_t at = 0;
-  while ((at = text.find(kMark, at)) != std::string::npos) {
-    const size_t digits = at + kMark.size();
-    size_t end = digits;
-    while (end < text.size() && std::isdigit(static_cast<unsigned char>(text[end]))) ++end;
-    const bool bounded = (at == 0 || std::isspace(static_cast<unsigned char>(text[at - 1]))) &&
-                         (end == text.size() || std::isspace(static_cast<unsigned char>(text[end])));
-    if (end == digits || !bounded) {
-      at = digits;
+  for (const std::string& line : util::Split(banner, '\n', /*skip_empty=*/true)) {
+    if (util::StartsWith(line, "Configured with:")) continue;
+    const size_t version = line.find(kVersionWord);
+    const size_t number = version + kVersionWord.size();
+    if (version == std::string::npos || number == line.size() ||
+        !std::isdigit(static_cast<unsigned char>(line[number]))) {
       continue;
     }
-    *absent_deps_version = std::atoi(text.c_str() + digits);
-    const size_t from = at > 0 ? at - 1 : at;
-    text.erase(from, end - from);
-    at = from;
+    size_t at = number;
+    while ((at = line.find(kMark, at)) != std::string::npos) {
+      const size_t digits = at + kMark.size();
+      size_t end = digits;
+      while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end]))) ++end;
+      const bool bounded = std::isspace(static_cast<unsigned char>(line[at - 1])) &&
+                           (end == line.size() ||
+                            std::isspace(static_cast<unsigned char>(line[end])));
+      int version_number = 0;
+      if (end != digits && bounded &&
+          std::from_chars(line.data() + digits, line.data() + end, version_number).ec ==
+              std::errc()) {
+        return version_number;
+      }
+      at = digits;
+    }
+    return 0;
   }
-  return text;
+  return 0;
 }
 
 namespace {
@@ -413,6 +427,37 @@ bool MaterializeHit(const storage::Blob& blob, const args::CompilerArgs& parsed,
   return true;
 }
 
+// `<compiler> -v` as printed, or nullopt when the probe fails.
+//
+// Spawning a process per compilation would be wasteful, so the answer is
+// memoised in the cache directory keyed by the binary's identity.
+// The memo key must change whenever the binary does, or a compiler rebuilt in
+// place is answered from the previous one's banner. Size alone does not catch
+// that: relinking a compiler after a source change routinely lands on the
+// same byte count, and the stale banner then decides the cache key for every
+// compilation the new binary performs. mtime is safe to use here even though
+// it is not machine-independent, because the memo is a purely local record of
+// a local probe -- what travels between machines is the banner it holds.
+std::optional<std::string> CompilerBanner(const std::string& compiler,
+                                          const std::string& real, uint64_t size,
+                                          int64_t mtime, const std::string& cache_dir) {
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("compiler-version-memo-v2");
+  memo_key.UpdateDelimited(real);
+  memo_key.UpdateU64(size);
+  memo_key.UpdateU64(static_cast<uint64_t>(mtime));
+  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
+  if (auto cached = util::ReadFile(memo_path)) return cached;
+
+  util::ProcResult probe = util::Run({compiler, "-v"},
+                                     {.capture_stdout = true, .capture_stderr = true});
+  // gcc and clang both print the version banner on stderr.
+  std::string banner = probe.stderr_data + probe.stdout_data;
+  if (probe.exit_code != 0 || banner.empty()) return std::nullopt;
+  util::WriteFileAtomic(memo_path, banner);
+  return banner;
+}
+
 }  // namespace
 
 CompilerId ResolveCompilerId(const std::string& compiler,
@@ -432,6 +477,12 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   // Set on every path below, including the ones that never read a banner.
   id.is_clang = LooksLikeClang("", real);
+
+  // Every mode reads the version, which decides what the compiler can be asked
+  // to do; only `version` hashes the banner.
+  const std::optional<std::string> banner =
+      CompilerBanner(compiler, real, info.size, info.mtime, cache_dir);
+  if (banner) id.absent_deps_version = AbsentDepsVersion(*banner);
 
   if (check_mode == "mtime") {
     hash::Hasher hasher;
@@ -454,41 +505,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 
   // Default: hash `<compiler> -v`, which reports version, target triple and
   // configure flags. Machine-independent, so entries are shareable via S3.
-  //
-  // Spawning a process per compilation would be wasteful, so the answer is
-  // memoised in the cache directory keyed by the binary's identity.
-  // The memo key must change whenever the binary does, or a compiler rebuilt in
-  // place is answered from the previous one's banner. Size alone does not catch
-  // that: relinking a compiler after a source change routinely lands on the
-  // same byte count, and the stale banner then decides the cache key for every
-  // compilation the new binary performs. mtime is safe to use here even though
-  // it is not machine-independent, because the memo is a purely local record of
-  // a local probe -- what travels between machines is the banner it holds.
-  hash::Hasher memo_key;
-  memo_key.UpdateDelimited("compiler-version-memo-v2");
-  memo_key.UpdateDelimited(real);
-  memo_key.UpdateU64(info.size);
-  memo_key.UpdateU64(static_cast<uint64_t>(info.mtime));
-  const std::string memo_path = cache_dir + "/compilers/" + memo_key.Hex();
-
-  if (auto cached = util::ReadFile(memo_path)) {
-    id.is_clang = LooksLikeClang(*cached, real);
-    // The memo is keyed by the local path, so it holds the banner as printed.
-    // Canonicalise on use rather than on store, so the same memo stays correct
-    // if the root mapping changes.
-    id.fingerprint = hash::HashString(roots.CanonicalizeText(
-        BannerWithoutAbsentDepsMark(*cached, &id.absent_deps_version)));
-    id.description = util::Split(*cached, '\n', /*skip_empty=*/true).empty()
-                         ? real
-                         : util::Split(*cached, '\n', true).back();
-    return id;
-  }
-
-  util::ProcResult probe = util::Run({compiler, "-v"},
-                                     {.capture_stdout = true, .capture_stderr = true});
-  // gcc and clang both print the version banner on stderr.
-  std::string banner = probe.stderr_data + probe.stdout_data;
-  if (probe.exit_code != 0 || banner.empty()) {
+  if (!banner) {
     // Fall back to identity by content rather than giving up on caching.
     hash::Hasher hasher;
     if (hasher.UpdateFile(real)) {
@@ -501,11 +518,12 @@ CompilerId ResolveCompilerId(const std::string& compiler,
     return id;
   }
 
-  util::WriteFileAtomic(memo_path, banner);
-  id.is_clang = LooksLikeClang(banner, real);
-  id.fingerprint = hash::HashString(roots.CanonicalizeText(
-      BannerWithoutAbsentDepsMark(banner, &id.absent_deps_version)));
-  const auto lines = util::Split(banner, '\n', /*skip_empty=*/true);
+  id.is_clang = LooksLikeClang(*banner, real);
+  // The memo is keyed by the local path, so it holds the banner as printed.
+  // Canonicalise on use rather than on store, so the same memo stays correct
+  // if the root mapping changes.
+  id.fingerprint = hash::HashString(roots.CanonicalizeText(*banner));
+  const auto lines = util::Split(*banner, '\n', /*skip_empty=*/true);
   id.description = lines.empty() ? real : lines.back();
   return id;
 }
@@ -513,7 +531,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v2";
+constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v3";
 constexpr std::string_view kManifestHeader = "vcache-depmanifest-2";
 
 // One remembered state: the files a scan read, and where its answer is stored.

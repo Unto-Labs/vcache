@@ -29,15 +29,13 @@ struct CompilerId {
   // The version the banner's `absent-deps-<n>` token announces, 0 without one.
   // The devtools gcc and clang carry that local patch: `-fabsent-deps=` writes
   // the paths the compile looked for and did not find. Its objects are the
-  // stock compiler's, so the token stays out of the fingerprint and the two
-  // share entries.
+  // stock compiler's but its dependency output is not (it names the PCH a
+  // compile read), so the token stays in the fingerprint.
   int absent_deps_version = 0;
 };
 
-// `banner` without its `absent-deps-<n>` token, whose version is stored in
-// `*absent_deps_version` (0 when there is none).
-std::string BannerWithoutAbsentDepsMark(std::string_view banner,
-                                        int* absent_deps_version);
+// The version of `banner`'s `absent-deps-<n>` token, 0 when there is none.
+int AbsentDepsVersion(std::string_view banner);
 
 // `check_mode` is one of "version" (default), "content" or "mtime":
 //   version -- hash `<compiler> -v` output. Stable across machines, so it is

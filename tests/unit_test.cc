@@ -3,6 +3,7 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -32,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <filesystem>
 #include <memory>
@@ -268,6 +270,85 @@ void TestLinkTraceClassification() {
   Check(core::ParseTraceLog(log, {}, "/", &second), "second trace parses");
   Check(second.absent.empty(), "a path later found is not left in the absent set");
   Check(second.inputs.size() == 1, "and is recorded as an input");
+
+  // Loaded objects and files written only are their own kinds in the log, and
+  // the link cache keeps both as inputs, as it did before they were told apart.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\tmap.txt\n");
+  core::TraceRecords records;
+  Check(core::ReadTraceRecords(log, "/home/u/proj", &records), "the kinds parse");
+  Check(records.loaded.size() == 1 && records.loaded[0] == "/usr/lib64/libbfd.so" &&
+            records.written.size() == 1 && records.written[0] == "/home/u/proj/map.txt" &&
+            records.reads.empty(),
+        "a loaded object and a file written only are kept apart from reads, made absolute");
+  core::LinkTrace kinds;
+  Check(core::ParseTraceLog(log, {}, "/home/u/proj", &kinds), "the kinds parse for a link");
+  CheckEq(util::Join(kinds.inputs, " "), "/home/u/proj/map.txt /usr/lib64/libbfd.so",
+          "a link keeps both as inputs");
+  Check(!core::TraceMarkedIncomplete(log), "a trace with no marker is not incomplete");
+  util::WriteFileAtomic(log + ".incomplete", "");
+  Check(core::TraceMarkedIncomplete(log), "the marker beside it makes it incomplete");
+  util::RemoveFile(log + ".incomplete");
+
+  // Only a shared object ld.so would load into this binary is preloaded. ELF
+  // only: on macOS the tracer is never used, and libc is a Mach-O dylib.
+#ifdef __linux__
+  Dl_info libc_info{};
+  const bool found_libc =
+      ::dladdr(::dlsym(RTLD_DEFAULT, "getpid"), &libc_info) != 0 && libc_info.dli_fname;
+  Check(found_libc && core::TracerLoadsHere(libc_info.dli_fname),
+        "a shared object this binary loaded can be preloaded");
+  Check(!core::TracerLoadsHere(dir + "/missing.so"), "a missing tracer cannot");
+  util::WriteFileAtomic(dir + "/text.so", "not an ELF file at all\n");
+  Check(!core::TracerLoadsHere(dir + "/text.so"), "nor can a file that is not ELF");
+  if (found_libc) {
+    const std::string elf = util::ReadFile(libc_info.dli_fname).value_or("");
+    std::string other_class = elf.substr(0, 64);
+    other_class[4] = other_class[4] == 1 ? 2 : 1;
+    util::WriteFileAtomic(dir + "/class.so", other_class);
+    Check(!core::TracerLoadsHere(dir + "/class.so"), "nor one of the other ELF class");
+    std::string executable = elf.substr(0, 64);
+    executable[16] = 2;  // ET_EXEC
+    util::WriteFileAtomic(dir + "/exec.so", executable);
+    Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
+  }
+#endif
+
+  // ld.so's refusals are taken out of a traced compile's stderr, span by span.
+  bool refused = false;
+  const std::string other_refusal =
+      "ERROR: ld.so: object '/b/wrap.so' from LD_PRELOAD cannot be preloaded "
+      "(cannot open shared object file): ignored.\n";
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:1: warning: x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS64): ignored.\n" + other_refusal +
+                  "last",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal + "last",
+          "a refusal of the tracer goes; another object's and the compiler's lines stay");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals("a.c:1: warning: x\n" + other_refusal,
+                                       "/v/vcache-fstrace.so", &refused),
+          "a.c:1: warning: x\n" + other_refusal,
+          "stderr with no refusal of the tracer is untouched");
+  Check(!refused, "and reports none");
+  // Another process wrote the refusal into the middle of a diagnostic.
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:3:5: error: ERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS32 (x)): ignored.\n'f' undeclared\n",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:3:5: error: 'f' undeclared\n",
+          "a refusal inside a diagnostic goes, and the diagnostic stays whole");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals(
+              "x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD cannot be "
+              "preloaded: ignored.\ny",
+              "/v/vcache-fstrace.so", &refused),
+          "x\ny", "an older glibc's refusal, with no reason, goes too");
+  Check(core::TracerPathPreloadable("/opt/vcache/bin/vcache-fstrace.so"),
+        "a tracer path without a space or colon is preloadable");
+  Check(!core::TracerPathPreloadable("/home/J Smith/bin/vcache-fstrace.so") &&
+            !core::TracerPathPreloadable("/opt/a:b/vcache-fstrace.so"),
+        "one ld.so would split at a space or colon is not");
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
@@ -1186,6 +1267,73 @@ void TestBlob() {
     Check(!storage::DeserializeBlob(flipped, &ignored),
           "flipping one body byte is rejected");
   }
+}
+
+// Builds an entry by hand, so a test can carry a section kind this build does
+// not know, under a valid checksum.
+std::string EncodeBlobBody(const std::string& body) {
+  std::string out = "VCACHE02" + hash::HashString(body);
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>(body.size() >> (8 * i)));
+  return out + body;
+}
+
+std::string EncodeSection(uint8_t kind, const std::string& payload) {
+  std::string out(1, static_cast<char>(kind));
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>(payload.size() >> (8 * i)));
+  return out + payload;
+}
+
+void TestBlobSidecars() {
+  Section("storage::Blob sidecar files");
+
+  const std::string digest(hash::kDigestHexLen, 'a');
+  storage::Blob blob;
+  blob.files.push_back(storage::BlobFile{"demo.d", "demo.d: lib.rs\n"});
+  blob.sidecar_files.push_back(storage::BlobSidecarFile{"libdemo.rlib", digest, false});
+  blob.sidecar_files.push_back(storage::BlobSidecarFile{"demo", hash::HashString("x"), true});
+  storage::Blob decoded;
+  Check(storage::DeserializeBlob(storage::SerializeBlob(blob), &decoded),
+        "an entry with sidecar files round-trips");
+  Check(decoded.files.size() == 1 && decoded.sidecar_files.size() == 2,
+        "inline and sidecar files stay apart");
+  Check(decoded.sidecar_files.size() == 2 && decoded.sidecar_files[0].name == "libdemo.rlib" &&
+            decoded.sidecar_files[0].digest == digest && !decoded.sidecar_files[0].executable &&
+            decoded.sidecar_files[1].name == "demo" &&
+            decoded.sidecar_files[1].digest == hash::HashString("x") &&
+            decoded.sidecar_files[1].executable,
+        "a sidecar keeps its name, digest and execute bit");
+
+  // The reader fails closed on its own format: a digest it cannot use would
+  // otherwise name a file that can never verify.
+  std::string short_digest_payload;
+  for (int i = 0; i < 8; ++i) short_digest_payload.push_back(i == 0 ? 1 : 0);
+  short_digest_payload += "x";
+  short_digest_payload.push_back(0);
+  short_digest_payload += "abc";
+  storage::Blob rejected;
+  Check(!storage::DeserializeBlob(EncodeBlobBody(EncodeSection(7, short_digest_payload)),
+                                  &rejected),
+        "a sidecar section with a short digest is rejected");
+  std::string upper_digest_payload = short_digest_payload.substr(0, 10) +
+                                     std::string(hash::kDigestHexLen, 'A');
+  Check(!storage::DeserializeBlob(EncodeBlobBody(EncodeSection(7, upper_digest_payload)),
+                                  &rejected),
+        "a sidecar section whose digest is not lowercase hex is rejected");
+
+  // Kinds a reader does not know are still skipped, which is what older
+  // entries rely on and what kept older readers from failing on this one.
+  std::string file_payload;
+  for (int i = 0; i < 8; ++i) file_payload.push_back(i == 0 ? 6 : 0);
+  file_payload += "a.rlib";
+  file_payload.push_back(0);
+  file_payload += "rlib bytes";
+  const std::string with_unknown = EncodeBlobBody(EncodeSection(99, "from a newer vcache") +
+                                                  EncodeSection(5, file_payload));
+  storage::Blob skipped;
+  Check(storage::DeserializeBlob(with_unknown, &skipped), "an unknown section kind is skipped");
+  Check(skipped.files.size() == 1 && skipped.files[0].name == "a.rlib" &&
+            skipped.files[0].contents == "rlib bytes" && skipped.sidecar_files.empty(),
+        "and the sections around it still read");
 }
 
 // An in-memory layer, so the chain's fan-out and backfill rules can be checked
@@ -4341,6 +4489,122 @@ void TestDiskTrimPins() {
   }
 }
 
+// Sidecar files sit in the shards beside entries and are evicted with them,
+// so storing one has to run the same growth check an entry does. It must not
+// sweep scratch dirs: a sidecar is stored before its compile has placed the
+// outputs, while the stage dir holds the only copy.
+void TestDiskStorageFiles() {
+  Section("storage::DiskStorage files");
+
+  const std::string payload(40 * 1024, 's');
+  const std::string digest = hash::HashString(payload);
+  const std::string shard = digest.substr(0, 2);
+  const std::string other_shard = shard == "00" ? "01" : "00";
+
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    storage::DiskStorage disk(tmp.path() + "/cache", 1 << 20, false);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "PutFile stores a file");
+    const std::string stored = tmp.path() + "/cache/" + shard + "/" + digest + ".rustout";
+    Check(util::ReadFile(stored) == std::optional<std::string>(payload),
+          "at <dir>/<digest[0:2]>/<digest>.<suffix>, byte for byte");
+    Check(util::FileExists(source), "and leaves the source in place");
+
+    Age(stored, 3600);
+    const auto aged = util::FileMtime(stored);
+    const auto got = disk.GetFile(digest, "rustout");
+    Check(got == std::optional<std::string>(stored), "GetFile names the stored file");
+    Check(aged && util::FileMtime(stored) && *util::FileMtime(stored) > *aged,
+          "and refreshes its mtime");
+    Check(!disk.GetFile(hash::HashString("absent"), "rustout"), "GetFile of an absent file is nullopt");
+    Check(!disk.failed(), "and an absent file is not an error");
+    Check(!disk.GetFile(digest, "linkout"), "the suffix is part of the name");
+    Check(!disk.GetFile("../../etc/passwd", "rustout"), "GetFile refuses a non-digest");
+
+    util::WriteFileAtomic(stored, std::string(payload.size(), 't'));
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "PutFile over an existing file succeeds");
+    Check(util::ReadFile(stored) == std::optional<std::string>(payload),
+          "and replaces a torn copy with the source bytes");
+
+    Check(disk.PutFile(hash::HashString("gone"), "rustout", tmp.path() + "/no-such-file") ==
+              storage::DiskStorage::PutFileStatus::kSourceMissing,
+          "a missing source is reported as such");
+    Check(!disk.failed(), "and is not a storage error");
+    Check(disk.PutFile("not-a-digest", "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kFailed,
+          "PutFile refuses a non-digest");
+
+    disk.RemoveFile(digest, "rustout");
+    Check(!util::FileExists(stored), "RemoveFile removes the stored file");
+  }
+
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    const std::string cache = tmp.path() + "/cache";
+    util::MakeDirs(cache + "/" + shard);
+    util::WriteFileAtomic(cache + "/" + shard + "/" + digest + ".rustout", "earlier");
+    storage::DiskStorage disk(cache, 1 << 20, /*read_only=*/true);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kReadOnly,
+          "a read-only store refuses PutFile");
+    Check(util::ReadFile(cache + "/" + shard + "/" + digest + ".rustout") ==
+              std::optional<std::string>("earlier"),
+          "and writes nothing");
+    Check(disk.GetFile(digest, "rustout").has_value(), "a read-only store still serves a file");
+    disk.RemoveFile(digest, "rustout");
+    Check(util::FileExists(cache + "/" + shard + "/" + digest + ".rustout"),
+          "and never removes one");
+  }
+
+  // 64 KiB budget, so a 40 KiB file crosses its shard's quarter-KiB share.
+  // An older 40 KiB entry in another shard puts the store over the limit.
+  const auto make_crossing_store = [&](const std::string& cache) {
+    const std::string old_key = KeyIn(other_shard, "0ld");
+    util::MakeDirs(cache + "/" + other_shard);
+    util::WriteFileAtomic(EntryPath(cache, old_key), payload);
+    Age(EntryPath(cache, old_key), 3600);
+    util::MakeDirs(cache + "/tmp/vcache-rs-orphan");
+    Age(cache + "/tmp/vcache-rs-orphan", 7 * 3600);
+    return EntryPath(cache, old_key);
+  };
+  {
+    TempCacheDir tmp;
+    const std::string source = tmp.path() + "/staged.rlib";
+    util::WriteFileAtomic(source, payload);
+    const std::string cache = tmp.path() + "/cache";
+    const std::string old_entry = make_crossing_store(cache);
+    storage::DiskStorage disk(cache, 64 * 1024, false);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "a sidecar that crosses its shard's budget is stored");
+    Check(!util::FileExists(old_entry), "and runs the eviction check, which evicts the older entry");
+    Check(util::IsDirectory(cache + "/tmp/vcache-rs-orphan"), "but sweeps no scratch dir");
+
+    const std::string second_old = make_crossing_store(cache);
+    Check(disk.PutFile(digest, "rustout", source) ==
+              storage::DiskStorage::PutFileStatus::kStored,
+          "storing the same sidecar again succeeds");
+    Check(util::FileExists(second_old), "and, since the shard did not grow, evicts nothing");
+  }
+  {
+    TempCacheDir tmp;
+    const std::string cache = tmp.path() + "/cache";
+    const std::string old_entry = make_crossing_store(cache);
+    storage::DiskStorage disk(cache, 64 * 1024, false);
+    Check(disk.Put(digest, payload), "the control: an entry that crosses is stored");
+    Check(!util::FileExists(old_entry), "evicts the older entry");
+    Check(!util::IsDirectory(cache + "/tmp/vcache-rs-orphan"), "and sweeps the scratch dir");
+  }
+}
+
 void TestDiskStorageEviction() {
   Section("disk storage: global eviction");
 
@@ -4766,6 +5030,18 @@ void TestCloneFile() {
   Check(::stat(nested.c_str(), &st) == 0 &&
             (st.st_mode & 07777) == vcache::util::DefaultFileMode(),
         "the clone gets the umask's default mode, not mkstemp's 0600");
+
+  const std::string beside = *dir + "/held/artifact";
+  const auto temp = vcache::util::CloneToTempBeside(from, beside);
+  Check(temp.has_value() && vcache::util::DirName(*temp) == *dir + "/held" &&
+            vcache::util::BaseName(*temp).starts_with(".vcache-tmp-"),
+        "CloneToTempBeside returns a private temp beside the destination");
+  Check(temp && vcache::util::ReadFile(*temp) == std::optional<std::string>("cached output"),
+        "holding the source bytes");
+  Check(!vcache::util::FileExists(beside), "and does not publish the destination");
+  errno = 0;
+  Check(!vcache::util::CloneToTempBeside(*dir + "/absent", beside) && errno == ENOENT,
+        "a missing source fails with ENOENT");
 }
 
 void TestPchArgs() {
@@ -5348,6 +5624,209 @@ void TestFileDigestMemo() {
   Check(util::FileExists(young_memo), "trim keeps a memo younger than 30 days");
 }
 
+void TestCxxManifestTrace() {
+  Section("core::cxx manifest trace");
+
+  auto scratch = util::MakeTempDir("vcache-cxx-trace-");
+  Check(scratch.has_value(), "cxx trace scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  // macOS's TMPDIR ends in '/', and a path with a doubled separator is not one
+  // a root, or the trace, would ever spell.
+  const std::string dir = core::WithoutDotSegments(*scratch);
+
+  // The compiler's own trees, from the executables that ran, wherever they are.
+  const std::string gcc14_trees =
+      "/opt/gcc-14/lib/clang /opt/gcc-14/lib/gcc /opt/gcc-14/lib32/gcc /opt/gcc-14/lib64/gcc "
+      "/opt/gcc-14/libexec/gcc /opt/gcc-14/libx32/gcc";
+  CheckEq(util::Join(core::CompilerInstallDirs(
+                         {"/opt/gcc-14/bin/g++",
+                          "/opt/gcc-14/libexec/gcc/x86_64-linux-gnu/14/cc1plus"}),
+                     " "),
+          gcc14_trees, "a bin/ or libexec/ executable names the trees under the prefix above it");
+  CheckEq(util::Join(core::CompilerInstallDirs({"/opt/gcc-14/clang"}), " "), gcc14_trees,
+          "an executable outside bin/ names the trees under its own directory");
+  const std::vector<std::string> usr_trees = core::CompilerInstallDirs({"/usr/bin/gcc"});
+  Check(std::find(usr_trees.begin(), usr_trees.end(), "/usr/lib/gcc") != usr_trees.end() &&
+            std::none_of(usr_trees.begin(), usr_trees.end(),
+                         [](const std::string& tree) { return tree == "/usr"; }),
+        "a compiler in /usr gives /usr/lib/gcc, never /usr itself");
+
+  CheckEq(util::Join(core::SearchPathDirs("/usr/bin::rel:/home/u/bin/"), " "),
+          "/usr/bin /home/u/bin", "PATH loses empty and relative entries");
+
+  CheckEq(core::WithoutDotSegments("/a/./b//c/./"), "/a/b/c", ". segments and doubled / go");
+  CheckEq(core::WithoutDotSegments("/a/b/../c/.d"), "/a/b/../c/.d", ".. and dot names stay");
+
+  // What is noise.
+  core::CxxTraceFilter filter;
+  filter.scratch_dir = dir + "/scratch";
+  filter.tracer = "/opt/vc/vcache-fstrace.so";
+  filter.keyed_pchs = {"/home/u/proj/h.h.gch"};
+  filter.compiler_files = {"/usr/bin/g++", "/lib64/libc.so.6"};
+  filter.compiler_dirs = {"/usr/lib/gcc", "/usr/libexec/gcc"};
+  filter.include_dirs = {"/usr/lib/gcc/x/16/include", "/usr/include", "/home/u/proj/inc"};
+  filter.search_path_dirs = {"/home/u/bin", "/home/u/proj/tools"};
+  filter.search_path_names = {"g++", "as"};
+  Check(core::IsCxxTraceNoise("/proc/self/exe", filter), "/proc is noise, as for a link");
+  Check(core::IsCxxTraceNoise("/opt/vc/vcache-fstrace.so", filter), "the tracer is noise");
+  Check(core::IsCxxTraceNoise(dir + "/scratch/out", filter), "the scratch directory is noise");
+  Check(core::IsCxxTraceNoise("/home/u/proj/h.h.gch", filter), "a keyed PCH is noise");
+  Check(core::IsCxxTraceNoise("/usr/bin/g++", filter) &&
+            core::IsCxxTraceNoise("/lib64/libc.so.6", filter),
+        "the executables that ran and the objects they loaded are noise");
+  Check(core::IsCxxTraceNoise("/usr/libexec/gcc/x/16/cc1plus", filter) &&
+            core::IsCxxTraceNoise("/usr/bin/../lib/gcc/x/16/specs", filter),
+        "the compiler's trees are noise, through .. too");
+  Check(!core::IsCxxTraceNoise("/usr/include/stdio.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/local/include/zz.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gcc/x/16/include/stddef.h", filter),
+        "the system headers are not, nor is the compiler's own include directory");
+  Check(!core::IsCxxTraceNoise("/home/u/proj/inc/a.h", filter) &&
+            !core::IsCxxTraceNoise("/usr/lib/gccx/a.h", filter) &&
+            !core::IsCxxTraceNoise("/etc/clang/x.cfg", filter),
+        "a project header, a sibling with a longer name and a driver config are not");
+
+  // Selection from the records.
+  core::TraceRecords records;
+  records.tools = {"/usr/bin/g++"};
+  records.loaded = {"/opt/lib/libmpc.so.3"};
+  records.written = {"/home/u/proj/./log.txt"};
+  records.reads = {"/home/u/proj/./inc/a.h", "/home/u/proj/inc/a.h", "/usr/libexec/gcc/x/cc1",
+                   "/home/u/proj/tmp.s", "/home/u/proj/second/h.h", "/home/u/proj/inc/x.h"};
+  records.absent = {"/home/u/proj/first/h.h", "/home/u/proj/./first//h.h.gch",
+                    "/home/u/proj/tmp.s", "/home/u/bin/g++", "/home/u/proj/tools/cfg.h",
+                    "/home/u/proj/tools/as", "/usr/lib/gcc/x/16/plugin",
+                    "/home/u/proj/build/../inc/x.h", "/home/u/proj/a/../b.h"};
+  const core::CxxTraceInputs selected = core::SelectCxxTraceInputs(records, filter);
+  CheckEq(util::Join(selected.reads, " "),
+          "/home/u/proj/inc/a.h /home/u/proj/inc/x.h /home/u/proj/second/h.h /home/u/proj/tmp.s",
+          "reads lose the noise and . segments, once each; executables, loaded objects "
+          "and files written only are not reads");
+  CheckEq(util::Join(selected.absent, " "),
+          "/home/u/proj/a/../b.h /home/u/proj/build/../inc/x.h /home/u/proj/first/h.h "
+          "/home/u/proj/first/h.h.gch /home/u/proj/tools/cfg.h",
+          "absent paths lose the noise, what was later read as spelled, and the driver's "
+          "search for its tools along PATH; a header probed in a PATH directory stays");
+  CheckEq(util::Join(selected.written, " "), "/home/u/proj/log.txt",
+          "files written only are kept apart");
+  Check(std::binary_search(selected.all_reads.begin(), selected.all_reads.end(),
+                           "/usr/libexec/gcc/x/cc1"),
+        "every read is evidence that a process was traced, noise included");
+
+  // A compiler process that did not load the tracer read nothing in the trace.
+  const core::RootMap roots = MakeRoots({dir + "/proj=proj"});
+  core::CxxTraceInputs seen;
+  seen.all_reads = {dir + "/proj/a.cc", dir + "/proj/inc/a.h"};
+  Check(!core::FindUntracedFile({{"/vcache/proj/./a.cc", "d"}, {"/vcache/proj/inc/a.h", "d"}},
+                                roots, seen)
+             .has_value(),
+        "a depfile whose every file the trace read was traced");
+  CheckEq(core::FindUntracedFile({{"/vcache/proj/a.cc", "d"}, {"/vcache/proj/b.h", "d"}}, roots,
+                                 seen)
+              .value_or(""),
+          dir + "/proj/b.h", "a file the trace never read is named, localised");
+
+  // Which process ran the preprocessor.
+  Check(core::IsCompilerFrontEnd("/usr/libexec/gcc/x86_64-linux-gnu/13/cc1") &&
+            core::IsCompilerFrontEnd("/usr/lib/gcc/x/13/cc1plus") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang") &&
+            core::IsCompilerFrontEnd("/usr/bin/clang++") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang-18") &&
+            core::IsCompilerFrontEnd("/opt/bin/clang++-18.1"),
+        "cc1, cc1plus and clang under its versioned names are front ends");
+  Check(!core::IsCompilerFrontEnd("/usr/bin/ccache") && !core::IsCompilerFrontEnd("/usr/bin/gcc") &&
+            !core::IsCompilerFrontEnd("/usr/bin/as") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-tidy") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clangd") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-"),
+        "a wrapper, a driver, the assembler and clang's other tools are not");
+  core::TraceRecords wrapped;
+  wrapped.tools = {"/usr/bin/ccache", "/bin/sh"};
+  Check(!core::TraceShowsFrontEnd(wrapped), "a trace of ccache serving a hit shows no front end");
+  wrapped.tools.push_back("/usr/libexec/gcc/x/13/cc1");
+  Check(core::TraceShowsFrontEnd(wrapped), "one where cc1 ran does");
+
+  // A missing include directory the trace never saw probed.
+  util::MakeDirs(dir + "/inc-there");
+  core::TraceRecords probes;
+  probes.absent = {dir + "/./gen", dir + "/inc-there/x.h"};
+  Check(!core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen/"}, probes).has_value(),
+        "an existing include directory, and a missing one the trace saw probed, pass");
+  CheckEq(core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen", dir + "/later"}, probes)
+              .value_or(""),
+          dir + "/later", "a missing include directory no process probed is named");
+
+  // Recording the selection beside a depfile's files.
+  util::MakeDirs(dir + "/proj/inc");
+  util::MakeDirs(dir + "/out");
+  util::WriteFileAtomic(dir + "/proj/a.cc", "int a;\n");
+  util::WriteFileAtomic(dir + "/proj/opt.h", "#pragma once\n");
+  util::WriteFileAtomic(dir + "/proj/stamp.h", "const char* t = __TIME__;\n");
+  const std::string memo_dir = dir + "/memo";
+  const int64_t later_ns = (static_cast<int64_t>(std::time(nullptr)) + 60) * 1'000'000'000;
+  const auto add = [&](std::vector<std::string> reads, std::vector<std::string> absent,
+                       std::vector<std::string> written, int64_t started_ns,
+                       const core::RootMap& with_roots) {
+    core::RecordedInputs recorded;
+    recorded.files = {{with_roots.Canonicalize(dir + "/proj/a.cc"), hash::HashString("int a;\n")}};
+    core::CxxTraceInputs trace;
+    trace.reads = std::move(reads);
+    trace.absent = std::move(absent);
+    trace.written = std::move(written);
+    core::AddCxxTraceInputs(trace, with_roots, dir + "/proj", started_ns, memo_dir, &recorded);
+    return recorded;
+  };
+  const core::RecordedInputs added =
+      add({dir + "/proj/a.cc", dir + "/proj/inc", dir + "/proj/opt.h", dir + "/proj/stamp.h"},
+          {dir + "/proj/first/bits/c.h", dir + "/proj/first/h.h", dir + "/proj/first/../h2.h",
+           dir + "/proj/inc/none.h", "/opt/rh"},
+          {}, later_ns, roots);
+  Check(added.declined.empty(), "a trace's extras are recorded");
+  Check(added.files.size() == 3 && added.files[1].first == "/vcache/proj/opt.h" &&
+            added.files[1].second == hash::HashString("#pragma once\n") &&
+            added.files[2].first == "/vcache/proj/stamp.h",
+        "a file the depfile named is not added twice, a directory not at all, and a time "
+        "macro in one the preprocessor did not read declines nothing");
+  CheckEq(util::Join(added.absent, " "),
+          "/opt/rh /vcache/proj/first /vcache/proj/first/../h2.h /vcache/proj/inc/none.h",
+          "absent paths are canonical and sorted, each the highest missing directory above "
+          "it, except through ..");
+  const core::RootMap out_root = MakeRoots({dir + "/proj=proj", dir + "/no-out/gen=gen"});
+  CheckEq(
+      util::Join(add({}, {dir + "/no-out/gen/include/h.h"}, {}, later_ns, out_root).absent, " "),
+      "/vcache/gen", "the walk stops at a root that does not exist yet, below a missing parent");
+  const core::RootMap nested_root = MakeRoots({dir + "/proj/no-a/sub=sub"});
+  CheckEq(util::Join(add({}, {dir + "/proj/no-a/sub/x/h.h"}, {}, later_ns, nested_root).absent,
+                     " "),
+          "/vcache/sub", "and at one inside the working directory");
+  const core::RecordedInputs gone =
+      add({dir + "/proj/gone.h"}, {dir + "/proj/x.h"}, {}, later_ns, roots);
+  Check(!gone.declined.empty() && gone.files.empty() && gone.absent.empty(),
+        "a file the compile read that is gone declines the state");
+  Check(!add({"/tmp/ccAbCdEf.h"}, {}, {}, later_ns, roots).declined.empty(),
+        "in the temporary directory too, unless the trace wrote it");
+  Check(add({dir + "/proj/ccAbCdEf.s"}, {}, {dir + "/proj/ccAbCdEf.s"}, later_ns, roots)
+            .declined.empty(),
+        "an intermediate the compile wrote and read and then removed declines nothing");
+  Check(!add({dir + "/proj/opt.h"}, {}, {}, 0, roots).declined.empty(),
+        "a file changed after the compile started declines the state");
+  Check(!add({"/dev/zero"}, {}, {}, later_ns, roots).declined.empty(),
+        "a device the compile read declines the state");
+
+  // A lookup checks each absent path is still absent.
+  Check(!core::FindAppearedPath({"/vcache/proj/first/h.h"}, roots).has_value(),
+        "an absent path that is still absent passes");
+  util::MakeDirs(dir + "/proj/first");
+  util::WriteFileAtomic(dir + "/proj/first/h.h", "#define V 1\n");
+  CheckEq(core::FindAppearedPath({"/vcache/proj/nothing.h", "/vcache/proj/first/h.h"}, roots)
+              .value_or(""),
+          dir + "/proj/first/h.h exists now", "one that exists now is named, localised");
+}
+
 void TestCxxManifest() {
   Section("core::cxx manifest");
 
@@ -5368,11 +5847,41 @@ void TestCxxManifest() {
   std::vector<core::CxxManifestState> rejected;
   Check(!core::ParseCxxManifest("vcache-depmanifest-2\nentry " + key_a + "\n", &rejected),
         "a dep-scan manifest is not read as a C/C++ manifest");
-  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\nstate abc\n", &rejected),
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate abc\n", &rejected),
         "a state with a short key is rejected");
   rejected.clear();
-  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\n" + digest + " /a.h\n", &rejected),
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\n" + digest + " /a.h\n", &rejected),
         "a file line before any state is rejected");
+
+  // Absent paths.
+  const std::vector<core::CxxManifestState> with_absent = {
+      {key_a, {{"/vcache/proj/src/a.cc", digest}},
+       {"/vcache/proj/first/a.h", "/vcache/proj/with space/a.h.gch"}},
+      {key_b, {}, {"/opt/rh"}},
+  };
+  const std::string rendered_absent = core::RenderCxxManifest(with_absent);
+  Check(rendered_absent.find("\nabsent /vcache/proj/first/a.h\n") != std::string::npos,
+        "an absent path renders as its own line kind");
+  std::vector<core::CxxManifestState> parsed_absent;
+  Check(core::ParseCxxManifest(rendered_absent, &parsed_absent) && parsed_absent.size() == 2 &&
+            parsed_absent[0].files == with_absent[0].files &&
+            parsed_absent[0].absent == with_absent[0].absent &&
+            parsed_absent[1].absent == with_absent[1].absent,
+        "and reads back into its own state, a path with a space included");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nabsent /a.h\n", &rejected),
+        "an absent line before any state is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate " + key_a + "\nabsent \n",
+                                &rejected),
+        "an absent line with no path is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-2\nstate " + key_a + "\nabsent a.h\n",
+                                &rejected),
+        "an absent line with a relative path is rejected");
+  rejected.clear();
+  Check(!core::ParseCxxManifest("vcache-cxxmanifest-1\nstate " + key_a + "\n", &rejected),
+        "a manifest from before absent paths is not read: its states never checked any");
 
   // Key arguments.
   const core::RootMap no_roots = MakeRoots({});
@@ -5626,9 +6135,12 @@ void TestRustOutputNames() {
   util::WriteFileAtomic(*scratch + "/outside-target", "out");
   Check(::symlink((*scratch + "/outside-target").c_str(), (cap + "/link").c_str()) == 0,
         "a symlink out of the capture directory can be planted");
+  constexpr uint64_t kNoSidecars = std::numeric_limits<uint64_t>::max();
   std::vector<storage::BlobFile> captured;
+  std::vector<storage::BlobSidecarFile> sidecars;
   std::string unparsed_dep_info;
-  Check(!rust::CaptureOutputs(cap, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(cap, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a name that escapes the output directory fails");
 
   const std::string inner = *scratch + "/inner";
@@ -5637,8 +6149,75 @@ void TestRustOutputNames() {
   Check(::symlink("lib.rlib", (inner + "/alias.rlib").c_str()) == 0,
         "a symlink inside the capture directory can be planted");
   captured.clear();
-  Check(!rust::CaptureOutputs(inner, roots, {}, &captured, &unparsed_dep_info),
+  Check(!rust::CaptureOutputs(inner, roots, {}, kNoSidecars, &captured, &sidecars,
+                              &unparsed_dep_info),
         "capturing a symlink that stays inside the directory fails too");
+
+  // A large output is left where rustc wrote it, by name; the .d is read and
+  // rewritten whatever its size.
+  const std::string sized = *scratch + "/sized";
+  util::MakeDirs(sized);
+  util::WriteFileAtomic(sized + "/libbig.rlib", std::string(64, 'r'));
+  util::WriteFileAtomic(sized + "/small.rmeta", std::string(8, 'm'));
+  util::WriteFileAtomic(sized + "/big.d", "big.d: " + std::string(80, 'x') + ".rs\n");
+  ::chmod((sized + "/libbig.rlib").c_str(), 0755);
+  captured.clear();
+  sidecars.clear();
+  Check(rust::CaptureOutputs(sized, roots, {}, 64, &captured, &sidecars, &unparsed_dep_info),
+        "a capture with a sidecar threshold succeeds");
+  Check(sidecars.size() == 1 && sidecars[0].name == "libbig.rlib" && sidecars[0].digest.empty() &&
+            sidecars[0].executable,
+        "a file at the threshold is a sidecar, with its execute bit and no digest yet");
+  std::vector<std::string> inline_names;
+  for (const storage::BlobFile& file : captured) inline_names.push_back(file.name);
+  std::sort(inline_names.begin(), inline_names.end());
+  Check(inline_names == std::vector<std::string>{"big.d", "small.rmeta"},
+        "a smaller file and a .d above the threshold stay inline");
+}
+
+// Large outputs are hashed and searched for leaked local paths in one read.
+// A path that straddles two reads must still be found, or a leaked OUT_DIR
+// lands in another checkout's build.
+void TestHashAndScanFile() {
+  Section("rust::HashAndScanFile");
+  auto scratch = util::MakeTempDir("vcache-rust-scan-");
+  Check(scratch.has_value(), "scan scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const std::string local = "/home/someone/target/debug/build/x-1/out";
+  std::string bytes(4096, '\0');
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(i * 7);
+  const std::string clean = *scratch + "/clean.rlib";
+  util::WriteFileAtomic(clean, bytes);
+  // 16-byte reads: the path starts 5 bytes before a read boundary.
+  std::string leaky = bytes;
+  leaky.replace(16 * 100 - 5, local.size(), local);
+  const std::string straddling = *scratch + "/straddling.rlib";
+  util::WriteFileAtomic(straddling, leaky);
+
+  const auto scanned = rust::HashAndScanFile(clean, {"/elsewhere", local}, 16);
+  Check(scanned.has_value() && !scanned->found_pattern, "a clean file has no pattern");
+  Check(scanned && scanned->digest == hash::HashFile(clean) && scanned->size == bytes.size(),
+        "and hashes as HashFile does");
+  const auto found = rust::HashAndScanFile(straddling, {"/elsewhere", local}, 16);
+  Check(found && found->found_pattern == std::optional<size_t>(1),
+        "a path split across two reads is found");
+  const auto found_large_reads = rust::HashAndScanFile(straddling, {local});
+  Check(found_large_reads && found_large_reads->found_pattern == std::optional<size_t>(0),
+        "and found with the default read size");
+  Check(found && found->digest == hash::HashFile(straddling),
+        "a file with a pattern is still hashed whole");
+  Check(!rust::HashAndScanFile(*scratch + "/absent", {local}, 16), "a missing file fails");
+#if defined(__linux__)
+  // procfs reports size 0 for a file with bytes: a read that does not match the
+  // size it started from fails closed.
+  Check(!rust::HashAndScanFile("/proc/self/status", {local}, 16),
+        "a file whose size differs from what it held fails closed");
+#endif
 }
 
 void TestUploadGeneration() {
@@ -6364,6 +6943,7 @@ int main(int argc, char** argv) {
   TestPreprocessedNormalization();
   TestPreprocessedHashSlicing();
   TestBlob();
+  TestBlobSidecars();
   TestCacheChain();
   TestCacheChainRemote();
   TestDaemonProtocol();
@@ -6398,6 +6978,7 @@ int main(int argc, char** argv) {
   // disk cache does on every Put -- primes the cache in the parent, the child
   // inherits it, and the strict-umask assertion fails.
   TestDiskStorageEviction();
+  TestDiskStorageFiles();
   TestDiskTrimPins();
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
@@ -6417,7 +6998,9 @@ int main(int argc, char** argv) {
   TestRustcFingerprint();
   TestFileDigestMemo();
   TestCxxManifest();
+  TestCxxManifestTrace();
   TestRustOutputNames();
+  TestHashAndScanFile();
   TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();

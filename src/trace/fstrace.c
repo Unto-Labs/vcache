@@ -1,14 +1,22 @@
 /* SPDX-FileCopyrightText: 2026 Unto Labs
  * SPDX-License-Identifier: Apache-2.0
  *
- * LD_PRELOAD file-access tracer for link steps.
+ * LD_PRELOAD file-access tracer for link steps, and for the C/C++ compiles a
+ * manifest state is recorded from.
  *
  * A link has no -E equivalent, so the only way to learn its true input set is
- * to watch it. This records both halves of the dependency question:
+ * to watch it. A compile has a depfile, which names what it read but not what
+ * the preprocessor looked for and did not find. This records both halves of
+ * the dependency question:
  *
  *   R  a path that was opened or stat'd successfully -- its CONTENT is an input
  *   M  a path probed and not found (ENOENT)         -- its ABSENCE is an input
  *   P  an executable that ran                       -- part of the toolchain
+ *   L  a shared object a process that ran loaded    -- part of the toolchain
+ *   W  a path opened for writing only               -- an output; a C/C++
+ *                                                       manifest drops it, the
+ *                                                       link cache keeps it as
+ *                                                       an input all the same
  *   D  a directory that was listed
  *
  * The second is the half a "record what was read" manifest cannot express, and
@@ -123,6 +131,18 @@ static void emit_result(const char *path, int failed, int saved_errno) {
   if (saved_errno == ENOENT) emit('M', path);
 }
 
+/* An open that cannot read says nothing about the file's content as an input.
+   Read-write opens stay R: the process may read what it finds. */
+static void emit_open_result(const char *path, int failed, int saved_errno,
+                             int written_only) {
+  if (!failed && written_only) { emit('W', path); return; }
+  emit_result(path, failed, saved_errno);
+}
+
+static int fopen_mode_written_only(const char *mode) {
+  return mode != NULL && (mode[0] == 'w' || mode[0] == 'a') && strchr(mode, '+') == NULL;
+}
+
 /* Resolve a relative openat path against its directory descriptor. Treating it
    as cwd-relative records a different file and can omit the real input. */
 static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) {
@@ -147,11 +167,14 @@ static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) 
 }
 
 static void emit_at_result(int dirfd, const char *path, int failed,
-                           int saved_errno) {
+                           int saved_errno, int written_only) {
   if (failed && saved_errno != ENOENT) return;
+  /* fstatat(fd, "", AT_EMPTY_PATH) and statx alike ask about an open
+     descriptor, not a path: nothing was looked up. */
+  if (path == NULL || *path == '\0') return;
   char resolved[VCACHE_RECORD_MAX];
   if (resolve_at_path(dirfd, path, resolved, sizeof resolved)) {
-    emit_result(resolved, failed, saved_errno);
+    emit_open_result(resolved, failed, saved_errno, written_only);
   } else {
     mark_incomplete();
   }
@@ -195,8 +218,10 @@ static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
   /* Dependencies are loaded before interposition is active. Include every
      other already-loaded DSO: for the common linkers the implementation is a
      shared library -- ld.bfd's logic lives in libbfd, lld's in libLLVM -- and
-     libz/libzstd emit output bytes directly for compressed debug sections. */
-  emit('R', info->dlpi_name);
+     libz/libzstd emit output bytes directly for compressed debug sections.
+     Its own kind, so a reader that keys the toolchain another way can tell
+     these apart from the files the process opened. */
+  emit('L', info->dlpi_name);
   return 0;
 }
 
@@ -212,7 +237,7 @@ int open(const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open)(path, flags, m);
   int saved = errno;
-  emit_result(path, r < 0, saved);
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -222,7 +247,7 @@ int open64(const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(open64)(path, flags, m);
   int saved = errno;
-  emit_result(path, r < 0, saved);
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -232,7 +257,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(openat)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved);
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -242,7 +267,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
   int r = NEXT(openat64)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved);
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -250,7 +275,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 FILE *fopen(const char *path, const char *mode) {
   FILE *r = NEXT(fopen)(path, mode);
   int saved = errno;
-  emit_result(path, r == NULL, saved);
+  emit_open_result(path, r == NULL, saved, fopen_mode_written_only(mode));
   errno = saved;
   return r;
 }
@@ -258,7 +283,7 @@ FILE *fopen(const char *path, const char *mode) {
 FILE *fopen64(const char *path, const char *mode) {
   FILE *r = NEXT(fopen64)(path, mode);
   int saved = errno;
-  emit_result(path, r == NULL, saved);
+  emit_open_result(path, r == NULL, saved, fopen_mode_written_only(mode));
   errno = saved;
   return r;
 }
@@ -279,6 +304,156 @@ int lstat(const char *path, struct stat *st) {
   return r;
 }
 
+/* The stat family under every name a compiler can reach it by. Before glibc
+   2.33 stat, lstat and fstatat were inline wrappers around __xstat, __lxstat
+   and __fxstatat, so a compiler built against an older glibc -- most prebuilt
+   and long-term-support toolchains -- calls only those, and the 64-bit forms
+   where it was built with large-file support. gcc and clang find a missing -I
+   directory with exactly one stat, so a hook missing here loses the absent
+   path that would invalidate a hit once the directory is created. */
+int stat64(const char *path, struct stat64 *st) {
+  int r = NEXT(stat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int lstat64(const char *path, struct stat64 *st) {
+  int r = NEXT(lstat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+  int r = NEXT(fstatat64)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* Declared by no current header; the versioned entry points old binaries
+   link against. glibc 2.33 and later keep them only as compatibility symbols,
+   which an unversioned dlsym may not return; the stat call each one wraps is
+   then the same call, since _STAT_VER is the native layout on every 64-bit
+   Linux target. */
+int __xstat(int ver, const char *path, struct stat *st);
+int __lxstat(int ver, const char *path, struct stat *st);
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags);
+int __xstat64(int ver, const char *path, struct stat64 *st);
+int __lxstat64(int ver, const char *path, struct stat64 *st);
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags);
+
+int __xstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__xstat) ? NEXT(__xstat)(ver, path, st) : NEXT(stat)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__lxstat) ? NEXT(__lxstat)(ver, path, st) : NEXT(lstat)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+  int r = NEXT(__fxstatat) ? NEXT(__fxstatat)(ver, dirfd, path, st, flags)
+                           : NEXT(fstatat)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+int __xstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__xstat64) ? NEXT(__xstat64)(ver, path, st) : NEXT(stat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__lxstat64) ? NEXT(__lxstat64)(ver, path, st) : NEXT(lstat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags) {
+  int r = NEXT(__fxstatat64) ? NEXT(__fxstatat64)(ver, dirfd, path, st, flags)
+                             : NEXT(fstatat64)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* statx is what newer libstdc++ and LLVM reach for. Forward-declared, so the
+   hook builds against a glibc whose headers predate it (2.28) too. */
+struct statx;
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st) {
+  int r = NEXT(statx)(dirfd, path, flags, mask, st);
+  int saved = errno;
+  emit_at_result(dirfd, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+/* What open and openat become under _FORTIFY_SOURCE with a mode-less call. */
+int __open_2(const char *path, int flags);
+int __open64_2(const char *path, int flags);
+int __openat_2(int dirfd, const char *path, int flags);
+int __openat64_2(int dirfd, const char *path, int flags);
+
+int __open_2(const char *path, int flags) {
+  int r = NEXT(__open_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __open64_2(const char *path, int flags) {
+  int r = NEXT(__open64_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat_2(int dirfd, const char *path, int flags) {
+  int r = NEXT(__openat_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat64_2(int dirfd, const char *path, int flags) {
+  int r = NEXT(__openat64_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int euidaccess(const char *path, int mode) {
+  int r = NEXT(euidaccess)(path, mode);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
 int access(const char *path, int mode) {
   int r = NEXT(access)(path, mode);
   int saved = errno;
@@ -290,7 +465,7 @@ int access(const char *path, int mode) {
 int faccessat(int dirfd, const char *path, int mode, int flags) {
   int r = NEXT(faccessat)(dirfd, path, mode, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved);
+  emit_at_result(dirfd, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }
@@ -298,7 +473,7 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
   int r = NEXT(fstatat)(dirfd, path, st, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved);
+  emit_at_result(dirfd, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }

@@ -39,6 +39,12 @@ std::optional<std::string> FindStaleManifestFile(const std::vector<ManifestFile>
                                                  const RootMap& roots,
                                                  const std::string& memo_dir = {});
 
+// Returns nullopt while every path, at its localised spelling, is still absent;
+// otherwise says which one exists now or cannot be shown absent. One lstat per
+// path: absence is ENOENT, the only failure the tracer records as one.
+std::optional<std::string> FindAppearedPath(const std::vector<std::string>& absent_paths,
+                                            const RootMap& roots);
+
 // "<hex digest> <canonical path>". The digest comes first so a path containing
 // spaces still parses by taking the rest of the line.
 std::string RenderManifestFile(const ManifestFile& file);

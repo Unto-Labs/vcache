@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/link_trace.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 
 #include "util/fs.h"
 #include "util/str.h"
@@ -49,11 +55,125 @@ bool IsIgnoredPath(const std::string& path) {
   return false;
 }
 
+bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out) {
+  auto text = util::ReadFile(log_path);
+  if (!text) return false;
+  for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
+    // A malformed line is a missing dependency record. Partial traces cannot
+    // be trusted: skipping one can turn a required input into a false hit.
+    if (line.size() < 3 || line[1] != '\t') return false;
+    const char kind = line[0];
+    std::string path = line.substr(2);
+    if (path[0] != '/') path = cwd + "/" + path;
+    switch (kind) {
+      case 'R': out->reads.push_back(std::move(path)); break;
+      case 'M': out->absent.push_back(std::move(path)); break;
+      case 'P': out->tools.push_back(std::move(path)); break;
+      case 'L': out->loaded.push_back(std::move(path)); break;
+      case 'W': out->written.push_back(std::move(path)); break;
+      case 'D': break;  // listings are covered by the paths probed within them
+      default: return false;
+    }
+  }
+  return true;
+}
+
+bool TraceMarkedIncomplete(const std::string& log_path) {
+  struct stat st;
+  return ::stat((log_path + ".incomplete").c_str(), &st) == 0;
+}
+
+std::string TracerPath() {
+  const char* override_path = std::getenv("VCACHE_TRACER");
+  if (override_path != nullptr && *override_path != '\0') return override_path;
+  auto self = util::SelfPath();
+  if (!self) return "";
+  return util::DirName(*self) + "/vcache-fstrace.so";
+}
+
+bool TracerLoadsHere(const std::string& tracer) {
+  // e_ident's class and data bytes, e_type and e_machine all sit in the first
+  // 20 bytes, at the same offsets in both classes.
+  const auto header = [](const std::string& path) -> std::optional<std::string> {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::nullopt;
+    std::string bytes(20, '\0');
+    const ssize_t got = ::read(fd, bytes.data(), bytes.size());
+    ::close(fd);
+    if (got != static_cast<ssize_t>(bytes.size()) || bytes.compare(0, 4, "\x7f" "ELF") != 0) {
+      return std::nullopt;
+    }
+    return bytes;
+  };
+  const std::optional<std::string> self = util::SelfPath();
+  if (!self) return false;
+  const std::optional<std::string> ours = header(*self);
+  const std::optional<std::string> theirs = header(tracer);
+  if (!ours || !theirs) return false;
+  constexpr char kSharedObjectType = 3;  // ET_DYN
+  const bool little_endian = (*theirs)[5] == 1;
+  const char type = (*theirs)[little_endian ? 16 : 17];
+  return (*ours)[4] == (*theirs)[4] && (*ours)[5] == (*theirs)[5] &&
+         ours->compare(18, 2, *theirs, 18, 2) == 0 && type == kSharedObjectType;
+}
+
+bool TracerPathPreloadable(const std::string& tracer) {
+  return tracer.find_first_of(" :") == std::string::npos;
+}
+
+std::string WithoutPreloadRefusals(const std::string& stderr_text, const std::string& tracer,
+                                   bool* removed) {
+  // ld.so writes "ERROR: ld.so: object '<path>' from LD_PRELOAD cannot be
+  // preloaded (<why>): ignored.\n" in one write, but another process of the
+  // tree can write between the pieces of a diagnostic it is printing, so only
+  // that span goes, never the rest of the line it landed in. Older glibc omits
+  // " (<why>)".
+  static constexpr std::string_view kLead = "ERROR: ld.so: object ";
+  static constexpr std::string_view kEnd = ": ignored.";
+  const std::string core = "'" + tracer + "' " + std::string(kPreloadIgnoredMessage);
+  *removed = false;
+  std::string kept;
+  kept.reserve(stderr_text.size());
+  size_t from = 0;
+  while (true) {
+    const size_t found = stderr_text.find(core, from);
+    if (found == std::string::npos) break;
+    size_t begin = found;
+    if (begin >= kLead.size() &&
+        stderr_text.compare(begin - kLead.size(), kLead.size(), kLead) == 0) {
+      begin -= kLead.size();
+    }
+    size_t after = found + core.size();
+    if (stderr_text.compare(after, 2, " (") == 0) {
+      // The reason may hold parentheses of its own; it ends at "): ignored.".
+      const size_t close = stderr_text.find(")" + std::string(kEnd), after);
+      const size_t newline = stderr_text.find('\n', after);
+      if (close != std::string::npos && (newline == std::string::npos || close < newline)) {
+        after = close + 1;
+      }
+    }
+    if (stderr_text.compare(after, kEnd.size(), kEnd) == 0) {
+      after += kEnd.size();
+      if (after < stderr_text.size() && stderr_text[after] == '\n') ++after;
+    } else {
+      // Not the shape ld.so writes: drop through to the end of the line, as
+      // nothing after it can be told apart from the refusal.
+      const size_t newline = stderr_text.find('\n', after);
+      after = newline == std::string::npos ? stderr_text.size() : newline + 1;
+    }
+    kept.append(stderr_text, from, begin - from);
+    *removed = true;
+    from = after;
+  }
+  kept.append(stderr_text, from, std::string::npos);
+  return kept;
+}
+
 bool ParseTraceLog(const std::string& log_path,
                    const std::vector<std::string>& outputs,
                    const std::string& cwd, LinkTrace* out) {
-  auto text = util::ReadFile(log_path);
-  if (!text) return false;
+  TraceRecords records;
+  if (!ReadTraceRecords(log_path, cwd, &records)) return false;
 
   std::vector<std::string> abs_outputs;
   abs_outputs.reserve(outputs.size());
@@ -66,26 +186,23 @@ bool ParseTraceLog(const std::string& log_path,
            abs_outputs.end();
   };
 
+  // A linker's own implementation is a shared library -- ld.bfd's logic lives
+  // in libbfd, lld's in libLLVM -- so what the processes loaded is an input.
+  // A file written is kept as one too, as it was before the tracer told the
+  // two apart: an intermediate is gone by the time it would be hashed.
   std::vector<std::string> reads, absent, tools;
-  for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
-    // A malformed line is a missing dependency record. Partial traces cannot
-    // be trusted: skipping one can turn a required input into a false hit.
-    if (line.size() < 3 || line[1] != '\t') return false;
-    const char kind = line[0];
-    std::string path = line.substr(2);
-    if (path.empty()) continue;
-    path = util::AbsoluteLexical(path[0] == '/' ? path : cwd + "/" + path);
-    if (IsIgnoredPath(path)) continue;
-    if (is_output(path)) continue;
-
-    switch (kind) {
-      case 'R': reads.push_back(std::move(path)); break;
-      case 'M': absent.push_back(std::move(path)); break;
-      case 'P': tools.push_back(std::move(path)); break;
-      case 'D': break;  // listings are covered by the paths probed within them
-      default: return false;
+  const auto keep = [&](const std::vector<std::string>& from, std::vector<std::string>* to) {
+    for (const std::string& raw : from) {
+      std::string path = util::AbsoluteLexical(raw);
+      if (IsIgnoredPath(path) || is_output(path)) continue;
+      to->push_back(std::move(path));
     }
-  }
+  };
+  keep(records.reads, &reads);
+  keep(records.loaded, &reads);
+  keep(records.written, &reads);
+  keep(records.absent, &absent);
+  keep(records.tools, &tools);
 
   const auto sort_unique = [](std::vector<std::string>* v) {
     std::sort(v->begin(), v->end());

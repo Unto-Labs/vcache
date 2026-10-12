@@ -307,14 +307,19 @@ on (it is off by default) a C or C++ lookup first checks a manifest, as
 ccache's depend mode does. It is keyed on the
 source, the whole command line (`-I` and `-D` included), the compiler, the
 roots and any precompiled header the command names, and each state in it lists
-the files an earlier compile's depfile named, with their digests, and the key
-that compile stored under. When every file of a state still hashes the same,
-that key is looked up and the preprocessor never runs. The key is the ordinary
-preprocessor key, so trees with the manifest on and off share entries. A miss
-records its state from the compile's own `-MD` output, which vcache requests
-when the build did not. The trade is exactness: a depfile names the headers a
-compile read, not the paths it probed, so a header created later earlier on the
-include path is not seen and a stale object can be served. See
+the files an earlier compile read, with their digests, the paths it probed and
+did not find, and the key that compile stored under. When every file of a state
+still hashes the same and every one of those paths is still absent, that key is
+looked up and the preprocessor never runs. The key is the ordinary preprocessor
+key, so trees with the manifest on and off share entries. A miss records its
+state from the compile's own `-MD` output, which vcache requests when the build
+did not, and on Linux from a trace of the compile through `vcache-fstrace.so`,
+which sees what the preprocessor looked for and did not find. The trade is
+exactness where the trace is not available (another platform, no tracer, a
+compiler process that does not load it): a depfile names the headers a compile
+read, not the paths it probed, so a header created later earlier on the include
+path is not seen and a stale object can be served. Even traced, a header created
+inside the compiler's own trees outside its include directories is not seen. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

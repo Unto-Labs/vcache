@@ -253,9 +253,12 @@ list they are left to the compiler fingerprint, as ccache leaves them. A listed
 path that exists when the state is recorded is a fault in the compiler: a state
 holding it would never be served, and the list cannot be trusted to be whole,
 so no state is recorded, and the log says `the compiler listed <path> as absent
-but it exists`. A compile that writes no list records no state either. A state
-holds the same kinds of inputs whichever way it was recorded, so the manifest
-format and its key version are unchanged.
+but it exists`. So does a path whose absence `lstat` cannot show (an error
+other than `ENOENT` or `ENOTDIR`), which a lookup would never take as absent
+(`... but it cannot be shown absent`). A trailing carriage return on a line is
+dropped. A compile that writes no list records no state either. A state holds
+the same kinds of inputs whichever way it was recorded, so the manifest format
+and its key version are unchanged.
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off

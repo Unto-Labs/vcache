@@ -5765,6 +5765,16 @@ void TestCxxAbsentList() {
   Check(!link_error, "dangling symlink created");
   CheckEq(core::ParseCxxAbsentList("dangling.h\n", proj).existing_path.value_or(""),
           proj + "/dangling.h", "and a dangling symlink, which a lookup's lstat would see");
+
+  const core::CxxAbsentList crlf = core::ParseCxxAbsentList("first/h.h\r\n\r\n", proj);
+  CheckEq(util::Join(crlf.paths, " "), proj + "/first/h.h",
+          "a trailing carriage return is dropped, and a line of only one is empty");
+  const std::string too_long = "inc/" + std::string(300, 'x') + ".h";
+  CheckEq(core::ParseCxxAbsentList(too_long + "\n", proj).existing_path.value_or(""),
+          proj + "/" + too_long,
+          "a path lstat cannot show absent (ENAMETOOLONG) is reported like one that exists");
+  Check(!core::ParseCxxAbsentList("inc/h.h/x.h\n", proj).existing_path.has_value(),
+        "a path through a file (ENOTDIR) is absent");
 }
 
 void TestCxxManifest() {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/compile.h"
 
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -1299,7 +1300,10 @@ std::optional<CxxTraceInputs> ReadCxxAbsentList(const std::string& list_path,
   }
   CxxAbsentList list = ParseCxxAbsentList(*text, cwd);
   if (list.existing_path) {
-    *declined = "the compiler listed " + *list.existing_path + " as absent but it exists";
+    struct stat st;
+    *declined = "the compiler listed " + *list.existing_path + " as absent but it " +
+                (::lstat(list.existing_path->c_str(), &st) == 0 ? "exists"
+                                                                : "cannot be shown absent");
     return std::nullopt;
   }
   CxxTraceFilter filter;

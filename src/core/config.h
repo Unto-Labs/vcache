@@ -182,10 +182,11 @@ struct Config {
   // comes from the depfile alone.
   bool cxx_manifest_trace = true;
 
-  // Record a C or C++ manifest state from the compiler's own list of the paths
-  // it probed and did not find, when its banner says it writes one
-  // (`absent-deps-1`, the devtools gcc and clang patch), instead of tracing it.
-  // Off, such a compiler is traced like any other.
+  // Where the compile has no tracer, record a C or C++ manifest state from the
+  // compiler's own list of the paths it probed and did not find, when its
+  // banner says it writes one (`absent-deps-1`, the devtools gcc and clang
+  // patch). The trace comes first either way. Off, a compile without a tracer
+  // records from the depfile alone.
   bool cxx_manifest_absent_deps = true;
 
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache

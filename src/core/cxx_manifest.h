@@ -212,12 +212,14 @@ void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const 
 struct CxxAbsentList {
   // Absolute, spelled as WithoutDotSegments gives them, sorted.
   std::vector<std::string> paths;
-  // A listed path that exists, as listed. A state holding it would never be
-  // served, and the list it came from cannot be trusted to be whole.
+  // A listed path that exists, or whose absence lstat cannot show, as listed.
+  // A state holding it would never be served, and a list naming a path that
+  // exists cannot be trusted to be whole.
   std::optional<std::string> existing_path;
 };
 
-// Parses `text`, skipping empty lines, and lstats every path.
+// Parses `text`, skipping empty lines and dropping a trailing carriage return,
+// and lstats every path.
 CxxAbsentList ParseCxxAbsentList(const std::string& text, const std::string& cwd);
 
 // The directories a compiler searches for <...> includes with no -I given, as

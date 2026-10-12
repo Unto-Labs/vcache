@@ -3,6 +3,7 @@
 #include "args/compiler_args.h"
 
 #include <algorithm>
+#include <cctype>
 #include <string_view>
 #include <unordered_set>
 

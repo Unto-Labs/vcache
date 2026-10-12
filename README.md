@@ -317,7 +317,9 @@ sees what the preprocessor looked for and did not find: a header created
 earlier on the include path misses, except inside the compiler's own trees
 outside its include directories, and except where the trace is not available
 (no tracer, another platform, a compiler process that does not load it), when
-the state comes from the depfile alone and that hole stays open. See
+the state comes from the depfile alone and that hole stays open. There, a gcc
+or clang built with the devtools absent-deps patch is asked to list those paths
+itself (`-fabsent-deps=`) instead. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

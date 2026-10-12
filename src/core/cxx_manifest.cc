@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -552,6 +553,25 @@ CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceF
     selected.absent.push_back(std::move(path));
   }
   return selected;
+}
+
+CxxAbsentList ParseCxxAbsentList(const std::string& text, const std::string& cwd) {
+  CxxAbsentList list;
+  for (std::string line : util::Split(text, '\n', /*skip_empty=*/true)) {
+    if (line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    const std::string path = CxxAbsolutePath(cwd, line);
+    struct stat st;
+    // A lookup takes any error but these as "not shown absent", so a state
+    // holding such a path would never be served.
+    if (!list.existing_path &&
+        (::lstat(path.c_str(), &st) == 0 || (errno != ENOENT && errno != ENOTDIR))) {
+      list.existing_path = path;
+    }
+    list.paths.push_back(WithoutDotSegments(path));
+  }
+  list.paths = Sorted(std::move(list.paths));
+  return list;
 }
 
 std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& files,

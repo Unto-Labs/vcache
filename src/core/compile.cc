@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/compile.h"
 
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -143,12 +144,15 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
 //
 // `add_md` asks for a depfile the caller did not: the C/C++ manifest records
 // the files a compile read from it. -MD writes the file beside the object and
-// changes nothing in the object itself.
+// changes nothing in the object itself. A non-empty `absent_list_path` asks a
+// compiler with the absent-deps patch to write there the paths it looked for
+// and did not find, which the manifest records too.
 std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
                                              const RootMap& roots,
                                              const std::string& output,
                                              const std::string& depfile,
-                                             bool add_md = false) {
+                                             bool add_md = false,
+                                             const std::string& absent_list_path = "") {
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
   for (const std::string& arg : parsed.base_args) cmd.push_back(arg);
@@ -177,6 +181,7 @@ std::vector<std::string> BuildCompileCommand(const args::CompilerArgs& parsed,
       cmd.push_back(parsed.output);
     }
   }
+  if (!absent_list_path.empty()) cmd.push_back("-fabsent-deps=" + absent_list_path);
   cmd.push_back("-o");
   cmd.push_back(output);
   cmd.push_back(parsed.source);
@@ -1127,35 +1132,35 @@ std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
   return dirs;
 }
 
-// The tracer to run the recording compile under, or empty, after logging why,
-// when the state is to come from the depfile alone.
-std::string CxxManifestTracer(const Config& config) {
+// The tracer to run the recording compile under, or empty, after logging why
+// and that the state is to come from `fallback` instead.
+std::string CxxManifestTracer(const Config& config, const std::string& fallback) {
 #ifdef __linux__
   if (!config.cxx_manifest_trace) {
-    VCACHE_LOG("cxx manifest: tracing is off; recording from the depfile");
+    VCACHE_LOG("cxx manifest: tracing is off; recording from " + fallback);
     return "";
   }
   const std::string tracer = TracerPath();
   if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0) {
-    VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from the depfile");
+    VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from " + fallback);
     return "";
   }
   if (!TracerLoadsHere(tracer)) {
     VCACHE_LOG("cxx manifest: '" + tracer + "' is not a shared object this binary's loader "
-               "would preload; recording from the depfile");
+               "would preload; recording from " + fallback);
     return "";
   }
   // Replacing it would change what the compile runs with, and adding to it
   // would trace a library loaded before the tracer could see it.
   const char* inherited_preload = std::getenv("LD_PRELOAD");
   if (inherited_preload != nullptr && *inherited_preload != '\0') {
-    VCACHE_LOG("cxx manifest: LD_PRELOAD is set; recording from the depfile");
+    VCACHE_LOG("cxx manifest: LD_PRELOAD is set; recording from " + fallback);
     return "";
   }
   return tracer;
 #else
   (void)config;
-  VCACHE_LOG("cxx manifest: no tracer on this platform; recording from the depfile");
+  VCACHE_LOG("cxx manifest: no tracer on this platform; recording from " + fallback);
   return "";
 #endif
 }
@@ -1222,17 +1227,118 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
   return SelectCxxTraceInputs(records, filter);
 }
 
+// The version of the absent-deps patch whose -fabsent-deps list and depfile
+// vcache knows the meaning of.
+constexpr int kKnownAbsentDepsVersion = 1;
+
+// True when clang is told to resolve relative paths against another
+// directory than the one it runs in. The relative paths in its list would then
+// be joined to the wrong directory.
+bool SetsWorkingDirectory(const args::CompilerArgs& parsed) {
+  for (const std::string& arg : parsed.argv) {
+    for (const std::string_view flag : {"-working-directory", "--working-directory"}) {
+      if (arg == flag || util::StartsWith(arg, std::string(flag) + "=")) return true;
+    }
+  }
+  return false;
+}
+
+// True when a recording compile without the tracer can ask the compiler for
+// its own list of the paths it probed and did not find. A patch version this
+// vcache does not know may mean something else by its list.
+bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id,
+                              const args::CompilerArgs& parsed) {
+  return compiler_id.absent_deps_version == kKnownAbsentDepsVersion &&
+         config.cxx_manifest_absent_deps && !SetsWorkingDirectory(parsed);
+}
+
+// Why a compiler with the absent-deps patch is not asked for its list.
+void LogAbsentListUnused(const Config& config, const CompilerId& compiler_id) {
+  if (compiler_id.absent_deps_version == 0) return;
+  if (compiler_id.absent_deps_version != kKnownAbsentDepsVersion) {
+    VCACHE_LOG("cxx manifest: the compiler reports absent-deps-" +
+               std::to_string(compiler_id.absent_deps_version) +
+               ", a version this vcache does not read; not asking for its list");
+  } else if (!config.cxx_manifest_absent_deps) {
+    VCACHE_LOG("cxx manifest: absent-deps lists are off; not asking for the compiler's list");
+  } else {
+    VCACHE_LOG("cxx manifest: -working-directory is set; not asking for the compiler's list");
+  }
+}
+
+// The driver as run and as resolved, for CompilerInstallDirs.
+std::vector<std::string> CompilerExecutables(const std::string& compiler,
+                                             const std::string& cwd) {
+  const std::optional<std::string> driver =
+      compiler.find('/') != std::string::npos
+          ? std::optional<std::string>(CxxAbsolutePath(cwd, compiler))
+          : util::FindInPath(compiler, "");
+  std::vector<std::string> executables;
+  if (!driver) return executables;
+  executables.push_back(*driver);
+  if (auto real = util::RealPath(*driver)) executables.push_back(*real);
+  return executables;
+}
+
+// The paths the compiler's -fabsent-deps list names, with what the trace
+// loses as noise dropped, or nullopt with `declined` saying why the state is
+// not to be recorded. A listed path that exists is a fault in the compiler:
+// the list cannot be trusted to be whole, and a state holding that path would
+// never be served.
+std::optional<CxxTraceInputs> ReadCxxAbsentList(const std::string& list_path,
+                                                const std::string& scratch_dir,
+                                                const std::vector<std::string>& keyed_pchs,
+                                                const args::CompilerArgs& parsed,
+                                                const CompilerId& compiler_id,
+                                                const std::string& cwd,
+                                                const std::string& cache_dir,
+                                                std::string* declined) {
+  const std::optional<std::string> text = util::ReadFile(list_path);
+  if (!text) {
+    *declined = "the compiler wrote no -fabsent-deps list";
+    return std::nullopt;
+  }
+  CxxAbsentList list = ParseCxxAbsentList(*text, cwd);
+  if (list.existing_path) {
+    struct stat st;
+    *declined = "the compiler listed " + *list.existing_path + " as absent but it " +
+                (::lstat(list.existing_path->c_str(), &st) == 0 ? "exists"
+                                                                : "cannot be shown absent");
+    return std::nullopt;
+  }
+  CxxTraceFilter filter;
+  filter.scratch_dir = scratch_dir;
+  filter.keyed_pchs = keyed_pchs;
+  // Without the include directories nothing tells the compiler's trees from
+  // the include directories inside them, so nothing is dropped as its own.
+  std::vector<std::string> include_dirs = SystemIncludeDirs(parsed, compiler_id, cache_dir);
+  if (!include_dirs.empty()) {
+    for (std::string& dir : CxxIncludeDirs(parsed, cwd)) include_dirs.push_back(std::move(dir));
+    filter.compiler_dirs = CompilerInstallDirs(CompilerExecutables(parsed.compiler, cwd));
+    filter.include_dirs = std::move(include_dirs);
+  }
+  TraceRecords records;
+  records.absent = std::move(list.paths);
+  return SelectCxxTraceInputs(records, filter);
+}
+
 // What the compile that just ran read, from the depfile it wrote and, with a
 // `trace` that shows every file the depfile names being read, from what the
-// tracer saw it open and fail to find. Declined, as RecordDepfileInputs and
-// AddCxxTraceInputs decline, and when the source is not among the files.
-// Without a usable trace, also declined under gcc when a .gch the key does not
-// cover sits where an #include could have picked it up, or when a file outside
-// the compiler's own include directories uses __has_include, since gcc's
-// depfile names neither a .gch nor a header that was only probed. The trace
-// sees both.
+// tracer saw it open and fail to find, or, with an `absent_list`, from the
+// compiler's own list of what it did not find. Declined, as
+// RecordDepfileInputs and AddCxxTraceInputs decline, and when the source is
+// not among the files. Without either, also declined under gcc when a .gch the
+// key does not cover sits where an #include could have picked it up, or when a
+// file outside the compiler's own include directories uses __has_include,
+// since gcc's depfile names neither a .gch nor a header that was only probed.
+// The trace sees both; the compiler's list sees the probes, and returns before
+// these declines. A patched compiler's depfile also names a PCH the key
+// identifies; that one is left out. Its naming a header __has_include found
+// does not stand in for a probe that found nothing, so from the depfile alone
+// the declines stay.
 RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
                                      const CxxTraceInputs* trace,
+                                     const CxxTraceInputs* absent_list,
                                      const args::CompilerArgs& parsed, const RootMap& roots,
                                      const CompilerId& compiler_id, const std::string& cwd,
                                      const std::string& cache_dir, const std::string& memo_dir,
@@ -1246,21 +1352,42 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
     inputs.declined = "the compile wrote no readable dependency file";
     return inputs;
   }
+  const auto normal = [](const std::string& path) {
+    return std::filesystem::path(path).lexically_normal().string();
+  };
+  if (compiler_id.absent_deps_version == kKnownAbsentDepsVersion && !keyed_pchs.empty()) {
+    // The key identifies a PCH in a way that holds across trees whose PCH
+    // bytes differ; hashing the bytes as well would keep the state to one tree.
+    std::vector<std::string> keyed;
+    for (const std::string& pch : keyed_pchs) keyed.push_back(normal(pch));
+    for (DepRule& rule : dep->rules) {
+      std::erase_if(rule.prerequisites, [&](const std::string& prereq) {
+        return std::find(keyed.begin(), keyed.end(), normal(CxxAbsolutePath(cwd, prereq))) !=
+               keyed.end();
+      });
+    }
+  }
   inputs = RecordDepfileInputs(*dep, cwd, roots, started_ns, scan_incbin,
                                /*find_probes=*/!compiler_id.is_clang);
   if (!inputs.declined.empty()) return inputs;
   // A state lists what it is checked against; one without the source would
   // match whatever is on disk. Compared lexically normalised, since both
   // compilers drop a leading ./ from the source they write.
-  const auto normal = [](const std::string& path) {
-    return std::filesystem::path(path).lexically_normal().string();
-  };
   const std::string source = normal(CxxAbsolutePath(cwd, parsed.source));
   if (std::none_of(inputs.files.begin(), inputs.files.end(), [&](const ManifestFile& file) {
         return normal(roots.Localize(file.first)) == source;
       })) {
     inputs.files.clear();
     inputs.declined = "the dependency file does not name the source";
+    return inputs;
+  }
+  if (absent_list != nullptr) {
+    AddCxxTraceInputs(*absent_list, roots, cwd, started_ns, memo_dir, &inputs);
+    if (inputs.declined.empty()) {
+      VCACHE_LOG("cxx manifest: recorded from the compiler's absent list: " +
+                 std::to_string(inputs.files.size()) + " files, " +
+                 std::to_string(inputs.absent.size()) + " absent paths");
+    }
     return inputs;
   }
   if (trace != nullptr) {
@@ -1608,15 +1735,30 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     manifest_depfile = tmp_depfile;
   }
 
-  const std::vector<std::string> compile_cmd = BuildCompileCommand(
-      parsed, roots, tmp_output, add_md ? manifest_depfile : tmp_depfile, add_md);
+  const bool records_manifest = !manifest_depfile.empty() && !config.read_only;
+  // The trace comes first: it also sees what the driver reads and probes on
+  // its own, which the compiler's list does not name. The list stands in for
+  // it where there is no tracer. The -E run stays untraced either way: only
+  // what the real compile opens and probes goes into a state.
+  const bool list_available = CompilerWritesAbsentList(config, compiler_id, parsed);
+  const std::string manifest_tracer =
+      records_manifest
+          ? CxxManifestTracer(config, list_available ? "the compiler's absent list"
+                                                     : "the depfile")
+          : "";
+  if (records_manifest && manifest_tracer.empty() && !list_available) {
+    LogAbsentListUnused(config, compiler_id);
+  }
+  // Like -MD, the list is vcache's own addition, in neither key.
+  const std::string absent_list_path =
+      records_manifest && manifest_tracer.empty() && list_available ? *temp_dir + "/absent"
+                                                                     : "";
+  const std::vector<std::string> compile_cmd =
+      BuildCompileCommand(parsed, roots, tmp_output, add_md ? manifest_depfile : tmp_depfile,
+                          add_md, absent_list_path);
   VCACHE_LOG("compile: " + util::Join(compile_cmd, " "));
 
   util::ProcOptions compile_options{.capture_stderr = true};
-  // The -E run stays untraced: only what the real compile opens and probes
-  // goes into a state.
-  const std::string manifest_tracer =
-      manifest_depfile.empty() || config.read_only ? "" : CxxManifestTracer(config);
   const std::string trace_log = manifest_tracer.empty() ? "" : *temp_dir + "/trace";
   if (!manifest_tracer.empty()) {
     compile_options.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
@@ -1710,10 +1852,17 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
               ? std::nullopt
               : ReadCxxManifestTrace(trace_log, manifest_tracer, *temp_dir, keyed_pchs, parsed,
                                      compiler_id, roots, cwd, cache_dir);
-      manifest_inputs = ReadCxxManifestInputs(manifest_depfile, traced ? &*traced : nullptr,
-                                              parsed, roots, compiler_id, cwd, cache_dir,
-                                              memo_dir, keyed_pchs, started_ns,
-                                              /*scan_incbin=*/derive_key);
+      const std::optional<CxxTraceInputs> absent_from_list =
+          absent_list_path.empty()
+              ? std::nullopt
+              : ReadCxxAbsentList(absent_list_path, *temp_dir, keyed_pchs, parsed, compiler_id,
+                                  cwd, cache_dir, &manifest_inputs.declined);
+      if (manifest_inputs.declined.empty()) {
+        manifest_inputs = ReadCxxManifestInputs(
+            manifest_depfile, traced ? &*traced : nullptr,
+            absent_from_list ? &*absent_from_list : nullptr, parsed, roots, compiler_id, cwd,
+            cache_dir, memo_dir, keyed_pchs, started_ns, /*scan_incbin=*/derive_key);
+      }
     }
     if (!manifest_inputs.declined.empty()) {
       VCACHE_LOG("cxx manifest: not recording: " + manifest_inputs.declined);

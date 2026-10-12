@@ -273,6 +273,10 @@ CompileCost LoadCompileCost(const std::string& cache_dir, const std::string& cos
   return ParseCostFile(*text);
 }
 
+bool CostRecordsWanted(const Config& config) {
+  return (config.daemon.single_flight || config.daemon.admission) && !config.read_only;
+}
+
 void RecordCompileCost(const std::string& cache_dir, std::string_view operation,
                        const std::string& source_path, std::string_view language,
                        const std::vector<std::string>& key_args, const RootMap& roots,

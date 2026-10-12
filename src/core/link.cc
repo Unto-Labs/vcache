@@ -406,7 +406,9 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   util::ProcResult result = util::Run(argv, opts);
   // Same rule as a compile: a link that dies is still a sample, and -flto's
   // figure is whatever wait4 reported for the largest waited-for child.
-  RecordCompileCost(cache_dir, "link", parsed.output, "", parsed.key_args, roots, result);
+  if (CostRecordsWanted(config)) {
+    RecordCompileCost(cache_dir, "link", parsed.output, "", parsed.key_args, roots, result);
+  }
 
   if (!result.stderr_data.empty()) {
     ::fputs(result.stderr_data.c_str(), stderr);

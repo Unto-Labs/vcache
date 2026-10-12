@@ -246,9 +246,10 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
                                             const std::string& manifest_key,
                                             const std::string& cache_dir,
                                             bool* media_failed, bool log_if_absent,
-                                            bool* get_failed) {
+                                            bool* get_failed, bool local_only = false) {
   std::vector<RustManifestState> states;
-  storage::GetResult got = cache->Get(manifest_key);
+  storage::GetResult got =
+      local_only ? cache->GetLocal(manifest_key) : cache->Get(manifest_key);
   const bool failed = core::ReportCacheMediaErrors(got.errors, cache_dir);
   *media_failed |= failed;
   if (get_failed != nullptr) *get_failed = failed;
@@ -272,7 +273,8 @@ void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
   core::PauseBeforeManifestPut();
   bool reread_failed = false;
   const std::vector<RustManifestState> reread =
-      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
+      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed,
+                   /*local_only=*/true);
   const std::vector<RustManifestState> states = core::MergeManifestStates(
       std::move(fresh), reread, loaded, &RustManifestState::key);
   storage::Blob blob;
@@ -641,8 +643,10 @@ int RunRustCompile(const std::vector<std::string>& argv,
     VCACHE_LOG("reserve: daemon unavailable, running unreserved");
   }
   util::ProcResult compiled = util::Run(cmd, compile_options);
-  core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
-                          compiled);
+  if (core::CostRecordsWanted(config)) {
+    core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
+                            compiled);
+  }
 
   if (compiled.exit_code != 0) {
     if (!compiled.stderr_data.empty()) {

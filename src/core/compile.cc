@@ -731,7 +731,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   fresh.result_key = result_key;
   fresh.files = std::move(files);
   PauseBeforeManifestPut();
-  storage::GetResult again = cache->Get(key);
+  storage::GetResult again = cache->GetLocal(key);
   const bool reread_failed = ReportCacheMediaErrors(again.errors, cache_dir);
   media_failed |= reread_failed;
   const std::vector<DepManifestEntry> reread = DepManifestEntries(again);
@@ -954,8 +954,10 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   util::ProcResult compiled = util::Run(compile_cmd, compile_options);
   // Recorded on a failed compile too: an OOM kill is the sample that matters
   // most, and the cost file is not the cache entry.
-  RecordCompileCost(cache_dir, "compile", parsed.source,
-                    args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
+  if (CostRecordsWanted(config)) {
+    RecordCompileCost(cache_dir, "compile", parsed.source,
+                      args::LanguageName(parsed.language), parsed.key_args, roots, compiled);
+  }
 
   if (!compiled.stderr_data.empty()) {
     ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);

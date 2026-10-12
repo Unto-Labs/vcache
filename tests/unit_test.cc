@@ -4545,6 +4545,17 @@ void TestRunRusage() {
 
 void TestCost() {
   Section("core::cost");
+  {
+    core::Config wanted;
+    Check(!core::CostRecordsWanted(wanted), "no cost records with single-flight and admission off");
+    wanted.daemon.single_flight = true;
+    Check(core::CostRecordsWanted(wanted), "single-flight wants cost records");
+    wanted.daemon.single_flight = false;
+    wanted.daemon.admission = true;
+    Check(core::CostRecordsWanted(wanted), "admission wants cost records");
+    wanted.read_only = true;
+    Check(!core::CostRecordsWanted(wanted), "a read-only client records no cost");
+  }
 
   TempCacheDir tree_a;
   TempCacheDir tree_b;

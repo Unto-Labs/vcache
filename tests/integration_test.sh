@@ -1162,6 +1162,19 @@ mkdir -p "$WORK/cost-src"
 cat > "$WORK/cost-src/t.cc" << 'EOF'
 int cost_probe() { return 1; }
 EOF
+# Cost records feed only single-flight and admission. With both off, the
+# default, a miss writes none.
+reset_cache
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "by default a miss writes no cost record" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_READONLY=1 "$VCACHE" g++ -c t.cc -o "$WORK/cost-ro.o" -DREADONLY_COST )
+check "nor does a read-only miss with admission on" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+export VCACHE_DAEMON_SINGLE_FLIGHT=1
 reset_cache
 COST_LOG="$WORK/cost.log"
 rm -f "$COST_LOG"
@@ -1288,6 +1301,7 @@ if [[ "$(uname -s)" == Linux ]]; then
 else
   skipped "link cost records are Linux-only"
 fi
+unset VCACHE_DAEMON_SINGLE_FLIGHT
 
 # --------------------------------------------------------------------------
 section "10. cache management commands"

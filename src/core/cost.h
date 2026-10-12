@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/config.h"
 #include "core/roots.h"
 #include "util/subprocess.h"
 
@@ -45,6 +46,11 @@ std::string ComputeCostKey(std::string_view operation, const std::string& source
 // Reads `<cache>/costs/<cost_key>`. A missing or unparseable file is an empty
 // record, which the next successful write replaces.
 CompileCost LoadCompileCost(const std::string& cache_dir, const std::string& cost_key);
+
+// Whether a miss records its cost at all. The records feed only the
+// scheduler -- single-flight's wait bounds and admission's estimates -- so
+// with both off, or under a read-only cache, a miss writes nothing.
+bool CostRecordsWanted(const Config& config);
 
 // Appends one observation and keeps the last eight. A failure to write is
 // logged and swallowed: losing a statistic must not fail the build. Two

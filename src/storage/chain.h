@@ -68,6 +68,13 @@ class CacheChain {
 
   GetResult Get(const std::string& key);
 
+  // As Get, but in-process it asks only the local layers and backfills
+  // nothing. A manifest store re-reads its key just before writing, to merge
+  // what a concurrent store on this machine wrote; going to S3 for that would
+  // add a round trip to every miss. A daemon chain is asked as usual: the
+  // daemon answers from its own layers.
+  GetResult GetLocal(const std::string& key);
+
   // Writes to every writable layer. Reports success if at least one took it,
   // and separately reports every layer that failed -- a store that reached
   // disk but not S3 is a success for the build and still a fault worth

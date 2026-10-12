@@ -984,6 +984,10 @@ Inspection commands:
 compiler-version memos in place: those are local records, not results another
 machine would share.
 
+Cost records are written only while `daemon.single_flight` or
+`daemon.admission` is on, and never by a read-only client, so with the
+defaults `--show-costs` has nothing to show.
+
 `--show-costs` prints one row per operation (`compile`, `rustc`, `link`) with
 the number of observations and the median and maximum of `max_rss_kb` and
 `wall_ms`, then up to ten cost keys with the largest peak and their canonical

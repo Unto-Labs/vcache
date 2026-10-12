@@ -41,6 +41,7 @@ class S3Storage : public Storage {
   bool Get(const std::string& key, std::string* value) override;
   bool Put(const std::string& key, const std::string& value) override;
   bool writable() const override { return !read_only_; }
+  bool remote() const override { return true; }
 
   // Deletes expired entries and, when a byte budget is configured, the oldest
   // entries beyond it. Unlike the disk layer this never runs inline: it costs a

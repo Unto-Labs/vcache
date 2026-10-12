@@ -5469,23 +5469,18 @@ EOF
   l=$(mf_log ad-gch3); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
   check "absent-deps-1: a .gch appearing beside it misses" \
     "$(grep -c 'rejected: .*/h\.h\.gch exists now' "$l")" "1"
-  # The depfile names that .gch, which the key does not cover. It is hashed,
-  # not scanned for time macros: every PCH holds the name __DATE__. That miss
-  # was a preprocessor hit, which records nothing, so the cache starts empty.
+  # The depfile names that .gch, which the key does not cover, and not the
+  # header it was built from. A time macro there is out of sight, so the .gch
+  # is scanned like any file the depfile names, and declines the state.
   reset_cache
-  l=$(mf_log ad-gch3b); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
-  check "absent-deps-1: a compile using an unkeyed .gch records a state" \
-    "$(grep -c "recorded from the compiler's absent list" "$l")/$(grep -c 'uses __DATE__' "$l" || true)" \
-    "1/0"
-  STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$(mf_log ad-gch4)" "$ads/gcc-ad1"
-  check "absent-deps-1: and the next compile with that .gch hits" "$(manifest_hits)" "1"
-  printf '#define V 5\n' > "$d/h.h"
+  printf '#define STAMP __TIME__\n' > "$d/h.h"
+  printf '#include "h.h"\nconst char* t = STAMP;\n' > "$d/main.c"
   ( cd "$d" && gcc -O2 -x c-header -c h.h -o h.h.gch )
-  l=$(mf_log ad-gch5); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
-  absent_plain "$d"
-  check "absent-deps-1: a rebuilt .gch and its header miss" \
-    "$(grep -cE 'rejected: .*/h\.h(\.gch)? changed' "$l")" "1"
-  check "absent-deps-1: and the object follows it" "$(same_object "$d")" "same"
+  l=$(mf_log ad-gch-time1); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: an unkeyed .gch whose header uses __TIME__ declines the state" \
+    "$(grep -cE 'not recording: .*/h\.h\.gch uses __(DATE|TIME)__' "$l")" "1"
+  l=$(mf_log ad-gch-time2); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: so the next compile is not a manifest hit" "$(manifest_hits)" "0"
 
   # This compiler's depfile names the PCH it read. One the key identifies is
   # left to the key: its bytes can differ between trees with one identity.

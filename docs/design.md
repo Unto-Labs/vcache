@@ -289,21 +289,22 @@ was modified or had its inode changed at or after the moment the compile
 started (it may not be the version the compile read; each file is read before
 it is stat'ed, so an edit between the two still shows), or whose bytes contain
 `__DATE__`, `__TIME__` or `__TIMESTAMP__`: the digest stays the same while the
-expansion changes, which only the preprocessor key would see. A `.gch` or
-`.pch` the depfile names (a patched compiler names the PCH it read) is hashed
-but not scanned: its bytes are not source, and every PCH holds the name
-`__DATE__` among its identifiers. A file that later gains such a token changes
-its digest, so the state is checked again when it is next written. The same
-tokens on the command line (`-DSTAMP=__TIME__`) keep the compile off the
-manifest altogether. A depfile that does not name the source declines the
-state, since a state with nothing to check would always match. From the depfile
-alone under a gcc without the patch, a file outside the compiler's own include
-directories (as `<compiler> -E -v` lists them, memoised under
-`<cache>/sysinc/`) whose bytes use `__has_include` declines it too: clang's
-depfile names a header `__has_include` found and no `#include` read, gcc's does
-not, and the trace sees both. For a derived key, `.incbin` declines it as well,
-since no preprocessed text was checked for it. A declined state leaves the
-entry stored under the preprocessor key as usual.
+expansion changes, which only the preprocessor key would see. That includes a
+`.gch` or `.pch` the depfile names (a patched compiler names the PCH it read)
+and the key does not identify, so such a state is declined: every PCH holds the
+name `__DATE__`, and gcc's depfile does not name the header the PCH was built
+from, whose time macros nothing else would see. A file that later gains such a
+token changes its digest, so the state is checked again when it is next
+written. The same tokens on the command line (`-DSTAMP=__TIME__`) keep the
+compile off the manifest altogether. A depfile that does not name the source
+declines the state, since a state with nothing to check would always match.
+From the depfile alone under a gcc without the patch, a file outside the
+compiler's own include directories (as `<compiler> -E -v` lists them, memoised
+under `<cache>/sysinc/`) whose bytes use `__has_include` declines it too:
+clang's depfile names a header `__has_include` found and no `#include` read,
+gcc's does not, and the trace sees both. For a derived key, `.incbin` declines
+it as well, since no preprocessed text was checked for it. A declined state
+leaves the entry stored under the preprocessor key as usual.
 
 **Absent paths.** A depfile names the files a compile read, not the paths the
 preprocessor probed and did not find. A header created earlier on the include

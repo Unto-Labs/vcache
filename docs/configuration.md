@@ -1022,9 +1022,10 @@ says why:
 - `DEPENDENCIES_OUTPUT` or `SUNPRO_DEPENDENCIES` in the environment: gcc
   writes that file from the preprocessor, which a manifest hit does not run.
 - `__DATE__`, `__TIME__` or `__TIMESTAMP__` on the command line, or in a file
-  the depfile names: the digest stays the same while the expansion does not. A
-  `.gch` or `.pch` the depfile names is not scanned: it is not source, and every
-  PCH holds the name `__DATE__`.
+  the depfile names: the digest stays the same while the expansion does not.
+  A `.gch` or `.pch` a patched compiler's depfile names, other than one the key
+  identifies, declines too: every PCH holds the name `__DATE__`, and the header
+  it was built from, whose time macros matter, is not in the depfile.
 - A file that changed after the compile started, which may not be the version
   the compile read.
 - A file the compiler read, by the trace, that is gone by the time the state

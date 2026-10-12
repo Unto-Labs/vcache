@@ -116,15 +116,11 @@ struct RecordedInputs {
   std::string declined;
 };
 
-// True for a path ending in .gch or .pch.
-bool IsPrecompiledHeaderPath(const std::string& path);
-
 // Reads every prerequisite `dep` lists, relative ones against `cwd`, and
 // returns each one's canonical path and digest. Declines when a file cannot be
 // read, uses a time macro, was modified at or after `started_ns` (it may not be
 // the version the compile read), or, with `scan_incbin`, contains `.incbin`.
-// With `find_probes`, also lists the files that use __has_include. A PCH is
-// only hashed: its bytes are not source.
+// With `find_probes`, also lists the files that use __has_include.
 RecordedInputs RecordDepfileInputs(const DepFile& dep, const std::string& cwd,
                                    const RootMap& roots, int64_t started_ns,
                                    bool scan_incbin, bool find_probes = false);

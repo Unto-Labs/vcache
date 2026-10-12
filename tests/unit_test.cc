@@ -3528,6 +3528,14 @@ void TestCompilerBannerMark() {
   const core::CompilerId memoised = core::ResolveCompilerId(patched, "version", cache_dir, roots);
   CheckEq(memoised.fingerprint, patched_id.fingerprint, "the memoised answer is the same");
   CheckEq(std::to_string(memoised.absent_deps_version), "1", "which keeps the version");
+  for (const char* mode : {"mtime", "content"}) {
+    const core::CompilerId by_mode = core::ResolveCompilerId(patched, mode, cache_dir, roots);
+    CheckEq(std::to_string(by_mode.absent_deps_version), "1",
+            std::string("the ") + mode + " check reads the version too");
+    CheckEq(std::to_string(core::ResolveCompilerId(stock, mode, cache_dir, roots)
+                               .absent_deps_version),
+            "0", std::string("and gives the stock stub none under ") + mode);
+  }
 }
 
 void TestCompilerArgs() {

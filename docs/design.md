@@ -292,6 +292,9 @@ exempt, on the same assumption about the compiler's own include directories.
 - `mtime` — canonicalised path, size and mtime only. Fastest, least safe across
   machines.
 
+`content` and `mtime` still read the memoised banner for the `absent-deps-<n>`
+version, without hashing it.
+
 `version` is the default specifically because a shared remote cache is a first-
 class use case, and mtime differs across machines for identical toolchains.
 

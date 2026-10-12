@@ -3498,6 +3498,17 @@ void TestCompilerArgs() {
     }
     Check(keyed, "the randstruct seed file is hashed into the key");
   }
+  // clang reads further options, -O and -D included, out of a --config file.
+  for (const auto& argv : {std::vector<std::string>{"clang", "--config=my.cfg", "-c", "f.c"},
+                           std::vector<std::string>{"clang", "--config", "my.cfg", "-c", "f.c"}}) {
+    auto configured = args::Parse(argv);
+    bool keyed = false;
+    for (const std::string& path : configured.key_files) {
+      if (path == "my.cfg") keyed = true;
+    }
+    Check(keyed && configured.source == "f.c",
+          "a clang --config file is hashed into the key (" + argv[1] + ")");
+  }
   bool has_mp = false, has_mmd = false;
   for (const std::string& arg : full_deps.dep_args) {
     if (arg == "-MP") has_mp = true;

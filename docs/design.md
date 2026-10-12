@@ -73,8 +73,9 @@ declines rather than guesses. `.incbin` is the case that matters in practice: it
 makes the *assembler* open a file, so neither its name nor its contents are in
 the text, and two compilations can hash identically while owing different
 objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
-profiles, plugins, the randstruct layout seed — are hashed by content instead,
-since there the flag at least names the file.
+profiles, plugins, the randstruct layout seed, and clang's `--config` file,
+which can carry `-O` or `-D` — are hashed by content instead, since there the
+flag at least names the file.
 
 A `-M`/`-MM` dependency scan has no preprocessed text, so its manifest key is
 built from what is known before the scan runs:

@@ -4534,6 +4534,35 @@ else
   skipped "header maps need clang and python3"
 fi
 
+# clang reads more options, -O and -D included, out of a --config file. Its
+# contents key both modes.
+if command -v clang >/dev/null 2>&1; then
+  mkdir -p "$WORK/ccfg"
+  printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
+    > "$WORK/ccfg/s.c"
+  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config="$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  echo '-O0' > "$WORK/ccfg/my.cfg"
+  cfgcc VCACHE_CXX_MANIFEST=0
+  echo '-O2' > "$WORK/ccfg/my.cfg"
+  cfgcc VCACHE_CXX_MANIFEST=0
+  check "preprocessor mode: editing a --config file from -O0 to -O2 misses" "$(misses)" "2"
+  ( cd "$WORK/ccfg" && clang --config="$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
+  check "and the object is the -O2 one" \
+    "$(cmp -s "$WORK/ccfg/s.o" "$WORK/ccfg/ref.o" && echo same)" "same"
+  reset_cache
+  echo '-O2' > "$WORK/ccfg/my.cfg"
+  cfgcc; cfgcc
+  check "manifest mode: a --config compile hits through the manifest" "$(manifest_hits)" "1"
+  echo '-O2 -DFOO' > "$WORK/ccfg/my.cfg"
+  cfgcc
+  check "manifest mode: adding -DFOO to the --config file misses" "$(misses)" "2"
+  check "and the object has the code -DFOO enables" \
+    "$(nm "$WORK/ccfg/s.o" 2>/dev/null | grep -c 'foo')" "1"
+else
+  skipped "--config needs clang"
+fi
+
 # A root given through a symlink localises to that spelling, while the working
 # directory is the resolved one; the state must still find its source.
 ln -s "$WORK/mf-a" "$WORK/mf-alias"

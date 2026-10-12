@@ -126,6 +126,8 @@ from what is known before the preprocessor runs:
   `COMPILER_PATH` and every `*_DEPLOYMENT_TARGET`. The preprocessor key takes
   those that are set as well, since a deployment target or SDK is stamped into
   a Mach-O object and `CCC_OVERRIDE_OPTIONS` can add `-O2` as easily as `-D`
+- the contents of an include-path argument that names a file: a clang header
+  map remaps include names on every `#include`, and no depfile names it
 - the identity of every precompiled header the command names
 
 A state lists every file the depfile of an earlier compile of that key named,

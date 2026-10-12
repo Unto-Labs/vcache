@@ -4497,6 +4497,43 @@ else
   skipped "clang is not installed"
 fi
 
+# A clang header map (-I m.hmap) remaps include names, and no depfile names it.
+if command -v clang >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$WORK/hmap/a" "$WORK/hmap/b"
+  echo 'int from_a(void) { return 1; }' > "$WORK/hmap/a/h.h"
+  echo 'int from_b(void) { return 2; }' > "$WORK/hmap/b/h.h"
+  printf '#include "h.h"\nint f(void) { return 0; }\n' > "$WORK/hmap/s.c"
+  mkhmap() {  # $1 output, $2 include name, $3 target path
+    python3 -I - "$@" << 'PY'
+import struct, sys
+out, key, target = sys.argv[1:4]
+prefix, suffix = target.rsplit('/', 1)
+strings = b'\0'
+def add(s):
+    global strings
+    off = len(strings); strings += s.encode() + b'\0'; return off
+k, p, x = add(key), add(prefix + '/'), add(suffix)
+buckets = [(0, 0, 0)] * 4
+buckets[sum(ord(c.lower()) * 13 for c in key) & 3] = (k, p, x)
+data = struct.pack('<IHHIIII', 0x686D6170, 1, 0, 24 + 12 * 4, 1, 4, len(target))
+for b in buckets: data += struct.pack('<III', *b)
+open(out, 'wb').write(data + strings)
+PY
+  }
+  hm() { ( cd "$WORK/hmap" && "$VCACHE" clang -I m.hmap -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  mkhmap "$WORK/hmap/m.hmap" h.h "$WORK/hmap/a/h.h"
+  hm; hm
+  check "a header-map compile hits through the manifest" "$(manifest_hits)" "1"
+  mkhmap "$WORK/hmap/m.hmap" h.h "$WORK/hmap/b/h.h"
+  hm
+  check "remapping the header in the map misses" "$(misses)" "2"
+  check "and the object has the newly mapped header's code" \
+    "$(nm "$WORK/hmap/s.o" 2>/dev/null | grep -c 'from_b')" "1"
+else
+  skipped "header maps need clang and python3"
+fi
+
 # A root given through a symlink localises to that spelling, while the working
 # directory is the resolved one; the state must still find its source.
 ln -s "$WORK/mf-a" "$WORK/mf-alias"

@@ -957,6 +957,19 @@ std::string ComputeCxxManifestKey(const args::CompilerArgs& parsed, const RootMa
     }
     hasher.UpdateDelimited(*digest);
   }
+  // An include-path argument that names a file is a clang header map, which
+  // remaps include names to paths. The compiler reads it on every include, yet
+  // no depfile names it, so its contents join the key.
+  for (const std::string& dir : CxxIncludeDirs(parsed, cwd)) {
+    if (!util::FileExists(dir) || util::IsDirectory(dir)) continue;
+    const std::optional<std::string> digest = hash::HashFileMemoized(dir, memo_dir);
+    if (!digest) {
+      VCACHE_LOG("cxx manifest: cannot hash header map " + dir);
+      return "";
+    }
+    hasher.UpdateDelimited("header-map");
+    hasher.UpdateDelimited(*digest);
+  }
   for (const std::string& name : config.extra_env_vars) {
     const char* value = std::getenv(name.c_str());
     hasher.UpdateDelimited(name);

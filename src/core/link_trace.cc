@@ -49,8 +49,10 @@ bool IsIgnoredPath(const std::string& path) {
 
   // Directory self-references the search-path logic produces by the dozen
   // ("/usr/lib/../lib/."). The directory itself is not an input; what was found
-  // or not found inside it is, and those are recorded separately.
-  if (util::EndsWith(path, "/.") || util::EndsWith(path, "/..")) return true;
+  // or not found inside it is, and those are recorded separately. A trailing
+  // /.. must stay: clang probes first/sub/.. before trying sub/../a.h, and a
+  // missing sub directory is what prevents that include path from winning.
+  if (util::EndsWith(path, "/.")) return true;
 
   return false;
 }

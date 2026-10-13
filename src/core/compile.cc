@@ -39,7 +39,7 @@ namespace {
 
 // Bumped whenever the key derivation or blob layout changes, so old entries are
 // ignored rather than misinterpreted.
-constexpr std::string_view kCacheKeyVersion = "vcache-key-v3";
+constexpr std::string_view kCacheKeyVersion = "vcache-key-v4";
 constexpr std::string_view kPchIdentityVersion = "vcache-pch-identity-v1";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
@@ -305,6 +305,7 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   feed(kCacheKeyVersion);
   feed(compiler_id.fingerprint);
   feed(native_target);
+  feed(parsed.assemble_only ? "assembly" : "object");
 
   // The two key inputs that are neither the source nor the flags, logged
   // because a miss caused by either is otherwise invisible: the command line

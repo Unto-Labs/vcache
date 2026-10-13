@@ -76,6 +76,12 @@ the text, and two compilations can hash identically while owing different
 objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
 profiles, plugins, the randstruct layout seed — are hashed by content instead,
 since there the flag at least names the file.
+For GCC consumers, preprocessing uses `-fpch-preprocess` so it loads the PCH
+the compile would use. The key covers each reported PCH's identity (`.sum` or
+`.vcache-key` when fresh, otherwise its bytes), including a `.gch` found by a
+plain `#include`. An unchanged header therefore cannot hide a changed PCH.
+Consumed PCHs are also checked for `.incbin`, whose external assembler input
+is not covered by the PCH's identity.
 
 A `-M`/`-MM` dependency scan has no preprocessed text, so its manifest key is
 built from what is known before the scan runs:
@@ -675,10 +681,11 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang
   (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
-  Both hit across directories because `-E` expands the header text, so the key
-  covers the header although the PCH bytes never enter it. The manifest key
-  names the PCH too (see above). gcc's `-fpch-preprocess` swaps that text for a
-  pragma naming the `.gch`, so it is declined.
+  Clang's `-E` expands the header text. GCC's internal `-E -fpch-preprocess`
+  loads the PCH and names it in a pragma; the key covers its identity or bytes.
+  GCC consumers can share across directories when their PCHs carry the same
+  fresh `.sum` or `.vcache-key`. The manifest key names explicit PCHs too.
+  Caller-supplied `-fpch-preprocess` remains declined.
 - **A PCH build is cached only at the same paths.** A build with `-x c-header`,
   `-x c++-header` or clang's `-Xclang -emit-pch` (CMake's form included) is
   keyed like any compile, from the header preprocessed with `-dD`: the PCH
@@ -706,13 +713,10 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   travels in the entry's meta, so a hit writes it too. It is written after the
   PCH, so no reader pairs a new identity with an old PCH, and every PCH build
   removes the old file first, so a failed or uncached build leaves none.
-- **How a PCH was built is not in the key of a compile that uses it.** clang
-  accepts a PCH that defines a macro the compile does not, and gcc uses a
-  `.gch` it never checks against an edited header; in both cases the expanded text describes a different
-  compilation from the one that ran. Build PCHs with the flags and headers of
-  the compiles that use them, as build systems do. A stale `.gch` stores an
-  object under the edited header's key. With an S3 tier that entry is shared
-  with every other host and stays until it expires, so clearing the local cache
-  does not remove it. clang's `-fno-validate-pch`, which removes the one check
-  that catches a stale PCH, is declined.
+- **Clang's preprocessor key still assumes a PCH matches its headers and flags.**
+  Clang can accept a PCH that defines a macro the compile does not; its expanded
+  header text can then describe a different compilation. Build Clang PCHs with
+  the flags and headers of their consumers. Its manifest key covers the PCH's
+  identity, and `-fno-validate-pch` remains declined. GCC's preprocessor key
+  covers the PCH it actually loads, even when the textual header differs.
 - **GCS** is not implemented. The `Storage` interface is where it would go.

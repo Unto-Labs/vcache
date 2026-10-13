@@ -88,7 +88,8 @@ std::string NormalizeLinemarker(const std::string& line, const RootMap& roots) {
 bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       const RootMap& roots,
                                       hash::Hasher* hasher,
-                                      bool* saw_incbin, hash::Hasher* also) {
+                                      bool* saw_incbin, hash::Hasher* also,
+                                      std::vector<std::string>* pch_paths) {
   if (saw_incbin != nullptr) *saw_incbin = false;
   const auto update = [&](std::string_view text) {
     hasher->Update(text);
@@ -133,7 +134,19 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
     }
   };
   auto feed_line = [&](std::string_view line, bool with_newline) {
-    if (!line.empty() && line[0] == '#') {
+    constexpr std::string_view kPchPragma = "#pragma GCC pch_preprocess \"";
+    if (pch_paths != nullptr && line.starts_with(kPchPragma)) {
+      if (line.size() <= kPchPragma.size() || line.back() != '"') {
+        ok = false;
+        return;
+      }
+      const std::string pch = Unescape(std::string(
+          line.substr(kPchPragma.size(), line.size() - kPchPragma.size() - 1)));
+      pch_paths->push_back(pch);
+      emit(kPchPragma);
+      emit(Escape(roots.Canonicalize(pch)));
+      emit("\"");
+    } else if (!line.empty() && line[0] == '#') {
       emit(NormalizeLinemarker(std::string(line), roots));
     } else {
       feed_plain(line);

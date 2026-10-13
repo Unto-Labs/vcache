@@ -18,6 +18,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "core/roots.h"
 #include "hash/hasher.h"
@@ -37,11 +38,14 @@ namespace vcache::core {
 // ContainsIncbin.
 // `also`, when non-null, is fed the same normalised text as `hasher`, for a
 // second digest over the same stream without a second pass over the file.
+// `pch_paths`, when non-null, collects GCC's PCH pragma paths for hashing the
+// consumed PCH identities; their spellings in the stream are canonicalised.
 bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       const RootMap& roots,
                                       hash::Hasher* hasher,
                                       bool* saw_incbin = nullptr,
-                                      hash::Hasher* also = nullptr);
+                                      hash::Hasher* also = nullptr,
+                                      std::vector<std::string>* pch_paths = nullptr);
 
 // True if `line` contains an `.incbin` directive.
 //

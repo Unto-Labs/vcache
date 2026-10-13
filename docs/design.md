@@ -43,6 +43,7 @@ Included:
 
 - a key-format version, so a change to this list invalidates old entries
 - compiler identity (see below)
+- the output kind: assembly (`-S`) or object (`-c`)
 - the sorted set of **canonical** root targets
 - codegen-affecting flags; an argument that is itself a path under a root is
   canonicalised, a path inside a longer argument is kept verbatim

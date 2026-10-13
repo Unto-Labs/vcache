@@ -280,6 +280,39 @@ check "--trim keeps a recent scratch directory" \
   "$([[ -d $VCACHE_DIR/tmp/vcache-running ]] && echo kept || echo removed)" "kept"
 
 # --------------------------------------------------------------------------
+section "1b. assembly and object output use separate entries"
+
+(
+  export VCACHE_CXX_MANIFEST=0 VCACHE_DAEMON=off
+  mkdir -p "$WORK/output-kind"
+  cd "$WORK/output-kind" || exit 1
+  printf 'int output_kind(void) { return 42; }\n' > kind.c
+  export VCACHE_ROOTS="$PWD=proj"
+  for first in -c -S; do
+    reset_cache
+    if [[ "$first" == -c ]]; then second=-S; else second=-c; fi
+    "$VCACHE" gcc -O2 "$first" kind.c -o first.out
+    "$VCACHE" gcc -O2 "$second" kind.c -o second.out
+    check "$first then $second each misses" "$(misses)" "2"
+    gcc -O2 "$second" kind.c -o expected.out
+    if cmp -s second.out expected.out; then
+      ok "$second returns the compiler's requested output kind"
+    else
+      bad "$second returns the compiler's requested output kind"
+    fi
+    "$VCACHE" gcc -O2 "$first" kind.c -o first-hit.out
+    "$VCACHE" gcc -O2 "$second" kind.c -o second-hit.out
+    check "both output kinds hit on repetition" "$(hits)" "2"
+    if cmp -s first.out first-hit.out && cmp -s expected.out second-hit.out; then
+      ok "hits preserve both output kinds"
+    else
+      bad "hits preserve both output kinds"
+    fi
+  done
+  [[ "$FAIL" == 0 ]]
+) && ok "output kind cache separation" || bad "output kind cache separation"
+
+# --------------------------------------------------------------------------
 section "2. out-of-tree builds (cwd differs, source tree does not)"
 
 reset_cache

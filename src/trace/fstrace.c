@@ -164,38 +164,65 @@ static int fopen_mode_written_only(const char *mode) {
   return mode != NULL && (mode[0] == 'w' || mode[0] == 'a') && strchr(mode, '+') == NULL;
 }
 
-/* Resolve a relative openat path against its directory descriptor. Treating it
-   as cwd-relative records a different file and can omit the real input. */
-static int resolve_at_path(int dirfd, const char *path, char *out, size_t size) {
-  if (path == NULL || *path == '\0') return 0;
-  if (*path == '/' || dirfd == AT_FDCWD) {
-    size_t n = strlen(path);
-    if (n >= size) return 0;
-    memcpy(out, path, n + 1);
-    return 1;
-  }
+/* The directory `dirfd` names, written to `out` with a trailing '/', and its
+   length; 0 when it cannot be named as a path: a descriptor that is not a
+   directory in this namespace (a socket, an anonymous inode), or a directory
+   since removed, which the kernel spells "<path> (deleted)" and which no
+   reader could find again. */
+static size_t dirfd_prefix(int dirfd, char *out, size_t size) {
   char proc_path[64];
   int pn = snprintf(proc_path, sizeof proc_path, "/proc/self/fd/%d", dirfd);
   if (pn <= 0 || (size_t)pn >= sizeof proc_path) return 0;
   long n = syscall(SYS_readlinkat, AT_FDCWD, proc_path, out, size - 1);
-  if (n <= 0 || (size_t)n >= size - 1) return 0;
+  if (n <= 0 || (size_t)n >= size - 1 || out[0] != '/') return 0;
+  static const char removed[] = " (deleted)";
   size_t used = (size_t)n;
+  if (used >= sizeof removed - 1 &&
+      memcmp(out + used - (sizeof removed - 1), removed, sizeof removed - 1) == 0) {
+    return 0;
+  }
   if (out[used - 1] != '/') out[used++] = '/';
+  return used;
+}
+
+/* `path` appended to the `used` bytes already in `out`; 0 when it does not fit. */
+static int append_path(char *out, size_t used, size_t size, const char *path) {
   size_t rest = strlen(path);
   if (used + rest >= size) return 0;
   memcpy(out + used, path, rest + 1);
   return 1;
 }
 
-static void emit_at_result(int dirfd, const char *path, int failed,
+/* The record path of a *at call. A relative path names a file in the
+   directory `dirfd` named when the call was made, so that directory is read
+   before the call: afterwards another thread may have closed and reused the
+   descriptor, or renamed the directory. Treating the path as cwd-relative
+   instead records a different file and can omit the real input. */
+struct at_path {
+  char buf[VCACHE_RECORD_MAX];
+  size_t dir_used;
+  int dir_known;
+};
+
+static void at_path_begin(struct at_path *at, int dirfd, const char *path) {
+  int saved = errno;
+  at->dir_used = 0;
+  at->dir_known = path != NULL && *path != '\0';
+  if (at->dir_known && *path != '/' && dirfd != AT_FDCWD) {
+    at->dir_used = dirfd_prefix(dirfd, at->buf, sizeof at->buf);
+    at->dir_known = at->dir_used > 0;
+  }
+  errno = saved;
+}
+
+static void emit_at_result(struct at_path *at, const char *path, int failed,
                            int saved_errno, int written_only) {
   if (failed && saved_errno != ENOENT) return;
-  char resolved[VCACHE_RECORD_MAX];
-  if (resolve_at_path(dirfd, path, resolved, sizeof resolved)) {
-    emit_open_result(resolved, failed, saved_errno, written_only);
-  } else {
+  if (!at->dir_known || !append_path(at->buf, at->dir_used, sizeof at->buf, path)) {
     mark_incomplete();
+    return;
   }
+  emit_open_result(at->buf, failed, saved_errno, written_only);
 }
 
 #define NEXT(sym)                                     \
@@ -273,9 +300,11 @@ int open64(const char *path, int flags, ...) {
 int openat(int dirfd, const char *path, int flags, ...) {
   mode_t m = 0;
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
   int r = NEXT(openat)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  emit_at_result(&at, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -283,9 +312,11 @@ int openat(int dirfd, const char *path, int flags, ...) {
 int openat64(int dirfd, const char *path, int flags, ...) {
   mode_t m = 0;
   if (flags & O_CREAT) { va_list a; va_start(a, flags); m = (mode_t)va_arg(a, int); va_end(a); }
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
   int r = NEXT(openat64)(dirfd, path, flags, m);
   int saved = errno;
-  emit_at_result(dirfd, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  emit_at_result(&at, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
@@ -331,17 +362,21 @@ int access(const char *path, int mode) {
 }
 
 int faccessat(int dirfd, const char *path, int mode, int flags) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
   int r = NEXT(faccessat)(dirfd, path, mode, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved, 0);
+  emit_at_result(&at, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }
 
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
   int r = NEXT(fstatat)(dirfd, path, st, flags);
   int saved = errno;
-  emit_at_result(dirfd, path, r != 0, saved, 0);
+  emit_at_result(&at, path, r != 0, saved, 0);
   errno = saved;
   return r;
 }

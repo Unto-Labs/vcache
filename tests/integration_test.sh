@@ -3942,6 +3942,32 @@ mkdir -p "$WORK/tracer-relative-log"
 check "a relative trace log is not written, nor its marker" \
   "$(ls -A "$WORK/tracer-relative-log" | wc -l | tr -d ' ')" "0"
 
+# A directory descriptor whose directory was removed names "<dir> (deleted)",
+# which is not a path any reader can check.
+mkdir -p "$WORK/tracer-removed"
+cat > "$WORK/tracer-removed/check.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  if (mkdir("gone", 0700) != 0) return 1;
+  int dir = open("gone", O_RDONLY | O_DIRECTORY);
+  if (dir < 0) return 2;
+  if (rmdir("gone") != 0) return 3;
+  int fd = openat(dir, "x", O_RDONLY);
+  return fd < 0 && errno == ENOENT ? 0 : 4;
+}
+EOF
+gcc "$WORK/tracer-removed/check.c" -o "$WORK/tracer-removed/check"
+( cd "$WORK/tracer-removed" && VCACHE_TRACE_LOG="$WORK/tracer-removed/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+check "a removed directory's descriptor runs as without the tracer" "$?" "0"
+check "and names no '(deleted)' path in the trace" \
+  "$(grep -c '(deleted)' "$WORK/tracer-removed/trace")" "0"
+check "and marks the trace incomplete instead" \
+  "$([[ -e "$WORK/tracer-removed/trace.incomplete" ]] && echo yes)" "yes"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF

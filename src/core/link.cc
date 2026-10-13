@@ -34,7 +34,7 @@ namespace vcache::core {
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kLinkKeyVersion = "vcache-link-v1";
+constexpr std::string_view kLinkKeyVersion = "vcache-link-v2";
 constexpr std::string_view kLinkManifestHeader = "vcache-linkmanifest-1";
 
 // How many remembered input-states one manifest holds, matching the dependency

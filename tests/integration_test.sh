@@ -3862,6 +3862,239 @@ check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
 
+# A record goes out in one write: finishing a short write with a second one can
+# land after another process's record and tear both. A regular file cannot be
+# made to take a short write on demand (past `ulimit -f` the retry fails too),
+# so a shim preloaded ahead of the tracer, whose writes go through syscall(),
+# cuts one record short.
+mkdir -p "$WORK/tracer-short"
+: > "$WORK/tracer-short/short-write-probe"
+cat > "$WORK/tracer-short/shim.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/syscall.h>
+long syscall(long number, ...) {
+  static long (*next)(long, ...);
+  static int cut;
+  if (next == NULL) next = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  long args[6];
+  va_list a;
+  va_start(a, number);
+  for (int i = 0; i < 6; ++i) args[i] = va_arg(a, long);
+  va_end(a);
+  if (number == SYS_write && !cut && args[2] > 4 &&
+      memmem((const void *)args[1], (size_t)args[2], "short-write-probe", 17) != NULL) {
+    cut = 1;
+    args[2] = 4;
+  }
+  return next(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+EOF
+gcc -fPIC -shared -o "$WORK/tracer-short/shim.so" "$WORK/tracer-short/shim.c" -ldl
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$WORK/tracer-short/trace" \
+  LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" cat short-write-probe )
+check "a short write marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-short/trace.incomplete" ]] && echo yes)" "yes"
+check "and the record is not finished by a second write" \
+  "$(grep -c 'short-write-probe$' "$WORK/tracer-short/trace")" "0"
+
+# A torn record has no newline. When the marker then cannot be created, the
+# lost-record line must still stand alone, or the torn prefix and the "!"
+# read as one valid-looking record.
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-short-sealed/log"
+  cat > "$WORK/tracer-short-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("short-write-probe", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-short-sealed/seal.c" -o "$WORK/tracer-short-sealed/seal"
+  : > "$WORK/tracer-short-sealed/short-write-probe"
+  ( cd "$WORK/tracer-short-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-short-sealed/log/trace" \
+    LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-short-sealed/log" )
+  check "a torn record followed by a lost-record line keeps the line on its own" \
+    "$(grep -cx '!' "$WORK/tracer-short-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
+# When "<log>.incomplete" cannot be created, the tracer says so in the log
+# itself. A record whose path holds a tab is the dropped record here.
+long_log="$WORK/tracer-long"
+while (( ${#long_log} < 4090 - 250 )); do long_log+="/$(printf 'd%.0s' {1..200})"; done
+mkdir -p "$long_log"
+long_log+="/$(printf 'l%.0s' $(seq $((4090 - ${#long_log} - 1))))"
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$long_log" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a marker whose name does not fit is a lost-record line in the log" \
+  "$(grep -cx '!' "$long_log")" "1"
+check "and no marker is made under a shortened name" \
+  "$(ls "$(dirname "$long_log")" | grep -c '\.incomplete$')" "0"
+
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-sealed"
+  cat > "$WORK/tracer-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  /* The tracer opened the log before main; now its directory refuses the marker. */
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("tab\tmissing", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-sealed/seal.c" -o "$WORK/tracer-sealed/seal"
+  mkdir -p "$WORK/tracer-sealed/log"
+  ( cd "$WORK/tracer-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-sealed/log/trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-sealed/log" )
+  check "a marker its directory refuses is a lost-record line in the log" \
+    "$(grep -cx '!' "$WORK/tracer-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
+mkdir -p "$WORK/tracer-relative-log"
+( cd "$WORK/tracer-relative-log" && VCACHE_TRACE_LOG=trace \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a relative trace log is not written, nor its marker" \
+  "$(ls -A "$WORK/tracer-relative-log" | wc -l | tr -d ' ')" "0"
+
+# A directory descriptor whose directory was removed names "<dir> (deleted)",
+# which is not a path any reader can check.
+mkdir -p "$WORK/tracer-removed"
+cat > "$WORK/tracer-removed/check.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  if (mkdir("gone", 0700) != 0) return 1;
+  int dir = open("gone", O_RDONLY | O_DIRECTORY);
+  if (dir < 0) return 2;
+  if (rmdir("gone") != 0) return 3;
+  int fd = openat(dir, "x", O_RDONLY);
+  return fd < 0 && errno == ENOENT ? 0 : 4;
+}
+EOF
+gcc "$WORK/tracer-removed/check.c" -o "$WORK/tracer-removed/check"
+( cd "$WORK/tracer-removed" && VCACHE_TRACE_LOG="$WORK/tracer-removed/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+check "a removed directory's descriptor runs as without the tracer" "$?" "0"
+check "and names no '(deleted)' path in the trace" \
+  "$(grep -c '(deleted)' "$WORK/tracer-removed/trace")" "0"
+check "and marks the trace incomplete instead" \
+  "$([[ -e "$WORK/tracer-removed/trace.incomplete" ]] && echo yes)" "yes"
+
+# ld.so names a shared object found through a relative LD_LIBRARY_PATH entry
+# relatively. It is part of the program all the same.
+mkdir -p "$WORK/tracer-dlpi/lib"
+printf 'int probe(void) { return 7; }\n' > "$WORK/tracer-dlpi/lib/probe.c"
+printf 'int probe(void);\nint main(void) { return probe() == 7 ? 0 : 1; }\n' \
+  > "$WORK/tracer-dlpi/main.c"
+gcc -fPIC -shared -o "$WORK/tracer-dlpi/lib/libprobe.so" "$WORK/tracer-dlpi/lib/probe.c"
+gcc -o "$WORK/tracer-dlpi/main" "$WORK/tracer-dlpi/main.c" -L"$WORK/tracer-dlpi/lib" -lprobe
+( cd "$WORK/tracer-dlpi" && VCACHE_TRACE_LOG="$WORK/tracer-dlpi/trace" LD_LIBRARY_PATH=lib \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./main )
+check "a program loading a library by a relative name runs" "$?" "0"
+check "and the library is an L record by its absolute path" \
+  "$(grep -cxF $'L\t'"$(cd "$WORK/tracer-dlpi" && pwd -P)/lib/libprobe.so" \
+     "$WORK/tracer-dlpi/trace")" "1"
+check "while libc keeps its absolute L record" \
+  "$(grep -cE $'^L\t/.*/libc\\.so' "$WORK/tracer-dlpi/trace")" "1"
+check "and the kernel's vDSO, named relatively too, is no record" \
+  "$(grep -c 'vdso' "$WORK/tracer-dlpi/trace")" "0"
+
+# Every way into a stat is a probe. coreutils calls statx and the LFS names
+# (stat64, fstatat64), Python's os.stat calls stat64, and a binary built against
+# glibc before 2.33 calls __xstat.
+mkdir -p "$WORK/tracer-stat/dir/listed"
+: > "$WORK/tracer-stat/dir/f"
+for f in sx fs64 xs; do : > "$WORK/tracer-stat/dir/$f"; done
+ln -sfn f "$WORK/tracer-stat/dir/link"
+traced_stat() {  # $1 = log name, rest = command run in $WORK/tracer-stat
+  local log="$WORK/tracer-stat/$1.trace"
+  shift
+  ( cd "$WORK/tracer-stat" && VCACHE_TRACE_LOG="$log" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" "$@" ) >/dev/null 2>&1
+}
+stat_record() {  # $1 = log name, $2 = kind, $3 = path suffix
+  grep -cE "^$2"$'\t'"(.*/)?$3\$" "$WORK/tracer-stat/$1.trace"
+}
+traced_stat coreutils-stat stat dir/f
+check "stat(1) records what it stats" "$(stat_record coreutils-stat R dir/f)" "1"
+traced_stat ls ls -l dir/f
+check "ls -l records what it lists" "$(stat_record ls R dir/f)" "1"
+traced_stat python python3 -c 'import os; os.stat("dir/f")'
+check "Python's os.stat records what it stats" "$(stat_record python R dir/f)" "1"
+traced_stat missing stat dir/missing
+check "and stat(1) of a missing path records its absence" \
+  "$(stat_record missing M dir/missing)" "1"
+cat > "$WORK/tracer-stat/check.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int __xstat(int ver, const char *path, struct stat *st);
+int main(void) {
+  struct statx sx;
+  if (statx(AT_FDCWD, "dir/sx", 0, STATX_BASIC_STATS, &sx) != 0) return 1;
+  struct stat64 st64;
+  if (fstatat64(AT_FDCWD, "dir/fs64", &st64, 0) != 0) return 2;
+  int dir = open("dir", O_RDONLY | O_DIRECTORY);
+  char target[16];
+  if (dir < 0 || readlinkat(dir, "link", target, sizeof target) != 1) return 3;
+  DIR *listing = fdopendir(open("dir/listed", O_RDONLY | O_DIRECTORY));
+  if (listing == NULL) return 4;
+  closedir(listing);
+#ifdef __x86_64__
+  const int stat_ver = 1;
+#else
+  const int stat_ver = 0;
+#endif
+  struct stat st;
+  if (__xstat(stat_ver, "dir/xs", &st) != 0) return 5;
+  /* What Rust's File::metadata does. */
+  int f = open("dir/f", O_RDONLY);
+  if (f < 0 || statx(f, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx) != 0) return 6;
+  /* Newer kernels take a NULL path with AT_EMPTY_PATH; older ones refuse it.
+     Either way it is a descriptor stat, not a lost record. */
+  (void)statx(f, NULL, AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+  /* An empty path without AT_EMPTY_PATH is ENOENT by definition: nothing to
+     record, nothing lost. */
+  if (openat(dir, "", O_RDONLY) >= 0) return 7;
+  /* An absence probed through a directory descriptor is an M record. */
+  if (openat(dir, "nope", O_RDONLY) >= 0) return 8;
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-stat/check.c" -o "$WORK/tracer-stat/check"
+( cd "$WORK/tracer-stat" && VCACHE_TRACE_LOG="$WORK/tracer-stat/calls.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+check "the stat-family fixture runs as without the tracer" "$?" "0"
+check "statx records what it stats" "$(stat_record calls R dir/sx)" "1"
+check "fstatat64 records what it stats" "$(stat_record calls R dir/fs64)" "1"
+check "readlinkat records the link under its directory" \
+  "$(grep -cxF $'R\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/link" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+check "fdopendir records the directory it lists" \
+  "$(grep -cxF $'D\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/listed" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+check "__xstat records what it stats" "$(stat_record calls R dir/xs)" "1"
+check "a stat of an open descriptor does not mark the trace incomplete" \
+  "$([[ -e "$WORK/tracer-stat/calls.trace.incomplete" ]] && echo yes || echo no)" "no"
+check "an absence probed through a directory descriptor is an M record" \
+  "$(grep -cxF $'M\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/nope" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF
@@ -4123,6 +4356,14 @@ __attribute__((constructor)) static void stub(void) {
     if (mfd >= 0) close(mfd);
     return;
   }
+  if (strcmp(mode, "lost-line") == 0) {
+    /* A usable-looking trace that carries the line the tracer writes when it
+       loses a record and cannot create the marker. */
+    const char *text = "P\t/bin/sh\nR\t/etc/hostname\n!\n";
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
+    return;
+  }
   if (strcmp(mode, "noprocs") == 0) {
     /* Reads, but never announces a process: the input set may be partial. */
     int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -4144,6 +4385,14 @@ STUBEOF
         "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-np ) 2>/dev/null
     check "a trace naming no processes is not stored" "$(disk_entries)" "0"
     check "and that is counted uncacheable too" "$(uncacheable)" "1"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=lost-line VCACHE_TRACER="$WORK/stub-tracer.so" \
+        VCACHE_LOG="$WORK/lost-line.log" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-lost ) 2>/dev/null
+    check "a trace with the tracer's lost-record line is not stored" "$(disk_entries)" "0"
+    check "and the link says the trace is unusable" \
+      "$(grep -c 'link: no usable trace' "$WORK/lost-line.log")" "1"
   else
     printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
   fi

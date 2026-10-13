@@ -211,7 +211,8 @@ something that is not an ELF shared object of vcache's own class and machine, a
 host other than Linux), when `LD_PRELOAD` is already set. A trace that turns
 out unusable after the compile gives the depfile alone, since the list was not
 asked for: when no process loaded the tracer, when the trace is marked
-incomplete, does not parse or names no process, when the compiler's include
+incomplete (a `.incomplete` file beside it, or a `!` line in it when that file
+cannot be created), does not parse or names no process, when the compiler's include
 directories cannot be listed, and when the trace does not show a file the
 depfile names being read, and when ld.so refused a preload in some process of
 the compile. ld.so's "cannot be preloaded" lines that name the tracer are then
@@ -677,6 +678,26 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   that way until the next miss records a state.
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
   through `vcache-fstrace.so`); ccache and sccache do not cache it.
+- **The tracer sees only calls that reach it through the dynamic linker.** It
+  interposes the open, stat (`stat`, `stat64`, `statx`, the `*at` forms and the
+  pre-2.33 `__xstat` family), `access`, `readlink`, `readlinkat`, `opendir` and
+  `fdopendir` entry points. A raw `syscall()`, a static binary, a process that
+  drops `LD_PRELOAD`, and glibc's own internal opens (locale, gconv, nss data,
+  which never cross the PLT) leave no record. A stat of an open descriptor
+  (`statx(fd, "", AT_EMPTY_PATH)`, as Rust's `File::metadata` makes) records
+  nothing either: the file was recorded when the descriptor was opened, as it
+  is for a `read`.
+- **A probe that fails for a reason other than `ENOENT` records nothing.** The
+  tracer records a successful open or probe as an input (`R`) and an `ENOENT`
+  failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other
+  failure leave no record. A compile, a link or a test traced by sunbird's
+  audit whose behaviour depends on such a refusal is keyed as if the probe had
+  not happened, and a later change to that path's permissions or file type
+  does not invalidate the entry. This is a documented limit, not a new record
+  kind: a reader refuses a trace holding a kind it does not know
+  (`ReadTraceRecords`), so a new kind would make every older vcache and audit
+  refuse every trace the new tracer writes, for a case that compiles and links
+  rarely meet.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang

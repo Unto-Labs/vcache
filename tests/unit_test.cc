@@ -328,6 +328,10 @@ void TestLinkTraceClassification() {
   core::LinkTrace malformed;
   Check(!core::ParseTraceLog(log, {}, "/", &malformed),
         "a malformed trace is rejected rather than partially trusted");
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\t/home/u/proj/a.o\n!\n");
+  core::TraceRecords lost;
+  Check(!core::ReadTraceRecords(log, "/", &lost),
+        "a trace carrying the tracer's lost-record line is refused");
   util::RemoveRecursive(dir);
 }
 

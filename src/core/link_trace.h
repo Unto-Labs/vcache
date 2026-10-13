@@ -37,8 +37,9 @@ struct TraceRecords {
   std::vector<std::string> written;  // W: opened for writing only
 };
 
-// False when the log cannot be read or any record is malformed, for the reason
-// ParseTraceLog gives.
+// False when the log cannot be read, any record is malformed, or the tracer
+// wrote its "!" line to say it lost a record without being able to mark the
+// log incomplete; for the reason ParseTraceLog gives.
 bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out);
 
 // True when the tracer could not record something and said so beside the log.

@@ -3968,6 +3968,25 @@ check "and names no '(deleted)' path in the trace" \
 check "and marks the trace incomplete instead" \
   "$([[ -e "$WORK/tracer-removed/trace.incomplete" ]] && echo yes)" "yes"
 
+# ld.so names a shared object found through a relative LD_LIBRARY_PATH entry
+# relatively. It is part of the program all the same.
+mkdir -p "$WORK/tracer-dlpi/lib"
+printf 'int probe(void) { return 7; }\n' > "$WORK/tracer-dlpi/lib/probe.c"
+printf 'int probe(void);\nint main(void) { return probe() == 7 ? 0 : 1; }\n' \
+  > "$WORK/tracer-dlpi/main.c"
+gcc -fPIC -shared -o "$WORK/tracer-dlpi/lib/libprobe.so" "$WORK/tracer-dlpi/lib/probe.c"
+gcc -o "$WORK/tracer-dlpi/main" "$WORK/tracer-dlpi/main.c" -L"$WORK/tracer-dlpi/lib" -lprobe
+( cd "$WORK/tracer-dlpi" && VCACHE_TRACE_LOG="$WORK/tracer-dlpi/trace" LD_LIBRARY_PATH=lib \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./main )
+check "a program loading a library by a relative name runs" "$?" "0"
+check "and the library is an L record by its absolute path" \
+  "$(grep -cxF $'L\t'"$(cd "$WORK/tracer-dlpi" && pwd -P)/lib/libprobe.so" \
+     "$WORK/tracer-dlpi/trace")" "1"
+check "while libc keeps its absolute L record" \
+  "$(grep -cE $'^L\t/.*/libc\\.so' "$WORK/tracer-dlpi/trace")" "1"
+check "and the kernel's vDSO, named relatively too, is no record" \
+  "$(grep -c 'vdso' "$WORK/tracer-dlpi/trace")" "0"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF

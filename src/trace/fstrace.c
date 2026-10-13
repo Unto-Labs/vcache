@@ -43,6 +43,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -185,6 +186,17 @@ static size_t dirfd_prefix(int dirfd, char *out, size_t size) {
   return used;
 }
 
+/* The working directory, written to `out` with a trailing '/', and its length;
+   0 when the kernel cannot name it as a path: removed, or outside this
+   process's root, which it spells "(unreachable)/...". */
+static size_t cwd_prefix(char *out, size_t size) {
+  long n = syscall(SYS_getcwd, out, size - 1);
+  if (n <= 1 || out[0] != '/') return 0;
+  size_t used = (size_t)n - 1;
+  if (out[used - 1] != '/') out[used++] = '/';
+  return used;
+}
+
 /* `path` appended to the `used` bytes already in `out`; 0 when it does not fit. */
 static int append_path(char *out, size_t used, size_t size, const char *path) {
   size_t rest = strlen(path);
@@ -250,15 +262,24 @@ static ElfW(Addr) self_base(void) {
   return base;
 }
 
+/* The kernel's vDSO, which ld.so lists under a bare name but is no file. */
+static int is_vdso(const struct dl_phdr_info *info) {
+  uintptr_t ehdr = (uintptr_t)getauxval(AT_SYSINFO_EHDR);
+  if (ehdr == 0) return 0;
+  return (uintptr_t)info->dlpi_phdr == ehdr + ((const ElfW(Ehdr) *)ehdr)->e_phoff;
+}
+
 static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
   (void)size;
   (void)data;
-  if (info->dlpi_name == NULL || info->dlpi_name[0] != '/') return 0;
+  /* The main program, announced as P. */
+  if (info->dlpi_name == NULL || info->dlpi_name[0] == '\0') return 0;
 
   /* The tracer observes the link; it does not take part in it. Recording
      ourselves would make every rebuild of vcache invalidate every link entry,
      for a file that cannot affect the output. */
   if (info->dlpi_addr == self_base()) return 0;
+  if (is_vdso(info)) return 0;
 
   /* Dependencies are loaded before interposition is active. Include every
      other already-loaded DSO: for the common linkers the implementation is a
@@ -266,7 +287,19 @@ static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
      libz/libzstd emit output bytes directly for compressed debug sections.
      Its own kind, so a reader that keys the toolchain another way can tell
      these apart from the files the process opened. */
-  emit('L', info->dlpi_name);
+  if (info->dlpi_name[0] == '/') {
+    emit('L', info->dlpi_name);
+    return 0;
+  }
+  /* Found through a relative LD_LIBRARY_PATH or DT_RUNPATH entry, the name is
+     the one ld.so opened, relative to the directory the process started in. */
+  char resolved[VCACHE_RECORD_MAX];
+  size_t used = cwd_prefix(resolved, sizeof resolved);
+  if (used == 0 || !append_path(resolved, used, sizeof resolved, info->dlpi_name)) {
+    mark_incomplete();
+    return 0;
+  }
+  emit('L', resolved);
   return 0;
 }
 

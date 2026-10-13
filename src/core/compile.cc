@@ -39,7 +39,7 @@ namespace {
 
 // Bumped whenever the key derivation or blob layout changes, so old entries are
 // ignored rather than misinterpreted.
-constexpr std::string_view kCacheKeyVersion = "vcache-key-v4";
+constexpr std::string_view kCacheKeyVersion = "vcache-key-v5";
 constexpr std::string_view kPchIdentityVersion = "vcache-pch-identity-v1";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
@@ -130,6 +130,9 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
     cmd.push_back(arg);
   }
   if (!compiler_id.is_clang) cmd.push_back("-fno-working-directory");
+  // Plain gcc -E ignores a PCH the compile can load, so its header text is
+  // not enough to identify the compilation. Ask it to name the PCH it uses.
+  if (!compiler_id.is_clang && !parsed.produces_pch) cmd.push_back("-fpch-preprocess");
   // A PCH carries the header's macro definitions to every compile that loads
   // it, and plain -E drops them: a header that only changes `#define FOO 1` to
   // `#define FOO 2` would preprocess identically, and clang's size check would
@@ -290,7 +293,7 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
                        const CompilerId& compiler_id, const Config& config,
                        const std::string& native_target,
                        const std::string& preprocessed_path, bool* saw_incbin,
-                       std::string* pch_identity) {
+                       std::string* pch_identity, const std::string& memo_dir) {
   hash::Hasher hasher;
   // A PCH build's identity takes every input of its key except the paths as
   // typed, so it is the same in every worktree; consumers' manifests name the
@@ -373,9 +376,23 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // and of the source itself. Its linemarkers still hold raw absolute paths --
   // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
   // on the way into the hash.
+  std::vector<std::string> preprocessed_pchs;
   if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher, saw_incbin,
-                                        want_identity ? &identity : nullptr)) {
+                                        want_identity ? &identity : nullptr, &preprocessed_pchs)) {
     return "";
+  }
+  for (const std::string& pch : preprocessed_pchs) {
+    // A loaded PCH hides its assembler directives from -E. The directive's
+    // external file can change without changing either the PCH or its key.
+    if (saw_incbin != nullptr) {
+      const std::optional<std::string> bytes = util::ReadFile(pch);
+      if (!bytes) return "";
+      *saw_incbin |= ContainsIncbin(*bytes);
+    }
+    const std::optional<std::string> consumed_identity = PchIdentity(pch, memo_dir);
+    if (!consumed_identity) return "";
+    feed("consumed-pch");
+    feed(*consumed_identity);
   }
   if (want_identity) *pch_identity = identity.Hex();
   return hasher.Hex();
@@ -1686,7 +1703,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   } else {
     bool saw_incbin = false;
     key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
-                     &saw_incbin, &pch_identity);
+                     &saw_incbin, &pch_identity, memo_dir);
     if (key.empty()) {
       RecordDecision(cache_dir, Reason::kNoCacheKey);
       return RunPassthrough(argv);

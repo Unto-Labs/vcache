@@ -466,6 +466,10 @@ the file is copied with `CloneFile` and given its execute bits under the
 umask. The `.d` is the exception: it names the stage dir, so it is written from
 the canonicalised copy captured for the entry and localised as a hit's is.
 Capture still reads every file once to build the entry.
+Rust JSON artifact notifications name the placed output directory on both a
+miss and a hit. Their cached paths use an output-directory placeholder, so
+relative output paths and output directories outside the roots also replay
+correctly; paths are escaped as JSON strings when rewritten.
 
 `VCACHE_LOG` gives each placement one line, so a build's log can be summed.
 "restored" and "placed" time the writes alone; "hit total" runs from asking the

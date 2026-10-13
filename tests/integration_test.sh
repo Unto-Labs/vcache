@@ -3900,6 +3900,31 @@ check "a short write marks the trace incomplete" \
 check "and the record is not finished by a second write" \
   "$(grep -c 'short-write-probe$' "$WORK/tracer-short/trace")" "0"
 
+# A torn record has no newline. When the marker then cannot be created, the
+# lost-record line must still stand alone, or the torn prefix and the "!"
+# read as one valid-looking record.
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-short-sealed/log"
+  cat > "$WORK/tracer-short-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("short-write-probe", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-short-sealed/seal.c" -o "$WORK/tracer-short-sealed/seal"
+  : > "$WORK/tracer-short-sealed/short-write-probe"
+  ( cd "$WORK/tracer-short-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-short-sealed/log/trace" \
+    LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-short-sealed/log" )
+  check "a torn record followed by a lost-record line keeps the line on its own" \
+    "$(grep -cx '!' "$WORK/tracer-short-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
 # When "<log>.incomplete" cannot be created, the tracer says so in the log
 # itself. A record whose path holds a tab is the dropped record here.
 long_log="$WORK/tracer-long"
@@ -4040,6 +4065,14 @@ int main(void) {
   /* What Rust's File::metadata does. */
   int f = open("dir/f", O_RDONLY);
   if (f < 0 || statx(f, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx) != 0) return 6;
+  /* Newer kernels take a NULL path with AT_EMPTY_PATH; older ones refuse it.
+     Either way it is a descriptor stat, not a lost record. */
+  (void)statx(f, NULL, AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+  /* An empty path without AT_EMPTY_PATH is ENOENT by definition: nothing to
+     record, nothing lost. */
+  if (openat(dir, "", O_RDONLY) >= 0) return 7;
+  /* An absence probed through a directory descriptor is an M record. */
+  if (openat(dir, "nope", O_RDONLY) >= 0) return 8;
   return 0;
 }
 EOF
@@ -4058,6 +4091,9 @@ check "fdopendir records the directory it lists" \
 check "__xstat records what it stats" "$(stat_record calls R dir/xs)" "1"
 check "a stat of an open descriptor does not mark the trace incomplete" \
   "$([[ -e "$WORK/tracer-stat/calls.trace.incomplete" ]] && echo yes || echo no)" "no"
+check "an absence probed through a directory descriptor is an M record" \
+  "$(grep -cxF $'M\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/nope" \
+     "$WORK/tracer-stat/calls.trace")" "1"
 
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"

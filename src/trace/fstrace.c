@@ -63,21 +63,29 @@ static const char *log_path(void) {
   return p != NULL && p[0] == '/' ? p : NULL;
 }
 
+static void mark_incomplete(void);
+
 static void ensure_log(void) {
   if (log_fd != -1) return;
   const char *p = log_path();
   if (p == NULL) { log_fd = -2; return; }
   log_fd = (int)syscall(SYS_openat, AT_FDCWD, p,
                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-  if (log_fd < 0) log_fd = -2;
+  if (log_fd < 0) {
+    /* Every record of this process is lost. The marker is the only channel
+       left; it may fail for the same reason, which the caller cannot see. */
+    log_fd = -2;
+    mark_incomplete();
+  }
 }
 
-/* A "!" line, which readers refuse the whole log on. */
+/* A "!" line, which readers refuse the whole log on. It starts with a newline
+   of its own: a torn record has none, and "R\t/x/ab!" would read as a record. */
 static void write_incomplete_sentinel(void) {
   ensure_log();
   if (log_fd < 0) return;
   for (;;) {
-    long r = syscall(SYS_write, log_fd, "!\n", 2);
+    long r = syscall(SYS_write, log_fd, "\n!\n", 3);
     if (r >= 0 || errno != EINTR) return;
   }
 }
@@ -229,6 +237,9 @@ static void at_path_begin(struct at_path *at, int dirfd, const char *path) {
 
 static void emit_at_result(struct at_path *at, const char *path, int failed,
                            int saved_errno, int written_only) {
+  /* An empty path names no file: without AT_EMPTY_PATH it is ENOENT by
+     definition, with it the descriptor's file was recorded at its open. */
+  if (path == NULL || *path == '\0') return;
   if (failed && saved_errno != ENOENT) return;
   if (!at->dir_known || !append_path(at->buf, at->dir_used, sizeof at->buf, path)) {
     mark_incomplete();
@@ -241,7 +252,7 @@ static void emit_at_result(struct at_path *at, const char *path, int failed,
    statx(fd, "", AT_EMPTY_PATH). The trace follows names, not descriptors: the
    file was recorded when the descriptor was opened, as it is for a read(). */
 static int stats_descriptor(const char *path, int flags) {
-  return path != NULL && *path == '\0' && (flags & AT_EMPTY_PATH) != 0;
+  return (path == NULL || *path == '\0') && (flags & AT_EMPTY_PATH) != 0;
 }
 
 #define NEXT(sym)                                     \
@@ -482,7 +493,8 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
    fstatat: their headers redirected those names here, with a struct layout
    version first. */
 int __xstat(int ver, const char *path, struct stat *st) {
-  int r = NEXT(__xstat)(ver, path, st);
+  (void)ver;
+  int r = NEXT(__xstat) != NULL ? NEXT(__xstat)(ver, path, st) : NEXT(stat)(path, st);
   int saved = errno;
   emit_result(path, r != 0, saved);
   errno = saved;
@@ -490,7 +502,8 @@ int __xstat(int ver, const char *path, struct stat *st) {
 }
 
 int __xstat64(int ver, const char *path, struct stat64 *st) {
-  int r = NEXT(__xstat64)(ver, path, st);
+  (void)ver;
+  int r = NEXT(__xstat64) != NULL ? NEXT(__xstat64)(ver, path, st) : NEXT(stat64)(path, st);
   int saved = errno;
   emit_result(path, r != 0, saved);
   errno = saved;
@@ -498,7 +511,8 @@ int __xstat64(int ver, const char *path, struct stat64 *st) {
 }
 
 int __lxstat(int ver, const char *path, struct stat *st) {
-  int r = NEXT(__lxstat)(ver, path, st);
+  (void)ver;
+  int r = NEXT(__lxstat) != NULL ? NEXT(__lxstat)(ver, path, st) : NEXT(lstat)(path, st);
   int saved = errno;
   emit_result(path, r != 0, saved);
   errno = saved;
@@ -506,7 +520,8 @@ int __lxstat(int ver, const char *path, struct stat *st) {
 }
 
 int __lxstat64(int ver, const char *path, struct stat64 *st) {
-  int r = NEXT(__lxstat64)(ver, path, st);
+  (void)ver;
+  int r = NEXT(__lxstat64) != NULL ? NEXT(__lxstat64)(ver, path, st) : NEXT(lstat64)(path, st);
   int saved = errno;
   emit_result(path, r != 0, saved);
   errno = saved;
@@ -514,6 +529,7 @@ int __lxstat64(int ver, const char *path, struct stat64 *st) {
 }
 
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+  if (NEXT(__fxstatat) == NULL) return fstatat(dirfd, path, st, flags);
   if (stats_descriptor(path, flags)) return NEXT(__fxstatat)(ver, dirfd, path, st, flags);
   struct at_path at;
   at_path_begin(&at, dirfd, path);
@@ -525,6 +541,7 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags)
 }
 
 int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags) {
+  if (NEXT(__fxstatat64) == NULL) return fstatat64(dirfd, path, st, flags);
   if (stats_descriptor(path, flags)) return NEXT(__fxstatat64)(ver, dirfd, path, st, flags);
   struct at_path at;
   at_path_begin(&at, dirfd, path);

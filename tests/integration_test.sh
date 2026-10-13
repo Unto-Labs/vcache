@@ -4824,6 +4824,36 @@ for cc in gcc clang; do
     "$(cmp -s "$sh/m.o" "$sh/plain.o" && echo same)" "same"
 done
 
+if command -v clang >/dev/null 2>&1; then
+  (
+    export VCACHE_CXX_MANIFEST=1 VCACHE_CXX_MANIFEST_TRACE=1 VCACHE_DAEMON=off
+    reset_cache
+    sh="$WORK/dotdot"
+    mkdir -p "$sh/first" "$sh/second/sub"
+    printf '#define V 2\n' > "$sh/second/a.h"
+    printf '#include <sub/../a.h>\nint v = V;\n' > "$sh/main.c"
+    for attempt in 1 2 3; do
+      if [[ "$attempt" == 3 ]]; then
+        mkdir -p "$sh/first/sub"
+        printf '#define V 1\n' > "$sh/first/a.h"
+      fi
+      ( cd "$sh" && VCACHE_MAP_CWD=0 VCACHE_ROOTS="$sh=proj" \
+          VCACHE_LOG="$sh/$attempt.log" \
+          "$VCACHE" clang -O2 -I first -I second -c main.c -o m.o )
+    done
+    ( cd "$sh" && clang -O2 -I first -I second -c main.c -o plain.o )
+    check "clang records its initial state from the trace" \
+      "$(grep -c 'recorded from the trace' "$sh/1.log")" "1"
+    check "clang reuses the unchanged state" \
+      "$(grep -c 'preprocessor skipped' "$sh/2.log")" "1"
+    check "clang rejects a state when the parent-directory probe appears" \
+      "$(grep -c 'rejected: .*first/sub.*exists now' "$sh/3.log")" "1"
+    check "clang compiles the newly shadowing header" \
+      "$(cmp -s "$sh/m.o" "$sh/plain.o" && echo same)" "same"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "clang parent-directory probes" || bad "clang parent-directory probes"
+fi
+
 # Absent paths are canonicalised through the roots as files are, so a tree at
 # another path hits a state another recorded, and checks its own include path.
 reset_cache

@@ -194,6 +194,8 @@ root exists would check that location instead of its own. A path through `..`
 is stored as probed, since resolving it could cross a symlink, and is compared
 with what was read as spelled. Absent paths are canonicalised through the roots
 like files, so a tree at another path checks its own.
+Probes ending in `/..` are kept too: Clang can probe `first/sub/..` before
+resolving `<sub/../a.h>`, and creating `first/sub` can change which header wins.
 
 Without a tracer the state comes from the compiler's list when it writes one
 (below), and otherwise from the depfile alone. The log says which and why: when

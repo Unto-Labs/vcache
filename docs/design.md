@@ -687,6 +687,17 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   (`statx(fd, "", AT_EMPTY_PATH)`, as Rust's `File::metadata` makes) records
   nothing either: the file was recorded when the descriptor was opened, as it
   is for a `read`.
+- **A probe that fails for a reason other than `ENOENT` records nothing.** The
+  tracer records a successful open or probe as an input (`R`) and an `ENOENT`
+  failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other
+  failure leave no record. A compile, a link or a test traced by sunbird's
+  audit whose behaviour depends on such a refusal is keyed as if the probe had
+  not happened, and a later change to that path's permissions or file type
+  does not invalidate the entry. This is a documented limit, not a new record
+  kind: a reader refuses a trace holding a kind it does not know
+  (`ReadTraceRecords`), so a new kind would make every older vcache and audit
+  refuse every trace the new tracer writes, for a case that compiles and links
+  rarely meet.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang

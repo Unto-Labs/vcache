@@ -50,8 +50,7 @@ static int log_fd = -1;
 
 /* Records must fit in one write. A path is bounded by PATH_MAX, but the tracer
    also sees strings that merely occupy a path argument, so the bound is
-   enforced rather than assumed. Staying at or below PIPE_BUF keeps an O_APPEND
-   write from being torn when the whole process tree is writing at once. */
+   enforced rather than assumed. */
 #define VCACHE_RECORD_MAX 4096
 
 static void ensure_log(void) {
@@ -63,8 +62,6 @@ static void ensure_log(void) {
   if (log_fd < 0) log_fd = -2;
 }
 
-/* One write per record. O_APPEND makes concurrent writes from the process tree
-   atomic up to PIPE_BUF, which every path we emit is comfortably below. */
 /* A lost record is not a lost log line: it is an input missing from the set
    that decides whether a later hit is sound. So any failure to record is made
    loud by creating "<log>.incomplete", which the caller checks before storing
@@ -113,10 +110,13 @@ static void emit(char kind, const char *path) {
   }
   buf[n++] = '\n';
 
-  size_t written = 0;
-  while (written < n) {
-    long r = syscall(SYS_write, log_fd, buf + written, n - written);
-    if (r > 0) { written += (size_t)r; continue; }
+  /* One record is one write. The whole process tree appends to one regular
+     file, where O_APPEND makes each write land whole and contiguous; a second
+     write for the rest of a short one can land after another process's record
+     and tear both. So a short write is a lost record, and is made loud. */
+  for (;;) {
+    long r = syscall(SYS_write, log_fd, buf, n);
+    if (r == (long)n) return;
     if (r < 0 && errno == EINTR) continue;
     mark_incomplete();
     return;

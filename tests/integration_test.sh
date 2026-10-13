@@ -3862,6 +3862,44 @@ check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
 
+# A record goes out in one write: finishing a short write with a second one can
+# land after another process's record and tear both. A regular file cannot be
+# made to take a short write on demand (past `ulimit -f` the retry fails too),
+# so a shim preloaded ahead of the tracer, whose writes go through syscall(),
+# cuts one record short.
+mkdir -p "$WORK/tracer-short"
+: > "$WORK/tracer-short/short-write-probe"
+cat > "$WORK/tracer-short/shim.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/syscall.h>
+long syscall(long number, ...) {
+  static long (*next)(long, ...);
+  static int cut;
+  if (next == NULL) next = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  long args[6];
+  va_list a;
+  va_start(a, number);
+  for (int i = 0; i < 6; ++i) args[i] = va_arg(a, long);
+  va_end(a);
+  if (number == SYS_write && !cut && args[2] > 4 &&
+      memmem((const void *)args[1], (size_t)args[2], "short-write-probe", 17) != NULL) {
+    cut = 1;
+    args[2] = 4;
+  }
+  return next(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+EOF
+gcc -fPIC -shared -o "$WORK/tracer-short/shim.so" "$WORK/tracer-short/shim.c" -ldl
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$WORK/tracer-short/trace" \
+  LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" cat short-write-probe )
+check "a short write marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-short/trace.incomplete" ]] && echo yes)" "yes"
+check "and the record is not finished by a second write" \
+  "$(grep -c 'short-write-probe$' "$WORK/tracer-short/trace")" "0"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF

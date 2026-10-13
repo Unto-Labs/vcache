@@ -283,6 +283,7 @@ check "--trim keeps a recent scratch directory" \
 section "1b. assembly and object output use separate entries"
 
 (
+  FAIL=0
   export VCACHE_CXX_MANIFEST=0 VCACHE_DAEMON=off
   mkdir -p "$WORK/output-kind"
   cd "$WORK/output-kind" || exit 1
@@ -3215,6 +3216,7 @@ done
 # --------------------------------------------------------------------------
 section "14a. joined include paths share dependency scans"
 (
+  FAIL=0
   export VCACHE_DAEMON=off VCACHE_DEP_SCAN=manifest
   reset_cache
   for tree in a b; do
@@ -4639,8 +4641,8 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
     "$(cmp -s "$sp/m.o" "$sp/plain.o" && echo same)" "same"
 
   # A .gch that appears after the state was recorded is one gcc probed for.
-  # The object is not compared: the -E run reads the header, not the .gch, so
-  # the preprocessor key cannot tell the two apart either.
+  # The trace must reject the old state before the PCH-aware preprocessor
+  # can derive the key for the new .gch.
   reset_cache
   rm -f "$sp/pch.h.gch"
   mf_stray "$(mf_log stray3)"
@@ -4653,6 +4655,56 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   check "and runs the preprocessor" "$(grep -c '\] preprocess: ' "$l")" "1"
 else
   skipped "stray .gch: gcc is not installed, or is clang"
+fi
+
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off
+    for manifest in 0 1; do
+      export VCACHE_CXX_MANIFEST=$manifest
+      reset_cache
+      root="$WORK/unkeyed-$manifest"
+      mkdir -p "$root/inc"
+      printf '#define VALUE 1\n' > "$root/inc/value.h"
+      printf '#include <value.h>\nint value = VALUE;\n' > "$root/main.c"
+      ( cd "$root" && "$VCACHE" gcc -O2 -I inc -c main.c -o m.o )
+      for value in 2 3; do
+        printf '#define VALUE %s\n' "$value" > "$root/inc/value.h"
+        ( cd "$root" && gcc -O2 -x c-header inc/value.h -o inc/value.h.gch )
+        printf '#define VALUE 1\n' > "$root/inc/value.h"
+        ( cd "$root" && "$VCACHE" gcc -O2 -I inc -c main.c -o m.o && \
+            gcc -O2 -I inc -c main.c -o plain.o )
+        check "manifest=$manifest follows PCH value $value despite unchanged header" \
+          "$(cmp -s "$root/m.o" "$root/plain.o" && echo same)" "same"
+      done
+    done
+    [[ "$FAIL" == 0 ]]
+  ) && ok "unkeyed PCH cache keys" || bad "unkeyed PCH cache keys"
+fi
+
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang && [[ $(uname -s) == Linux ]]; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off VCACHE_CXX_MANIFEST=0
+    reset_cache
+    root="$WORK/pch-incbin"
+    mkdir -p "$root"
+    cd "$root" || exit 1
+    cat > pch.h <<'EOF'
+__asm__(".incbin \"payload.bin\"");
+EOF
+    printf '#include "pch.h"\nint value = 1;\n' > main.c
+    printf 'one' > payload.bin
+    gcc -x c-header pch.h -o pch.h.gch
+    "$VCACHE" gcc -c main.c -o first.o
+    printf 'two' > payload.bin
+    "$VCACHE" gcc -c main.c -o second.o
+    gcc -c main.c -o plain.o
+    check "PCH .incbin follows the changed assembler input" \
+      "$(cmp -s second.o plain.o && echo same)" "same"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "PCH assembler inputs" || bad "PCH assembler inputs"
 fi
 
 # Two compiles of one source with different headers write one manifest. The
@@ -4846,6 +4898,7 @@ done
 
 if command -v clang >/dev/null 2>&1; then
   (
+    FAIL=0
     export VCACHE_CXX_MANIFEST=1 VCACHE_CXX_MANIFEST_TRACE=1 VCACHE_DAEMON=off
     reset_cache
     sh="$WORK/dotdot"
@@ -5247,7 +5300,8 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   cat > "$sf/bin/slowg++" <<EOF
 #!/bin/sh
 case " \$* " in
-  *" -c "*) case " \$* " in *" -E "*) ;; *) echo compile >> "$sf/count"; sleep 2 ;; esac ;;
+  *" -E "*) exit 1 ;;
+  *" -c "*) echo compile >> "$sf/count"; sleep 2 ;;
 esac
 exec g++ "\$@"
 EOF
@@ -5388,11 +5442,12 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   reset_cache
   mf_build_gch
   l=$(mf_log g1); mf_use_gch "$l"
-  check "gcc: a .gch consumer -E cannot handle compiles and misses" "$(misses)" "1"
-  check "gcc: under a key derived from what it read" "$(grep -c '\] derived key ' "$l")" "1"
+  check "gcc: a .gch consumer compiles and misses" "$(misses)" "1"
+  check "gcc: the preprocessor loads the PCH without its original include path" \
+    "$(grep -c '\] preprocess: .*-fpch-preprocess' "$l")" "1"
   check "gcc: keyed on the .gch" "$(grep -c 'PCH .*h\.h\.gch is bytes' "$l")" "1"
   mf_use_gch "$(mf_log g2)"
-  check "gcc: the next compile hits the derived key" "$(manifest_hits)" "1"
+  check "gcc: the next compile hits through the manifest" "$(manifest_hits)" "1"
   printf '#pragma once\n#define BIG 6\n' > "$gp/inc/big.h"
   mf_build_gch
   mf_use_gch "$(mf_log g3)"

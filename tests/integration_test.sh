@@ -3900,6 +3900,48 @@ check "a short write marks the trace incomplete" \
 check "and the record is not finished by a second write" \
   "$(grep -c 'short-write-probe$' "$WORK/tracer-short/trace")" "0"
 
+# When "<log>.incomplete" cannot be created, the tracer says so in the log
+# itself. A record whose path holds a tab is the dropped record here.
+long_log="$WORK/tracer-long"
+while (( ${#long_log} < 4090 - 250 )); do long_log+="/$(printf 'd%.0s' {1..200})"; done
+mkdir -p "$long_log"
+long_log+="/$(printf 'l%.0s' $(seq $((4090 - ${#long_log} - 1))))"
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$long_log" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a marker whose name does not fit is a lost-record line in the log" \
+  "$(grep -cx '!' "$long_log")" "1"
+check "and no marker is made under a shortened name" \
+  "$(ls "$(dirname "$long_log")" | grep -c '\.incomplete$')" "0"
+
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-sealed"
+  cat > "$WORK/tracer-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  /* The tracer opened the log before main; now its directory refuses the marker. */
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("tab\tmissing", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-sealed/seal.c" -o "$WORK/tracer-sealed/seal"
+  mkdir -p "$WORK/tracer-sealed/log"
+  ( cd "$WORK/tracer-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-sealed/log/trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-sealed/log" )
+  check "a marker its directory refuses is a lost-record line in the log" \
+    "$(grep -cx '!' "$WORK/tracer-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
+mkdir -p "$WORK/tracer-relative-log"
+( cd "$WORK/tracer-relative-log" && VCACHE_TRACE_LOG=trace \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a relative trace log is not written, nor its marker" \
+  "$(ls -A "$WORK/tracer-relative-log" | wc -l | tr -d ' ')" "0"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF
@@ -4161,6 +4203,14 @@ __attribute__((constructor)) static void stub(void) {
     if (mfd >= 0) close(mfd);
     return;
   }
+  if (strcmp(mode, "lost-line") == 0) {
+    /* A usable-looking trace that carries the line the tracer writes when it
+       loses a record and cannot create the marker. */
+    const char *text = "P\t/bin/sh\nR\t/etc/hostname\n!\n";
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
+    return;
+  }
   if (strcmp(mode, "noprocs") == 0) {
     /* Reads, but never announces a process: the input set may be partial. */
     int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -4182,6 +4232,14 @@ STUBEOF
         "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-np ) 2>/dev/null
     check "a trace naming no processes is not stored" "$(disk_entries)" "0"
     check "and that is counted uncacheable too" "$(uncacheable)" "1"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=lost-line VCACHE_TRACER="$WORK/stub-tracer.so" \
+        VCACHE_LOG="$WORK/lost-line.log" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-lost ) 2>/dev/null
+    check "a trace with the tracer's lost-record line is not stored" "$(disk_entries)" "0"
+    check "and the link says the trace is unusable" \
+      "$(grep -c 'link: no usable trace' "$WORK/lost-line.log")" "1"
   else
     printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
   fi

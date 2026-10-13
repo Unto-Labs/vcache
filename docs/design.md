@@ -211,7 +211,8 @@ something that is not an ELF shared object of vcache's own class and machine, a
 host other than Linux), when `LD_PRELOAD` is already set. A trace that turns
 out unusable after the compile gives the depfile alone, since the list was not
 asked for: when no process loaded the tracer, when the trace is marked
-incomplete, does not parse or names no process, when the compiler's include
+incomplete (a `.incomplete` file beside it, or a `!` line in it when that file
+cannot be created), does not parse or names no process, when the compiler's include
 directories cannot be listed, and when the trace does not show a file the
 depfile names being read, and when ld.so refused a preload in some process of
 the compile. ld.so's "cannot be preloaded" lines that name the tracer are then

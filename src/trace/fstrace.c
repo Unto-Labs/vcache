@@ -36,6 +36,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <link.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,33 +54,53 @@ static int log_fd = -1;
    enforced rather than assumed. */
 #define VCACHE_RECORD_MAX 4096
 
+/* VCACHE_TRACE_LOG, or NULL when tracing is off. A relative name counts as
+   unset: the log and its marker would land in whatever directory each process
+   of the tree is in when it first records. */
+static const char *log_path(void) {
+  const char *p = getenv("VCACHE_TRACE_LOG");
+  return p != NULL && p[0] == '/' ? p : NULL;
+}
+
 static void ensure_log(void) {
   if (log_fd != -1) return;
-  const char *p = getenv("VCACHE_TRACE_LOG");
-  if (p == NULL || *p == '\0') { log_fd = -2; return; }
+  const char *p = log_path();
+  if (p == NULL) { log_fd = -2; return; }
   log_fd = (int)syscall(SYS_openat, AT_FDCWD, p,
                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
   if (log_fd < 0) log_fd = -2;
 }
 
+/* A "!" line, which readers refuse the whole log on. */
+static void write_incomplete_sentinel(void) {
+  ensure_log();
+  if (log_fd < 0) return;
+  for (;;) {
+    long r = syscall(SYS_write, log_fd, "!\n", 2);
+    if (r >= 0 || errno != EINTR) return;
+  }
+}
+
 /* A lost record is not a lost log line: it is an input missing from the set
    that decides whether a later hit is sound. So any failure to record is made
    loud by creating "<log>.incomplete", which the caller checks before storing
-   an entry. Losing the marker too is survivable -- a tracer that cannot write
-   at all produces no process records either, which the caller already
-   refuses. */
+   an entry. A marker whose name does not fit, or that its directory refuses,
+   would leave the log looking whole -- possibly with other processes' P
+   records in it -- so the sentinel in the log is its backstop. */
 static void mark_incomplete(void) {
-  const char *p = getenv("VCACHE_TRACE_LOG");
-  if (p == NULL || *p == '\0') return;
-  char path[VCACHE_RECORD_MAX];
-  size_t n = 0;
-  for (const char *q = p; *q != '\0' && n < sizeof path - 12; ++q) path[n++] = *q;
-  const char suffix[] = ".incomplete";
-  for (size_t i = 0; i < sizeof suffix - 1; ++i) path[n++] = suffix[i];
-  path[n] = '\0';
-  int fd = (int)syscall(SYS_openat, AT_FDCWD, path,
-                        O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-  if (fd >= 0) syscall(SYS_close, fd);
+  const char *log = log_path();
+  if (log == NULL) return;
+  static const char suffix[] = ".incomplete";
+  char marker[PATH_MAX];
+  size_t n = strlen(log);
+  if (n + sizeof suffix <= sizeof marker) {
+    memcpy(marker, log, n);
+    memcpy(marker + n, suffix, sizeof suffix);
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, marker,
+                          O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0) { syscall(SYS_close, fd); return; }
+  }
+  write_incomplete_sentinel();
 }
 
 static void emit(char kind, const char *path) {

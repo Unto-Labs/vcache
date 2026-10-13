@@ -61,6 +61,9 @@ bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, Trace
   auto text = util::ReadFile(log_path);
   if (!text) return false;
   for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
+    // The tracer's own word that it lost a record, when it could not create
+    // the marker that TraceMarkedIncomplete looks for.
+    if (line == "!") return false;
     // A malformed line is a missing dependency record. Partial traces cannot
     // be trusted: skipping one can turn a required input into a false hit.
     if (line.size() < 3 || line[1] != '\t') return false;

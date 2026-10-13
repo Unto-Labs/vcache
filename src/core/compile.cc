@@ -537,7 +537,7 @@ CompilerId ResolveCompilerId(const std::string& compiler,
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v3";
+constexpr std::string_view kDepScanKeyVersion = "vcache-depscan-v4";
 constexpr std::string_view kManifestHeader = "vcache-depmanifest-2";
 
 // One remembered state: the files a scan read, and where its answer is stored.
@@ -551,6 +551,23 @@ struct DepManifestEntry {
 std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
                                         const RootMap& roots,
                                         bool keep_link_args) {
+  const auto canonical_arg = [&](const std::string& arg) {
+    // Macro values and tool selectors such as -B must remain as spelled.
+    static constexpr std::string_view kPathPrefixes[] = {
+        "-include-pch=", "-isystem", "-iquote", "-idirafter", "-include", "-imacros",
+        "-isysroot", "-iframework", "-iprefix", "-iwithprefixbefore", "-iwithprefix",
+        "--sysroot=", "-I", "-F", "-L", "-fsanitize-ignorelist=", "-fsanitize-blacklist=",
+        "-fsanitize-system-ignorelist=", "-fsanitize-coverage-allowlist=",
+        "-fsanitize-coverage-ignorelist=", "-fprofile-list=", "-fprofile-sample-use=",
+        "-fprofile-remapping-file=",
+    };
+    for (std::string_view prefix : kPathPrefixes) {
+      if (arg.size() > prefix.size() && util::StartsWith(arg, prefix)) {
+        return std::string(prefix) + roots.Canonicalize(std::string_view(arg).substr(prefix.size()));
+      }
+    }
+    return roots.Canonicalize(arg);
+  };
   std::vector<std::string> out;
   for (size_t i = 1; i < parsed.argv.size(); ++i) {
     const std::string& arg = parsed.argv[i];
@@ -566,7 +583,7 @@ std::vector<std::string> DepScanKeyArgs(const args::CompilerArgs& parsed,
       if (args::LinkOnlyFlagTakesValue(arg) && i + 1 < parsed.argv.size()) ++i;
       continue;
     }
-    out.push_back(roots.Canonicalize(arg));
+    out.push_back(canonical_arg(arg));
   }
   return out;
 }

@@ -3994,6 +3994,24 @@ void TestDepScanKeyArgs() {
   CheckEq(key_args({"gcc", "-MM", "main.c", "-MF", "a.d"}, no_roots),
           key_args({"gcc", "-MM", "main.c", "-MF", "b.d"}, no_roots),
           "where the answer goes is not key material");
+
+  for (const std::string flag : {"-I", "-isystem", "-iquote", "-idirafter", "-include",
+                                 "-imacros", "-F", "-L", "-isysroot", "--sysroot=",
+                                 "-iframework", "-fsanitize-ignorelist=",
+                                 "-fprofile-sample-use="}) {
+    const auto joined_args = [&](const std::string& tree) {
+      return util::Join(core::DepScanKeyArgs(
+                            args::Parse({"clang", "-M", "main.c", flag + tree + "/inc"}),
+                            MakeRoots({tree + "=proj"}), /*keep_link_args=*/true), "\n");
+    };
+    CheckEq(joined_args("/home/u/a"), joined_args("/home/u/b"),
+            "dep scan canonicalises joined path flag " + flag);
+  }
+  Check(key_args({"gcc", "-M", "main.c", "-DVALUE=/home/u/a/inc"},
+                 MakeRoots({"/home/u/a=proj"})) !=
+            key_args({"gcc", "-M", "main.c", "-DVALUE=/home/u/b/inc"},
+                     MakeRoots({"/home/u/b=proj"})),
+        "dep scan keeps path-valued macro definitions distinct");
 }
 
 void TestRustManifest() {

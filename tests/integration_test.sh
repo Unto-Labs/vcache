@@ -3213,6 +3213,26 @@ for mode in "-MM" "-M -MP"; do
 done
 
 # --------------------------------------------------------------------------
+section "14a. joined include paths share dependency scans"
+(
+  export VCACHE_DAEMON=off VCACHE_DEP_SCAN=manifest
+  reset_cache
+  for tree in a b; do
+    root="$WORK/joined-$tree"
+    mkdir -p "$root/inc"
+    printf '#define VALUE 42\n' > "$root/inc/value.h"
+    printf '#include <value.h>\nint value = VALUE;\n' > "$root/main.c"
+    ( cd "$root" && VCACHE_ROOTS="$root=proj" VCACHE_LOG="$root/scan.log" \
+        "$VCACHE" gcc -M "-I$root/inc" main.c -MF deps.d )
+  done
+  check "joined absolute include path hits the other checkout's scan" \
+    "$(grep -c 'dep scan hit' "$WORK/joined-b/scan.log")" "1"
+  check "joined include scan localizes the header path" \
+    "$(grep -c "$WORK/joined-b/inc/value.h" "$WORK/joined-b/deps.d")" "1"
+  [[ "$FAIL" == 0 ]]
+) && ok "joined dependency-scan paths" || bad "joined dependency-scan paths"
+
+# --------------------------------------------------------------------------
 section "14b. Concurrent dep-scan stores keep both states"
 
 # Same source, different headers, one canonical root. The paused store must

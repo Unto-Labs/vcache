@@ -83,9 +83,9 @@ built from what is known before the scan runs:
 - its own key-format version
 - compiler identity and the resolved native target
 - the sorted set of canonical root targets
-- the command line minus `-o`/`-MF`, with `-I`, `-D` and friends kept verbatim;
-  an argument that is itself a path under a root is canonicalised, a path joined
-  to its flag (`-I/abs/inc`) is not
+- the command line minus `-o`/`-MF`, including `-I`, `-D` and friends;
+  paths under a root are canonicalised, including joined path flags such as
+  `-I/abs/inc` and `-isystem/abs/inc`. Macro definitions stay as written
 - the source's **canonical path** and its contents. The path matters because
   headers are found relative to the source: identical sources reached by
   different canonical paths read different files, and a state recorded for one

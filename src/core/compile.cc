@@ -944,7 +944,7 @@ namespace {
 
 // New kinds of entry, so neither changes an existing key: the manifest itself,
 // and the result key of a compile that could not be preprocessed.
-constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v4";
+constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v5";
 constexpr std::string_view kCxxDerivedKeyVersion = "vcache-cxx-derived-v1";
 
 // gcc writes a dependency file named by one of these from the preprocessor.

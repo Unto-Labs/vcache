@@ -678,6 +678,15 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   that way until the next miss records a state.
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
   through `vcache-fstrace.so`); ccache and sccache do not cache it.
+- **The tracer sees only calls that reach it through the dynamic linker.** It
+  interposes the open, stat (`stat`, `stat64`, `statx`, the `*at` forms and the
+  pre-2.33 `__xstat` family), `access`, `readlink`, `readlinkat`, `opendir` and
+  `fdopendir` entry points. A raw `syscall()`, a static binary, a process that
+  drops `LD_PRELOAD`, and glibc's own internal opens (locale, gconv, nss data,
+  which never cross the PLT) leave no record. A stat of an open descriptor
+  (`statx(fd, "", AT_EMPTY_PATH)`, as Rust's `File::metadata` makes) records
+  nothing either: the file was recorded when the descriptor was opened, as it
+  is for a `read`.
 - **Objective-C/C++** are parsed and treated as cacheable but are untested here,
   since no such toolchain was available.
 - **Precompiled headers** are covered by the integration tests for clang

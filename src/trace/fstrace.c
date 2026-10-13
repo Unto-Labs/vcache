@@ -237,6 +237,13 @@ static void emit_at_result(struct at_path *at, const char *path, int failed,
   emit_open_result(at->buf, failed, saved_errno, written_only);
 }
 
+/* A stat of the descriptor itself, as Rust's File::metadata makes with
+   statx(fd, "", AT_EMPTY_PATH). The trace follows names, not descriptors: the
+   file was recorded when the descriptor was opened, as it is for a read(). */
+static int stats_descriptor(const char *path, int flags) {
+  return path != NULL && *path == '\0' && (flags & AT_EMPTY_PATH) != 0;
+}
+
 #define NEXT(sym)                                     \
   ({                                                  \
     static __typeof__(&sym) next_##sym;                   \
@@ -405,6 +412,7 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
 }
 
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+  if (stats_descriptor(path, flags)) return NEXT(fstatat)(dirfd, path, st, flags);
   struct at_path at;
   at_path_begin(&at, dirfd, path);
   int r = NEXT(fstatat)(dirfd, path, st, flags);
@@ -429,3 +437,143 @@ ssize_t readlink(const char *path, char *buf, size_t n) {
   errno = saved;
   return r;
 }
+
+int stat64(const char *path, struct stat64 *st) {
+  int r = NEXT(stat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int lstat64(const char *path, struct stat64 *st) {
+  int r = NEXT(lstat64)(path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+  if (stats_descriptor(path, flags)) return NEXT(fstatat64)(dirfd, path, st, flags);
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(fstatat64)(dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(&at, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+#ifdef STATX_BASIC_STATS
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st) {
+  if (stats_descriptor(path, flags)) return NEXT(statx)(dirfd, path, flags, mask, st);
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(statx)(dirfd, path, flags, mask, st);
+  int saved = errno;
+  emit_at_result(&at, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+#endif
+
+/* Binaries built against glibc before 2.33 call these for stat, lstat and
+   fstatat: their headers redirected those names here, with a struct layout
+   version first. */
+int __xstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__xstat)(ver, path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __xstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__xstat64)(ver, path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat(int ver, const char *path, struct stat *st) {
+  int r = NEXT(__lxstat)(ver, path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __lxstat64(int ver, const char *path, struct stat64 *st) {
+  int r = NEXT(__lxstat64)(ver, path, st);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+  if (stats_descriptor(path, flags)) return NEXT(__fxstatat)(ver, dirfd, path, st, flags);
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(__fxstatat)(ver, dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(&at, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags) {
+  if (stats_descriptor(path, flags)) return NEXT(__fxstatat64)(ver, dirfd, path, st, flags);
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(__fxstatat64)(ver, dirfd, path, st, flags);
+  int saved = errno;
+  emit_at_result(&at, path, r != 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t n) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  ssize_t r = NEXT(readlinkat)(dirfd, path, buf, n);
+  int saved = errno;
+  emit_at_result(&at, path, r < 0, saved, 0);
+  errno = saved;
+  return r;
+}
+
+DIR *fdopendir(int fd) {
+  DIR *r = NEXT(fdopendir)(fd);
+  int saved = errno;
+  if (r != NULL) {
+    char dir[VCACHE_RECORD_MAX];
+    size_t used = dirfd_prefix(fd, dir, sizeof dir);
+    if (used == 0) {
+      mark_incomplete();
+    } else {
+      if (used > 1) --used;  /* the separator dirfd_prefix adds, unless this is "/" */
+      dir[used] = '\0';
+      emit('D', dir);
+    }
+  }
+  errno = saved;
+  return r;
+}
+
+/* glibc has had a wrapper since 2.43; before it, a call is a raw syscall. */
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 43)
+int openat2(int dirfd, const char *path, const struct open_how *how, size_t size) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(openat2)(dirfd, path, how, size);
+  int saved = errno;
+  emit_at_result(&at, path, r < 0, saved, r >= 0 && (how->flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+#endif
+#endif

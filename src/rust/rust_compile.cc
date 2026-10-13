@@ -74,8 +74,8 @@ using core::RootMap;
 // Both bump together. A hit usually follows a manifest state to its entry key
 // without recomputing it, so an entry key bump alone would still lead an older
 // vcache from a v1 manifest into an entry whose sidecar section it skips.
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v4";
-constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v2";
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v5";
+constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v3";
 
 // Measured on a sunbird dev build: thresholds of 1, 2 and 4 MiB gave the same
 // warm build, 8 MiB and above a slower one, and the trimmer's walk did not
@@ -324,6 +324,57 @@ void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
 // artifact paths it wrote, which during a miss are inside vcache's staging
 // directory; substituting a placeholder keeps the entry directory-independent.
 constexpr std::string_view kOutDirPlaceholder = "/vcache-outdir";
+
+std::string JsonDirPrefix(std::string dir) {
+  while (!dir.empty() && dir.back() == '/') dir.pop_back();
+  std::string escaped;
+  for (unsigned char byte : dir) {
+    switch (byte) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (byte < 0x20) {
+          escaped += "\\u00";
+          escaped += "0123456789abcdef"[byte >> 4];
+          escaped += "0123456789abcdef"[byte & 15];
+        } else {
+          escaped += static_cast<char>(byte);
+        }
+    }
+  }
+  return escaped + "/";
+}
+
+// Artifact notifications name the stage directory even though consumers can
+// only open the placed outputs. Keep their paths independent of the roots,
+// since --out-dir can be relative or outside every mapped tree.
+std::string RewriteArtifactDir(std::string text, const std::string& from,
+                               const std::string& to) {
+  const std::string from_prefix = JsonDirPrefix(from);
+  const std::string to_prefix = JsonDirPrefix(to);
+  constexpr std::string_view kArtifact = "\"artifact\"";
+  size_t pos = 0;
+  const auto skip_space = [&]() {
+    while (pos < text.size() && std::string_view(" \t\r\n").find(text[pos]) !=
+                                   std::string_view::npos) ++pos;
+  };
+  while ((pos = text.find(kArtifact, pos)) != std::string::npos) {
+    pos += kArtifact.size();
+    skip_space();
+    if (pos == text.size() || text[pos++] != ':') continue;
+    skip_space();
+    if (pos == text.size() || text[pos++] != '"') continue;
+    if (text.compare(pos, from_prefix.size(), from_prefix) != 0) continue;
+    text.replace(pos, from_prefix.size(), to_prefix);
+    pos += to_prefix.size();
+  }
+  return text;
+}
 
 // Rewrites `from` to `to` at the start of every target and prerequisite.
 void SubstituteDir(core::DepFile* dep, const std::string& from,
@@ -722,7 +773,8 @@ HitOutcome ServeHit(const storage::GetResult& got, const args::RustcArgs& parsed
                               InlineBytes(blob.files) + sidecar_bytes, restore_started));
   VCACHE_LOG("rust: hit total " + util::MillisecondsSince(lookup_started) + " ms");
   if (!blob.stderr_text.empty()) {
-    const std::string text = roots.LocalizeText(blob.stderr_text);
+    const std::string text = RewriteArtifactDir(
+        roots.LocalizeText(blob.stderr_text), std::string(kOutDirPlaceholder), parsed.out_dir);
     ::fwrite(text.data(), 1, text.size(), stderr);
   }
   return HitOutcome::kServed;
@@ -1031,7 +1083,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
   }
 
   const bool storing = !config.read_only && cache != nullptr;
-  const std::string canonical_stderr = roots.CanonicalizeText(compiled.stderr_data);
+  const std::string canonical_stderr = roots.CanonicalizeText(RewriteArtifactDir(
+      compiled.stderr_data, stage_dir, std::string(kOutDirPlaceholder)));
   StorePrepared prepared = StorePrepared::kRefused;
   if (storing && !unparsed_dep_info.empty()) {
     core::RecordDecision(cache_dir, {Reason::kUnparsedDepInfo, unparsed_dep_info});
@@ -1062,7 +1115,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // points cargo at a file vcache has not written yet, and the dependent fails
   // with "extern location for <crate> does not exist".
   if (!compiled.stderr_data.empty()) {
-    ::fwrite(compiled.stderr_data.data(), 1, compiled.stderr_data.size(), stderr);
+    const std::string text = RewriteArtifactDir(compiled.stderr_data, stage_dir, parsed.out_dir);
+    ::fwrite(text.data(), 1, text.size(), stderr);
     ::fflush(stderr);
   }
 

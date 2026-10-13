@@ -762,6 +762,34 @@ else
 fi
 
 # --------------------------------------------------------------------------
+section "9f. Rust artifact notification paths"
+if command -v rustc >/dev/null 2>&1; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off
+    reset_cache
+    for tree in a b c; do
+      root="$WORK/artifacts-$tree"
+      case "$tree" in
+        a) output="$root/output" ;;
+        b) output='relative "quoted" \ output' ;;
+        c) output="$WORK/outside-root" ;;
+      esac
+      mkdir -p "$root/src"
+      printf 'pub fn value() -> u32 { 42 }\n' > "$root/src/lib.rs"
+      ( cd "$root" && VCACHE_ROOTS="$root=crate" "$VCACHE" rustc --crate-name artifacts \
+          --crate-type lib --emit=metadata,dep-info --error-format=json --json=artifacts \
+          --out-dir "$output" src/lib.rs ) 2> "$root/stderr.json"
+      check "Rust $tree announces the placed metadata artifact" \
+        "$(jq -r 'select(.emit == "metadata") | .artifact' "$root/stderr.json")" \
+        "$output/libartifacts.rmeta"
+    done
+    check "Rust artifact replay hits across checkouts" "$(hits)" "2"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "Rust artifact paths" || bad "Rust artifact paths"
+fi
+
+# --------------------------------------------------------------------------
 section "9g. Rust: outputs are placed as rustc left them, or not stored"
 
 if ! command -v rustc >/dev/null 2>&1; then

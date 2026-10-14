@@ -4315,6 +4315,45 @@ else
   skipped "a successful chroot: unshare -r is not available"
 fi
 
+# glibc headers before 2.41 declare the path of statx and fstatat nonnull,
+# though the kernel takes NULL with AT_EMPTY_PATH and Rust's File::metadata
+# passes it. At -O2 the compiler then deletes the wrappers' NULL tests and the
+# traced process segfaults (el10, glibc 2.39, gcc 14). The same prototypes
+# forced onto this host's headers reproduce it.
+mkdir -p "$WORK/tracer-nonnull"
+cat > "$WORK/tracer-nonnull/nonnull.h" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/stat.h>
+extern int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st)
+    __attribute__((nonnull(2, 5)));
+extern int fstatat(int dirfd, const char *path, struct stat *st, int flags)
+    __attribute__((nonnull(2, 3)));
+EOF
+cat > "$WORK/tracer-nonnull/probe.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stddef.h>
+#include <sys/stat.h>
+int main(void) {
+  int fd = open("/dev/null", O_RDONLY);
+  struct statx sx;
+  struct stat st;
+  if (fd < 0) return 1;
+  /* Newer kernels accept the NULL path; older ones refuse it. Either way the
+     wrapper must not dereference it. */
+  (void)statx(fd, NULL, AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+  (void)fstatat(fd, NULL, &st, AT_EMPTY_PATH);
+  return 0;
+}
+EOF
+gcc -std=c11 -O2 -fPIC -shared -Wall -Wextra -include "$WORK/tracer-nonnull/nonnull.h" \
+  -o "$WORK/tracer-nonnull/fstrace-nonnull.so" "$TOP/src/trace/fstrace.c" -ldl
+gcc "$WORK/tracer-nonnull/probe.c" -o "$WORK/tracer-nonnull/probe"
+( cd "$WORK/tracer-nonnull" && VCACHE_TRACE_LOG="$WORK/tracer-nonnull/trace" \
+  LD_PRELOAD="$WORK/tracer-nonnull/fstrace-nonnull.so" ./probe )
+check "a NULL path with AT_EMPTY_PATH survives a tracer built against nonnull prototypes" "$?" "0"
+
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
   cat > "$1/helper.c" <<EOF

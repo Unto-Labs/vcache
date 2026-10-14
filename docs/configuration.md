@@ -987,15 +987,17 @@ from:
 | Setting | Meaning |
 | --- | --- |
 | `true` *(default)* | The depfile and a trace of the compile. |
-| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1`, the depfile and that compiler's own list of what it did not find (below). |
+| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1` or `absent-deps-2`, the depfile and that compiler's own list of what it did not find (below). |
 
-A compiler built with the devtools absent-deps patch (gcc or clang) prints
-`absent-deps-1` after its version and, given `-fabsent-deps=FILE`, writes there
-every path the preprocessor looked for and did not find. Its depfile also names
-a header `__has_include` found and the PCH it read. The trace stays the first
-source for such a compiler too: it also sees what the driver reads and probes
-on its own (clang's `.cfg` files, the GCC installation it detects, gcc's
-`specs`), which the list does not name and leaves to the compiler fingerprint,
+A compiler built with the devtools absent-deps patch prints `absent-deps-1`
+(gcc) or `absent-deps-2` (clang) after its version and, given
+`-fabsent-deps=FILE`, writes there every path the preprocessor looked for and
+did not find. Version 2 also lists what clang's driver probed and did not find
+(its `.cfg` files, the GCC installation candidates, the distro files). Its
+depfile also names a header `__has_include` found and the PCH it read. The
+trace stays the first source for such a compiler too: it also sees what the
+driver reads (and gcc's driver probes, such as its `specs`), which the list does
+not name and leaves to the compiler fingerprint,
 and on `src/daemon/server.cc` recording from the list was not measurably
 cheaper. The list is the second source: where the compile has no tracer (any of
 the reasons below, `cxx_manifest_trace = false` among them), it gets
@@ -1011,7 +1013,7 @@ to a patched compiler too: its depfile names a header `__has_include` found,
 but not a probe that found nothing. A listed path that exists when the state is
 recorded is a compiler fault, and no state is recorded (`not recording: the
 compiler listed <path> as absent but it exists`). A version vcache does not
-know (`absent-deps-2` and up) is never asked for its list, and the log names
+know (`absent-deps-3` and up) is never asked for its list, and the log names
 the version; nor is clang under `-working-directory`, whose list is relative to
 that directory. To compare the two sources, set `cxx_manifest_trace = false`
 for the list and leave it on for the trace. `cxx_manifest_absent_deps`

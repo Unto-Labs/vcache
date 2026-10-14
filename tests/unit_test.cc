@@ -3541,8 +3541,16 @@ void TestCompilerBannerMark() {
   CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC) absent-deps-1\n")),
           "1", "gcc's token gives its version");
   CheckEq(std::to_string(core::AbsentDepsVersion(
+              "clang version 23.1.4 (https://github.com/llvm/llvm-project.git bb46d66) "
+              "absent-deps-2\nTarget: x86_64-unknown-linux-gnu\n")),
+          "2", "clang's version 2 token");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
               "clang version 22.1.8 (repo b65aa9b) absent-deps-12\nTarget: x86_64\n")),
           "12", "clang's two-digit version");
+  Check(!core::IsReadableAbsentDepsVersion(0), "version 0 (no patch) has no list to read");
+  Check(core::IsReadableAbsentDepsVersion(1), "version 1 (gcc, the first clang) is read");
+  Check(core::IsReadableAbsentDepsVersion(2), "version 2 (clang with its driver's probes) is read");
+  Check(!core::IsReadableAbsentDepsVersion(3), "version 3 is not known and not read");
   CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC)\n")), "0",
           "a stock banner has version 0");
   CheckEq(std::to_string(core::AbsentDepsVersion("absent-deps-x absent-deps-1y\n")), "0",
@@ -3578,6 +3586,8 @@ void TestCompilerBannerMark() {
   };
   const std::string stock = stub("gcc-stock", "gcc version 16.1.0 (GCC)");
   const std::string patched = stub("gcc-patched", "gcc version 16.1.0 (GCC) absent-deps-1");
+  const std::string patched2 =
+      stub("clang-patched2", "clang version 23.1.4 (repo bb46d66) absent-deps-2");
   const core::RootMap roots = MakeRoots({});
   const core::CompilerId stock_id = core::ResolveCompilerId(stock, "version", cache_dir, roots);
   const core::CompilerId patched_id = core::ResolveCompilerId(patched, "version", cache_dir, roots);
@@ -3586,6 +3596,11 @@ void TestCompilerBannerMark() {
         "the patched stub does not share the stock fingerprint");
   CheckEq(std::to_string(stock_id.absent_deps_version), "0", "stock: no absent-deps version");
   CheckEq(std::to_string(patched_id.absent_deps_version), "1", "patched: absent-deps version 1");
+  const core::CompilerId patched2_id =
+      core::ResolveCompilerId(patched2, "version", cache_dir, roots);
+  CheckEq(std::to_string(patched2_id.absent_deps_version), "2", "clang stub: absent-deps version 2");
+  Check(patched2_id.fingerprint != patched_id.fingerprint,
+        "version 2 does not share version 1's fingerprint");
   const core::CompilerId memoised = core::ResolveCompilerId(patched, "version", cache_dir, roots);
   CheckEq(memoised.fingerprint, patched_id.fingerprint, "the memoised answer is the same");
   CheckEq(std::to_string(memoised.absent_deps_version), "1", "which keeps the version");

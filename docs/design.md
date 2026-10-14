@@ -237,16 +237,20 @@ hit. A refusal of any other object is the build's own and stays. The entry is
 stored as usual.
 
 **The compiler's own list.** The devtools gcc and clang carry a patch that ends
-the version line of `-v` with `absent-deps-1`. Given `-fabsent-deps=FILE` such
-a compiler writes there every path the preprocessor looked for and did not
-find: each search directory tried before the one that supplied a header, each
-`__has_include` that found nothing, each `.gch` or `.pch` probed beside a
-header, each include directory that does not exist. Its depfile names a header
-`__has_include` found and every PCH it read. The trace still comes first: it
-also sees what the driver reads and probes on its own, which the list does not
-name, and recording from the list is not measurably cheaper. So when there is
-no tracer for the compile (any reason above, `cxx_manifest_trace` off among
-them), the banner carries version 1 (`CompilerId::absent_deps_version`) and
+the version line of `-v` with `absent-deps-1` (gcc) or `absent-deps-2` (clang).
+Given `-fabsent-deps=FILE` such a compiler writes there every path the
+preprocessor looked for and did not find: each search directory tried before
+the one that supplied a header, each `__has_include` that found nothing, each
+`.gch` or `.pch` probed beside a header, each include directory that does not
+exist. Version 2 writes the same list and adds what clang's driver probed and
+did not find: its config files, the GCC installation candidates and the distro
+files. Its depfile names a header `__has_include` found and every PCH it read.
+The trace still comes first: it also sees what the driver reads (and, for gcc
+and a version 1 clang, what it probes), which the list does not name, and
+recording from the list is not measurably cheaper. So when there is no tracer
+for the compile (any reason above, `cxx_manifest_trace` off among them), the
+banner carries version 1 or 2 (`CompilerId::absent_deps_version`,
+`IsReadableAbsentDepsVersion`) and
 `cxx_manifest_absent_deps` is on, the recording compile gets
 `-fabsent-deps=<scratch>/absent` beside the `-MD -MF` vcache adds; with a
 tracer it gets no such flag. The `-E` run follows the same rule (below). The

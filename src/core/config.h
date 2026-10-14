@@ -186,8 +186,8 @@ struct Config {
 
   // Where the compile has no tracer, record a C or C++ manifest state from the
   // compiler's own list of the paths it probed and did not find, when its
-  // banner says it writes one (`absent-deps-1`, the devtools gcc and clang
-  // patch). The trace comes first either way. Off, a compile without a tracer
+  // banner says it writes one (`absent-deps-1` or `-2`, the devtools gcc and
+  // clang patch). The trace comes first either way. Off, a compile without a tracer
   // records from the depfile alone.
   bool cxx_manifest_absent_deps = true;
 

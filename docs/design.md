@@ -161,7 +161,7 @@ that dependency file from the preprocessor, which a manifest hit never runs,
 and ignores the variable once `-MD` is on the command line.
 
 The second is a trace of the same compile. It runs with `vcache-fstrace.so`
-preloaded, as a link does (the `-E` run for the key does not), and the trace
+preloaded, as a link does, and the trace
 adds every file the compiler opened that the depfile does not name, and every
 path it probed and did not find. Where there is no tracer, a compiler that
 lists what it did not find is asked for that list instead (below). The depfile
@@ -249,8 +249,8 @@ no tracer for the compile (any reason above, `cxx_manifest_trace` off among
 them), the banner carries version 1 (`CompilerId::absent_deps_version`) and
 `cxx_manifest_absent_deps` is on, the recording compile gets
 `-fabsent-deps=<scratch>/absent` beside the `-MD -MF` vcache adds; with a
-tracer it gets no such flag, and the `-E` run never does. The flag is vcache's
-own, like `-MD`, and enters neither key. A version vcache does not know, the
+tracer it gets no such flag. The `-E` run follows the same rule (below). The
+flag is vcache's own, like `-MD`, and enters neither key. A version vcache does not know, the
 switch off, or clang's `-working-directory` (the list's relative paths are
 relative to that directory, not to where the compiler runs) records from the
 depfile alone, and the log says why. `cxx_manifest_trace = false` with a
@@ -299,6 +299,37 @@ name that key. With single-flight, such a compile leases the manifest key, and
 a peer it wakes looks in the manifest. Before the manifest existed, the same
 compile was a *preprocess failed* passthrough; if the compile fails too, it is
 still counted that way.
+
+**A preprocessor hit records a state too.** A lookup whose manifest has no
+matching state can still hit through the preprocessor key: a header edited
+only in a comment or in whitespace (the state's digest is stale, the
+preprocessed text is not), a clang PCH rebuilt with other bytes and no side
+file (the manifest key changes, the preprocessor key does not), an entry a
+tree with `cxx_manifest` off stored. Such a hit records a state naming the key
+it hit, so the next lookup skips the preprocessor. It is recorded from the
+`-E` run, set up as a recording compile is: whenever a state could be recorded
+(a manifest key, not read-only, not `recache`) and the manifest did not serve,
+the `-E` run gets `-MD -MF <scratch>/pp.d` (no `-MT`; the file is not kept),
+and `vcache-fstrace.so` preloaded or, without a tracer, a patched compiler's
+`-fabsent-deps=<scratch>/pp-absent`. Neither changes the preprocessed text,
+and neither enters a key; the devtools gcc and clang honour `-fabsent-deps=`
+under `-E`, and gcc's list under `-fpch-preprocess` names the same `.gch`
+probes as the compile's. The depfile, the trace and the list go through the
+same reading as a miss's, with the same declines: a time macro, a file changed
+after the lookup started, an unusable trace, ld.so refusing the preload, a gcc
+`__has_include` or unkeyed `.gch` from the depfile alone, clang's
+`-working-directory` (whose `-E` run then gets none of this), and a compile
+whose own dependency flags are not `-MD`. The `-E` run writes no object, so
+there is no `.incbin` scan; the preprocessor key has already refused `.incbin`.
+The hit's stored depfile is never read: the tree that stored it may have used
+`-MMD`. clang's `-E` does not load a PCH but reads the header it was built
+from; the state then lists that header, which only narrows it, and the PCH is
+in the manifest key either way. On a preprocessor miss the `-E` run's depfile,
+trace and list are dropped, and the compile records the state as before. The
+log says `cxx manifest: recorded a state from the preprocessor run`, a decline
+says `cxx manifest: not recording: <reason>`, and `--show-stats` counts these
+hits under `pp hits recorded`. The cost is one preload and a few hundred trace
+records on each `-E` run after a manifest miss; a manifest hit runs no `-E`.
 
 **Precompiled headers.** clang's depfile lists the PCH's headers but not the
 `.pch`, and gcc's lists neither the `.gch` nor its header, so a PCH joins the
@@ -705,12 +736,6 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 
 ## Known limitations
 
-- **A preprocessor hit records no manifest state.** States are recorded from
-  the depfile and the trace of a compile that ran. A lookup whose manifest key has no matching
-  state but whose preprocessor key hits (a header edited only in a comment, a
-  PCH rebuilt with different bytes and no `.sum`, an entry another tree stored
-  in preprocessor mode) is served by the preprocessor, and keeps being served
-  that way until the next miss records a state.
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
   through `vcache-fstrace.so`); ccache and sccache do not cache it.
 - **The tracer sees only calls that reach it through the dynamic linker.** It

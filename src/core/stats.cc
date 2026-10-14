@@ -28,7 +28,7 @@ constexpr const char* kNames[] = {
     "cache hit (disk)", "cache hit (s3)",   "cache miss",
     "uncacheable",      "compile failed",   "entries stored",
     "store failed",     "preprocess failed",
-    "cache media errors", "manifest hits",
+    "cache media errors", "manifest hits",      "pp hits recorded",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                   static_cast<size_t>(Counter::kCount),
@@ -231,11 +231,15 @@ std::string FormatStats(const Stats& stats, const std::string& cache_dir,
     out << stats.values[i] << "\n";
   };
   for (size_t i = 0; i < static_cast<size_t>(Counter::kCount); ++i) {
-    // Stored last for older readers, shown beside the hits it is a part of.
-    if (i == static_cast<size_t>(Counter::kManifestHit)) continue;
+    // Stored last for older readers, shown beside the hits they are a part of.
+    if (i == static_cast<size_t>(Counter::kManifestHit) ||
+        i == static_cast<size_t>(Counter::kManifestRecordedOnPreprocessorHit)) {
+      continue;
+    }
     print_counter(i);
     if (i == static_cast<size_t>(Counter::kHitS3)) {
       print_counter(static_cast<size_t>(Counter::kManifestHit));
+      print_counter(static_cast<size_t>(Counter::kManifestRecordedOnPreprocessorHit));
     } else if (i == static_cast<size_t>(Counter::kUncacheable)) {
       out << FormatReasons(stats, Outcome::kUncacheable);
       // Passthrough has no counter of its own, so it appears only once a

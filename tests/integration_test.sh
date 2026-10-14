@@ -5380,7 +5380,8 @@ rm -f "$tl/calls"
 l=$(mf_log trace1); mf_traced "$l"
 check "a miss records from a trace" "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
 check "its compile runs under the tracer" "$(traced_calls)" "1"
-check "and its -E run does not" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
+check "and so does its -E run, for the state a preprocessor hit would record" \
+  "$(grep -c 'vcache-fstrace\.so|.* -E main\.c$' "$tl/calls")" "1"
 check "and leaves no trace behind" \
   "$(find "$VCACHE_DIR" "$tl" -name 'trace*' | wc -l | tr -d ' ')" "0"
 calls_before=$(wc -l < "$tl/calls")
@@ -5394,6 +5395,7 @@ rm -f "$tl/calls"
 l=$(mf_log trace-ro); mf_traced "$l" VCACHE_READONLY=1
 check "a read-only miss compiles untraced" \
   "$(traced_calls)/$(grep -c 'recorded from the trace' "$l" || true)" "0/0"
+check "and preprocesses untraced" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
 
 # A trace that cannot be trusted to be whole is not used; the state comes from
 # the depfile, as it does where there is no tracer.
@@ -5967,6 +5969,105 @@ else
   skipped "g++ is not installed, or is clang"
 fi
 
+# A preprocessor hit records a state from its -E run, traced and given a
+# depfile as a recording compile is. Editing a comment leaves the preprocessed
+# text as it was and the state's digest stale: the next compile is served by
+# the preprocessor, and the one after it by the manifest.
+mkdir -p "$WORK/mf-pphit"
+mf_pphit() {  # $1 compiler, $2 log, then environment assignments
+  local cc=$1 log=$2; shift 2
+  ( cd "$WORK/mf-pphit" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
+      "$VCACHE" "$cc" -O2 -c t.c -o t.o ) 2>/dev/null
+}
+pphit_recorded() { stat_of "pp hits recorded"; }
+printf '#include "h.h"\nint six(void) { return SIX; }\n' > "$WORK/mf-pphit/t.c"
+for cc in gcc clang; do
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    skipped "$cc: not installed"
+    continue
+  fi
+  reset_cache
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log "pphit1-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: the first compile misses and records a state" \
+    "$(misses)/$(grep -c 'cxx manifest: stored 1 states' "$l")" "1/1"
+  check "$cc: a miss records nothing from its -E run" \
+    "$(grep -c 'recorded a state from the preprocessor run' "$l" || true)" "0"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log "pphit2-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: a comment edit misses the manifest" \
+    "$(grep -c 'rejected: .*h\.h changed' "$l")" "1"
+  check "$cc: and hits through the preprocessor" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'preprocessor skipped' "$l" || true)" "1/0"
+  check "$cc: the -E run is given a depfile" \
+    "$(grep -cE '\] preprocess: .* -MD -MF [^ ]*/pp\.d .*-E t\.c$' "$l")" "1"
+  check "$cc: the hit records a state from the -E run" \
+    "$(grep -c 'cxx manifest: recorded a state from the preprocessor run' "$l")" "1"
+  check "$cc: from its trace, in place of the stale state, which named the same key" \
+    "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+    "1/1"
+  check "$cc: --show-stats counts it" "$(pphit_recorded)" "1"
+  l=$(mf_log "pphit3-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: the next compile skips the preprocessor" \
+    "$(grep -c 'state 1 of 1; preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" \
+    "1/0"
+  check "$cc: and a manifest hit is not counted as recording" "$(pphit_recorded)" "1"
+done
+
+# With tracing off, gcc's -E run records from its depfile alone.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  untraced=(VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_CXX_MANIFEST_ABSENT_DEPS=0)
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  mf_pphit gcc "$(mf_log pphit-untraced1)" "${untraced[@]}"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log pphit-untraced2); mf_pphit gcc "$l" "${untraced[@]}"
+  check "gcc untraced: the preprocessor hit records from the depfile" \
+    "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'recorded a state from the preprocessor run' "$l")" \
+    "1/1"
+  check "gcc untraced: and not from a trace" \
+    "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+  l=$(mf_log pphit-untraced3); mf_pphit gcc "$l" "${untraced[@]}"
+  check "gcc untraced: the next compile skips the preprocessor" \
+    "$(grep -c 'preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" "1/0"
+else
+  skipped "gcc is not installed, or is clang"
+fi
+
+# The declines a miss applies hold for the -E run too: a header naming a time
+# macro, and clang told to resolve paths against another directory.
+if command -v gcc >/dev/null 2>&1; then
+  reset_cache
+  printf '/* one: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  mf_pphit gcc "$(mf_log pphit-time1)"
+  printf '/* two: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log pphit-time2); mf_pphit gcc "$l"
+  check "a preprocessor hit on a header naming __TIME__ records nothing" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'not recording: .*h\.h uses __TIME__' "$l")/$(grep -c 'stored [0-9] states' "$l" || true)" \
+    "1/1/0"
+fi
+if command -v clang >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/mf-pphit-wd/sub"
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit-wd/sub/h.h"
+  printf '#include "h.h"\nint six(void) { return SIX; }\n' > "$WORK/mf-pphit-wd/sub/t.c"
+  mf_pphit_wd() {  # $1 log
+    ( cd "$WORK/mf-pphit-wd" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" clang -working-directory=sub -O2 -c "$WORK/mf-pphit-wd/sub/t.c" -o t.o ) \
+      2>/dev/null
+  }
+  mf_pphit_wd "$(mf_log pphit-wd1)"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit-wd/sub/h.h"
+  l=$(mf_log pphit-wd2); mf_pphit_wd "$l"
+  check "clang -working-directory: a preprocessor hit records nothing" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'not recording: the compiler changes its working directory' "$l")" \
+    "1/1"
+  check "clang -working-directory: and its -E run gets no depfile" \
+    "$(grep -c '\] preprocess: .*pp\.d' "$l" || true)" "0"
+else
+  skipped "clang: not installed"
+fi
+
 # --------------------------------------------------------------------------
 section "19b. C/C++ manifest from the compiler's absent-path list"
 
@@ -6058,9 +6159,9 @@ EOF
     "$(grep -c "no tracer at '.*'; recording from the compiler's absent list" "$l")" "1"
   check "absent-deps-1: and not from a trace or the depfile alone" \
     "$(grep -cE 'recorded from the trace|recording from the depfile' "$l" || true)" "0"
-  check "absent-deps-1: only the recording compile is given -fabsent-deps=" \
-    "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/absent -o [^ ]*/out main\.c$' "$ads/calls")" \
-    "1/1"
+  check "absent-deps-1: the recording compile and the -E run each get their own -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/absent -o [^ ]*/out main\.c$' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/pp-absent -E main\.c$' "$ads/calls")" \
+    "2/1/1"
   check "absent-deps-1: and nothing runs under LD_PRELOAD" \
     "$(grep -vc '^none|' "$ads/calls" || true)" "0"
   absent_run "$d" "$(mf_log ad-shadow2)" "$ads/gcc-ad1" -I first -I second
@@ -6264,6 +6365,31 @@ EOF
   check "absent-deps-1: and its object uses it" "$(same_object "$ads/xb")" "same"
   l=$(mf_log ad-xa2); absent_tree xa "$l"
   check "absent-deps-1: while the first tree still hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
+
+  # A preprocessor hit records from the list its -E run wrote.
+  reset_cache
+  d="$ads/pphit"
+  shadow_tree "$d"
+  printf '/* one */\n#define V 2\n' > "$d/second/h.h"
+  absent_list first/h.h
+  absent_run "$d" "$(mf_log ad-pphit1)" "$ads/gcc-ad1" -I first -I second
+  printf '/* two */\n#define V 2\n' > "$d/second/h.h"
+  rm -f "$ads/calls"
+  l=$(mf_log ad-pphit2); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: a preprocessor hit records from its -E run's list" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")/$(grep -c 'recorded a state from the preprocessor run' "$l")" \
+    "1/1"
+  check "absent-deps-1: which only the -E run was given" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/pp-absent -E main\.c$' "$ads/calls")" \
+    "1/1"
+  l=$(mf_log ad-pphit3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: the next compile skips the preprocessor" \
+    "$(grep -c 'preprocessor skipped' "$l")" "1"
+  printf '#define V 1\n' > "$d/first/h.h"
+  absent_list
+  l=$(mf_log ad-pphit4); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: and a header created at a path the -E run's list named misses" \
+    "$(grep -c 'rejected: .*first/h\.h exists now' "$l")/$(misses)" "1/2"
 else
   skipped "absent-deps lists: gcc is not installed, or is clang"
 fi

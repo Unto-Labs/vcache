@@ -123,7 +123,17 @@ static size_t cwd_prefix(char *out, size_t size) {
   return used;
 }
 
+/* glibc declares the path of statx, fstatat and friends nonnull, though the
+   kernel takes NULL with AT_EMPTY_PATH and Rust's File::metadata passes it.
+   A compiler drops a NULL test on a parameter so declared (el10's glibc 2.39
+   headers, gcc 16); hiding where the pointer came from keeps every test below. */
+static const char *maybe_null(const char *path) {
+  __asm__("" : "+r"(path));
+  return path;
+}
+
 static void emit(char kind, const char *path) {
+  path = maybe_null(path);
   if (path == NULL || *path == '\0') return;
   ensure_log();
   if (log_fd < 0) return;
@@ -238,6 +248,7 @@ struct at_path {
 };
 
 static void at_path_begin(struct at_path *at, int dirfd, const char *path) {
+  path = maybe_null(path);
   int saved = errno;
   at->dir_used = 0;
   at->dir_known = path != NULL && *path != '\0';
@@ -250,6 +261,7 @@ static void at_path_begin(struct at_path *at, int dirfd, const char *path) {
 
 static void emit_at_result(struct at_path *at, const char *path, int failed,
                            int saved_errno, int written_only) {
+  path = maybe_null(path);
   /* An empty path names no file: without AT_EMPTY_PATH it is ENOENT by
      definition, with it the descriptor's file was recorded at its open. */
   if (path == NULL || *path == '\0') return;
@@ -265,6 +277,7 @@ static void emit_at_result(struct at_path *at, const char *path, int failed,
    statx(fd, "", AT_EMPTY_PATH). The trace follows names, not descriptors: the
    file was recorded when the descriptor was opened, as it is for a read(). */
 static int stats_descriptor(const char *path, int flags) {
+  path = maybe_null(path);
   return (path == NULL || *path == '\0') && (flags & AT_EMPTY_PATH) != 0;
 }
 

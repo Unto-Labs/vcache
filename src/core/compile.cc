@@ -953,7 +953,7 @@ namespace {
 
 // New kinds of entry, so neither changes an existing key: the manifest itself,
 // and the result key of a compile that could not be preprocessed.
-constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v6";
+constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v7";
 constexpr std::string_view kCxxDerivedKeyVersion = "vcache-cxx-derived-v1";
 
 // gcc writes a dependency file named by one of these from the preprocessor.
@@ -1244,8 +1244,9 @@ constexpr const char* kCompilerToolNames[] = {
 // What the trace of the compile adds to its depfile, or nullopt, after logging
 // why, when the trace cannot be trusted to be whole: no process loaded the
 // tracer (a static compiler, a hardened loader), the tracer said it lost a
-// record, a record is malformed, or the compiler's include directories cannot
-// be listed, which leaves nothing to tell its trees from what they hold.
+// record, a record is malformed or relative (an older tracer's), or the
+// compiler's include directories cannot be listed, which leaves nothing to
+// tell its trees from what they hold.
 std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
                                                    const std::string& tracer,
                                                    const std::string& scratch_dir,
@@ -1264,7 +1265,7 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
     return std::nullopt;
   }
   TraceRecords records;
-  if (!ReadTraceRecords(trace_log, cwd, &records)) {
+  if (!ReadTraceRecords(trace_log, &records)) {
     VCACHE_LOG("cxx manifest: the trace did not parse; recording from the depfile");
     return std::nullopt;
   }
@@ -1932,6 +1933,12 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (!manifest_key.empty()) {
     if (manifest_depfile.empty()) {
       manifest_inputs.declined = "the compile writes no -MD dependency file";
+    } else if (SetsWorkingDirectory(parsed)) {
+      // clang's relative paths, in its depfile and its probes, are relative to
+      // that directory, and joined to this one they can name a file of the
+      // same name here instead of the one it read. The preprocessed key still
+      // serves such a compile.
+      manifest_inputs.declined = "the compiler changes its working directory";
     } else {
       if (preload_refused) {
         VCACHE_LOG("cxx manifest: ld.so refused the tracer in a process of the compile; "

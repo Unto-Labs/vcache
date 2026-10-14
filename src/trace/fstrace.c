@@ -112,6 +112,17 @@ static void mark_incomplete(void) {
   write_incomplete_sentinel();
 }
 
+/* The working directory, written to `out` with a trailing '/', and its length;
+   0 when the kernel cannot name it as a path: removed, or outside this
+   process's root, which it spells "(unreachable)/...". */
+static size_t cwd_prefix(char *out, size_t size) {
+  long n = syscall(SYS_getcwd, out, size - 1);
+  if (n <= 1 || out[0] != '/') return 0;
+  size_t used = (size_t)n - 1;
+  if (out[used - 1] != '/') out[used++] = '/';
+  return used;
+}
+
 static void emit(char kind, const char *path) {
   if (path == NULL || *path == '\0') return;
   ensure_log();
@@ -121,15 +132,28 @@ static void emit(char kind, const char *path) {
   size_t n = 0;
   buf[n++] = kind;
   buf[n++] = '\t';
-  const char *q = path;
-  for (; *q != '\0' && n < sizeof buf - 1; ++q) {
-    if (*q == '\n' || *q == '\t') {
-      /* The line protocol cannot represent these bytes. Substitution would
-         name a different file and make later validation unsound. */
+  const size_t path_begin = n;
+  if (*path != '/') {
+    /* A relative path names a file in the directory this process is in now,
+       which no reader can know: the whole tree appends to one log, and any
+       process may have changed directory since it started. glibc changes it
+       off the PLT too (fts, ftw, posix_spawn), so the directory is asked for
+       on every record rather than remembered. */
+    size_t used = cwd_prefix(buf + n, sizeof buf - n);
+    if (used == 0) {
       mark_incomplete();
       return;
     }
-    buf[n++] = *q;
+    n += used;
+  }
+  const char *q = path;
+  for (; *q != '\0' && n < sizeof buf - 1; ++q) buf[n++] = *q;
+  if (memchr(buf + path_begin, '\n', n - path_begin) != NULL ||
+      memchr(buf + path_begin, '\t', n - path_begin) != NULL) {
+    /* The line protocol cannot represent these bytes. Substitution would
+       name a different file and make later validation unsound. */
+    mark_incomplete();
+    return;
   }
   if (*q != '\0') {
     /* Truncating would record a path that is not the one that was touched,
@@ -190,17 +214,6 @@ static size_t dirfd_prefix(int dirfd, char *out, size_t size) {
       memcmp(out + used - (sizeof removed - 1), removed, sizeof removed - 1) == 0) {
     return 0;
   }
-  if (out[used - 1] != '/') out[used++] = '/';
-  return used;
-}
-
-/* The working directory, written to `out` with a trailing '/', and its length;
-   0 when the kernel cannot name it as a path: removed, or outside this
-   process's root, which it spells "(unreachable)/...". */
-static size_t cwd_prefix(char *out, size_t size) {
-  long n = syscall(SYS_getcwd, out, size - 1);
-  if (n <= 1 || out[0] != '/') return 0;
-  size_t used = (size_t)n - 1;
   if (out[used - 1] != '/') out[used++] = '/';
   return used;
 }
@@ -618,6 +631,43 @@ DIR *fdopendir(int fd) {
       emit('D', dir);
     }
   }
+  errno = saved;
+  return r;
+}
+
+/* After a change of root every absolute record names a file inside the new
+   root, which a reader would check outside it, and the log's own name now
+   resolves inside it too. So the log's directory is held open across the
+   call, and a successful one leaves the marker in the directory the reader
+   looks in. A failed call changes nothing and leaves none. */
+int chroot(const char *path) {
+  const char *log = log_path();
+  if (log == NULL) return NEXT(chroot)(path);
+  ensure_log();
+  char dir[PATH_MAX];
+  const char *base = strrchr(log, '/') + 1;
+  size_t dir_len = (size_t)(base - log);
+  int dir_fd = -1;
+  if (dir_len < sizeof dir) {
+    memcpy(dir, log, dir_len);
+    dir[dir_len] = '\0';
+    dir_fd = (int)syscall(SYS_openat, AT_FDCWD, dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+  }
+  int r = NEXT(chroot)(path);
+  int saved = errno;
+  if (r == 0) {
+    static const char suffix[] = ".incomplete";
+    char marker[PATH_MAX];
+    size_t n = strlen(base);
+    int fd = -1;
+    if (dir_fd >= 0 && n + sizeof suffix <= sizeof marker) {
+      memcpy(marker, base, n);
+      memcpy(marker + n, suffix, sizeof suffix);
+      fd = (int)syscall(SYS_openat, dir_fd, marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    }
+    if (fd >= 0) syscall(SYS_close, fd); else write_incomplete_sentinel();
+  }
+  if (dir_fd >= 0) syscall(SYS_close, dir_fd);
   errno = saved;
   return r;
 }

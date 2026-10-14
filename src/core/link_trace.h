@@ -27,8 +27,8 @@ struct LinkTrace {
   std::vector<std::string> tools;
 };
 
-// The records of a tracer log by kind, each path made absolute against `cwd`
-// and otherwise spelled as the traced process passed it.
+// The records of a tracer log by kind, each path absolute: the tracer joins a
+// relative one to the directory the process was in when it made the call.
 struct TraceRecords {
   std::vector<std::string> reads;   // R
   std::vector<std::string> absent;  // M
@@ -37,10 +37,12 @@ struct TraceRecords {
   std::vector<std::string> written;  // W: opened for writing only
 };
 
-// False when the log cannot be read, any record is malformed, or the tracer
-// wrote its "!" line to say it lost a record without being able to mark the
-// log incomplete; for the reason ParseTraceLog gives.
-bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out);
+// False when the log cannot be read, any record is malformed or relative, or
+// the tracer wrote its "!" line to say it lost a record without being able to
+// mark the log incomplete; for the reason ParseTraceLog gives. A relative
+// record comes from a tracer that wrote paths as the process spelled them,
+// and the directory it was relative to is unknown.
+bool ReadTraceRecords(const std::string& log_path, TraceRecords* out);
 
 // True when the tracer could not record something and said so beside the log.
 bool TraceMarkedIncomplete(const std::string& log_path);
@@ -72,7 +74,7 @@ std::string WithoutPreloadRefusals(const std::string& stderr_text, const std::st
 
 // Parses a tracer log. `outputs` are the files this link writes; they are
 // excluded from every set, since an output is not an input to itself.
-// `cwd` resolves relative paths as the tracer recorded them.
+// `cwd` resolves relative `outputs`; the records are absolute.
 //
 // Returns false when the log cannot be read or any record is malformed. A
 // partially readable trace is not a usable input set: the missing record may be

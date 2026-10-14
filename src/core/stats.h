@@ -32,6 +32,9 @@ enum class Counter {
   // not run the preprocessor, a Rust one that did not run dep-info. Last, so
   // the file an older version wrote still lines up.
   kManifestHit,
+  // Of the preprocessor hits, those that recorded a manifest state from the
+  // -E run, so the next lookup skips the preprocessor.
+  kManifestRecordedOnPreprocessorHit,
   kCount,  // sentinel
 };
 

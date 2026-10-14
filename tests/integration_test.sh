@@ -3909,6 +3909,9 @@ int main(void) {
   if (input < 0) return 3;
   close(input);
   close(dir);
+  if (chdir("dir") != 0) return 4;
+  int also = openat(AT_FDCWD, "also-missing", O_RDONLY);
+  if (also >= 0 || errno != ENOENT) return 5;
   return 0;
 }
 EOF
@@ -3921,13 +3924,18 @@ check "the tracer preserves a failed call's errno" "$tracer_rc" "0"
 check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
+openat_p=$(cd "$WORK/tracer-openat" && pwd -P)
+check "a relative absence is recorded under the working directory" \
+  "$(grep -cxF $'M\t'"$openat_p/definitely-missing" "$WORK/tracer-openat/trace")" "1"
+check "and an AT_FDCWD one under the directory changed to since" \
+  "$(grep -cxF $'M\t'"$openat_p/dir/also-missing" "$WORK/tracer-openat/trace")" "1"
 
 # Every name the stat family goes by is traced. A compiler built against glibc
 # before 2.33 calls __xstat and friends, and newer code statx; gcc and clang
 # find a missing -I directory with one such call. The legacy entry points are
 # reached through dlsym, which finds the preloaded tracer first, since glibc
-# 2.33 and later no longer lets a new program link against them. Paths are
-# recorded as the process spelled them.
+# 2.33 and later no longer lets a new program link against them. A relative
+# path is recorded under the working directory.
 cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -3956,11 +3964,14 @@ rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
   VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
   LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./stats )
 check "the legacy and statx entry points behave as without the tracer" "$?" "0"
-check "each records the path it found absent" \
-  "$(grep -cE $'^M\t''absent-(xstat|lxstat64|stat64|statx)$' \
-      "$WORK/tracer-openat/trace")" "4"
+absent_recorded=0
+for name in xstat lxstat64 stat64 statx; do
+  absent_recorded=$(( absent_recorded +
+    $(grep -cxF $'M\t'"$openat_p/absent-$name" "$WORK/tracer-openat/trace") ))
+done
+check "each records the path it found absent" "$absent_recorded" "4"
 check "and what it found" \
-  "$(grep -cx $'R\tdir/value' "$WORK/tracer-openat/trace")" "1"
+  "$(grep -cxF $'R\t'"$openat_p/dir/value" "$WORK/tracer-openat/trace")" "1"
 check "a stat of a descriptor, with an empty path, is not a lost record" \
   "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
 
@@ -4127,8 +4138,9 @@ traced_stat() {  # $1 = log name, rest = command run in $WORK/tracer-stat
   ( cd "$WORK/tracer-stat" && VCACHE_TRACE_LOG="$log" \
     LD_PRELOAD="$TOP/bin/vcache-fstrace.so" "$@" ) >/dev/null 2>&1
 }
-stat_record() {  # $1 = log name, $2 = kind, $3 = path suffix
-  grep -cE "^$2"$'\t'"(.*/)?$3\$" "$WORK/tracer-stat/$1.trace"
+stat_p=$(cd "$WORK/tracer-stat" && pwd -P)
+stat_record() {  # $1 = log name, $2 = kind, $3 = path under the fixture
+  grep -cxF "$2"$'\t'"$stat_p/$3" "$WORK/tracer-stat/$1.trace"
 }
 traced_stat coreutils-stat stat dir/f
 check "stat(1) records what it stats" "$(stat_record coreutils-stat R dir/f)" "1"
@@ -4196,6 +4208,112 @@ check "a stat of an open descriptor does not mark the trace incomplete" \
 check "an absence probed through a directory descriptor is an M record" \
   "$(grep -cxF $'M\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/nope" \
      "$WORK/tracer-stat/calls.trace")" "1"
+
+# Every record is absolute. A relative path names a file in the directory the
+# process is in when it makes the call, which no reader can know: the whole
+# tree appends to one log, and a process may change directory at any time.
+mkdir -p "$WORK/tracer-cwd/x" "$WORK/tracer-cwd/a" "$WORK/tracer-cwd/b"
+for f in x/rel a/rel b/rel; do : > "$WORK/tracer-cwd/$f"; done
+cwd_p=$(cd "$WORK/tracer-cwd" && pwd -P)
+( cd "$WORK/tracer-cwd" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/sh.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" sh -c 'cd x && cat rel' )
+check "a read after cd is recorded under the directory it was made in" \
+  "$(grep -cxF $'R\t'"$cwd_p/x/rel" "$WORK/tracer-cwd/sh.trace")" "1"
+check "and no record is relative" \
+  "$(grep -c $'^.\t[^/]' "$WORK/tracer-cwd/sh.trace")" "0"
+cat > "$WORK/tracer-cwd/chdir.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  int a = open("a", O_RDONLY | O_DIRECTORY);
+  if (a < 0 || chdir("a") != 0) return 1;
+  int fd = open("rel", O_RDONLY);
+  if (fd < 0) return 2;
+  close(fd);
+  if (chdir("../b") != 0) return 3;
+  fd = open("rel", O_RDONLY);
+  if (fd < 0) return 4;
+  close(fd);
+  if (fchdir(a) != 0) return 5;
+  struct stat st;
+  return stat("rel", &st) == 0 ? 0 : 6;
+}
+EOF
+gcc "$WORK/tracer-cwd/chdir.c" -o "$WORK/tracer-cwd/chdir"
+( cd "$WORK/tracer-cwd" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/chdir.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chdir )
+check "a program changing directory runs as without the tracer" "$?" "0"
+check "its reads in the first directory, by chdir and by fchdir, are recorded there" \
+  "$(grep -cxF $'R\t'"$cwd_p/a/rel" "$WORK/tracer-cwd/chdir.trace")" "2"
+check "and its read in the second there" \
+  "$(grep -cxF $'R\t'"$cwd_p/b/rel" "$WORK/tracer-cwd/chdir.trace")" "1"
+
+# A working directory the kernel cannot name leaves the record nothing to be
+# relative to: it is a lost record, never a bare relative one.
+mkdir -p "$WORK/tracer-cwd/gone-run"
+cat > "$WORK/tracer-cwd/gone.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  if (mkdir("gone", 0700) != 0 || chdir("gone") != 0 || rmdir("../gone") != 0) return 1;
+  return open("rel", O_RDONLY) < 0 ? 0 : 2;
+}
+EOF
+gcc "$WORK/tracer-cwd/gone.c" -o "$WORK/tracer-cwd/gone"
+( cd "$WORK/tracer-cwd/gone-run" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/gone.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ../gone )
+check "a removed working directory runs as without the tracer" "$?" "0"
+check "and marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-cwd/gone.trace.incomplete" ]] && echo yes)" "yes"
+check "instead of recording the path relatively" \
+  "$(grep -c $'\trel$' "$WORK/tracer-cwd/gone.trace")" "0"
+
+# The working directory counts toward the record's length: a relative path
+# that fits alone but not under the directory is a lost record.
+overflow_dir="$WORK/tracer-overflow/$(printf 'o%.0s' {1..100})"
+mkdir -p "$overflow_dir"
+overflow_component=$(printf 'q%.0s' {1..250})
+overflow_path=$overflow_component
+for _ in {2..16}; do overflow_path+="/$overflow_component"; done
+( cd "$overflow_dir" && VCACHE_TRACE_LOG="$WORK/tracer-overflow/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat "$overflow_path" ) 2>/dev/null
+check "a relative path too long under the working directory marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-overflow/trace.incomplete" ]] && echo yes)" "yes"
+check "and is not recorded" \
+  "$(grep -c "$overflow_component" "$WORK/tracer-overflow/trace")" "0"
+
+# After a change of root every absolute path names a file inside the new root,
+# which no reader could check, so a successful chroot marks the trace
+# incomplete beside the log; a failed one changes nothing.
+mkdir -p "$WORK/tracer-chroot/jail"
+cat > "$WORK/tracer-chroot/chroot.c" <<'EOF'
+#include <unistd.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  return chroot(argv[1]) == 0 ? 0 : 1;
+}
+EOF
+gcc "$WORK/tracer-chroot/chroot.c" -o "$WORK/tracer-chroot/chroot"
+if [[ "$(id -u)" != 0 ]]; then
+  ( cd "$WORK/tracer-chroot" && VCACHE_TRACE_LOG="$WORK/tracer-chroot/failed.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chroot "$WORK/tracer-chroot/jail" )
+  check "an unprivileged chroot fails as without the tracer" "$?" "1"
+  check "and leaves no marker" \
+    "$([[ -e "$WORK/tracer-chroot/failed.trace.incomplete" ]] && echo yes || echo no)" "no"
+else
+  skipped "root's chroot succeeds"
+fi
+if unshare -r true 2>/dev/null; then
+  ( cd "$WORK/tracer-chroot" && unshare -r env VCACHE_TRACE_LOG="$WORK/tracer-chroot/done.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chroot "$WORK/tracer-chroot/jail" )
+  check "a chroot in a user namespace succeeds under the tracer" "$?" "0"
+  check "and leaves the marker beside the log" \
+    "$([[ -e "$WORK/tracer-chroot/done.trace.incomplete" ]] && echo yes)" "yes"
+else
+  skipped "a successful chroot: unshare -r is not available"
+fi
 
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
@@ -4466,6 +4584,14 @@ __attribute__((constructor)) static void stub(void) {
     if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
     return;
   }
+  if (strcmp(mode, "relative") == 0) {
+    /* What a tracer from before records were absolute writes for a process
+       that may have changed directory. */
+    const char *text = "P\t/bin/sh\nR\tmain.c\n";
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
+    return;
+  }
   if (strcmp(mode, "noprocs") == 0) {
     /* Reads, but never announces a process: the input set may be partial. */
     int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -4495,6 +4621,14 @@ STUBEOF
     check "a trace with the tracer's lost-record line is not stored" "$(disk_entries)" "0"
     check "and the link says the trace is unusable" \
       "$(grep -c 'link: no usable trace' "$WORK/lost-line.log")" "1"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so" \
+        VCACHE_LOG="$WORK/relative-record.log" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-rel ) 2>/dev/null
+    check "a trace with a relative record is not stored" "$(disk_entries)" "0"
+    check "and the link says the trace is unusable" \
+      "$(grep -c 'link: no usable trace' "$WORK/relative-record.log")" "1"
   else
     printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
   fi
@@ -5414,6 +5548,12 @@ if [[ -f "$WORK/stub-tracer.so" ]]; then
     "$(grep -c 'the trace names no process; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   reset_cache
+  l=$(mf_log trace-rel)
+  mf_traced "$l" STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so"
+  check "a trace with a relative record falls back to the depfile" \
+    "$(grep -c 'the trace did not parse; recording from the depfile' "$l")" "1"
+  check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  reset_cache
   l=$(mf_log trace-nolog)
   mf_traced "$l" VCACHE_TRACER="$WORK/stub-tracer.so"
   check "a tracer that writes no log is reported as never loaded" \
@@ -5436,6 +5576,31 @@ l=$(mf_log trace-none); mf_traced "$l" VCACHE_TRACER="$WORK/no-such-tracer.so"
 check "without a tracer the state comes from the depfile" \
   "$(grep -c "no tracer at '$WORK/no-such-tracer.so'; recording from the depfile" "$l")" "1"
 check "and is still recorded" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+
+# Under -working-directory, clang's relative paths are relative to that
+# directory, and joined to the one it runs in they name the decoys here.
+if command -v clang >/dev/null 2>&1; then
+  reset_cache
+  for t in A B; do
+    mkdir -p "$WORK/mf-workdir/$t"
+    printf '#define V 1\n' > "$WORK/mf-workdir/$t/h.h"
+    printf '#include "h.h"\nint v = V;\n' > "$WORK/mf-workdir/$t/main.c"
+  done
+  l=$(mf_log workdir)
+  ( cd "$WORK/mf-workdir/A" && VCACHE_LOG="$l" "$VCACHE" clang \
+      "-working-directory=$WORK/mf-workdir/B" -c main.c -MD -MF m.d -o m.o ) 2>/dev/null
+  check "a compile that changes its working directory records no state" \
+    "$(grep -c 'not recording: the compiler changes its working directory' "$l")" "1"
+  check "and stores none" "$(grep -c 'cxx manifest: stored 1 states' "$l" || true)" "0"
+  l=$(mf_log workdir-pp)
+  ( cd "$WORK/mf-workdir/A" && VCACHE_LOG="$l" "$VCACHE" clang \
+      "-working-directory=$WORK/mf-workdir/B" -c main.c -MD -MF m.d -o m.o ) 2>/dev/null
+  check "nor does its preprocessor hit" \
+    "$(grep -c 'not recording: the compiler changes its working directory' "$l")/$(
+       grep -c 'recorded a state from the preprocessor run' "$l" || true)" "1/0"
+else
+  skipped "-working-directory: clang is not installed"
+fi
 
 # A tracer ld.so would refuse is not preloaded: the refusal would go to the
 # compile's stderr, and from there into the entry and every hit.

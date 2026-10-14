@@ -273,13 +273,14 @@ void TestLinkTraceClassification() {
 
   // Loaded objects and files written only are their own kinds in the log, and
   // the link cache keeps both as inputs, as it did before they were told apart.
-  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\tmap.txt\n");
+  util::WriteFileAtomic(log,
+                        "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\t/home/u/proj/map.txt\n");
   core::TraceRecords records;
-  Check(core::ReadTraceRecords(log, "/home/u/proj", &records), "the kinds parse");
+  Check(core::ReadTraceRecords(log, &records), "the kinds parse");
   Check(records.loaded.size() == 1 && records.loaded[0] == "/usr/lib64/libbfd.so" &&
             records.written.size() == 1 && records.written[0] == "/home/u/proj/map.txt" &&
             records.reads.empty(),
-        "a loaded object and a file written only are kept apart from reads, made absolute");
+        "a loaded object and a file written only are kept apart from reads");
   core::LinkTrace kinds;
   Check(core::ParseTraceLog(log, {}, "/home/u/proj", &kinds), "the kinds parse for a link");
   CheckEq(util::Join(kinds.inputs, " "), "/home/u/proj/map.txt /usr/lib64/libbfd.so",
@@ -358,8 +359,16 @@ void TestLinkTraceClassification() {
         "a malformed trace is rejected rather than partially trusted");
   util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\t/home/u/proj/a.o\n!\n");
   core::TraceRecords lost;
-  Check(!core::ReadTraceRecords(log, "/", &lost),
+  Check(!core::ReadTraceRecords(log, &lost),
         "a trace carrying the tracer's lost-record line is refused");
+  // An older tracer wrote paths as the process spelled them, relative to a
+  // directory the process may have left.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\ta.o\n");
+  core::TraceRecords relative_records;
+  Check(!core::ReadTraceRecords(log, &relative_records), "a relative record is refused");
+  core::LinkTrace relative_trace;
+  Check(!core::ParseTraceLog(log, {}, "/home/u/proj", &relative_trace),
+        "and so is a link trace holding one");
   util::RemoveRecursive(dir);
 }
 

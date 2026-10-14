@@ -57,7 +57,7 @@ bool IsIgnoredPath(const std::string& path) {
   return false;
 }
 
-bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, TraceRecords* out) {
+bool ReadTraceRecords(const std::string& log_path, TraceRecords* out) {
   auto text = util::ReadFile(log_path);
   if (!text) return false;
   for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
@@ -68,8 +68,10 @@ bool ReadTraceRecords(const std::string& log_path, const std::string& cwd, Trace
     // be trusted: skipping one can turn a required input into a false hit.
     if (line.size() < 3 || line[1] != '\t') return false;
     const char kind = line[0];
+    // A tracer from before records were made absolute: joining the record to
+    // any directory here can name a file the process never touched.
+    if (line[2] != '/') return false;
     std::string path = line.substr(2);
-    if (path[0] != '/') path = cwd + "/" + path;
     switch (kind) {
       case 'R': out->reads.push_back(std::move(path)); break;
       case 'M': out->absent.push_back(std::move(path)); break;
@@ -178,7 +180,7 @@ bool ParseTraceLog(const std::string& log_path,
                    const std::vector<std::string>& outputs,
                    const std::string& cwd, LinkTrace* out) {
   TraceRecords records;
-  if (!ReadTraceRecords(log_path, cwd, &records)) return false;
+  if (!ReadTraceRecords(log_path, &records)) return false;
 
   std::vector<std::string> abs_outputs;
   abs_outputs.reserve(outputs.size());

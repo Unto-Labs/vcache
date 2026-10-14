@@ -222,11 +222,13 @@ splits `LD_PRELOAD` there), and when `LD_PRELOAD` is already set. A trace that
 turns out unusable after the compile gives the depfile alone, since the list
 was not asked for: when no process loaded the tracer, when the trace is marked
 incomplete (a `.incomplete` file beside it, or a `!` line in it when that file
-cannot be created), does not parse or names no process, when no compiler front
-end (`cc1*`, `clang`) ran under it, when a missing directory on the include
-path is not among its absent paths, when the compiler's include directories
-cannot be listed, when the trace does not show a file the depfile names being
-read, and when ld.so refused a preload in some process of the compile. Only a
+cannot be created), does not parse, holds a relative record (written by a
+tracer from before records were absolute) or names no process, when no
+compiler front end (`cc1*`, `clang`) ran under it, when a missing directory on
+the include path is not among its absent paths, when the compiler's include
+directories cannot be listed, when the trace does not show a file the depfile
+names being read, and when ld.so refused a preload in some process of the
+compile. Only a
 state from the trace or the list is protected against a header created earlier
 on the include path; one from the depfile alone, which is every state on macOS,
 has the depend-mode hole. ld.so's "cannot be preloaded" lines that name the
@@ -254,12 +256,14 @@ banner carries version 1 or 2 (`CompilerId::absent_deps_version`,
 `cxx_manifest_absent_deps` is on, the recording compile gets
 `-fabsent-deps=<scratch>/absent` beside the `-MD -MF` vcache adds; with a
 tracer it gets no such flag. The `-E` run follows the same rule (below). The
-flag is vcache's own, like `-MD`, and enters neither key. A version vcache does not know, the
-switch off, or clang's `-working-directory` (the list's relative paths are
-relative to that directory, not to where the compiler runs) records from the
-depfile alone, and the log says why. `cxx_manifest_trace = false` with a
-patched compiler is how to record from the list on purpose, to compare it with
-the trace.
+flag is vcache's own, like `-MD`, and enters neither key. A version vcache does
+not know or the switch off records from the depfile alone, and the log says
+why. Clang's `-working-directory` records no state: the relative paths of its
+list, its depfile and its probes are relative to that directory, not to where
+the compiler runs, and joined to the latter they can name a file there of the
+same name. The preprocessed key still serves such a compile.
+`cxx_manifest_trace = false` with a patched compiler is how to record from the
+list on purpose, to compare it with the trace.
 
 The state's files come from the depfile, less a PCH the manifest key already
 identifies, whose bytes may differ between trees that share one identity. Its
@@ -751,6 +755,17 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   (`statx(fd, "", AT_EMPTY_PATH)`, as Rust's `File::metadata` makes) records
   nothing either: the file was recorded when the descriptor was opened, as it
   is for a `read`.
+- **Every traced path is absolute, against the physical working directory.**
+  The tracer joins a relative path to the directory `getcwd` names when the
+  call returns, as `util::CurrentDir()` does for the readers, so a process that
+  changes directory is recorded where it read. A working directory the kernel
+  cannot name (removed, or outside the process's root) or a record too long
+  with it joined is a lost record, which marks the trace incomplete. So does a
+  successful `chroot`, after which absolute paths name files inside the new
+  root; a raw `SYS_chroot` or `pivot_root` is not seen. A thread changing
+  directory between another's call and its record misattributes that record. A
+  reader refuses a trace holding a relative record, which only a tracer from
+  before this rule writes: the directory it was relative to is unknown.
 - **A probe that fails for a reason other than `ENOENT` records nothing.** The
   tracer records a successful open or probe as an input (`R`) and an `ENOENT`
   failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other

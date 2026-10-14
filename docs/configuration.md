@@ -956,6 +956,18 @@ on stored, and the reverse. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
 `--show-stats` counts it as a hit and again under `manifest hits`.
 
+A lookup the manifest does not answer but the preprocessor key does (a header
+edited only in a comment, a clang PCH rebuilt with other bytes and no side
+file, an entry stored with `cxx_manifest` off) records a state too, so the next
+lookup skips the preprocessor. It comes from the `-E` run, which after a
+manifest miss gets `-MD -MF <scratch>` and the tracer, or a patched compiler's
+`-fabsent-deps=<scratch>`, exactly as a recording compile does; neither changes
+the preprocessed text or a key. The same rules decline it as decline a miss's
+state (below), and clang's `-working-directory` declines it too. The log says
+`cxx manifest: recorded a state from the preprocessor run`, and `--show-stats`
+counts it under `pp hits recorded`. On a preprocessor miss what the `-E` run
+saw is dropped; the compile records the state.
+
 | Setting | Meaning |
 | --- | --- |
 | `true` | Look up and record manifest states. |
@@ -990,8 +1002,9 @@ the reasons below, `cxx_manifest_trace = false` among them), it gets
 `-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says `no
 tracer at '...'; recording from the compiler's absent list` (or `tracing is
 off; ...`) and then `cxx manifest: recorded from the compiler's absent list: N
-files, M absent paths`. With a tracer the flag is not passed. The paths are
-stored as the trace's are, through the roots and as the highest missing
+files, M absent paths`. With a tracer the flag is not passed. The `-E` run gets
+its own flag on the same terms, for the state a preprocessor hit records. The
+paths are stored as the trace's are, through the roots and as the highest missing
 ancestor, and the gcc `.gch` and `__has_include` rules below do not apply to a
 state from the list, which holds the probes. From the depfile alone they apply
 to a patched compiler too: its depfile names a header `__has_include` found,
@@ -1238,7 +1251,9 @@ source path.
 `--show-stats` lists *manifest hits* under the two hit rows: the hits a
 manifest answered, without running the preprocessor for C and C++ or the
 dep-info run for Rust. They are part of the hit counts above them, not added
-to them.
+to them. *pp hits recorded* follows: the C and C++ hits the preprocessor key
+answered that recorded a manifest state from the `-E` run, also part of the
+hit counts.
 
 `--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
 indented under each, plus a *passthrough* row for runs that fell back to the

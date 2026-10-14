@@ -5220,8 +5220,8 @@ void TestStats() {
             old_stats.Get(Counter::kCacheMediaError) == 9,
         "a nine-line file from an older version parses positionally");
   Check(old_stats.reasons.empty(), "and has no reasons");
-  CheckEq(core::RenderStats(old_stats), old_format + "0\n",
-          "and renders back with a zero manifest-hit counter after them");
+  CheckEq(core::RenderStats(old_stats), old_format + "0\n0\n",
+          "and renders back with zero manifest counters after them");
 
   core::Stats stats;
   stats.Add(Counter::kMiss, 5);
@@ -5238,19 +5238,19 @@ void TestStats() {
         "a passthrough reason is counted on its own");
   const std::string rendered = core::RenderStats(stats);
   CheckEq(rendered,
-          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n"
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n0\n"
           "reason\tlink\t1\n"
           "reason\tno rust dep-info\t1\n"
           "reason\tno temp dir\t1\n"
           "reason\tpreprocess only\t2\n",
-          "reason lines follow the ten positional counters");
+          "reason lines follow the eleven positional counters");
   const core::Stats reparsed = core::ParseStats(rendered);
   Check(reparsed.reasons == stats.reasons &&
             std::equal(std::begin(reparsed.values), std::end(reparsed.values),
                        std::begin(stats.values)),
         "ParseStats reads back what RenderStats wrote");
 
-  const core::Stats extended = core::ParseStats(old_format +
+  const core::Stats extended = core::ParseStats(old_format + "0\n0\n" +
                                                 "reason\tlink\t4\n"
                                                 "histogram 1 2 3\n"
                                                 "\n"
@@ -5261,7 +5261,7 @@ void TestStats() {
   Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
         "unknown trailing lines are ignored");
   CheckEq(core::RenderStats(extended),
-          old_format + "0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          old_format + "0\n0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
           "a reason this version does not know is carried through");
 
   const core::Stats damaged = core::ParseStats(old_format +
@@ -5295,12 +5295,15 @@ void TestStats() {
   core::Stats manifest_stats;
   manifest_stats.Add(Counter::kHitDisk, 3);
   manifest_stats.Add(Counter::kManifestHit, 2);
+  manifest_stats.Add(Counter::kManifestRecordedOnPreprocessorHit, 1);
   Check(core::FormatStats(manifest_stats, "/c", 0, 1)
                 .find("cache hit (disk)    3\n"
                       "cache hit (s3)      0\n"
                       "manifest hits       2\n"
+                      "pp hits recorded    1\n"
                       "cache miss          0\n") != std::string::npos,
-        "--show-stats lists manifest hits under the hits they are part of");
+        "--show-stats lists manifest hits and the preprocessor hits that recorded a state "
+        "under the hits they are part of");
   const std::string plain = core::FormatStats(core::Stats{}, "/c", 0, 1);
   Check(plain.find("passthrough") == std::string::npos && plain.find("\n  ") == std::string::npos,
         "--show-stats adds nothing while every reason is zero");

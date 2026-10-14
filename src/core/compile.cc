@@ -117,9 +117,15 @@ bool LooksLikeClang(const std::string& banner, const std::string& path) {
 // clang emits no such linemarker and rejects the flag as unused -- fatally so
 // under -Werror, which would turn every clang compile into a failed preprocess
 // and silently disable the cache. So it goes only to the driver that needs it.
+//
+// A non-empty `depfile` and `absent_list_path` are for a manifest state a
+// preprocessor hit records: -MD changes nothing in the preprocessed text, and
+// neither enters a key.
 std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed,
                                                 const RootMap& roots,
-                                                const CompilerId& compiler_id) {
+                                                const CompilerId& compiler_id,
+                                                const std::string& depfile = "",
+                                                const std::string& absent_list_path = "") {
   std::vector<std::string> cmd;
   cmd.push_back(parsed.compiler);
   // base_args deliberately excludes dependency flags: gcc rejects -MP or -MF
@@ -138,6 +144,12 @@ std::vector<std::string> BuildPreprocessCommand(const args::CompilerArgs& parsed
   // `#define FOO 2` would preprocess identically, and clang's size check would
   // accept the old PCH too. -dD keeps the definitions in the text.
   if (parsed.produces_pch) cmd.push_back("-dD");
+  if (!depfile.empty()) {
+    cmd.push_back("-MD");
+    cmd.push_back("-MF");
+    cmd.push_back(depfile);
+  }
+  if (!absent_list_path.empty()) cmd.push_back("-fabsent-deps=" + absent_list_path);
   cmd.push_back("-E");
   cmd.push_back(parsed.source);
   return cmd;
@@ -1129,7 +1141,7 @@ std::vector<CxxManifestState> LoadCxxManifest(storage::CacheChain* cache,
   return states;
 }
 
-void StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_key,
+bool StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_key,
                       CxxManifestState fresh, const std::vector<CxxManifestState>& loaded,
                       const std::string& cache_dir, bool* media_failed) {
   PauseBeforeManifestPut();
@@ -1146,6 +1158,7 @@ void StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
   *media_failed |= ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "cxx manifest: stored " + std::to_string(states.size()) + " states"
                         : std::string("cxx manifest: could not store"));
+  return put.stored;
 }
 
 // The compiler's own <...> include directories, from `<compiler> -E -v` in the
@@ -1197,42 +1210,53 @@ std::vector<std::string> SystemIncludeDirs(const args::CompilerArgs& parsed,
   return dirs;
 }
 
-// The tracer to run the recording compile under, or empty, after logging why
-// and that the state is to come from `fallback` instead.
-std::string CxxManifestTracer(const Config& config, const std::string& fallback) {
+// The tracer a recording run can be preloaded with, or empty with
+// `untraced_reason` saying why not.
+std::string UsableCxxManifestTracer(const Config& config, std::string* untraced_reason) {
 #ifdef __linux__
   if (!config.cxx_manifest_trace) {
-    VCACHE_LOG("cxx manifest: tracing is off; recording from " + fallback);
+    *untraced_reason = "tracing is off";
     return "";
   }
   const std::string tracer = TracerPath();
   if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0) {
-    VCACHE_LOG("cxx manifest: no tracer at '" + tracer + "'; recording from " + fallback);
+    *untraced_reason = "no tracer at '" + tracer + "'";
     return "";
   }
   if (!TracerPathPreloadable(tracer)) {
-    VCACHE_LOG("cxx manifest: ld.so would split the tracer's path '" + tracer +
-               "' at a space or colon; recording from " + fallback);
+    *untraced_reason =
+        "ld.so would split the tracer's path '" + tracer + "' at a space or colon";
     return "";
   }
   if (!TracerLoadsHere(tracer)) {
-    VCACHE_LOG("cxx manifest: '" + tracer + "' is not a shared object this binary's loader "
-               "would preload; recording from " + fallback);
+    *untraced_reason =
+        "'" + tracer + "' is not a shared object this binary's loader would preload";
     return "";
   }
   // Replacing it would change what the compile runs with, and adding to it
   // would trace a library loaded before the tracer could see it.
   const char* inherited_preload = std::getenv("LD_PRELOAD");
   if (inherited_preload != nullptr && *inherited_preload != '\0') {
-    VCACHE_LOG("cxx manifest: LD_PRELOAD is set; recording from " + fallback);
+    *untraced_reason = "LD_PRELOAD is set";
     return "";
   }
   return tracer;
 #else
   (void)config;
-  VCACHE_LOG("cxx manifest: no tracer on this platform; recording from " + fallback);
+  *untraced_reason = "no tracer on this platform";
   return "";
 #endif
+}
+
+// The tracer to run the recording compile under, or empty, after logging why
+// and that the state is to come from `fallback` instead.
+std::string CxxManifestTracer(const Config& config, const std::string& fallback) {
+  std::string untraced_reason;
+  std::string tracer = UsableCxxManifestTracer(config, &untraced_reason);
+  if (tracer.empty()) {
+    VCACHE_LOG("cxx manifest: " + untraced_reason + "; recording from " + fallback);
+  }
+  return tracer;
 }
 
 // The basenames of the executables a compiler driver runs, besides itself.
@@ -1517,6 +1541,91 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   return inputs;
 }
 
+// How the -E run is set up so that a preprocessor hit can record a manifest
+// state from it, as a miss records one from its compile. `declined` is set,
+// and nothing else, when no state could be recorded from it.
+struct CxxPreprocessRecording {
+  std::string declined;
+  std::string depfile;
+  std::string tracer;
+  std::string untraced_reason;
+  std::string trace_log;
+  std::string absent_list;
+  bool preload_refused = false;
+};
+
+// Nothing is logged here: on a preprocessor miss the -E run's records are
+// dropped, and the recording compile logs its own choice.
+CxxPreprocessRecording PlanCxxPreprocessRecording(const Config& config,
+                                                  const CompilerId& compiler_id,
+                                                  const args::CompilerArgs& parsed,
+                                                  const std::string& scratch_dir) {
+  CxxPreprocessRecording run;
+  // The depfile, the trace and the list name relative paths against the
+  // directory the compiler was told to use, not the one it runs in.
+  if (SetsWorkingDirectory(parsed)) {
+    run.declined = "the compiler changes its working directory";
+    return run;
+  }
+  // A miss records no state for such a compile either.
+  if (parsed.generates_deps && !UsesDependencyFlag(parsed, "-MD")) {
+    run.declined = "the compile writes no -MD dependency file";
+    return run;
+  }
+  run.depfile = scratch_dir + "/pp.d";
+  run.tracer = UsableCxxManifestTracer(config, &run.untraced_reason);
+  if (!run.tracer.empty()) {
+    run.trace_log = scratch_dir + "/pp-trace";
+  } else if (CompilerWritesAbsentList(config, compiler_id, parsed)) {
+    run.absent_list = scratch_dir + "/pp-absent";
+  }
+  return run;
+}
+
+// What the -E run read, from its depfile and its trace or the compiler's
+// list, declined as ReadCxxManifestInputs declines for a miss. There is no
+// object to scan for .incbin; the preprocessor key has already refused it.
+RecordedInputs ReadCxxPreprocessorRunInputs(const CxxPreprocessRecording& run,
+                                            const Config& config,
+                                            const args::CompilerArgs& parsed,
+                                            const RootMap& roots,
+                                            const CompilerId& compiler_id,
+                                            const std::string& cwd,
+                                            const std::string& cache_dir,
+                                            const std::string& memo_dir,
+                                            const std::vector<std::string>& keyed_pchs,
+                                            const std::string& scratch_dir,
+                                            int64_t started_ns) {
+  RecordedInputs inputs;
+  if (!run.declined.empty()) {
+    inputs.declined = run.declined;
+    return inputs;
+  }
+  if (run.tracer.empty()) {
+    VCACHE_LOG("cxx manifest: " + run.untraced_reason + "; recording from " +
+               (run.absent_list.empty() ? "the depfile" : "the compiler's absent list"));
+    if (run.absent_list.empty()) LogAbsentListUnused(config, compiler_id);
+  } else if (run.preload_refused) {
+    VCACHE_LOG("cxx manifest: ld.so refused the tracer in a process of the preprocessor run; "
+               "recording from the depfile");
+  }
+  const std::optional<CxxTraceInputs> traced =
+      run.trace_log.empty() || run.preload_refused
+          ? std::nullopt
+          : ReadCxxManifestTrace(run.trace_log, run.tracer, scratch_dir, keyed_pchs, parsed,
+                                 compiler_id, roots, cwd, cache_dir);
+  const std::optional<CxxTraceInputs> absent_from_list =
+      run.absent_list.empty()
+          ? std::nullopt
+          : ReadCxxAbsentList(run.absent_list, scratch_dir, keyed_pchs, parsed, compiler_id, cwd,
+                              cache_dir, &inputs.declined);
+  if (!inputs.declined.empty()) return inputs;
+  return ReadCxxManifestInputs(run.depfile, traced ? &*traced : nullptr,
+                               absent_from_list ? &*absent_from_list : nullptr, parsed, roots,
+                               compiler_id, cwd, cache_dir, memo_dir, keyed_pchs, started_ns,
+                               /*scan_incbin=*/false);
+}
+
 }  // namespace
 
 bool PchCarriesTimestamps(const args::CompilerArgs& parsed, bool is_clang) {
@@ -1724,12 +1833,29 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // ---- preprocess ---------------------------------------------------------
 
   const std::string preprocessed = *temp_dir + "/pp.i";
+  // A preprocessor hit records a state from this run, so the next lookup is
+  // answered by the manifest. A miss records from its compile instead.
+  std::optional<CxxPreprocessRecording> pp_recording;
+  if (!manifest_key.empty() && !config.read_only && !config.recache) {
+    pp_recording = PlanCxxPreprocessRecording(config, compiler_id, parsed, *temp_dir);
+  }
   const std::vector<std::string> pp_cmd =
-      BuildPreprocessCommand(parsed, roots, compiler_id);
+      pp_recording ? BuildPreprocessCommand(parsed, roots, compiler_id, pp_recording->depfile,
+                                            pp_recording->absent_list)
+                   : BuildPreprocessCommand(parsed, roots, compiler_id);
   VCACHE_LOG("preprocess: " + util::Join(pp_cmd, " "));
 
-  util::ProcResult pp = util::Run(
-      pp_cmd, {.capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed});
+  util::ProcOptions pp_options{
+      .capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed};
+  if (pp_recording && !pp_recording->trace_log.empty()) {
+    pp_options.env.emplace_back("VCACHE_TRACE_LOG", pp_recording->trace_log);
+    pp_options.env.emplace_back("LD_PRELOAD", pp_recording->tracer);
+  }
+  util::ProcResult pp = util::Run(pp_cmd, pp_options);
+  if (pp_recording && !pp_recording->trace_log.empty()) {
+    pp.stderr_data = WithoutPreloadRefusals(pp.stderr_data, pp_recording->tracer,
+                                            &pp_recording->preload_refused);
+  }
   // A compile the preprocessor cannot handle can still be cached from what the
   // compile itself reads: a PCH consumer whose command lacks an include path
   // the PCH's header text needs compiles, and fails only under -E. Only an
@@ -1773,6 +1899,21 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // ---- lookup -------------------------------------------------------------
 
   if (!derive_key && !config.recache && key != manifest_unserved_key && try_hit(key, "")) {
+    if (pp_recording) {
+      // Never from the entry's stored depfile: the tree that stored it may
+      // have written it with -MMD.
+      RecordedInputs read = ReadCxxPreprocessorRunInputs(
+          *pp_recording, config, parsed, roots, compiler_id, cwd, cache_dir, memo_dir,
+          keyed_pchs, *temp_dir, started_ns);
+      if (!read.declined.empty()) {
+        VCACHE_LOG("cxx manifest: not recording: " + read.declined);
+      } else if (StoreCxxManifest(cache, manifest_key,
+                                  {key, std::move(read.files), std::move(read.absent)},
+                                  manifest_states, cache_dir, &media_failed)) {
+        VCACHE_LOG("cxx manifest: recorded a state from the preprocessor run");
+        RecordCounter(cache_dir, Counter::kManifestRecordedOnPreprocessorHit);
+      }
+    }
     return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
   }
 
@@ -1824,8 +1965,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const bool records_manifest = !manifest_depfile.empty() && !config.read_only;
   // The trace comes first: it also sees what the driver reads and probes on
   // its own, which the compiler's list does not name. The list stands in for
-  // it where there is no tracer. The -E run stays untraced either way: only
-  // what the real compile opens and probes goes into a state.
+  // it where there is no tracer. On a miss only what the real compile opens
+  // and probes goes into a state; what the -E run saw is dropped.
   const bool list_available = CompilerWritesAbsentList(config, compiler_id, parsed);
   const std::string manifest_tracer =
       records_manifest

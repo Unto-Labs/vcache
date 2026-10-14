@@ -77,10 +77,10 @@ using core::RootMap;
 constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v5";
 constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v3";
 
-// Measured on a sunbird dev build: thresholds of 1, 2 and 4 MiB gave the same
-// warm build, 8 MiB and above a slower one, and the trimmer's walk did not
-// move. 4 MiB takes the gain with the fewest files that can be evicted apart
-// from their entry (docs/design.md, "Restoring outputs").
+// Measured on a large Rust workspace's dev build: thresholds of 1, 2 and 4 MiB
+// gave the same warm build, 8 MiB and above a slower one, and the trimmer's
+// walk did not move. 4 MiB takes the gain with the fewest files that can be
+// evicted apart from their entry (docs/design.md, "Restoring outputs").
 constexpr uint64_t kSidecarMinBytes = 4ull << 20;
 const std::string kSidecarSuffix = "rustout";
 
@@ -281,9 +281,10 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
                                             const std::string& manifest_key,
                                             const std::string& cache_dir,
                                             bool* media_failed, bool log_if_absent,
-                                            bool* get_failed) {
+                                            bool* get_failed, bool local_only = false) {
   std::vector<RustManifestState> states;
-  storage::GetResult got = cache->Get(manifest_key);
+  storage::GetResult got =
+      local_only ? cache->GetLocal(manifest_key) : cache->Get(manifest_key);
   const bool failed = core::ReportCacheMediaErrors(got.errors, cache_dir);
   *media_failed |= failed;
   if (get_failed != nullptr) *get_failed = failed;
@@ -307,7 +308,8 @@ void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
   core::PauseBeforeManifestPut();
   bool reread_failed = false;
   const std::vector<RustManifestState> reread =
-      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
+      LoadManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed,
+                   /*local_only=*/true);
   const std::vector<RustManifestState> states = core::MergeManifestStates(
       std::move(fresh), reread, loaded, &RustManifestState::key);
   storage::Blob blob;
@@ -1051,17 +1053,22 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   VCACHE_LOG("rust compile: " + util::Join(cmd, " "));
   util::ProcOptions compile_options{.capture_stderr = true};
-  if (session && config.daemon.admission) {
+  if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
+    VCACHE_LOG("reserve: an enclosing vcache holds the reservation; not reserving again");
+  } else if (session && config.daemon.admission) {
     const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
     session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, false));
     compile_options.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+    compile_options.env.emplace_back(daemon::kReservationHeldEnv, "1");
   } else if (config.daemon.admission && !config.read_only &&
              config.daemon.mode != core::DaemonMode::kOff) {
     VCACHE_LOG("reserve: daemon unavailable, running unreserved");
   }
   util::ProcResult compiled = util::Run(cmd, compile_options);
-  core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
-                          compiled);
+  if (core::CostRecordsWanted(config)) {
+    core::RecordCompileCost(cache_dir, "rustc", parsed.source, "rust", parsed.key_args, roots,
+                            compiled);
+  }
 
   if (compiled.exit_code != 0) {
     if (!compiled.stderr_data.empty()) {

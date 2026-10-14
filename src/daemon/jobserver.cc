@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -39,6 +40,17 @@ bool WriteAll(int fd, const char* data, size_t len) {
 
 std::string JobserverMakeFlagsLine(const std::string& fifo_path) {
   return "MAKEFLAGS=-j --jobserver-auth=fifo:" + fifo_path + "\n";
+}
+
+bool MakeReadsFifoJobserver(const std::string& version_text) {
+  static const std::string kPrefix = "GNU Make ";
+  if (version_text.compare(0, kPrefix.size(), kPrefix) != 0) return false;
+  int major = 0;
+  int minor = 0;
+  if (std::sscanf(version_text.c_str() + kPrefix.size(), "%d.%d", &major, &minor) < 1) {
+    return false;
+  }
+  return major > 4 || (major == 4 && minor >= 4);
 }
 
 int JobserverSignedTokenChange(int total, int free_fifo_bytes, int withdrawn, uint64_t waiting,
@@ -121,6 +133,10 @@ std::optional<JobserverPool> JobserverPool::Open(const std::string& path, int sl
     if (error != nullptr) *error = why;
     return std::nullopt;
   };
+#if !defined(__linux__)
+  (void)slots;
+  return fail("the fifo jobserver is Linux-only");
+#endif
   if (slots <= 0) return fail("no slots");
   if (path.size() >= static_cast<size_t>(PATH_MAX)) return fail("path too long: " + path);
 

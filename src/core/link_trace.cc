@@ -122,26 +122,55 @@ bool TracerLoadsHere(const std::string& tracer) {
          ours->compare(18, 2, *theirs, 18, 2) == 0 && type == kSharedObjectType;
 }
 
+bool TracerPathPreloadable(const std::string& tracer) {
+  return tracer.find_first_of(" :") == std::string::npos;
+}
+
 std::string WithoutPreloadRefusals(const std::string& stderr_text, const std::string& tracer,
                                    bool* removed) {
-  // ld.so: "ERROR: ld.so: object '<path>' from LD_PRELOAD cannot be preloaded
-  // (<why>): ignored."
-  const std::string refusal = "'" + tracer + "' " + std::string(kPreloadIgnoredMessage);
+  // ld.so writes "ERROR: ld.so: object '<path>' from LD_PRELOAD cannot be
+  // preloaded (<why>): ignored.\n" in one write, but another process of the
+  // tree can write between the pieces of a diagnostic it is printing, so only
+  // that span goes, never the rest of the line it landed in. Older glibc omits
+  // " (<why>)".
+  static constexpr std::string_view kLead = "ERROR: ld.so: object ";
+  static constexpr std::string_view kEnd = ": ignored.";
+  const std::string core = "'" + tracer + "' " + std::string(kPreloadIgnoredMessage);
   *removed = false;
   std::string kept;
   kept.reserve(stderr_text.size());
-  size_t begin = 0;
-  while (begin < stderr_text.size()) {
-    size_t end = stderr_text.find('\n', begin);
-    end = end == std::string::npos ? stderr_text.size() : end + 1;
-    const std::string_view line(stderr_text.data() + begin, end - begin);
-    if (line.find(refusal) != std::string_view::npos) {
-      *removed = true;
-    } else {
-      kept.append(line);
+  size_t from = 0;
+  while (true) {
+    const size_t found = stderr_text.find(core, from);
+    if (found == std::string::npos) break;
+    size_t begin = found;
+    if (begin >= kLead.size() &&
+        stderr_text.compare(begin - kLead.size(), kLead.size(), kLead) == 0) {
+      begin -= kLead.size();
     }
-    begin = end;
+    size_t after = found + core.size();
+    if (stderr_text.compare(after, 2, " (") == 0) {
+      // The reason may hold parentheses of its own; it ends at "): ignored.".
+      const size_t close = stderr_text.find(")" + std::string(kEnd), after);
+      const size_t newline = stderr_text.find('\n', after);
+      if (close != std::string::npos && (newline == std::string::npos || close < newline)) {
+        after = close + 1;
+      }
+    }
+    if (stderr_text.compare(after, kEnd.size(), kEnd) == 0) {
+      after += kEnd.size();
+      if (after < stderr_text.size() && stderr_text[after] == '\n') ++after;
+    } else {
+      // Not the shape ld.so writes: drop through to the end of the line, as
+      // nothing after it can be told apart from the refusal.
+      const size_t newline = stderr_text.find('\n', after);
+      after = newline == std::string::npos ? stderr_text.size() : newline + 1;
+    }
+    kept.append(stderr_text, from, begin - from);
+    *removed = true;
+    from = after;
   }
+  kept.append(stderr_text, from, std::string::npos);
   return kept;
 }
 

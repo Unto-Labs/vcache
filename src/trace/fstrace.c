@@ -372,6 +372,48 @@ int openat64(int dirfd, const char *path, int flags, ...) {
   return r;
 }
 
+/* What open and openat become under _FORTIFY_SOURCE with a mode-less call. */
+int __open_2(const char *path, int flags);
+int __open64_2(const char *path, int flags);
+int __openat_2(int dirfd, const char *path, int flags);
+int __openat64_2(int dirfd, const char *path, int flags);
+
+int __open_2(const char *path, int flags) {
+  int r = NEXT(__open_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __open64_2(const char *path, int flags) {
+  int r = NEXT(__open64_2)(path, flags);
+  int saved = errno;
+  emit_open_result(path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat_2(int dirfd, const char *path, int flags) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(__openat_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(&at, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
+int __openat64_2(int dirfd, const char *path, int flags) {
+  struct at_path at;
+  at_path_begin(&at, dirfd, path);
+  int r = NEXT(__openat64_2)(dirfd, path, flags);
+  int saved = errno;
+  emit_at_result(&at, path, r < 0, saved, (flags & O_ACCMODE) == O_WRONLY);
+  errno = saved;
+  return r;
+}
+
 FILE *fopen(const char *path, const char *mode) {
   FILE *r = NEXT(fopen)(path, mode);
   int saved = errno;

@@ -74,8 +74,9 @@ declines rather than guesses. `.incbin` is the case that matters in practice: it
 makes the *assembler* open a file, so neither its name nor its contents are in
 the text, and two compilations can hash identically while owing different
 objects. Files gcc reads after preprocessing — sanitizer ignore lists, sample
-profiles, plugins, the randstruct layout seed — are hashed by content instead,
-since there the flag at least names the file.
+profiles, plugins, the randstruct layout seed, and clang's `--config` file,
+which can carry `-O` or `-D` — are hashed by content instead, since there the
+flag at least names the file.
 For GCC consumers, preprocessing uses `-fpch-preprocess` so it loads the PCH
 the compile would use. The key covers each reported PCH's identity (`.sum` or
 `.vcache-key` when fresh, otherwise its bytes), including a `.gch` found by a
@@ -105,7 +106,7 @@ is served only while all of them still match.
 
 The preprocessor key needs the preprocessed text, so a lookup that computes it
 runs the preprocessor, and that is most of what a hit costs. A compile first
-looks up a manifest instead (`cxx_manifest`, on by default). Its key is built
+looks up a manifest instead (`cxx_manifest`, off by default). Its key is built
 from what is known before the preprocessor runs:
 
 - its own key-format version, and the preprocessor key's, since states name
@@ -128,6 +129,13 @@ from what is known before the preprocessor runs:
 - `hash_env_vars`, and `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
   `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`, which add include
   directories
+- the variables the driver reads before any header: `SDKROOT`,
+  `DEVELOPER_DIR`, `TOOLCHAINS`, `CCC_OVERRIDE_OPTIONS`, `GCC_EXEC_PREFIX`,
+  `COMPILER_PATH` and every `*_DEPLOYMENT_TARGET`. The preprocessor key takes
+  those that are set as well, since a deployment target or SDK is stamped into
+  a Mach-O object and `CCC_OVERRIDE_OPTIONS` can add `-O2` as easily as `-D`
+- the contents of an include-path argument that names a file: a clang header
+  map remaps include names on every `#include`, and no depfile names it
 - the identity of every precompiled header the command names
 
 A state lists the files an earlier compile of that key read, with their
@@ -200,6 +208,7 @@ root exists would check that location instead of its own. A path through `..`
 is stored as probed, since resolving it could cross a symlink, and is compared
 with what was read as spelled. Absent paths are canonicalised through the roots
 like files, so a tree at another path checks its own.
+
 Probes ending in `/..` are kept too: Clang can probe `first/sub/..` before
 resolving `<sub/../a.h>`, and creating `first/sub` can change which header wins.
 
@@ -208,17 +217,24 @@ Without a tracer the state comes from the compiler's list when it writes one
 tracing is off (`cxx_manifest_trace`), when there is no tracer (no
 `vcache-fstrace.so` beside the binary, `VCACHE_TRACER` naming nothing or
 something that is not an ELF shared object of vcache's own class and machine, a
-host other than Linux), when `LD_PRELOAD` is already set. A trace that turns
-out unusable after the compile gives the depfile alone, since the list was not
-asked for: when no process loaded the tracer, when the trace is marked
+host other than Linux), when the tracer's path holds a space or a colon (ld.so
+splits `LD_PRELOAD` there), and when `LD_PRELOAD` is already set. A trace that
+turns out unusable after the compile gives the depfile alone, since the list
+was not asked for: when no process loaded the tracer, when the trace is marked
 incomplete (a `.incomplete` file beside it, or a `!` line in it when that file
-cannot be created), does not parse or names no process, when the compiler's include
-directories cannot be listed, and when the trace does not show a file the
-depfile names being read, and when ld.so refused a preload in some process of
-the compile. ld.so's "cannot be preloaded" lines that name the tracer are then
-taken out of the compile's stderr: they come from preloading it, and an entry
-would replay them on every hit. A refusal of any other object is the build's
-own and stays. The entry is stored as usual.
+cannot be created), does not parse or names no process, when no compiler front
+end (`cc1*`, `clang`) ran under it, when a missing directory on the include
+path is not among its absent paths, when the compiler's include directories
+cannot be listed, when the trace does not show a file the depfile names being
+read, and when ld.so refused a preload in some process of the compile. Only a
+state from the trace or the list is protected against a header created earlier
+on the include path; one from the depfile alone, which is every state on macOS,
+has the depend-mode hole. ld.so's "cannot be preloaded" lines that name the
+tracer are then taken out of the compile's stderr, each as exactly the span
+ld.so wrote, so a diagnostic another process was printing around it stays
+whole: they come from preloading it, and an entry would replay them on every
+hit. A refusal of any other object is the build's own and stays. The entry is
+stored as usual.
 
 **The compiler's own list.** The devtools gcc and clang carry a patch that ends
 the version line of `-v` with `absent-deps-1`. Given `-fabsent-deps=FILE` such
@@ -269,6 +285,7 @@ other than `ENOENT` or `ENOTDIR`), which a lookup would never take as absent
 dropped. A compile that writes no list records no state either. A state holds
 the same kinds of inputs whichever way it was recorded, so the manifest format
 and its key version are unchanged.
+
 
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
@@ -345,6 +362,19 @@ lists a header `__has_include` found in its depfile, and under gcc the
 `__has_include` rule above declines such states. A system header that probes is
 exempt, on the same assumption about the compiler's own include directories.
 
+**The swapped-path race.** A state is declined when a file it lists changed
+after the compile started, judged by that file's own mtime and ctime. A
+symlink retargeted, or a directory renamed, during the compile is not seen
+that way: the file now at the recorded path can be older than the compile
+while being a different file from the one the compiler read. Reproduced with a
+wrapper that ran `ln -sfn v2 inc` right after the compiler read `inc/h.h` from
+`v1`: the state recorded `v2`'s digest against `v1`'s object, and the next
+compile, with `inc` pointing at `v2`, was served the `v1` object. ccache's
+"include file too new" check has the same shape. Closing it would mean
+checking every path component (or the digests the compiler actually read)
+rather than the file alone; it is left open, since it needs the tree to change
+under a running compile.
+
 ## Compiler identity
 
 `VCACHE_COMPILER_CHECK` selects:
@@ -385,9 +415,10 @@ output, and a Rust output of 4 MiB or more other than its `.d`, is kept in the
 disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
 (`linkout`, `rustout`), and the entry names it by digest (a `kFile` section for
 link, a `kSidecarFile` section for Rust). Both go through `DiskStorage::PutFile`
-and `GetFile`. A sidecar is created by `CloneFile`, a reflink where the
-filesystem has one, and restored the same way into an exclusive temporary
-beside the output. The hit hashes that clone, not the stored file, and renames
+and `GetFile`. A sidecar is created by `CloneFile`, a reflink (FICLONE) where
+the filesystem has one (Btrfs, XFS with reflink; Linux only), and restored the same way into
+an exclusive temporary beside the output. Elsewhere, macOS included, `CloneFile`
+copies the bytes, so a sidecar hit costs a full copy plus the hash. The hit hashes that clone, not the stored file, and renames
 it into place only if it matches; a Rust hit verifies every sidecar before it
 places anything or forwards diagnostics. The checksum covers only the digest,
 so the hash is what proves the bytes. A Rust sidecar that fails it is removed,
@@ -415,7 +446,9 @@ on both. It also includes vcache's own resident set at the fork, which on a
 heavy translation unit was 368,068 KiB through vcache against 368,992 KiB for
 the compiler run directly.
 
-The same two numbers are kept, for misses only, under `<cache>/costs/`. Each
+The same two numbers are kept under `<cache>/costs/`, for misses only and
+only when `daemon.single_flight` or `daemon.admission` is on, the two
+features that read them; a read-only client keeps none. Each
 file holds the last eight observations of one codegen class (operation,
 canonical source or link output, language, and the optimisation and debug
 flags — not the source text and not include paths). `--clear` removes cache
@@ -426,13 +459,15 @@ the build. `vcache --show-costs` summarises the records.
 Each compile, dependency scan and link works in a scratch directory under
 `<cache>/tmp/` (the system temp dir only when that cannot be created). It is
 removed when vcache exits; a vcache that is killed mid-compile cannot, so
-`--trim`, and a store that triggers an eviction check, sweep them. The name
-carries the owner's pid and a tag for its pid namespace and boot,
-`<prefix><pid>.<tag>-XXXXXX`. A directory whose owner is still running is kept
-however old its mtime, since a long compile rewriting existing files does not
-change it; one whose owner has exited goes after ten minutes. A directory the
-sweep cannot check (another container, an earlier boot, an older vcache) goes
-once it has not been modified for six hours.
+`--trim`, and a store that triggers an eviction check, sweep them. The owner
+holds an exclusive `flock` on `.vcache-owner` inside the directory while it
+runs, so a directory whose lock is held is kept however old its mtime, since a
+long compile rewriting existing files does not change it; one whose lock is free
+goes after ten minutes. The lock works on macOS and across containers sharing a
+cache, where a pid means nothing. Without a lock file (an older vcache) the
+owner's pid and a tag for its pid namespace and boot in the name,
+`<prefix><pid>.<tag>-XXXXXX`, decide the same where the sweep can see that pid;
+otherwise the directory goes once it has not been modified for six hours.
 
 **Disk.** Entries live at `<dir>/<first-2-hex>/<rest>`, sharded 256 ways. Each
 store checks only its own shard against `max_size/256` and evicts LRU within it,
@@ -488,15 +523,15 @@ hit total 0.391 ms
 
 ### Measurements
 
-A clean `cargo build` (dev profile) of sunbird's root workspace on a 128-core
-host, through `build-limited` (30 CPUs): 344 rustc runs, of which a warm build
+A clean `cargo build` (dev profile) of a large Rust workspace on a many-core
+Linux host, limited to 30 CPUs: 344 rustc runs, of which a warm build
 serves 341 from the cache, restoring 4,801 MiB. Store and target directory on
 one XFS filesystem, entries in the page cache, daemon off, `sync` before each
 build. Hit builds are four interleaved samples per binary, median and range;
 the fill is one sample. A summed time adds up every process's line, so with
 builds running in parallel it exceeds the wall time.
 
-| | origin/fbg | fsync kept | no fsync |
+| | before | fsync kept | no fsync |
 |---|---|---|---|
 | warm build, wall | 6.6 s (6.3–7.5) | 6.4 s (5.6–8.7) | 3.6 s (3.3–3.9) |
 | warm build, summed "hit total" | not logged | 42.6 s (36.0–73.0) | 5.7 s (5.1–6.0) |
@@ -506,8 +541,8 @@ builds running in parallel it exceeds the wall time.
 
 "fsync kept" is this change with only its `durable = false` arguments
 reverted. Without the fsync a warm build's restore cost is mostly reading and
-checking entries: 4.5 s of the 5.7 s. The `fastdev` profile (no debug info,
-1,234 MiB restored) showed the same shape in two unsynced samples: summed
+checking entries: 4.5 s of the 5.7 s. A profile without debug info
+(1,234 MiB restored) showed the same shape in two unsynced samples: summed
 "restored" 33.0 s and 37.8 s with the fsync, 1.4 s and 1.1 s without.
 
 Placing a miss by rename, two synced fills each, interleaved: summed "placed"

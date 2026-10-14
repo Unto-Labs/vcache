@@ -5,8 +5,10 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
@@ -95,6 +97,11 @@ void Check(bool condition, const std::string& what) {
     ++g_fail;
     std::printf("  \033[31mFAIL\033[0m %s\n", what.c_str());
   }
+}
+
+// For checks of a Linux-only mechanism on another platform.
+[[maybe_unused]] void Skipped(const std::string& what) {
+  std::printf("  \033[33mSKIP\033[0m %s\n", what.c_str());
 }
 
 bool Contains(const std::vector<std::string>& haystack, const std::string& needle) {
@@ -282,7 +289,9 @@ void TestLinkTraceClassification() {
   Check(core::TraceMarkedIncomplete(log), "the marker beside it makes it incomplete");
   util::RemoveFile(log + ".incomplete");
 
-  // Only a shared object ld.so would load into this binary is preloaded.
+  // Only a shared object ld.so would load into this binary is preloaded. ELF
+  // only: on macOS the tracer is never used, and libc is a Mach-O dylib.
+#ifdef __linux__
   Dl_info libc_info{};
   const bool found_libc =
       ::dladdr(::dlsym(RTLD_DEFAULT, "getpid"), &libc_info) != 0 && libc_info.dli_fname;
@@ -302,8 +311,9 @@ void TestLinkTraceClassification() {
     util::WriteFileAtomic(dir + "/exec.so", executable);
     Check(!core::TracerLoadsHere(dir + "/exec.so"), "nor an executable");
   }
+#endif
 
-  // ld.so's refusals are taken out of a traced compile's stderr, line by line.
+  // ld.so's refusals are taken out of a traced compile's stderr, span by span.
   bool refused = false;
   const std::string other_refusal =
       "ERROR: ld.so: object '/b/wrap.so' from LD_PRELOAD cannot be preloaded "
@@ -321,6 +331,24 @@ void TestLinkTraceClassification() {
           "a.c:1: warning: x\n" + other_refusal,
           "stderr with no refusal of the tracer is untouched");
   Check(!refused, "and reports none");
+  // Another process wrote the refusal into the middle of a diagnostic.
+  CheckEq(core::WithoutPreloadRefusals(
+              "a.c:3:5: error: ERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD "
+              "cannot be preloaded (wrong ELF class: ELFCLASS32 (x)): ignored.\n'f' undeclared\n",
+              "/v/vcache-fstrace.so", &refused),
+          "a.c:3:5: error: 'f' undeclared\n",
+          "a refusal inside a diagnostic goes, and the diagnostic stays whole");
+  Check(refused, "and is reported");
+  CheckEq(core::WithoutPreloadRefusals(
+              "x\nERROR: ld.so: object '/v/vcache-fstrace.so' from LD_PRELOAD cannot be "
+              "preloaded: ignored.\ny",
+              "/v/vcache-fstrace.so", &refused),
+          "x\ny", "an older glibc's refusal, with no reason, goes too");
+  Check(core::TracerPathPreloadable("/opt/vcache/bin/vcache-fstrace.so"),
+        "a tracer path without a space or colon is preloadable");
+  Check(!core::TracerPathPreloadable("/home/J Smith/bin/vcache-fstrace.so") &&
+            !core::TracerPathPreloadable("/opt/a:b/vcache-fstrace.so"),
+        "one ld.so would split at a space or colon is not");
 
   Check(!core::ParseTraceLog(dir + "/missing", {}, "/", &trace),
         "a missing trace log is reported");
@@ -1089,6 +1117,16 @@ void TestScratchDirs() {
   set_age(foreign_old, 7 * 3600);
   set_age(foreign_new, 3600);
 
+  // A foreign owner that holds its lock, as a compile in another container
+  // sharing the cache does: its pid says nothing here, the lock does.
+  const std::string foreign_locked = foreign_prefix + "-Qr90St";
+  util::MakeDirs(foreign_locked);
+  const int foreign_lock_fd = ::open((foreign_locked + "/.vcache-owner").c_str(),
+                                     O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  Check(foreign_lock_fd >= 0 && ::flock(foreign_lock_fd, LOCK_EX) == 0,
+        "a foreign owner holds its scratch lock");
+  set_age(foreign_locked, 7 * 3600);
+
   // Dead owners: a child makes its scratch directories and exits without
   // removing them, as a compile killed mid-run does.
   const pid_t child = ::fork();
@@ -1119,6 +1157,12 @@ void TestScratchDirs() {
   Check(!util::IsDirectory(foreign_old),
         "a foreign owner's directory older than the limit is removed although the pid is live here");
   Check(util::IsDirectory(foreign_new), "a foreign owner's directory younger than the limit is kept");
+  Check(util::IsDirectory(foreign_locked),
+        "a foreign owner's directory is kept however old while its lock is held");
+  if (foreign_lock_fd >= 0) ::close(foreign_lock_fd);
+  set_age(foreign_locked, 3600);
+  Check(util::RemoveStaleScratchDirs(*cache, 6 * 3600) == 1 && !util::IsDirectory(foreign_locked),
+        "once its lock is released the foreign directory goes after the grace");
   Check(!dead_old.empty() && !util::IsDirectory(dead_old),
         "a dead owner's directory goes after the grace, long before the age limit");
   Check(!dead_new.empty() && util::IsDirectory(dead_new),
@@ -1163,9 +1207,11 @@ void TestReadFile() {
 
   Check(!util::ReadFile(*scratch + "/missing").has_value(), "a missing path reads as nullopt");
 
+#if defined(__linux__)
   const auto status = util::ReadFile("/proc/self/status");
   Check(status.has_value() && !status->empty() && status->rfind("Name:", 0) == 0,
         "/proc/self/status is non-empty and starts with Name:");
+#endif
 }
 
 void TestBlob() {
@@ -2007,6 +2053,9 @@ void TestCompileSessionStalledSend() {
   daemon::Writer header;
   header.U64(request.data().size());
   for (int i = 0; i < 4096; ++i) flood.append(header.data() + request.data());
+  // MSG_DONTWAIT alone is not enough on macOS, where a send to a full AF_UNIX
+  // peer can still block; a non-blocking descriptor is honoured everywhere.
+  ::fcntl(held_fd, F_SETFL, ::fcntl(held_fd, F_GETFL) | O_NONBLOCK);
   size_t flood_offset = 0;
   bool queued_requests = false;
   const bool stalled = PollUntil([&] {
@@ -2669,6 +2718,7 @@ void TestMemoryAdmission() {
               LeaseStat(server, "memory reserved", 2097152),
           "a zero estimate uses the default compile cost");
   }
+#if defined(__linux__)
   {
     SessionDaemon server(0, false, false, 50000);
     LeasePeer first(server), second(server);
@@ -2717,6 +2767,9 @@ void TestMemoryAdmission() {
           "RSS above the estimate contributes zero unrealised memory to the next grant");
     first.StopCompiler();
   }
+#else
+  Skipped("realised-RSS admission: Linux-only (samples /proc)");
+#endif
   {
     SessionDaemon server(0, false, false, 1024);
     LeasePeer holder(server), queued(server);
@@ -2812,7 +2865,7 @@ void TestMemoryAdmission() {
   }
 }
 
-void TestAdmissionProcessTree() {
+[[maybe_unused]] void TestAdmissionProcessTree() {
   Section("daemon::admission process tree");
   SessionDaemon server(0, false, false, 90000, {}, true);
   LeasePeer holder(server), queued(server);
@@ -2952,10 +3005,14 @@ void TestAdmissionReview() {
     Check(util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) ==
               std::string::npos, "steady RSS sampling does not write per-tick log lines");
     holder.Close();
+#if defined(__linux__)
     Check(PollUntil([&] {
       return util::ReadFile(server.directory + "/memory-log").value_or("").find(prefix) !=
              std::string::npos;
     }, 1000), "reservation release logs the process-tree RSS peak");
+#else
+    Skipped("the process-tree RSS peak: Linux-only (samples /proc)");
+#endif
     if (gate >= 0) ::close(gate);
   }
   {
@@ -3046,7 +3103,7 @@ void TestAdmissionReview() {
   }
 }
 
-void TestAdmissionBoundsAndTreePeaks() {
+[[maybe_unused]] void TestAdmissionBoundsAndTreePeaks() {
   Section("daemon::admission bounds and tree peaks");
   const auto memory_reserved = [](const SessionDaemon& server) {
     const auto status = server.Status();
@@ -3671,6 +3728,17 @@ void TestCompilerArgs() {
       if (path == "scripts/seed") keyed = true;
     }
     Check(keyed, "the randstruct seed file is hashed into the key");
+  }
+  // clang reads further options, -O and -D included, out of a --config file.
+  for (const auto& argv : {std::vector<std::string>{"clang", "--config=my.cfg", "-c", "f.c"},
+                           std::vector<std::string>{"clang", "--config", "my.cfg", "-c", "f.c"}}) {
+    auto configured = args::Parse(argv);
+    bool keyed = false;
+    for (const std::string& path : configured.key_files) {
+      if (path == "my.cfg") keyed = true;
+    }
+    Check(keyed && configured.source == "f.c",
+          "a clang --config file is hashed into the key (" + argv[1] + ")");
   }
   bool has_mp = false, has_mmd = false;
   for (const std::string& arg : full_deps.dep_args) {
@@ -4398,6 +4466,20 @@ size_t CountFiles(const std::string& dir) {
   return util::ListFilesRecursive(dir).size();
 }
 
+// Stands in for a running daemon: holds <cache>/daemon/lock the way it does.
+struct HeldDaemonLock {
+  int fd = -1;
+  explicit HeldDaemonLock(const std::string& cache) {
+    util::MakeDirs(cache + "/daemon");
+    fd = ::open((cache + "/daemon/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+  ~HeldDaemonLock() { if (fd >= 0) ::close(fd); }
+};
+
 void TestDiskTrimPins() {
   Section("storage::disk trim");
 
@@ -4414,10 +4496,44 @@ void TestDiskTrimPins() {
     Age(EntryPath(tmp.path(), k2), 50);
     util::MakeDirs(tmp.path() + "/daemon/pending");
     util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(daemon.fd >= 0, "the test holds the daemon lock");
     Check(disk.Put(k3, payload), "the store that crosses the budget succeeds");
     Check(util::FileExists(EntryPath(tmp.path(), k1)), "a pending upload is not evicted");
     Check(!util::FileExists(EntryPath(tmp.path(), k2)), "an unpinned older entry is evicted");
     Check(util::FileExists(EntryPath(tmp.path(), k3)), "the new entry stays");
+  }
+  {
+    // A daemon that was killed leaves its journal and its lock file, but no
+    // lock. Its pins must not outlive it, or they keep their entries past the
+    // budget and every newer entry is evicted instead.
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload) && disk.Put(k2, payload), "the dead-daemon case stores two entries");
+    Age(EntryPath(tmp.path(), k1), 100);
+    Age(EntryPath(tmp.path(), k2), 50);
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k2, "");
+    util::WriteFileAtomic(tmp.path() + "/daemon/lock", "");
+    Check(disk.Put(k3, payload), "the store over a dead daemon's journal succeeds");
+    Check(!util::FileExists(EntryPath(tmp.path(), k1)),
+          "a dead daemon's journal does not pin the oldest entry");
+    Check(util::FileExists(EntryPath(tmp.path(), k3)), "and the new entry stays");
+    Check(disk.Clear(), "--clear succeeds with a dead daemon's journal");
+    Check(!util::IsDirectory(tmp.path() + "/daemon/pending"),
+          "--clear drops a dead daemon's journal");
+  }
+  {
+    TempCacheDir tmp;
+    storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    Check(disk.Put(k1, payload), "the live-daemon clear stores an entry");
+    util::MakeDirs(tmp.path() + "/daemon/pending");
+    util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + k1, "");
+    HeldDaemonLock daemon(tmp.path());
+    Check(disk.Clear(), "--clear succeeds under a live daemon");
+    Check(util::FileExists(tmp.path() + "/daemon/pending/" + k1),
+          "--clear leaves a live daemon's journal to the daemon");
   }
   {
     TempCacheDir tmp;
@@ -4439,6 +4555,7 @@ void TestDiskTrimPins() {
       util::WriteFileAtomic(tmp.path() + "/daemon/pending/" + key, "");
     }
     storage::DiskStorage disk(tmp.path(), 10 * 1024, false);
+    HeldDaemonLock daemon(tmp.path());
     const pid_t pid = ::fork();
     Check(pid >= 0, "the all-pinned trim can be watched");
     if (pid == 0) {
@@ -5252,6 +5369,17 @@ void TestRunRusage() {
 
 void TestCost() {
   Section("core::cost");
+  {
+    core::Config wanted;
+    Check(!core::CostRecordsWanted(wanted), "no cost records with single-flight and admission off");
+    wanted.daemon.single_flight = true;
+    Check(core::CostRecordsWanted(wanted), "single-flight wants cost records");
+    wanted.daemon.single_flight = false;
+    wanted.daemon.admission = true;
+    Check(core::CostRecordsWanted(wanted), "admission wants cost records");
+    wanted.read_only = true;
+    Check(!core::CostRecordsWanted(wanted), "a read-only client records no cost");
+  }
 
   TempCacheDir tree_a;
   TempCacheDir tree_b;
@@ -5592,7 +5720,9 @@ void TestCxxManifestTrace() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string& dir = *scratch;
+  // macOS's TMPDIR ends in '/', and a path with a doubled separator is not one
+  // a root, or the trace, would ever spell.
+  const std::string dir = core::WithoutDotSegments(*scratch);
 
   // The compiler's own trees, from the executables that ran, wherever they are.
   const std::string gcc14_trees =
@@ -5685,6 +5815,36 @@ void TestCxxManifestTrace() {
                                  seen)
               .value_or(""),
           dir + "/proj/b.h", "a file the trace never read is named, localised");
+
+  // Which process ran the preprocessor.
+  Check(core::IsCompilerFrontEnd("/usr/libexec/gcc/x86_64-linux-gnu/13/cc1") &&
+            core::IsCompilerFrontEnd("/usr/lib/gcc/x/13/cc1plus") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang") &&
+            core::IsCompilerFrontEnd("/usr/bin/clang++") &&
+            core::IsCompilerFrontEnd("/usr/lib/llvm-18/bin/clang-18") &&
+            core::IsCompilerFrontEnd("/opt/bin/clang++-18.1"),
+        "cc1, cc1plus and clang under its versioned names are front ends");
+  Check(!core::IsCompilerFrontEnd("/usr/bin/ccache") && !core::IsCompilerFrontEnd("/usr/bin/gcc") &&
+            !core::IsCompilerFrontEnd("/usr/bin/as") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-tidy") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clangd") &&
+            !core::IsCompilerFrontEnd("/usr/bin/clang-"),
+        "a wrapper, a driver, the assembler and clang's other tools are not");
+  core::TraceRecords wrapped;
+  wrapped.tools = {"/usr/bin/ccache", "/bin/sh"};
+  Check(!core::TraceShowsFrontEnd(wrapped), "a trace of ccache serving a hit shows no front end");
+  wrapped.tools.push_back("/usr/libexec/gcc/x/13/cc1");
+  Check(core::TraceShowsFrontEnd(wrapped), "one where cc1 ran does");
+
+  // A missing include directory the trace never saw probed.
+  util::MakeDirs(dir + "/inc-there");
+  core::TraceRecords probes;
+  probes.absent = {dir + "/./gen", dir + "/inc-there/x.h"};
+  Check(!core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen/"}, probes).has_value(),
+        "an existing include directory, and a missing one the trace saw probed, pass");
+  CheckEq(core::FindUnprobedIncludeDir({dir + "/inc-there", dir + "/gen", dir + "/later"}, probes)
+              .value_or(""),
+          dir + "/later", "a missing include directory no process probed is named");
 
   // Recording the selection beside a depfile's files.
   util::MakeDirs(dir + "/proj/inc");
@@ -5913,7 +6073,9 @@ void TestCxxManifest() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string& dir = *scratch;
+  // macOS's TMPDIR ends in '/', which would give "T//vcache-..." paths that a
+  // root deliberately does not match.
+  const std::string dir = fs::path(*scratch).lexically_normal().string();
   const std::string memo_dir = dir + "/memo";
 
   // PCH identity, in order of preference.
@@ -6515,7 +6677,26 @@ void TestJobserver() {
   CheckEq(daemon::JobserverMakeFlagsLine("/tmp/vcache-jobserver.fifo"),
           "MAKEFLAGS=-j --jobserver-auth=fifo:/tmp/vcache-jobserver.fifo\n",
           "--jobserver-env output format");
+  Check(daemon::MakeReadsFifoJobserver("GNU Make 4.4.1\nBuilt for x86_64\n") &&
+            daemon::MakeReadsFifoJobserver("GNU Make 5.0\n"),
+        "GNU make 4.4 and newer read a fifo jobserver");
+  Check(!daemon::MakeReadsFifoJobserver("GNU Make 4.3\n") &&
+            !daemon::MakeReadsFifoJobserver("GNU Make 3.81\n") &&
+            !daemon::MakeReadsFifoJobserver("bmake 20240711\n") &&
+            !daemon::MakeReadsFifoJobserver(""),
+        "older GNU make and other makes do not");
 
+#if !defined(__linux__)
+  {
+    TempCacheDir dir;
+    std::string why;
+    Check(!daemon::JobserverPool::Open(dir.path() + "/jobserver.fifo", 3, &why) &&
+              why.find("Linux") != std::string::npos,
+          "the fifo pool refuses to open off Linux (" + why + ")");
+  }
+  Skipped("fifo jobserver pool: Linux-only (FIONREAD does not count a fifo here)");
+  return;
+#endif
   TempCacheDir dir;
   const std::string path = dir.path() + "/jobserver.fifo";
   ::mkfifo(path.c_str(), 0600);
@@ -6641,6 +6822,7 @@ void TestElasticJobserver() {
           row.name);
   }
   TempCacheDir dir;
+#if defined(__linux__)
   std::string error;
   auto pool = daemon::JobserverPool::Open(dir.path() + "/elastic.fifo", 4, &error);
   Check(pool && pool->Withdraw(2) == 2 && pool->withdrawn() == 2 && pool->fifo_bytes() == 1,
@@ -6743,6 +6925,9 @@ void TestElasticJobserver() {
   }
   if (blocked_fd >= 0) ::close(blocked_fd);
   ::close(completed[0]);
+#else
+  Skipped("elastic fifo pool: Linux-only");
+#endif
   std::map<std::string, std::optional<std::string>> saved;
   for (const std::string name : {"VCACHE_CONFIG", "VCACHE_DAEMON_JOBSERVER_MIN_JOBS"}) {
     const char* value = ::getenv(name.c_str());
@@ -6954,10 +7139,15 @@ int main(int argc, char** argv) {
   TestHeldHitLayer();
   TestJobserver();
   TestElasticJobserver();
+#if defined(__linux__)
+  // Both sample a compiler's process tree through /proc.
   TestAdmissionProcessTree();
+#endif
   TestAdmissionReview();
   TestManifestPause();
+#if defined(__linux__)
   TestAdmissionBoundsAndTreePeaks();
+#endif
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

@@ -57,7 +57,13 @@ bool TracerLoadsHere(const std::string& tracer);
 // The message ld.so writes to stderr when it ignores an LD_PRELOAD entry.
 inline constexpr std::string_view kPreloadIgnoredMessage = "from LD_PRELOAD cannot be preloaded";
 
-// `stderr_text` without ld.so's refusals to preload `tracer`. Sets `removed`
+// False when ld.so would not see `tracer` as one entry of LD_PRELOAD, which it
+// splits at spaces and colons: every piece would be refused on stderr, under
+// names WithoutPreloadRefusals cannot recognise.
+bool TracerPathPreloadable(const std::string& tracer);
+
+// `stderr_text` without ld.so's refusals to preload `tracer`, each exactly the
+// span ld.so wrote, so a diagnostic it interrupted stays whole. Sets `removed`
 // when there was one: some process of the traced tree did not load the
 // tracer, and a cached entry must not replay what preloading it caused. A
 // refusal of any other object is the build's own doing and stays.

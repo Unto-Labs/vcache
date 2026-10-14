@@ -78,6 +78,12 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 skipped() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+# GNU make 4.4 is the first to read a fifo named by --jobserver-auth.
+make_reads_fifo_jobserver() {
+  local v
+  v=$(make --version 2>/dev/null | sed -n '1s/^GNU Make \([0-9][0-9.]*\).*/\1/p')
+  [[ -n "$v" && "$(printf '%s\n' 4.4 "$v" | sort -V | head -1)" == "4.4" ]]
+}
 
 # BSD sed -i wants a backup suffix and GNU sed -i must not have one separated
 # from it, so no single spelling works on both -- and getting it wrong makes sed
@@ -272,7 +278,7 @@ check "a finished compile leaves no scratch directory in the cache" \
 check "a finished compile leaves nothing in TMPDIR" \
   "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'vcache-*' | wc -l | tr -d ' ')" "0"
 mkdir -p "$VCACHE_DIR/tmp/vcache-killed" "$VCACHE_DIR/tmp/vcache-running"
-touch -d '7 hours ago' "$VCACHE_DIR/tmp/vcache-killed"
+perl -e 'utime time - 7 * 3600, time - 7 * 3600, @ARGV' "$VCACHE_DIR/tmp/vcache-killed"  # BSD touch has no relative -d
 "$VCACHE" --trim >/dev/null 2>&1
 check "--trim removes a scratch directory a killed compile left" \
   "$([[ -d $VCACHE_DIR/tmp/vcache-killed ]] && echo kept || echo removed)" "removed"
@@ -977,8 +983,10 @@ section "9i. Rust: a miss is placed by rename"
 # Reading rustc's output back and writing it again cost as much as the fsync
 # on a large rlib. A rename moves the file rustc wrote. The .d still goes
 # through memory, since it names the stage dir.
-if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
-  skipped "needs rustc and Linux"
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
 else
   # --show-stats leaves out a reason that never happened.
   unplaceable() { local n; n=$(stat_of "output unplaceable"); echo "${n:-0}"; }
@@ -996,11 +1004,11 @@ else
 
   reset_cache
   write_altering_rustc "$WORK/rename-rustc/rustc" \
-    "stat -c %i libdemo.rlib > $(printf %q "$WORK/rename-staged-inode")"
+    "{ stat -c %i libdemo.rlib 2>/dev/null || stat -f %i libdemo.rlib; } > $(printf %q "$WORK/rename-staged-inode")"
   rename_compile rename-a "$WORK/rename-rustc/rustc"
   check "the renamed miss stores its entry" "$(misses) $(unplaceable)" "1 0"
   check "the placed rlib is the file rustc wrote, not a copy" \
-    "$(stat -c %i "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
+    "$(inode_of "$WORK/rename-a/out/libdemo.rlib")" "$(cat "$WORK/rename-staged-inode")"
   check "the .d names this output directory" \
     "$(grep -c "^$WORK/rename-a/out/libdemo.rlib:" "$WORK/rename-a/out/demo.d")" "1"
   check "the .d names neither the stage dir nor the placeholder" \
@@ -1010,6 +1018,10 @@ else
   check "and restores the same rlib" \
     "$(cmp -s "$WORK/rename-a/out/libdemo.rlib" "$WORK/rename-b/out/libdemo.rlib" && echo same)" "same"
 
+  # The shims below interpose rename with LD_PRELOAD, which is Linux-only.
+  if [[ "$(uname -s)" != Linux ]]; then
+    skipped "EXDEV placement: the rename shim needs LD_PRELOAD (Linux)"
+  else
   # The scratch dir falls back to $TMPDIR when the cache's cannot be made, and
   # $TMPDIR is often tmpfs. A shim makes every rename from outside the output
   # directory into it fail with EXDEV, as a rename across filesystems does.
@@ -1062,16 +1074,18 @@ XDEVEOF
     "$(misses) $(unplaceable)" "1 0"
   check "and is 0700" "$(file_mode "$WORK/rename-xdev-bin/out/xdevbin")" "700"
   check "and runs" "$("$WORK/rename-xdev-bin/out/xdevbin" >/dev/null 2>&1 && echo ran)" "ran"
+  fi
 fi
 
 # --------------------------------------------------------------------------
 section "9j. Rust: large outputs are sidecars, restored by clone"
 
 # An output of 4 MiB or more is kept beside the entry as <digest>.rustout and
-# cloned on a hit, so its bytes never pass through the entry or memory. The
-# entry's checksum then covers only the digest, so every hit hashes the clone.
-if ! command -v rustc >/dev/null 2>&1 || [[ "$(uname)" != Linux ]]; then
-  skipped "needs rustc and Linux"
+# cloned on a hit (copied where the filesystem cannot clone), so its bytes
+# never pass through the entry or memory. The entry's checksum then covers only
+# the digest, so every hit hashes the clone.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
 else
   sidecar_files() {
     find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*.rustout" \
@@ -1079,7 +1093,8 @@ else
   }
   largest_entry_bytes() {
     find "$VCACHE_DIR" -mindepth 2 -maxdepth 2 -type f -path "$VCACHE_DIR/??/*" \
-      ! -name '*.rustout' -printf '%s\n' 2>/dev/null | sort -n | tail -1
+      ! -name '*.rustout' -exec wc -c {} + 2>/dev/null | awk '$2 != "total" { print $1 }' |
+      sort -n | tail -1
   }
   reason_count() { local n; n=$(stat_of "$1"); echo "${n:-0}"; }
   # 2 MiB of non-zero static data makes a 6 MiB rlib (object, embedded bitcode
@@ -1120,7 +1135,7 @@ else
   check "and restores the same rlib" \
     "$(cmp -s "$WORK/side-a/out/libbig.rlib" "$WORK/side-b/out/libbig.rlib" && echo same)" "same"
   check "as a file of its own, not a link to the sidecar" \
-    "$([[ $(stat -c %i "$WORK/side-b/out/libbig.rlib") != $(stat -c %i "$stored") ]] && echo own)" "own"
+    "$([[ $(inode_of "$WORK/side-b/out/libbig.rlib") != $(inode_of "$stored") ]] && echo own)" "own"
   check "the hit replays the warning once" "$(warnings_in side-b)" "1"
   check "the hit's .d is localised" \
     "$(grep -c "^$WORK/side-b/out/libbig.rlib:" "$WORK/side-b/out/big.d")" "1"
@@ -1129,11 +1144,11 @@ else
 
   # Eviction is oldest-mtime-first over every file in the shards, and a hit
   # refreshes only what it reads: the sidecar must be refreshed by the hit.
-  touch -d @946684800 "$stored"
+  perl -e 'utime 946684800, 946684800, @ARGV' "$stored"  # BSD touch has no -d @
   sidecar_compile side-c rustc dep-info,link
   check "a hit on an aged sidecar" "$(hits)" "2"
   check "refreshes the sidecar's mtime" \
-    "$([[ $(stat -c %Y "$stored") -gt 946684800 ]] && echo yes)" "yes"
+    "$([[ $(mtime_of "$stored") -gt 946684800 ]] && echo yes)" "yes"
 
   # A sidecar evicted on its own: the hit fails before anything reaches cargo,
   # and the compile replays its own diagnostics only.
@@ -1177,7 +1192,7 @@ else
     VCACHE_S3_ENDPOINT=http://127.0.0.1:9 VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 \
     VCACHE_S3_NO_CREDENTIALS=1
   check "with S3 configured the large rlib stays inline" \
-    "$(sidecar_files) $([[ $(largest_entry_bytes) -gt 5242880 ]] && echo inline)" "0 inline"
+    "$(sidecar_files) $([[ $(largest_entry_bytes) -ge 4194304 ]] && echo inline)" "0 inline"
 
   # A cargo-made OUT_DIR baked into a large output, split across the scan's
   # 1 MiB reads, must keep the entry out of the store. The build still gets
@@ -1205,6 +1220,9 @@ else
     "placed"
   check "and forwards its diagnostics" "$(warnings_in side-leak)" "1"
 
+  if [[ "$(uname -s)" != Linux ]]; then
+    skipped "a partly placed sidecar set: the rename shim needs LD_PRELOAD (Linux)"
+  else
   # A rename that fails after another sidecar was already placed leaves a
   # partial set: no other manifest state or entry may be tried, only a compile
   # repairs every name. A shim fails the second rename into the output dir.
@@ -1249,6 +1267,7 @@ SECONDEOF
     "$(cmp -s "$WORK/side-part-a/out/libbig.rlib" "$WORK/side-part-b/out/libbig.rlib" && cmp -s "$WORK/side-second.bin" "$WORK/side-part-b/out/second.bin" && echo whole)" \
     "whole"
   check "with the warning forwarded once" "$(warnings_in side-part-b)" "1"
+  fi
 
   # Under umask 077 the restored binary must be 0700, as the linker made it.
   reset_cache
@@ -1642,11 +1661,15 @@ EOF
   session_suffix() {
     LC_ALL=C grep -aoE 'inc\.[a-z0-9]+\.[a-z0-9]+\.rcgu\.o' "$1" | head -1 | cut -d. -f3
   }
+  # Older rustc (1.75, for one) names the object inc.<cgu>.rcgu.o with no
+  # session suffix; there the two rlibs must simply be identical.
   t1_suffix=$(session_suffix "$WORK/inc-t1/deps/libinc.rlib")
   t4_suffix=$(session_suffix "$WORK/inc-t4/deps/libinc.rlib")
-  if [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
-      LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
-        cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; then
+  if { [[ -z "$t1_suffix" && -z "$t4_suffix" ]] &&
+         cmp -s "$WORK/inc-t4/deps/libinc.rlib" "$WORK/inc-t1/deps/libinc.rlib"; } ||
+     { [[ -n "$t1_suffix" && -n "$t4_suffix" ]] &&
+         LC_ALL=C sed "s/$t4_suffix/$t1_suffix/g" "$WORK/inc-t4/deps/libinc.rlib" |
+           cmp -s - "$WORK/inc-t1/deps/libinc.rlib"; }; then
     ok "libinc.rlib compiled in another incremental directory matches apart from the session"
   else
     bad "libinc.rlib compiled in another incremental directory matches apart from the session"
@@ -1753,6 +1776,19 @@ mkdir -p "$WORK/cost-src"
 cat > "$WORK/cost-src/t.cc" << 'EOF'
 int cost_probe() { return 1; }
 EOF
+# Cost records feed only single-flight and admission. With both off, the
+# default, a miss writes none.
+reset_cache
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" \
+    "$VCACHE" g++ -c t.cc -o "$WORK/cost.o" )
+check "by default a miss writes no cost record" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+( cd "$WORK/cost-src" && VCACHE_ROOTS="$WORK/cost-src=proj" VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_READONLY=1 "$VCACHE" g++ -c t.cc -o "$WORK/cost-ro.o" -DREADONLY_COST )
+check "nor does a read-only miss with admission on" \
+  "$(find "$VCACHE_DIR/costs" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+export VCACHE_DAEMON_SINGLE_FLIGHT=1
 reset_cache
 COST_LOG="$WORK/cost.log"
 rm -f "$COST_LOG"
@@ -1879,6 +1915,7 @@ if [[ "$(uname -s)" == Linux ]]; then
 else
   skipped "link cost records are Linux-only"
 fi
+unset VCACHE_DAEMON_SINGLE_FLIGHT
 
 # --------------------------------------------------------------------------
 section "10. cache management commands"
@@ -2819,10 +2856,26 @@ reset_cache
 check "jobserver is off by default" \
   "$("$VCACHE" --start-daemon >/dev/null && [[ ! -p "$VCACHE_DIR/daemon/jobserver.fifo" ]] && echo yes)" "yes"
 check "--jobserver-env without a pool exits 1" \
-  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 reset_cache
 
+# Older GNU make reads the printed line as an unlimited -j (3.81) or rejects
+# it (4.2, 4.3), so --jobserver-env refuses rather than print it for them.
+mkdir -p "$WORK/js-make"
+printf '#!/bin/sh\necho "GNU Make 4.3"\n' > "$WORK/js-make/make43"
+printf '#!/bin/sh\necho "GNU Make 4.4.1"\n' > "$WORK/js-make/make44"
+chmod +x "$WORK/js-make/make43" "$WORK/js-make/make44"
+js_old=$(MAKE="$WORK/js-make/make43" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env refuses GNU make 4.3" \
+  "$([[ "$js_old" == *"needs GNU make 4.4"* && "$js_old" == *"exit=1" ]] && echo yes)" "yes"
+js_new=$(MAKE="$WORK/js-make/make44" "$VCACHE" --jobserver-env 2>&1; echo "exit=$?")
+check "--jobserver-env accepts GNU make 4.4 and then wants a pool" \
+  "$([[ "$js_new" == *"no jobserver"* && "$js_new" == *"exit=1" ]] && echo yes)" "yes"
+
+if [[ "$(uname -s)" != Linux ]]; then
+  skipped "the fifo jobserver pool is Linux-only"
+else
 export VCACHE_DAEMON_JOBSERVER=1
 export VCACHE_DAEMON_JOBSERVER_JOBS=2
 export VCACHE_DAEMON_IDLE_TIMEOUT=60
@@ -2834,7 +2887,8 @@ check "jobserver tokens total" "$(daemon_stat 'jobserver tokens total')" "2"
 check "jobserver tokens free" "$(daemon_stat 'jobserver tokens free')" "2"
 check "jobserver tokens withdrawn" "$(daemon_stat 'jobserver tokens withdrawn')" "0"
 check "--jobserver-env prints the fifo MAKEFLAGS line" \
-  "$("$VCACHE" --jobserver-env)" "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)" \
+  "MAKEFLAGS=-j --jobserver-auth=fifo:$JS_FIFO"
 
 mkdir -p "$WORK/js"
 cat > "$WORK/js/tick.sh" << 'EOF'
@@ -2879,11 +2933,15 @@ EOF
 js_max() { awk '{ print $2 }' "$WORK/js/count"; }
 # The printed line contains a space. An unquoted $(...) splits it, and env
 # then keeps only MAKEFLAGS=-j. Quoting passes the whole assignment.
-js_flags=$("$VCACHE" --jobserver-env)
-printf '0 0\n' > "$WORK/js/count"
-mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
-check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
-check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+js_flags=$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env)
+if make_reads_fifo_jobserver; then
+  printf '0 0\n' > "$WORK/js/count"
+  mk_out=$(with_deadline 20 bash -c 'cd "$1" && env "$2" make >/dev/null' _ "$WORK/js" "$js_flags")
+  check "make under the jobserver finishes" "$([[ "$mk_out" != *timeout* ]] && echo yes)" "yes"
+  check "make under the jobserver never exceeds 2" "$(js_max)" "2"
+else
+  skipped "GNU make >= 4.4 not installed"
+fi
 
 # PATH ninja on this machine is a wrapper that appends -j, which makes ninja
 # ignore the fifo. The real client is /usr/bin/ninja.
@@ -2938,9 +2996,10 @@ reset_cache
 JS_FIFO="$VCACHE_DIR/daemon/jobserver.fifo"
 rm -f "$JS_FIFO"
 check "--jobserver-env exits 1 when the fifo is missing" \
-  "$("$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
+  "$(VCACHE_JOBSERVER_ANY_CLIENT=1 "$VCACHE" --jobserver-env >/dev/null 2>&1; echo $?)" "1"
 "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 unset VCACHE_DAEMON_JOBSERVER VCACHE_DAEMON_JOBSERVER_JOBS VCACHE_DAEMON_IDLE_TIMEOUT
+fi
 
 # --------------------------------------------------------------------------
 section "12. runtime dependencies stay minimal"
@@ -3686,8 +3745,9 @@ done
 ( cd "$WORK/a-considerably-longer-cc-two" && \
   "$VCACHE" --vcache-root="$PWD=proj" ./bin/mycc -g -O2 -I include -c src/lib.cc -o lib.o ) 2>/dev/null
 check "an in-tree compiler hits across checkouts" "$(hits)" "1"
-# The entry and its C/C++ manifest: two compiler identities would store four.
-check "and only one entry was stored" "$(disk_entries)" "2"
+# One entry, and no manifest: that mode is off by default. Two compiler
+# identities would store two.
+check "and only one entry was stored" "$(disk_entries)" "1"
 check "and the objects are byte-identical" \
   "$(cmp -s "$WORK/cc-one/lib.o" "$WORK/a-considerably-longer-cc-two/lib.o" \
      && echo same)" "same"
@@ -3861,6 +3921,48 @@ check "the tracer preserves a failed call's errno" "$tracer_rc" "0"
 check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
+
+# Every name the stat family goes by is traced. A compiler built against glibc
+# before 2.33 calls __xstat and friends, and newer code statx; gcc and clang
+# find a missing -I directory with one such call. The legacy entry points are
+# reached through dlsym, which finds the preloaded tracer first, since glibc
+# 2.33 and later no longer lets a new program link against them. Paths are
+# recorded as the process spelled them.
+cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+int main(void) {
+  struct stat st;
+  struct stat64 st64;
+  struct statx stx;
+  int (*xstat)(int, const char *, struct stat *) = dlsym(RTLD_DEFAULT, "__xstat");
+  int (*lxstat64)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__lxstat64");
+  if (xstat == NULL || lxstat64 == NULL) return 1;
+  if (xstat(1, "absent-xstat", &st) == 0) return 2;
+  if (lxstat64(1, "absent-lxstat64", &st64) == 0) return 3;
+  if (stat64("absent-stat64", &st64) == 0) return 4;
+  if (statx(AT_FDCWD, "absent-statx", 0, STATX_BASIC_STATS, &stx) == 0) return 5;
+  if (xstat(1, "dir/value", &st) != 0) return 6;
+  if (statx(0, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) return 7;
+  return 0;
+}
+STATSEOF
+gcc "$WORK/tracer-openat/stats.c" -o "$WORK/tracer-openat/stats" -ldl
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./stats )
+check "the legacy and statx entry points behave as without the tracer" "$?" "0"
+check "each records the path it found absent" \
+  "$(grep -cE $'^M\t''absent-(xstat|lxstat64|stat64|statx)$' \
+      "$WORK/tracer-openat/trace")" "4"
+check "and what it found" \
+  "$(grep -cx $'R\tdir/value' "$WORK/tracer-openat/trace")" "1"
+check "a stat of a descriptor, with an empty path, is not a lost record" \
+  "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
 
 # A record goes out in one write: finishing a short write with a second one can
 # land after another process's record and tear both. A regular file cannot be
@@ -4753,6 +4855,24 @@ fi
 # --------------------------------------------------------------------------
 section "19. C/C++ manifest mode"
 
+check "manifest mode is off by default" \
+  "$(env -u VCACHE_CXX_MANIFEST "$VCACHE" --show-config | grep -c 'c/c++ manifest: *off')" "1"
+# By default a header created earlier on the include path is seen: the
+# preprocessor runs on every lookup.
+reset_cache
+mkdir -p "$WORK/mf-shadow/a" "$WORK/mf-shadow/b"
+printf 'int from_b(void);\n' > "$WORK/mf-shadow/b/h.h"
+printf '#include "h.h"\nint s(void) { return 0; }\n' > "$WORK/mf-shadow/s.c"
+( cd "$WORK/mf-shadow" && env -u VCACHE_CXX_MANIFEST "$VCACHE" gcc -O2 -Ia -Ib -c s.c -o s.o ) 2>/dev/null
+printf '#define SHADOWED 1\nint from_a(void) { return SHADOWED; }\n' > "$WORK/mf-shadow/a/h.h"
+( cd "$WORK/mf-shadow" && env -u VCACHE_CXX_MANIFEST "$VCACHE" gcc -O2 -Ia -Ib -c s.c -o s.o ) 2>/dev/null
+check "by default a header created earlier on the include path misses" "$(misses)" "2"
+check "and the object has the new header's code" \
+  "$(nm "$WORK/mf-shadow/s.o" 2>/dev/null | grep -c 'from_a')" "1"
+
+# It is opt-in; this section turns it on.
+export VCACHE_CXX_MANIFEST=1
+
 # A compile first looks up a manifest keyed on what is known before the
 # preprocessor runs. A state whose recorded files all still hash the same names
 # the result key, and the preprocessor never runs.
@@ -5142,6 +5262,11 @@ else
   skipped "__has_include: gcc is not installed, or is clang"
 fi
 
+# Everything from here to the end of the refused-tracer checks needs the
+# compile tracer, which is Linux-only. Elsewhere a state comes from the depfile
+# alone and, as in ccache's depend mode, cannot see a header created earlier on
+# the include path (docs/design.md says so).
+if [[ "$(uname -s)" == Linux ]]; then
 # The shadowing hole: a header created earlier on the include path than the
 # one a state recorded. A depfile names only what was read; the trace records
 # the paths probed and not found, and a lookup checks each is still absent.
@@ -5322,13 +5447,16 @@ check "a tracer that is not a shared object is not preloaded" \
 ( cd "$tl" && VCACHE_MAP_CWD=0 "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/notelf-hit.err"
 check "and neither the miss nor the hit prints a loader message" \
   "$(cat "$tl/notelf-miss.err" "$tl/notelf-hit.err" | grep -c 'cannot be preloaded' || true)" "0"
+else
+  skipped "absent include paths and the compile trace: the tracer is Linux-only"
+fi
 
 # A compile in which ld.so refused to preload the tracer in some process is
 # cached as usual, from the depfile, without the refusal: it is the tracer's
 # doing, and a hit must not replay it. A PCH built that way still gets its
 # .vcache-key. No cc1 of another ELF class is at hand, so the wrapper prints
 # ld.so's exact refusal line naming the tracer it was given, then runs cc1.
-if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+if [[ "$(uname -s)" == Linux ]] && command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   reset_cache
   mkdir -p "$tl/badwrap"
   cat > "$tl/badwrap/cc1" <<EOF
@@ -5382,6 +5510,100 @@ EOF
     "$(grep -c 'preprocessor skipped' "$l")/$(grep -c "no-such-lib.so" "$tl/ownwrap2.err")" "1/1"
 fi
 
+# The guards on whose trace a state may come from. Linux-only, as the tracer is.
+if [[ "$(uname -s)" == Linux ]]; then
+# A tracer path ld.so would split at a space or colon is not preloaded: every
+# piece would be refused on stderr under a name nothing could recognise.
+reset_cache
+mkdir -p "$tl/with space"
+cp "$(dirname "$VCACHE")/vcache-fstrace.so" "$tl/with space/vcache-fstrace.so"
+l=$(mf_log trace-space)
+( cd "$tl" && VCACHE_TRACER="$tl/with space/vcache-fstrace.so" VCACHE_MAP_CWD=0 \
+    VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c main.c -o m.o ) 2> "$tl/space.err"
+check "a tracer path with a space is not preloaded" \
+  "$(grep -c 'split the tracer.s path .* at a space or colon; recording from the depfile' "$l")" "1"
+check "and the compile prints no loader message" \
+  "$(grep -c 'cannot be preloaded' "$tl/space.err" || true)" "0"
+
+# A trace in which no compiler front end ran cannot show the include search,
+# however completely it shows the headers being read: a launcher serving a hit
+# of its own (ccache gcc) reads every header and writes the depfile, and
+# probes nothing. This "launcher" runs gcc untraced, then reads under the
+# tracer every file the depfile names, as such a hit does. Before the check,
+# its trace was used and a header created in first/ got a stale hit.
+reset_cache
+lw="$WORK/mf-launcher"
+mkdir -p "$lw/bin" "$lw/first" "$lw/second"
+printf '#define V 2\n' > "$lw/second/h.h"
+printf '#include "h.h"\nint v = V;\n' > "$lw/main.c"
+cat > "$lw/bin/gcc" <<'LAUNCHEOF'
+#!/bin/sh
+case " $* " in *" -E "*) exec gcc "$@" ;; esac
+env -u LD_PRELOAD gcc "$@" || exit $?
+mf=; prev=
+for a in "$@"; do [ "$prev" = -MF ] && mf=$a; prev=$a; done
+[ -n "$mf" ] || exit 0
+files=$(sed -e 's/^[^:]*://' -e 's/\\$//' "$mf")
+[ -n "$files" ] && cat $files > /dev/null < /dev/null
+exit 0
+LAUNCHEOF
+chmod +x "$lw/bin/gcc"
+mf_launcher() {  # $1 log
+  ( cd "$lw" && VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+      "$VCACHE" "$lw/bin/gcc" -O2 -I first -I second -c main.c -o m.o ) 2>/dev/null
+}
+l=$(mf_log launcher1); mf_launcher "$l"
+check "a trace where no compiler front end ran is not used" \
+  "$(grep -c 'no compiler front end ran under the tracer; recording from the depfile' "$l")" "1"
+check "and no state comes from it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+
+# gcc and clang stat each directory on the include path once. A front end that
+# loaded the tracer and read every file, yet left a missing -I directory out of
+# the trace, means the tracer missed the call that looked; the trace is not used.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  pb="$WORK/mf-unprobed"
+  mkdir -p "$pb/wrap" "$pb/second"
+  printf '#define V 2\n' > "$pb/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$pb/main.c"
+  cat > "$pb/cc1.c" <<'CC1EOF'
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* Named cc1, so the trace shows a front end. Reads the files in FAKE_READS
+   under the tracer, then runs the real cc1 without it, so nothing it probes
+   reaches the trace. */
+int main(int argc, char **argv) {
+  (void)argc;
+  char *reads = strdup(getenv("FAKE_READS"));
+  for (char *p = strtok(reads, ":"); p != NULL; p = strtok(NULL, ":")) {
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) close(fd);
+  }
+  unsetenv("LD_PRELOAD");
+  execv(getenv("REAL_CC1"), argv);
+  return 127;
+}
+CC1EOF
+  gcc -O2 "$pb/cc1.c" -o "$pb/wrap/cc1"
+  l=$(mf_log unprobed1)
+  ( cd "$pb" && REAL_CC1="$(gcc -print-prog-name=cc1)" FAKE_READS="main.c:second/h.h" \
+      VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" gcc -B "$pb/wrap/" -O2 -I gen -I second -c main.c -o m.o ) 2>/dev/null
+  check "a missing -I directory the trace never saw probed keeps the state off the trace" \
+    "$(grep -c "does not show the missing include directory $pb/gen being probed" "$l")" "1"
+  check "and no state comes from it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+  # The real tracer does see gcc probe it.
+  reset_cache
+  l=$(mf_log unprobed2)
+  ( cd "$pb" && VCACHE_CXX_MANIFEST=1 VCACHE_MAP_CWD=0 VCACHE_LOG="$l" \
+      "$VCACHE" gcc -O2 -I gen -I second -c main.c -o m.o ) 2>/dev/null
+  check "under the real tracer the missing directory is in the trace" \
+    "$(grep -c 'recorded from the trace' "$l")" "1"
+fi
+fi
+
 # A compiler process that did not load the tracer records nothing, so the
 # trace says nothing about what it probed. Here cc1 runs behind a wrapper that
 # drops LD_PRELOAD; the depfile path, with its gcc declines, applies.
@@ -5400,8 +5622,10 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
         "$VCACHE" gcc -B "$ut/wrap/" -O2 -I inc -c main.c -o m.o ) 2>/dev/null
   }
   l=$(mf_log untraced1); mf_untraced "$l"
-  check "gcc: a trace that never saw the preprocessor read falls back to the depfile" \
-    "$(grep -c 'the trace does not show .*main\.c being read; recording from the depfile' "$l")" "1"
+  # The wrapper is a shell script, so the trace shows no front end either, and
+  # that is the reason given first.
+  check "gcc: a trace that never saw the preprocessor run falls back to the depfile" \
+    "$(grep -c 'no compiler front end ran under the tracer; recording from the depfile' "$l")" "1"
   check "gcc: where __has_include declines the state" \
     "$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" "1"
   mf_untraced "$(mf_log untraced2)"
@@ -5455,6 +5679,8 @@ else
   skipped "/usr/local/include: gcc is missing or is clang, or unshare -rm is not allowed"
 fi
 
+# Absent paths come only from the compile trace, which is Linux-only.
+if [[ "$(uname -s)" == Linux ]]; then
 # The walk from an absent path up to the highest missing directory stops at a
 # root: above it, the path would name this tree's location, and a tree whose
 # generated-header root exists would check this tree's instead.
@@ -5499,6 +5725,9 @@ check "a header created in a PATH directory the include probed misses" \
   "$(grep -c 'rejected: .*tools/cfg\.h exists now' "$l")" "1"
 check "and the object uses it" \
   "$(cmp -s "$WORK/mf-pathdir/m.o" "$WORK/mf-pathdir/plain.o" && echo same)" "same"
+else
+  skipped "absent-path walks and PATH probes: the tracer is Linux-only"
+fi
 
 # gcc writes a dependency file named by DEPENDENCIES_OUTPUT during the -E run
 # and ignores the variable once -MD is on the command line.
@@ -5511,8 +5740,13 @@ l=$(mf_log depenv2)
 DEPENDENCIES_OUTPUT="$WORK/mf-depenv/env.d" mf_compile "$WORK/mf-depenv" "$l"
 check "DEPENDENCIES_OUTPUT keeps to the preprocessor" \
   "$(grep -c 'cxx manifest: DEPENDENCIES_OUTPUT is set' "$l")" "1"
-check "and its dependency file is still written" \
-  "$([[ -s "$WORK/mf-depenv/env.d" ]] && echo written || echo missing)" "written"
+# Only gcc honours the variable; Apple's gcc is clang, which ignores it.
+if cc_is_clang; then
+  skipped "DEPENDENCIES_OUTPUT: gcc is clang here, which does not write it"
+else
+  check "and its dependency file is still written" \
+    "$([[ -s "$WORK/mf-depenv/env.d" ]] && echo written || echo missing)" "written"
+fi
 
 # Read-only: a hit is served from a manifest, and a miss writes none.
 reset_cache
@@ -5650,7 +5884,7 @@ if command -v clang++ >/dev/null 2>&1; then
   check "clang: a .sum newer than the PCH keys it" "$(grep -c 'PCH .*h\.pch is sum' "$l")" "1"
   mf_use_pch "$(mf_log s2)" -I inc
   check "clang: and the manifest hits on it" "$(manifest_hits)" "1"
-  touch -d '1 hour ago' "$pc/h.pch.sum"
+  perl -e 'utime time - 3600, time - 3600, @ARGV' "$pc/h.pch.sum"  # BSD touch has no relative -d
   l=$(mf_log s3); mf_use_pch "$l" -I inc
   check "clang: a .sum older than the PCH is ignored" \
     "$(grep -c 'h\.pch\.sum is older than the PCH' "$l")" "1"
@@ -6105,6 +6339,126 @@ else
   skipped "absent-deps lists through a clang-style stub: clang is not installed"
 fi
 
+# The driver reads some variables before any header: an SDK, a deployment
+# target, clang's CCC_OVERRIDE_OPTIONS. Neither key may ignore them.
+if command -v clang >/dev/null 2>&1; then
+  mkdir -p "$WORK/drv"
+  printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
+    > "$WORK/drv/s.c"
+  drv() { ( cd "$WORK/drv" && env "$@" "$VCACHE" clang -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  drv VCACHE_CXX_MANIFEST=0
+  drv VCACHE_CXX_MANIFEST=0 CCC_OVERRIDE_OPTIONS=+-O2
+  check "preprocessor mode: CCC_OVERRIDE_OPTIONS adding -O2 misses" "$(misses)" "2"
+  ( cd "$WORK/drv" && CCC_OVERRIDE_OPTIONS=+-O2 clang -c s.c -o ref.o ) 2>/dev/null
+  check "and the object is the -O2 one" \
+    "$(cmp -s "$WORK/drv/s.o" "$WORK/drv/ref.o" && echo same)" "same"
+  reset_cache
+  drv
+  drv
+  check "manifest mode: a repeat compile hits through the manifest" "$(manifest_hits)" "1"
+  drv CCC_OVERRIDE_OPTIONS=+-DFOO
+  check "manifest mode: CCC_OVERRIDE_OPTIONS adding -DFOO misses" "$(misses)" "2"
+  check "and the object has the code -DFOO enables" \
+    "$(nm "$WORK/drv/s.o" 2>/dev/null | grep -c 'foo')" "1"
+else
+  skipped "clang is not installed"
+fi
+
+# A clang header map (-I m.hmap) remaps include names, and no depfile names it.
+if command -v clang >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$WORK/hmap/a" "$WORK/hmap/b"
+  echo 'int from_a(void) { return 1; }' > "$WORK/hmap/a/h.h"
+  echo 'int from_b(void) { return 2; }' > "$WORK/hmap/b/h.h"
+  printf '#include "h.h"\nint f(void) { return 0; }\n' > "$WORK/hmap/s.c"
+  mkhmap() {  # $1 output, $2 include name, $3 target path
+    python3 -I - "$@" << 'PY'
+import struct, sys
+out, key, target = sys.argv[1:4]
+prefix, suffix = target.rsplit('/', 1)
+strings = b'\0'
+def add(s):
+    global strings
+    off = len(strings); strings += s.encode() + b'\0'; return off
+k, p, x = add(key), add(prefix + '/'), add(suffix)
+buckets = [(0, 0, 0)] * 4
+buckets[sum(ord(c.lower()) * 13 for c in key) & 3] = (k, p, x)
+data = struct.pack('<IHHIIII', 0x686D6170, 1, 0, 24 + 12 * 4, 1, 4, len(target))
+for b in buckets: data += struct.pack('<III', *b)
+open(out, 'wb').write(data + strings)
+PY
+  }
+  hm() { ( cd "$WORK/hmap" && "$VCACHE" clang -I m.hmap -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  mkhmap "$WORK/hmap/m.hmap" h.h "$WORK/hmap/a/h.h"
+  hm; hm
+  check "a header-map compile hits through the manifest" "$(manifest_hits)" "1"
+  mkhmap "$WORK/hmap/m.hmap" h.h "$WORK/hmap/b/h.h"
+  hm
+  check "remapping the header in the map misses" "$(misses)" "2"
+  check "and the object has the newly mapped header's code" \
+    "$(nm "$WORK/hmap/s.o" 2>/dev/null | grep -c 'from_b')" "1"
+else
+  skipped "header maps need clang and python3"
+fi
+
+# clang reads more options, -O and -D included, out of a --config file. Its
+# contents key both modes.
+if command -v clang >/dev/null 2>&1; then
+  mkdir -p "$WORK/ccfg"
+  printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
+    > "$WORK/ccfg/s.c"
+  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config="$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
+  reset_cache
+  echo '-O0' > "$WORK/ccfg/my.cfg"
+  cfgcc VCACHE_CXX_MANIFEST=0
+  echo '-O2' > "$WORK/ccfg/my.cfg"
+  cfgcc VCACHE_CXX_MANIFEST=0
+  check "preprocessor mode: editing a --config file from -O0 to -O2 misses" "$(misses)" "2"
+  ( cd "$WORK/ccfg" && clang --config="$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
+  check "and the object is the -O2 one" \
+    "$(cmp -s "$WORK/ccfg/s.o" "$WORK/ccfg/ref.o" && echo same)" "same"
+  reset_cache
+  echo '-O2' > "$WORK/ccfg/my.cfg"
+  cfgcc; cfgcc
+  check "manifest mode: a --config compile hits through the manifest" "$(manifest_hits)" "1"
+  echo '-O2 -DFOO' > "$WORK/ccfg/my.cfg"
+  cfgcc
+  check "manifest mode: adding -DFOO to the --config file misses" "$(misses)" "2"
+  check "and the object has the code -DFOO enables" \
+    "$(nm "$WORK/ccfg/s.o" 2>/dev/null | grep -c 'foo')" "1"
+else
+  skipped "--config needs clang"
+fi
+
+# Digests of settled files are memoised under filehash/, which --clear empties
+# along with the entries.
+reset_cache
+mkdir -p "$WORK/memo"
+printf 'int old_header(void);\n' > "$WORK/memo/h.h"
+printf '#include "h.h"\nint m(void) { return 0; }\n' > "$WORK/memo/m.c"
+perl -e 'utime time - 3600, time - 3600, @ARGV' "$WORK/memo/h.h" "$WORK/memo/m.c"
+( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
+( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
+check "settled files' digests are memoised under filehash/" \
+  "$([[ -n "$(ls -A "$VCACHE_DIR/filehash" 2>/dev/null)" ]] && echo yes)" "yes"
+"$VCACHE" --clear >/dev/null
+check "--clear empties filehash/ with the entries" \
+  "$([[ -d "$VCACHE_DIR/filehash" ]] && echo kept || echo removed)" "removed"
+
+# A root given through a symlink localises to that spelling, while the working
+# directory is the resolved one; the state must still find its source.
+ln -s "$WORK/mf-a" "$WORK/mf-alias"
+reset_cache
+l=$(mf_log alias)
+( cd "$WORK/mf-a" && VCACHE_ROOTS="$WORK/mf-alias=proj" VCACHE_LOG="$l" \
+    "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
+check "a root given through a symlink still records a state" \
+  "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+rm -f "$WORK/mf-alias"
+
+unset VCACHE_CXX_MANIFEST
+
 # --------------------------------------------------------------------------
 section "--show-stats breaks decisions down by reason"
 
@@ -6161,7 +6515,11 @@ if command -v python3 >/dev/null 2>&1; then
     > "$WORK/compile-sessions.report" 2> "$WORK/compile-sessions.errors"
   session_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/compile-sessions.report"
   check "compile session integration driver completes" "$session_test_exit" "0"
   if [[ "$session_test_exit" != 0 ]]; then cat "$WORK/compile-sessions.errors"; fi
@@ -6175,7 +6533,11 @@ if command -v python3 >/dev/null 2>&1; then
     > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
   lease_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/single-flight.report"
   check "single-flight integration driver completes" "$lease_test_exit" "0"
   if [[ "$lease_test_exit" != 0 ]]; then cat "$WORK/single-flight.errors"; fi
@@ -6189,7 +6551,11 @@ if command -v python3 >/dev/null 2>&1; then
     "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
   elastic_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/elastic.report"
   check "elastic jobserver integration driver completes" "$elastic_test_exit" "0"
   if [[ "$elastic_test_exit" != 0 ]]; then cat "$WORK/elastic.errors"; fi
@@ -6203,13 +6569,56 @@ if command -v python3 >/dev/null 2>&1; then
     "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
   admission_test_exit=$?
   while IFS='|' read -r outcome message; do
-    if [[ "$outcome" == PASS ]]; then ok "$message"; else bad "$message"; fi
+    case "$outcome" in
+      PASS) ok "$message" ;;
+      SKIP) skipped "$message" ;;
+      *) bad "$message" ;;
+    esac
   done < "$WORK/admission.report"
   check "memory admission integration driver completes" "$admission_test_exit" "0"
   if [[ "$admission_test_exit" != 0 ]]; then cat "$WORK/admission.errors"; fi
 else
   bad "memory admission integration requires python3"
 fi
+
+section "10e. Nested admission"
+# A compiler or linker running under a reservation can start vcache again
+# (rustc's linker through masquerade). The daemon already samples that child
+# as part of the parent's tree, so the child must not queue for memory of its
+# own behind the reservation it is part of.
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
+reset_cache
+mkdir -p "$WORK/nested"
+printf 'int outer(void) { return 1; }\n' > "$WORK/nested/outer.c"
+printf 'int inner(void) { return 2; }\n' > "$WORK/nested/inner.c"
+cat > "$WORK/nested/cc" << EOF
+#!/bin/sh
+# The preprocessor run and the banner probe are the compiler's own; only the
+# compile proper is wrapped.
+for arg in "\$@"; do
+  if [ "\$arg" = "-E" ] || [ "\$arg" = "-v" ]; then exec gcc "\$@"; fi
+done
+printf '%s\n' "\${VCACHE_MEMORY_RESERVED:-unset}" > "$WORK/nested/marker"
+VCACHE_LOG="$WORK/nested/inner.log" "$VCACHE" gcc -c "$WORK/nested/inner.c" \
+  -o "$WORK/nested/inner.o"
+exec gcc "\$@"
+EOF
+chmod +x "$WORK/nested/cc"
+( cd "$WORK/nested" && VCACHE_DAEMON=auto VCACHE_DAEMON_ADMISSION=1 \
+    VCACHE_DAEMON_IDLE_TIMEOUT=60 VCACHE_COMPILER_CHECK=mtime \
+    VCACHE_LOG="$WORK/nested/outer.log" \
+    "$VCACHE" "$WORK/nested/cc" -c outer.c -o outer.o ) >/dev/null 2>&1
+check "a reserved compiler sees the reservation marker" \
+  "$(cat "$WORK/nested/marker" 2>/dev/null)" "1"
+check "the outer compile reserved memory" \
+  "$([[ "$(grep -c 'reserve: granted' "$WORK/nested/outer.log" 2>/dev/null)" -ge 1 ]] && echo yes)" "yes"
+check "a vcache inside the reservation does not reserve again" \
+  "$(grep -c 'not reserving again' "$WORK/nested/inner.log" 2>/dev/null)" "1"
+check "and sends no reserve request of its own" \
+  "$(grep -c 'reserve: granted' "$WORK/nested/inner.log" 2>/dev/null || true)" "0"
+check "both nested compiles produce objects" \
+  "$([[ -s "$WORK/nested/outer.o" && -s "$WORK/nested/inner.o" ]] && echo yes)" "yes"
+"$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------
 printf '\n\033[1mintegration: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

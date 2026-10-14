@@ -34,7 +34,7 @@ namespace vcache::core {
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kLinkKeyVersion = "vcache-link-v2";
+constexpr std::string_view kLinkKeyVersion = "vcache-link-v3";
 constexpr std::string_view kLinkManifestHeader = "vcache-linkmanifest-1";
 
 // How many remembered input-states one manifest holds, matching the dependency
@@ -289,7 +289,8 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   }
 
   const std::string tracer = TracerPath();
-  if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0 || !TracerLoadsHere(tracer)) {
+  if (tracer.empty() || ::access(tracer.c_str(), R_OK) != 0 || !TracerLoadsHere(tracer) ||
+      !TracerPathPreloadable(tracer)) {
     // Without the tracer there is no absent set, and without an absent set a
     // hit cannot be shown to be sound. Decline rather than cache on a guess.
     RecordDecision(cache_dir, {Reason::kNoTracer, tracer});
@@ -393,10 +394,13 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
   opts.env.emplace_back("LD_PRELOAD", tracer);
-  if (session && config.daemon.admission) {
+  if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
+    VCACHE_LOG("reserve: an enclosing vcache holds the reservation; not reserving again");
+  } else if (session && config.daemon.admission) {
     const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
     session->ReserveMemory(cost_key, daemon::MemoryEstimateKb(config, cost_key, true));
     opts.on_spawn = [&](int pid) { session->CompilerSpawned(pid); };
+    opts.env.emplace_back(daemon::kReservationHeldEnv, "1");
   } else if (config.daemon.admission && !config.read_only &&
              config.daemon.mode != DaemonMode::kOff) {
     VCACHE_LOG("reserve: daemon unavailable, running unreserved");
@@ -404,7 +408,9 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   util::ProcResult result = util::Run(argv, opts);
   // Same rule as a compile: a link that dies is still a sample, and -flto's
   // figure is whatever wait4 reported for the largest waited-for child.
-  RecordCompileCost(cache_dir, "link", parsed.output, "", parsed.key_args, roots, result);
+  if (CostRecordsWanted(config)) {
+    RecordCompileCost(cache_dir, "link", parsed.output, "", parsed.key_args, roots, result);
+  }
 
   if (!result.stderr_data.empty()) {
     ::fputs(result.stderr_data.c_str(), stderr);

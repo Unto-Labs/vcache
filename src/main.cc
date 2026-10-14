@@ -86,8 +86,9 @@ void PrintUsage() {
       "      --daemon-foreground\n"
       "                        run the daemon in the foreground (systemd,\n"
       "                        launchd, debugging)\n"
-      "      --jobserver-env   print MAKEFLAGS for the daemon's jobserver,\n"
-      "                        or exit 1 when it has no pool\n"
+      "      --jobserver-env   print MAKEFLAGS for the daemon's jobserver\n"
+      "                        (Linux, GNU make 4.4+), or exit 1 when it\n"
+      "                        has no pool or make is older\n"
       "\n"
       "Root mapping (the point of vcache):\n"
       "  --vcache-root=PATH[=TARGET]   repeatable; may also be given as\n"
@@ -232,7 +233,42 @@ int StopDaemon(const vcache::core::Config& config) {
   return 0;
 }
 
+// The make the printed line is for: $MAKE when a build set it, else the first
+// `make` on PATH.
+std::string MakeForJobserver() {
+  const char* named = std::getenv("MAKE");
+  std::string make = named != nullptr && *named != '\0' ? named : "make";
+  if (make.find('/') == std::string::npos) {
+    if (auto found = vcache::util::FindInPath(make, "")) make = *found;
+  }
+  return make;
+}
+
 int JobserverEnv(const vcache::core::Config& config) {
+  // The line only works for a client that reads a fifo jobserver. Older GNU
+  // make takes the bare -j as "no limit" (3.81) or rejects the auth string
+  // (4.2, 4.3), which would turn a bounded build into an unbounded one.
+  // VCACHE_JOBSERVER_ANY_CLIENT=1 skips the check for other clients, such as
+  // ninja 1.13 or cargo, or a make this process cannot find.
+  const char* any_client = std::getenv("VCACHE_JOBSERVER_ANY_CLIENT");
+  if (any_client == nullptr || std::string(any_client) != "1") {
+    const std::string make = MakeForJobserver();
+    vcache::util::ProcOptions options;
+    options.capture_stdout = true;
+    options.capture_stderr = true;
+    const auto result = vcache::util::Run({make, "--version"}, options);
+    if (result.exit_code != 0 ||
+        !vcache::daemon::MakeReadsFifoJobserver(result.stdout_data)) {
+      const std::string first_line =
+          result.stdout_data.substr(0, result.stdout_data.find('\n'));
+      ::fprintf(stderr,
+                "vcache: --jobserver-env needs GNU make 4.4 or newer, which reads a fifo "
+                "jobserver; %s is %s. Set MAKE to a newer make, or "
+                "VCACHE_JOBSERVER_ANY_CLIENT=1 for another client.\n",
+                make.c_str(), first_line.empty() ? "not runnable" : first_line.c_str());
+      return 1;
+    }
+  }
   std::string why;
   auto client = vcache::daemon::DaemonClient::Connect(config, &why);
   std::string text;
@@ -460,7 +496,7 @@ int main(int argc, char** argv) {
           "Vendored components under third-party/ keep their own licences:\n"
           "BLAKE3 (Apache 2.0 with LLVM exception), toml++ (MIT), Boost "
           "(BSL-1.0),\n"
-          "gperftools (BSD 3-clause).\n",
+          "gperftools (BSD 3-clause), the curl.h subset (curl licence).\n",
           kVersion);
       return 0;
     }

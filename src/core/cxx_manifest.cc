@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <utility>
 
 #include "core/preprocessed.h"
 #include "hash/file_memo.h"
@@ -19,6 +20,8 @@
 #include "util/fs.h"
 #include "util/log.h"
 #include "util/str.h"
+
+extern char** environ;
 
 namespace vcache::core {
 namespace {
@@ -583,6 +586,36 @@ std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& fil
   return std::nullopt;
 }
 
+bool IsCompilerFrontEnd(const std::string& executable) {
+  const std::string name = util::BaseName(executable);
+  if (name == "cc1" || name == "cc1plus" || name == "cc1obj" || name == "cc1objplus") return true;
+  if (!util::StartsWith(name, "clang")) return false;
+  std::string_view rest = std::string_view(name).substr(5);
+  if (util::StartsWith(rest, "++")) rest.remove_prefix(2);
+  if (rest.empty()) return true;
+  // clang-18, clang++-18.1: the versioned names distributions install.
+  if (rest[0] != '-' || rest.size() == 1) return false;
+  return std::all_of(rest.begin() + 1, rest.end(),
+                     [](char c) { return (c >= '0' && c <= '9') || c == '.'; });
+}
+
+bool TraceShowsFrontEnd(const TraceRecords& records) {
+  return std::any_of(records.tools.begin(), records.tools.end(), IsCompilerFrontEnd);
+}
+
+std::optional<std::string> FindUnprobedIncludeDir(const std::vector<std::string>& include_dirs,
+                                                  const TraceRecords& records) {
+  std::set<std::string> absent;
+  for (const std::string& path : records.absent) absent.insert(WithoutDotSegments(path));
+  for (const std::string& dir : include_dirs) {
+    struct stat st;
+    if (::stat(dir.c_str(), &st) == 0) continue;
+    const std::string normal = WithoutDotSegments(dir);
+    if (absent.count(normal) == 0) return normal;
+  }
+  return std::nullopt;
+}
+
 void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const std::string& cwd,
                        int64_t started_ns, const std::string& memo_dir,
                        RecordedInputs* recorded) {
@@ -641,6 +674,26 @@ void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const 
     recorded->absent.push_back(roots.Canonicalize(highest));
   }
   recorded->absent = Sorted(std::move(recorded->absent));
+}
+
+std::vector<std::pair<std::string, std::string>> DriverEnvironment() {
+  std::vector<std::pair<std::string, std::string>> set;
+  for (const char* name : kDriverEnvVars) {
+    if (const char* value = std::getenv(name)) set.emplace_back(name, value);
+  }
+  static constexpr std::string_view kDeploymentTarget = "_DEPLOYMENT_TARGET";
+  for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+    const std::string_view text(*entry);
+    const size_t eq = text.find('=');
+    if (eq == std::string_view::npos) continue;
+    const std::string_view name = text.substr(0, eq);
+    if (name.size() > kDeploymentTarget.size() &&
+        name.substr(name.size() - kDeploymentTarget.size()) == kDeploymentTarget) {
+      set.emplace_back(std::string(name), std::string(text.substr(eq + 1)));
+    }
+  }
+  std::sort(set.begin(), set.end());
+  return set;
 }
 
 }  // namespace vcache::core

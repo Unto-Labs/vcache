@@ -33,7 +33,8 @@ class DiskStorage : public Storage {
   bool writable() const override { return !read_only_; }
   void Trim() override;
 
-  // Deletes every cache entry. Used by `vcache --clear`.
+  // Deletes every cache entry, and the daemon's upload journal when no daemon
+  // is running. Used by `vcache --clear`.
   bool Clear();
 
   // Sums the on-disk size of all entries. Walks the whole tree, so it is only
@@ -43,6 +44,7 @@ class DiskStorage : public Storage {
   const std::string& dir() const { return dir_; }
 
   // True when the daemon's upload journal still names the entry at this path.
+  // Eviction honours it only while a daemon holds daemon/lock.
   bool IsPendingUpload(const std::string& entry_path) const;
 
   // Content-addressed files beside the entries, for outputs too large to carry

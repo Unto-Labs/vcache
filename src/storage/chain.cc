@@ -235,6 +235,24 @@ GetResult CacheChain::Get(const std::string& key) {
   return result;
 }
 
+GetResult CacheChain::GetLocal(const std::string& key) {
+  if (remote_ != nullptr) return Get(key);
+  GetResult result;
+  for (auto& layer : layers_) {
+    if (layer->remote()) continue;
+    std::string value;
+    if (!layer->Get(key, &value)) {
+      if (layer->failed()) result.errors.push_back(layer->Name() + ": " + layer->last_error());
+      continue;
+    }
+    result.hit = true;
+    result.value = std::move(value);
+    result.layer = layer->Name();
+    return result;
+  }
+  return result;
+}
+
 PutResult CacheChain::Put(const std::string& key, const std::string& value) {
   PutResult result;
   if (remote_ != nullptr) {

@@ -105,10 +105,12 @@ std::optional<std::string> MakeTempDir(const std::string& prefix);
 std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const std::string& prefix);
 
 // Removes the scratch directories under `<cache_dir>/tmp` whose compile is over and
-// returns how many it removed. MakeScratchDir names the owner pid, and a directory
-// whose owner this process can see is kept while the owner lives and for a short
-// grace after it dies. One whose owner it cannot see (another pid namespace, an
-// earlier boot, an older vcache) goes once unmodified for `max_age_seconds`.
+// returns how many it removed. MakeScratchDir holds an flock on `.vcache-owner`
+// inside the directory for the owner's lifetime, so a directory whose lock is held
+// is kept, and one whose lock is free goes after a short grace. Without a lock
+// file (an older vcache, or one that could not create it) the owner pid in the
+// name decides when this process can see it; otherwise the directory goes once
+// unmodified for `max_age_seconds`.
 size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seconds);
 
 bool RemoveRecursive(const std::string& path);

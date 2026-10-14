@@ -150,6 +150,9 @@ std::optional<std::string> KeyedFileFlagValue(std::string_view arg) {
       // other would give a kernel whose structs disagree about their own
       // layout, with nothing on the command line to show it.
       "-frandomize-layout-seed-file=",
+      // clang reads more command-line options out of this file, -O and -D
+      // included.
+      "--config=",
   };
   for (std::string_view p : kPrefixes) {
     if (StartsWith(arg, p)) return std::string(arg.substr(p.size()));
@@ -558,6 +561,15 @@ CompilerArgs Parse(const std::vector<std::string>& raw_argv) {
       result.base_args.push_back(arg);
       result.key_args.push_back(arg);
       if (!keyed_file->empty()) result.key_files.push_back(*keyed_file);
+      continue;
+    }
+    if (arg == "--config" && i + 1 < result.argv.size()) {
+      const std::string& file = result.argv[++i];
+      result.base_args.push_back(arg);
+      result.base_args.push_back(file);
+      result.key_args.push_back(arg);
+      result.key_args.push_back(file);
+      result.key_files.push_back(file);
       continue;
     }
 

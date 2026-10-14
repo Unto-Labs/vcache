@@ -7,6 +7,7 @@
 #if defined(__linux__)
 #include <linux/fs.h>   // FICLONE, used under #ifdef below
 #endif
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <limits.h>
 #include <signal.h>
@@ -492,6 +493,32 @@ std::optional<ScratchOwner> ParseScratchOwner(const std::string& name) {
 
 bool ProcessAlive(pid_t pid) { return ::kill(pid, 0) == 0 || errno == EPERM; }
 
+// The owner of a scratch directory holds an exclusive flock on this file for as
+// long as it runs. A pid and tag only answer "alive?" inside one pid namespace on
+// one boot; a lock answers it on macOS, across containers sharing the cache and,
+// where the filesystem maps flock to network locks, across hosts.
+constexpr const char* kScratchLockName = ".vcache-owner";
+
+// Opens and locks `<dir>/.vcache-owner`. The descriptor stays open, and the lock
+// held, until this process exits; close-on-exec keeps it out of the compiler.
+void HoldScratchLock(const std::string& dir) {
+  const std::string path = dir + "/" + kScratchLockName;
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) return;
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) ::close(fd);
+}
+
+enum class ScratchLock { kNone, kHeld, kFree };
+
+ScratchLock ProbeScratchLock(const std::string& dir) {
+  const std::string path = dir + "/" + kScratchLockName;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) return ScratchLock::kNone;
+  const bool held = ::flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+  ::close(fd);
+  return held ? ScratchLock::kHeld : ScratchLock::kFree;
+}
+
 }  // namespace
 
 std::optional<std::string> MakeTempDir(const std::string& prefix) {
@@ -504,7 +531,10 @@ std::optional<std::string> MakeScratchDir(const std::string& cache_dir, const st
   const std::string owned_prefix =
       tag.empty() ? prefix : prefix + std::to_string(::getpid()) + "." + tag + "-";
   if (!cache_dir.empty() && MakeDirs(ScratchRoot(cache_dir))) {
-    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), owned_prefix)) return dir;
+    if (auto dir = MakeTempDirUnder(ScratchRoot(cache_dir), owned_prefix)) {
+      HoldScratchLock(*dir);
+      return dir;
+    }
   }
   return MakeTempDir(owned_prefix);
 }
@@ -517,14 +547,19 @@ size_t RemoveStaleScratchDirs(const std::string& cache_dir, int64_t max_age_seco
   const std::string own_tag = ScratchOwnerTag();
   size_t removed = 0;
   for (const auto& entry : it) {
-    const auto owner = ParseScratchOwner(entry.path().filename().string());
-    const bool owner_visible = owner && !own_tag.empty() && owner->tag == own_tag;
-    // A running compile does not touch its directory's mtime while the compiler
-    // rewrites files in it, so age alone cannot tell a long compile from a dead one.
-    if (owner_visible && ProcessAlive(owner->pid)) continue;
     struct stat st{};
     if (::lstat(entry.path().c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-    const int64_t limit_seconds = owner_visible ? kDeadOwnerScratchGraceSeconds : max_age_seconds;
+    // A running compile does not touch its directory's mtime while the compiler
+    // rewrites files in it, so age alone cannot tell a long compile from a dead one.
+    const ScratchLock lock = ProbeScratchLock(entry.path().string());
+    if (lock == ScratchLock::kHeld) continue;
+    const auto owner = ParseScratchOwner(entry.path().filename().string());
+    const bool owner_visible = owner && !own_tag.empty() && owner->tag == own_tag;
+    if (lock == ScratchLock::kNone && owner_visible && ProcessAlive(owner->pid)) continue;
+    // A free lock proves the owner gone wherever it ran; without one, only an
+    // owner this process can see is known to be dead.
+    const bool owner_dead = lock == ScratchLock::kFree || owner_visible;
+    const int64_t limit_seconds = owner_dead ? kDeadOwnerScratchGraceSeconds : max_age_seconds;
     if (now - static_cast<int64_t>(st.st_mtime) <= limit_seconds) continue;
     if (RemoveRecursive(entry.path().string())) ++removed;
   }

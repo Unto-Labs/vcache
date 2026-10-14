@@ -72,6 +72,21 @@ inline constexpr const char* kIncludePathEnvVars[] = {
     "OBJCPLUS_INCLUDE_PATH",
 };
 
+// The variables the compiler driver itself reads that change what it compiles
+// or which tools it runs: the SDK and toolchain selection Apple's drivers take
+// from the environment, clang's CCC_OVERRIDE_OPTIONS (which edits the command
+// line), and gcc's GCC_EXEC_PREFIX and COMPILER_PATH (which choose cc1, as and
+// the headers beside them). Every `*_DEPLOYMENT_TARGET` counts too.
+inline constexpr const char* kDriverEnvVars[] = {
+    "SDKROOT", "DEVELOPER_DIR", "TOOLCHAINS", "CCC_OVERRIDE_OPTIONS",
+    "GCC_EXEC_PREFIX", "COMPILER_PATH",
+};
+
+// Those of the driver variables that are set, as sorted name/value pairs.
+// Unset ones are left out, so a key that feeds this list does not change for an
+// environment that sets none of them.
+std::vector<std::pair<std::string, std::string>> DriverEnvironment();
+
 struct ConsumedPchs {
   // Absolute, in command-line order, without duplicates.
   std::vector<std::string> paths;
@@ -193,6 +208,25 @@ CxxTraceInputs SelectCxxTraceInputs(const TraceRecords& records, const CxxTraceF
 // depfile names are what show it was traced.
 std::optional<std::string> FindUntracedFile(const std::vector<ManifestFile>& files,
                                             const RootMap& roots, const CxxTraceInputs& trace);
+
+// True for the executable of a compiler front end, the process that runs the
+// preprocessor: gcc's cc1 family, or clang (clang, clang++, clang-18, ...),
+// which preprocesses in its own -cc1 process.
+bool IsCompilerFrontEnd(const std::string& executable);
+
+// True when some process of the trace is a compiler front end. Without one the
+// include search did not run under the tracer -- `ccache gcc` serving a hit of
+// its own reads every header and writes the depfile, but probes nothing -- so
+// the trace has no absent paths to offer however complete its reads look.
+bool TraceShowsFrontEnd(const TraceRecords& records);
+
+// The first of `include_dirs` (absolute) that does not exist and that no
+// traced process was seen probing, or nullopt. gcc and clang stat every
+// directory on the include path once; a missing one absent from the trace means
+// the tracer missed the call that looked, and with it the path whose creation
+// would make a later hit stale.
+std::optional<std::string> FindUnprobedIncludeDir(const std::vector<std::string>& include_dirs,
+                                                  const TraceRecords& records);
 
 // Adds to `recorded` every file of `trace` it does not list yet, by digest,
 // and every absent path, as the highest of its ancestors that does not exist

@@ -20,6 +20,15 @@ uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms);
 uint64_t LeaseWaitBoundMs(const std::string& cache_dir, const std::string& cost_key);
 uint64_t MemoryEstimateKb(const core::Config& config, const std::string& cost_key, bool link);
 
+// Set in the environment of a compiler or linker that runs under a memory
+// reservation. A vcache started beneath it (rustc's linker through
+// masquerade, a driver that re-enters vcache) is already inside that
+// reservation, and the daemon samples its RSS as part of the same tree.
+// Reserving again would count it twice, and with strict FIFO grants the child
+// could wait out the whole bound behind its own parent.
+inline constexpr char kReservationHeldEnv[] = "VCACHE_MEMORY_RESERVED";
+bool AncestorHoldsReservation();
+
 class CompileSessionHandle {
  public:
   ~CompileSessionHandle();

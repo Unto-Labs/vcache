@@ -32,6 +32,10 @@ class Storage {
 
   virtual bool writable() const { return true; }
 
+  // True for a layer on another machine, which a lookup that only wants this
+  // machine's copy skips.
+  virtual bool remote() const { return false; }
+
   // Frees space according to the backend's own policy. No-op where the
   // backend has no local size budget.
   virtual void Trim() {}

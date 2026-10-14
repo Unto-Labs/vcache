@@ -96,6 +96,13 @@ int AbsentDepsVersion(std::string_view banner) {
   return 0;
 }
 
+// Version 1 is gcc's patch and clang's first. Clang's version 2 writes the same
+// list and adds the paths its driver probed and did not find (config files, the
+// GCC installation, the distro files), which version 1 left to the tracer.
+bool IsReadableAbsentDepsVersion(int absent_deps_version) {
+  return absent_deps_version == 1 || absent_deps_version == 2;
+}
+
 namespace {
 
 // Which driver this is. The version banner settles it whenever there is one;
@@ -1332,10 +1339,6 @@ std::optional<CxxTraceInputs> ReadCxxManifestTrace(const std::string& trace_log,
   return SelectCxxTraceInputs(records, filter);
 }
 
-// The version of the absent-deps patch whose -fabsent-deps list and depfile
-// vcache knows the meaning of.
-constexpr int kKnownAbsentDepsVersion = 1;
-
 // True when clang is told to resolve relative paths against another
 // directory than the one it runs in. The relative paths in its list would then
 // be joined to the wrong directory.
@@ -1353,14 +1356,14 @@ bool SetsWorkingDirectory(const args::CompilerArgs& parsed) {
 // vcache does not know may mean something else by its list.
 bool CompilerWritesAbsentList(const Config& config, const CompilerId& compiler_id,
                               const args::CompilerArgs& parsed) {
-  return compiler_id.absent_deps_version == kKnownAbsentDepsVersion &&
+  return IsReadableAbsentDepsVersion(compiler_id.absent_deps_version) &&
          config.cxx_manifest_absent_deps && !SetsWorkingDirectory(parsed);
 }
 
 // Why a compiler with the absent-deps patch is not asked for its list.
 void LogAbsentListUnused(const Config& config, const CompilerId& compiler_id) {
   if (compiler_id.absent_deps_version == 0) return;
-  if (compiler_id.absent_deps_version != kKnownAbsentDepsVersion) {
+  if (!IsReadableAbsentDepsVersion(compiler_id.absent_deps_version)) {
     VCACHE_LOG("cxx manifest: the compiler reports absent-deps-" +
                std::to_string(compiler_id.absent_deps_version) +
                ", a version this vcache does not read; not asking for its list");
@@ -1460,7 +1463,7 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   const auto normal = [](const std::string& path) {
     return std::filesystem::path(path).lexically_normal().string();
   };
-  if (compiler_id.absent_deps_version == kKnownAbsentDepsVersion && !keyed_pchs.empty()) {
+  if (IsReadableAbsentDepsVersion(compiler_id.absent_deps_version) && !keyed_pchs.empty()) {
     // The key identifies a PCH in a way that holds across trees whose PCH
     // bytes differ; hashing the bytes as well would keep the state to one tree.
     std::vector<std::string> keyed;

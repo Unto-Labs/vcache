@@ -6236,9 +6236,10 @@ fi
 # --------------------------------------------------------------------------
 section "19b. C/C++ manifest from the compiler's absent-path list"
 
-# The devtools gcc and clang print `absent-deps-1` after the version in -v, and
-# given -fabsent-deps=FILE write there every path the preprocessor looked for
-# and did not find. The trace still comes first, since it also sees what the
+# The devtools gcc and clang print `absent-deps-1` (clang `absent-deps-2`, whose
+# list adds its driver's probes) after the version in -v, and given
+# -fabsent-deps=FILE write there every path the preprocessor looked for and did
+# not find. The trace still comes first, since it also sees what the
 # driver reads and probes; where there is no tracer, a state takes its absent
 # paths from that list. Most cases here run with VCACHE_TRACER naming nothing.
 # The stub prints that banner around gcc, writes the lines of $STUB_ABSENT
@@ -6275,6 +6276,7 @@ EOF
   }
   make_absent_stub "$ads/gcc-ad1" absent-deps-1
   make_absent_stub "$ads/gcc-ad2" absent-deps-2
+  make_absent_stub "$ads/gcc-ad3" absent-deps-3
   absent_list() { printf '%s\n' "$@" > "$ads/list"; }
   absent_run() {  # $1 dir, $2 log, $3 compiler, then compiler arguments
     local dir=$1 log=$2 cc=$3; shift 3
@@ -6490,11 +6492,20 @@ EOF
     "$(VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 "$VCACHE" --show-config | grep -c 'c/c++ manifest absent-deps lists: off')" "1"
   reset_cache
   rm -f "$ads/calls"
-  l=$(mf_log ad-v2); absent_run "$d" "$l" "$ads/gcc-ad2" -I first -I second
-  check "absent-deps-2 without a tracer records from the depfile, naming the version" \
-    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c 'the compiler reports absent-deps-2, a version this vcache does not read; not asking for its list' "$l")" \
+  l=$(mf_log ad-v3); absent_run "$d" "$l" "$ads/gcc-ad3" -I first -I second
+  check "absent-deps-3 without a tracer records from the depfile, naming the version" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c 'the compiler reports absent-deps-3, a version this vcache does not read; not asking for its list' "$l")" \
     "1/1"
-  check "absent-deps-2 passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+  check "absent-deps-3 passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+  reset_cache
+  # Version 2 (clang listing its driver's probes too) writes the same list.
+  rm -f "$ads/calls"
+  l=$(mf_log ad-v2); absent_run "$d" "$l" "$ads/gcc-ad2" -I first -I second
+  check "absent-deps-2 without a tracer records from the compiler's list" \
+    "$(grep -c "no tracer at '.*'; recording from the compiler's absent list" "$l")/$(grep -cE "cxx manifest: recorded from the compiler's absent list: [0-9]+ files, 1 absent paths" "$l")" \
+    "1/1"
+  check "absent-deps-2: the recording compile and the -E run each get -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")" "2"
   reset_cache
   l=$(mf_log ad-stock); absent_run "$d" "$l" gcc -I first -I second
   check "a compiler without the marker and without a tracer records from the depfile" \

@@ -37,6 +37,10 @@ struct CompilerId {
 // The version of `banner`'s `absent-deps-<n>` token, 0 when there is none.
 int AbsentDepsVersion(std::string_view banner);
 
+// True for an absent-deps patch version whose -fabsent-deps list and depfile
+// vcache knows the meaning of.
+bool IsReadableAbsentDepsVersion(int absent_deps_version);
+
 // `check_mode` is one of "version" (default), "content" or "mtime":
 //   version -- hash `<compiler> -v` output. Stable across machines, so it is
 //              the right default once a shared S3 layer is in play.

@@ -6484,6 +6484,32 @@ EOF
     "$(grep -c 'rejected: .*/gen exists now' "$l")" "1"
   check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
 
+  # A probe through a regular file fails with ENOTDIR: an earlier include
+  # directory holds a file `sub` where a later one holds `sub/h.h`. Nothing can
+  # appear there until `sub` becomes a directory, so the probe is absent, and
+  # the state recorded with it must be served.
+  reset_cache
+  d="$ads/notdir"
+  mkdir -p "$d/first" "$d/second/sub"
+  printf 'not a directory\n' > "$d/first/sub"
+  printf '#define V 2\n' > "$d/second/sub/h.h"
+  printf '#include "sub/h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list first/sub/h.h
+  l=$(mf_log ad-notdir1); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: a probe through a regular file is recorded" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  l=$(mf_log ad-notdir2); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: and the next compile hits through the manifest" "$(manifest_hits)" "1"
+  rm "$d/first/sub"
+  mkdir -p "$d/first/sub"
+  printf '#define V 1\n' > "$d/first/sub/h.h"
+  absent_list
+  l=$(mf_log ad-notdir3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  absent_plain "$d" -I first -I second
+  check "absent-deps-1: the file becoming a directory with the header misses" \
+    "$(grep -c 'rejected: .*first/sub/h\.h exists now' "$l")" "1"
+  check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
+
   # A listed path that exists is the compiler's fault: no state is stored.
   reset_cache
   d="$ads/exists"

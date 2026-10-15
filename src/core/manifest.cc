@@ -36,8 +36,11 @@ std::optional<std::string> FindAppearedPath(const std::vector<std::string>& abse
     const std::string local = roots.Localize(canonical_path);
     struct stat st;
     if (::lstat(local.c_str(), &st) == 0) return local + " exists now";
-    // EACCES, EIO and friends do not prove absence.
-    if (errno != ENOENT) return local + " cannot be shown absent";
+    // ENOTDIR proves absence as ENOENT does: nothing can appear below a
+    // regular file until it becomes a directory, which lstat then sees. A
+    // compiler's absent list names such probes, and recording takes them as
+    // absent too. EACCES, EIO and friends do not prove absence.
+    if (errno != ENOENT && errno != ENOTDIR) return local + " cannot be shown absent";
   }
   return std::nullopt;
 }

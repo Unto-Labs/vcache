@@ -5985,6 +5985,9 @@ void TestCxxAbsentList() {
           "a path lstat cannot show absent (ENAMETOOLONG) is reported like one that exists");
   Check(!core::ParseCxxAbsentList("inc/h.h/x.h\n", proj).existing_path.has_value(),
         "a path through a file (ENOTDIR) is absent");
+  // A lookup must agree, or a state recorded with that path is never served.
+  Check(!core::FindAppearedPath({proj + "/inc/h.h/x.h"}, MakeRoots({})).has_value(),
+        "and a lookup takes it as still absent");
 }
 
 void TestCxxManifest() {

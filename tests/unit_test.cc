@@ -273,13 +273,14 @@ void TestLinkTraceClassification() {
 
   // Loaded objects and files written only are their own kinds in the log, and
   // the link cache keeps both as inputs, as it did before they were told apart.
-  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\tmap.txt\n");
+  util::WriteFileAtomic(log,
+                        "P\t/usr/bin/ld\nL\t/usr/lib64/libbfd.so\nW\t/home/u/proj/map.txt\n");
   core::TraceRecords records;
-  Check(core::ReadTraceRecords(log, "/home/u/proj", &records), "the kinds parse");
+  Check(core::ReadTraceRecords(log, &records), "the kinds parse");
   Check(records.loaded.size() == 1 && records.loaded[0] == "/usr/lib64/libbfd.so" &&
             records.written.size() == 1 && records.written[0] == "/home/u/proj/map.txt" &&
             records.reads.empty(),
-        "a loaded object and a file written only are kept apart from reads, made absolute");
+        "a loaded object and a file written only are kept apart from reads");
   core::LinkTrace kinds;
   Check(core::ParseTraceLog(log, {}, "/home/u/proj", &kinds), "the kinds parse for a link");
   CheckEq(util::Join(kinds.inputs, " "), "/home/u/proj/map.txt /usr/lib64/libbfd.so",
@@ -356,6 +357,26 @@ void TestLinkTraceClassification() {
   core::LinkTrace malformed;
   Check(!core::ParseTraceLog(log, {}, "/", &malformed),
         "a malformed trace is rejected rather than partially trusted");
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\t/home/u/proj/a.o\n!\n");
+  core::TraceRecords lost;
+  Check(!core::ReadTraceRecords(log, &lost),
+        "a trace carrying the tracer's lost-record line is refused");
+  // A write cut short (ENOSPC, RLIMIT_FSIZE) leaves a prefix of a path with
+  // no newline after it, which would read as a record of another path.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nM\t/usr/inc");
+  core::TraceRecords cut;
+  Check(!core::ReadTraceRecords(log, &cut), "a trace whose last record has no newline is refused");
+  util::WriteFileAtomic(log, "");
+  core::TraceRecords empty;
+  Check(core::ReadTraceRecords(log, &empty), "an empty trace still reads");
+  // An older tracer wrote paths as the process spelled them, relative to a
+  // directory the process may have left.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\ta.o\n");
+  core::TraceRecords relative_records;
+  Check(!core::ReadTraceRecords(log, &relative_records), "a relative record is refused");
+  core::LinkTrace relative_trace;
+  Check(!core::ParseTraceLog(log, {}, "/home/u/proj", &relative_trace),
+        "and so is a link trace holding one");
   util::RemoveRecursive(dir);
 }
 
@@ -3532,6 +3553,84 @@ void TestSha256() {
         "a block-sized key is used directly, not hashed");
 }
 
+void TestCompilerBannerMark() {
+  Section("compiler banner: the absent-deps token is read and fingerprinted");
+  CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC) absent-deps-1\n")),
+          "1", "gcc's token gives its version");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "clang version 23.1.4 (https://github.com/llvm/llvm-project.git bb46d66) "
+              "absent-deps-2\nTarget: x86_64-unknown-linux-gnu\n")),
+          "2", "clang's version 2 token");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "clang version 22.1.8 (repo b65aa9b) absent-deps-12\nTarget: x86_64\n")),
+          "12", "clang's two-digit version");
+  Check(!core::IsReadableAbsentDepsVersion(0), "version 0 (no patch) has no list to read");
+  Check(core::IsReadableAbsentDepsVersion(1), "version 1 (gcc, the first clang) is read");
+  Check(core::IsReadableAbsentDepsVersion(2), "version 2 (clang with its driver's probes) is read");
+  Check(!core::IsReadableAbsentDepsVersion(3), "version 3 is not known and not read");
+  CheckEq(std::to_string(core::AbsentDepsVersion("gcc version 16.1.0 (GCC)\n")), "0",
+          "a stock banner has version 0");
+  CheckEq(std::to_string(core::AbsentDepsVersion("absent-deps-x absent-deps-1y\n")), "0",
+          "a token without a bounded number is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "Found CUDA installation: /usr/local/cuda, version \n"
+              "InstalledDir: /opt/absent-deps-3 /bin\n"
+              "gcc version 16.1.0 (GCC)\n")),
+          "0", "a token off the version line is not one");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "Configured with: ../configure --x absent-deps-2 --y\n"
+              "gcc version 16.2.0 (GCC) absent-deps-1\n")),
+          "1", "the version line's token is read past a configure line");
+  CheckEq(std::to_string(core::AbsentDepsVersion(
+              "gcc version 16.1.0 (GCC) absent-deps-99999999999\n")),
+          "0", "a version that does not fit an int is not one");
+
+  auto scratch = util::MakeTempDir("vcache-banner-");
+  Check(scratch.has_value(), "banner scratch dir");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const std::string cache_dir = *scratch + "/cache";
+  util::MakeDirs(cache_dir + "/compilers");
+  auto stub = [&](const std::string& name, const std::string& banner_line) {
+    const std::string path = *scratch + "/" + name;
+    util::WriteFileAtomic(path, "#!/bin/sh\necho \"" + banner_line + "\" >&2\n");
+    ::chmod(path.c_str(), 0755);
+    return path;
+  };
+  const std::string stock = stub("gcc-stock", "gcc version 16.1.0 (GCC)");
+  const std::string patched = stub("gcc-patched", "gcc version 16.1.0 (GCC) absent-deps-1");
+  const std::string patched2 =
+      stub("clang-patched2", "clang version 23.1.4 (repo bb46d66) absent-deps-2");
+  const core::RootMap roots = MakeRoots({});
+  const core::CompilerId stock_id = core::ResolveCompilerId(stock, "version", cache_dir, roots);
+  const core::CompilerId patched_id = core::ResolveCompilerId(patched, "version", cache_dir, roots);
+  Check(!stock_id.fingerprint.empty(), "the stock stub has a fingerprint");
+  Check(patched_id.fingerprint != stock_id.fingerprint,
+        "the patched stub does not share the stock fingerprint");
+  CheckEq(std::to_string(stock_id.absent_deps_version), "0", "stock: no absent-deps version");
+  CheckEq(std::to_string(patched_id.absent_deps_version), "1", "patched: absent-deps version 1");
+  const core::CompilerId patched2_id =
+      core::ResolveCompilerId(patched2, "version", cache_dir, roots);
+  CheckEq(std::to_string(patched2_id.absent_deps_version), "2", "clang stub: absent-deps version 2");
+  Check(patched2_id.fingerprint != patched_id.fingerprint,
+        "version 2 does not share version 1's fingerprint");
+  const core::CompilerId memoised = core::ResolveCompilerId(patched, "version", cache_dir, roots);
+  CheckEq(memoised.fingerprint, patched_id.fingerprint, "the memoised answer is the same");
+  CheckEq(std::to_string(memoised.absent_deps_version), "1", "which keeps the version");
+  for (const char* mode : {"mtime", "content"}) {
+    const core::CompilerId by_mode = core::ResolveCompilerId(patched, mode, cache_dir, roots);
+    CheckEq(std::to_string(by_mode.absent_deps_version), "1",
+            std::string("the ") + mode + " check reads the version too");
+    CheckEq(std::to_string(core::ResolveCompilerId(stock, mode, cache_dir, roots)
+                               .absent_deps_version),
+            "0", std::string("and gives the stock stub none under ") + mode);
+  }
+}
+
 void TestCompilerArgs() {
   Section("args::CompilerArgs (gcc/clang)");
 
@@ -3840,6 +3939,7 @@ void TestClangArgs() {
       {{"-gen-cdb-fragment-path", "/tmp/cdb"}, "-gen-cdb-fragment-path"},
       {{"-gsplit-dwarf"}, "-gsplit-dwarf (.dwo)"},
       {{"-gsplit-dwarf=split"}, "-gsplit-dwarf=split (.dwo)"},
+      {{"-fabsent-deps=a.absent"}, "-fabsent-deps=FILE (the paths probed and not found)"},
   };
   for (const Case& c : side_outputs) {
     std::vector<std::string> argv = {"clang", "-c", "a.c", "-o", "a.o"};
@@ -3998,6 +4098,24 @@ void TestDepScanKeyArgs() {
   CheckEq(key_args({"gcc", "-MM", "main.c", "-MF", "a.d"}, no_roots),
           key_args({"gcc", "-MM", "main.c", "-MF", "b.d"}, no_roots),
           "where the answer goes is not key material");
+
+  for (const std::string flag : {"-I", "-isystem", "-iquote", "-idirafter", "-include",
+                                 "-imacros", "-F", "-L", "-isysroot", "--sysroot=",
+                                 "-iframework", "-fsanitize-ignorelist=",
+                                 "-fprofile-sample-use="}) {
+    const auto joined_args = [&](const std::string& tree) {
+      return util::Join(core::DepScanKeyArgs(
+                            args::Parse({"clang", "-M", "main.c", flag + tree + "/inc"}),
+                            MakeRoots({tree + "=proj"}), /*keep_link_args=*/true), "\n");
+    };
+    CheckEq(joined_args("/home/u/a"), joined_args("/home/u/b"),
+            "dep scan canonicalises joined path flag " + flag);
+  }
+  Check(key_args({"gcc", "-M", "main.c", "-DVALUE=/home/u/a/inc"},
+                 MakeRoots({"/home/u/a=proj"})) !=
+            key_args({"gcc", "-M", "main.c", "-DVALUE=/home/u/b/inc"},
+                     MakeRoots({"/home/u/b=proj"})),
+        "dep scan keeps path-valued macro definitions distinct");
 }
 
 void TestRustManifest() {
@@ -5125,8 +5243,8 @@ void TestStats() {
             old_stats.Get(Counter::kCacheMediaError) == 9,
         "a nine-line file from an older version parses positionally");
   Check(old_stats.reasons.empty(), "and has no reasons");
-  CheckEq(core::RenderStats(old_stats), old_format + "0\n",
-          "and renders back with a zero manifest-hit counter after them");
+  CheckEq(core::RenderStats(old_stats), old_format + "0\n0\n",
+          "and renders back with zero manifest counters after them");
 
   core::Stats stats;
   stats.Add(Counter::kMiss, 5);
@@ -5143,19 +5261,19 @@ void TestStats() {
         "a passthrough reason is counted on its own");
   const std::string rendered = core::RenderStats(stats);
   CheckEq(rendered,
-          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n"
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n0\n"
           "reason\tlink\t1\n"
           "reason\tno rust dep-info\t1\n"
           "reason\tno temp dir\t1\n"
           "reason\tpreprocess only\t2\n",
-          "reason lines follow the ten positional counters");
+          "reason lines follow the eleven positional counters");
   const core::Stats reparsed = core::ParseStats(rendered);
   Check(reparsed.reasons == stats.reasons &&
             std::equal(std::begin(reparsed.values), std::end(reparsed.values),
                        std::begin(stats.values)),
         "ParseStats reads back what RenderStats wrote");
 
-  const core::Stats extended = core::ParseStats(old_format +
+  const core::Stats extended = core::ParseStats(old_format + "0\n0\n" +
                                                 "reason\tlink\t4\n"
                                                 "histogram 1 2 3\n"
                                                 "\n"
@@ -5166,7 +5284,7 @@ void TestStats() {
   Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
         "unknown trailing lines are ignored");
   CheckEq(core::RenderStats(extended),
-          old_format + "0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          old_format + "0\n0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
           "a reason this version does not know is carried through");
 
   const core::Stats damaged = core::ParseStats(old_format +
@@ -5200,12 +5318,15 @@ void TestStats() {
   core::Stats manifest_stats;
   manifest_stats.Add(Counter::kHitDisk, 3);
   manifest_stats.Add(Counter::kManifestHit, 2);
+  manifest_stats.Add(Counter::kManifestRecordedOnPreprocessorHit, 1);
   Check(core::FormatStats(manifest_stats, "/c", 0, 1)
                 .find("cache hit (disk)    3\n"
                       "cache hit (s3)      0\n"
                       "manifest hits       2\n"
+                      "pp hits recorded    1\n"
                       "cache miss          0\n") != std::string::npos,
-        "--show-stats lists manifest hits under the hits they are part of");
+        "--show-stats lists manifest hits and the preprocessor hits that recorded a state "
+        "under the hits they are part of");
   const std::string plain = core::FormatStats(core::Stats{}, "/c", 0, 1);
   Check(plain.find("passthrough") == std::string::npos && plain.find("\n  ") == std::string::npos,
         "--show-stats adds nothing while every reason is zero");
@@ -5825,6 +5946,56 @@ void TestCxxManifestTrace() {
   CheckEq(core::FindAppearedPath({"/vcache/proj/nothing.h", "/vcache/proj/first/h.h"}, roots)
               .value_or(""),
           dir + "/proj/first/h.h exists now", "one that exists now is named, localised");
+}
+
+void TestCxxAbsentList() {
+  Section("core::cxx manifest absent-deps list");
+
+  auto scratch = util::MakeTempDir("vcache-cxx-absent-");
+  Check(scratch.has_value(), "absent-list scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  // macOS's TMPDIR ends in a slash; the parser drops the doubled one.
+  const std::string proj = core::WithoutDotSegments(*scratch) + "/proj";
+  util::MakeDirs(proj + "/inc");
+
+  const core::CxxAbsentList listed =
+      core::ParseCxxAbsentList("first/h.h\n\n" + proj + "/inc/none.h\n./gen/./a.h\n\n", proj);
+  CheckEq(util::Join(listed.paths, " "),
+          proj + "/first/h.h " + proj + "/gen/a.h " + proj + "/inc/none.h",
+          "relative paths are joined to the working directory, . segments go, empty lines "
+          "are skipped, and the paths come back sorted");
+  Check(!listed.existing_path.has_value(), "a list of absent paths names none that exists");
+  Check(core::ParseCxxAbsentList("", proj).paths.empty() &&
+            core::ParseCxxAbsentList("\n\n", proj).paths.empty(),
+        "an empty list, or one of empty lines, names nothing");
+
+  util::WriteFileAtomic(proj + "/inc/h.h", "#pragma once\n");
+  CheckEq(core::ParseCxxAbsentList("first/h.h\ninc/h.h\n", proj).existing_path.value_or(""),
+          proj + "/inc/h.h", "a listed path that exists is reported");
+  CheckEq(core::ParseCxxAbsentList("inc\n", proj).existing_path.value_or(""), proj + "/inc",
+          "so is a directory");
+  std::error_code link_error;
+  std::filesystem::create_symlink("no-such-target", proj + "/dangling.h", link_error);
+  Check(!link_error, "dangling symlink created");
+  CheckEq(core::ParseCxxAbsentList("dangling.h\n", proj).existing_path.value_or(""),
+          proj + "/dangling.h", "and a dangling symlink, which a lookup's lstat would see");
+
+  const core::CxxAbsentList crlf = core::ParseCxxAbsentList("first/h.h\r\n\r\n", proj);
+  CheckEq(util::Join(crlf.paths, " "), proj + "/first/h.h",
+          "a trailing carriage return is dropped, and a line of only one is empty");
+  const std::string too_long = "inc/" + std::string(300, 'x') + ".h";
+  CheckEq(core::ParseCxxAbsentList(too_long + "\n", proj).existing_path.value_or(""),
+          proj + "/" + too_long,
+          "a path lstat cannot show absent (ENAMETOOLONG) is reported like one that exists");
+  Check(!core::ParseCxxAbsentList("inc/h.h/x.h\n", proj).existing_path.has_value(),
+        "a path through a file (ENOTDIR) is absent");
+  // A lookup must agree, or a state recorded with that path is never served.
+  Check(!core::FindAppearedPath({proj + "/inc/h.h/x.h"}, MakeRoots({})).has_value(),
+        "and a lookup takes it as still absent");
 }
 
 void TestCxxManifest() {
@@ -6968,6 +7139,7 @@ int main(int argc, char** argv) {
   TestSigV4();
   TestS3ResponseParsing();
   TestWrittenFileMode();
+  TestCompilerBannerMark();
   TestWriteErrnoIsPreserved();
   TestWriteCloseFailure();
   TestCloneFile();
@@ -6999,6 +7171,7 @@ int main(int argc, char** argv) {
   TestFileDigestMemo();
   TestCxxManifest();
   TestCxxManifestTrace();
+  TestCxxAbsentList();
   TestRustOutputNames();
   TestHashAndScanFile();
   TestUploadGeneration();

@@ -98,6 +98,16 @@ sed_inplace() {
 # True when the C compiler called `gcc` is really clang, as it is on macOS.
 # Some expectations differ between the two and are not about vcache being wrong.
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
+# GNU timeout is not on stock macOS. perl's alarm survives exec and kills the
+# command with SIGALRM when the bound passes.
+run_bounded() {  # $1 seconds, then the command
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$secs" "$@"
+  fi
+}
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # Releases a manifest-pause fifo. The write happens only when the compile is
@@ -284,6 +294,40 @@ check "--trim removes a scratch directory a killed compile left" \
   "$([[ -d $VCACHE_DIR/tmp/vcache-killed ]] && echo kept || echo removed)" "removed"
 check "--trim keeps a recent scratch directory" \
   "$([[ -d $VCACHE_DIR/tmp/vcache-running ]] && echo kept || echo removed)" "kept"
+
+# --------------------------------------------------------------------------
+section "1b. assembly and object output use separate entries"
+
+(
+  FAIL=0
+  export VCACHE_CXX_MANIFEST=0 VCACHE_DAEMON=off
+  mkdir -p "$WORK/output-kind"
+  cd "$WORK/output-kind" || exit 1
+  printf 'int output_kind(void) { return 42; }\n' > kind.c
+  export VCACHE_ROOTS="$PWD=proj"
+  for first in -c -S; do
+    reset_cache
+    if [[ "$first" == -c ]]; then second=-S; else second=-c; fi
+    "$VCACHE" gcc -O2 "$first" kind.c -o first.out
+    "$VCACHE" gcc -O2 "$second" kind.c -o second.out
+    check "$first then $second each misses" "$(misses)" "2"
+    gcc -O2 "$second" kind.c -o expected.out
+    if cmp -s second.out expected.out; then
+      ok "$second returns the compiler's requested output kind"
+    else
+      bad "$second returns the compiler's requested output kind"
+    fi
+    "$VCACHE" gcc -O2 "$first" kind.c -o first-hit.out
+    "$VCACHE" gcc -O2 "$second" kind.c -o second-hit.out
+    check "both output kinds hit on repetition" "$(hits)" "2"
+    if cmp -s first.out first-hit.out && cmp -s expected.out second-hit.out; then
+      ok "hits preserve both output kinds"
+    else
+      bad "hits preserve both output kinds"
+    fi
+  done
+  [[ "$FAIL" == 0 ]]
+) && ok "output kind cache separation" || bad "output kind cache separation"
 
 # --------------------------------------------------------------------------
 section "2. out-of-tree builds (cwd differs, source tree does not)"
@@ -732,6 +776,34 @@ EOF
   fi
 else
   printf '  \033[33mSKIP\033[0m rustc not installed\n'
+fi
+
+# --------------------------------------------------------------------------
+section "9f. Rust artifact notification paths"
+if command -v rustc >/dev/null 2>&1; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off
+    reset_cache
+    for tree in a b c; do
+      root="$WORK/artifacts-$tree"
+      case "$tree" in
+        a) output="$root/output" ;;
+        b) output='relative "quoted" \ output' ;;
+        c) output="$WORK/outside-root" ;;
+      esac
+      mkdir -p "$root/src"
+      printf 'pub fn value() -> u32 { 42 }\n' > "$root/src/lib.rs"
+      ( cd "$root" && VCACHE_ROOTS="$root=crate" "$VCACHE" rustc --crate-name artifacts \
+          --crate-type lib --emit=metadata,dep-info --error-format=json --json=artifacts \
+          --out-dir "$output" src/lib.rs ) 2> "$root/stderr.json"
+      check "Rust $tree announces the placed metadata artifact" \
+        "$(jq -r 'select(.emit == "metadata") | .artifact' "$root/stderr.json")" \
+        "$output/libartifacts.rmeta"
+    done
+    check "Rust artifact replay hits across checkouts" "$(hits)" "2"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "Rust artifact paths" || bad "Rust artifact paths"
 fi
 
 # --------------------------------------------------------------------------
@@ -3239,6 +3311,27 @@ for mode in "-MM" "-M -MP"; do
 done
 
 # --------------------------------------------------------------------------
+section "14a. joined include paths share dependency scans"
+(
+  FAIL=0
+  export VCACHE_DAEMON=off VCACHE_DEP_SCAN=manifest
+  reset_cache
+  for tree in a b; do
+    root="$WORK/joined-$tree"
+    mkdir -p "$root/inc"
+    printf '#define VALUE 42\n' > "$root/inc/value.h"
+    printf '#include <value.h>\nint value = VALUE;\n' > "$root/main.c"
+    ( cd "$root" && VCACHE_ROOTS="$root=proj" VCACHE_LOG="$root/scan.log" \
+        "$VCACHE" gcc -M "-I$root/inc" main.c -MF deps.d )
+  done
+  check "joined absolute include path hits the other checkout's scan" \
+    "$(grep -c 'dep scan hit' "$WORK/joined-b/scan.log")" "1"
+  check "joined include scan localizes the header path" \
+    "$(grep -c "$WORK/joined-b/inc/value.h" "$WORK/joined-b/deps.d")" "1"
+  [[ "$FAIL" == 0 ]]
+) && ok "joined dependency-scan paths" || bad "joined dependency-scan paths"
+
+# --------------------------------------------------------------------------
 section "14b. Concurrent dep-scan stores keep both states"
 
 # Same source, different headers, one canonical root. The paused store must
@@ -3718,6 +3811,86 @@ check "a same-size rebuilt compiler is not served from the old memo" \
 check "and it did not report a hit" "$(hits)" "0"
 
 # --------------------------------------------------------------------------
+section "a compiler with the absent-deps patch does not share the stock entries"
+# A gcc or clang built with the absent-deps patch prints `absent-deps-<n>`
+# after the version in -v.
+# Their objects are the stock compiler's, but their dependency output is not:
+# it names the PCH a compile read. The stub patches the stock output the same
+# way, so an entry served across the two would replay the stock depfile. It
+# takes -fabsent-deps= as the patched compiler does, with nothing to list.
+ad="$WORK/absent-deps"
+mkdir -p "$ad"
+printf 'int f(void) { return 1; }\n' > "$ad/s.c"
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+reset_cache
+cat > "$ad/patched-gcc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  gcc -v 2>&1 | sed 's/^\(gcc version .*\)\$/\1 absent-deps-1/' >&2
+  exit 0
+fi
+scan=; prev=; deps=
+for a do
+  shift
+  case "\$a" in
+    -M|-MM) scan=1 ;;
+    -fabsent-deps=*) : > "\${a#-fabsent-deps=}"; continue ;;
+  esac
+  if [ "\$prev" = -MF ]; then deps="\$deps \$a"; fi
+  prev=\$a
+  set -- "\$@" "\$a"
+done
+if [ -n "\$scan" ]; then
+  prev=
+  for a in "\$@"; do [ "\$prev" = -o ] && deps="\$deps \$a"; prev=\$a; done
+fi
+gcc "\$@" || exit \$?
+for d in \$deps; do [ -f "\$d" ] && sed -i '1s|: |: $ad/pch.h.gch |' "\$d"; done
+exit 0
+EOF
+chmod +x "$ad/patched-gcc"
+ad_compile() {  # $1 compiler, $2 depfile
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" \
+      "$VCACHE" "$1" -O2 -MD -MF "$2" -c s.c -o s.o ) 2>/dev/null
+}
+ad_compile gcc stock.d
+ad_compile "$ad/patched-gcc" patched.d
+check "the patched compiler misses on the stock entry" "$(hits)/$(misses)" "0/2"
+check "and its depfile names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.d")" "1"
+reset_cache
+ad_scan() {  # $1 compiler, $2 output
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" "$VCACHE" "$1" -M s.c -o "$2" ) 2>/dev/null
+}
+ad_scan gcc stock.M
+ad_scan "$ad/patched-gcc" patched.M
+check "the patched compiler's dependency scan misses on the stock one" \
+  "$(hits)/$(misses)" "0/2"
+check "and its output names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.M")" "1"
+else
+  skipped "the absent-deps fingerprint stub wraps gcc, which is not installed or is clang"
+fi
+
+# The banner is hashed as printed. A token that starts a line must not take the
+# line break with it: these two banners then read the same.
+reset_cache
+for cc in split joined; do
+  if [ $cc = split ]; then
+    banner='mycc version 1.0\nabsent-deps-1 Thread model: posix'
+  else
+    banner='mycc version 1.0 Thread model: posix'
+  fi
+  cat > "$ad/$cc-cc" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then printf '$banner\n' >&2; exit 0; fi
+exec gcc "\$@"
+EOF
+  chmod +x "$ad/$cc-cc"
+  ( cd "$ad" && VCACHE_ROOTS="$ad=proj" "$VCACHE" "$ad/$cc-cc" -O2 -c s.c -o s.o ) 2>/dev/null
+done
+check "banners that differ only in a line break do not share entries" \
+  "$(hits)/$(misses)" "0/2"
+
+# --------------------------------------------------------------------------
 section "link caching"
 
 # Linux only. The tracer that discovers a link's input set needs LD_PRELOAD
@@ -3751,6 +3924,9 @@ int main(void) {
   if (input < 0) return 3;
   close(input);
   close(dir);
+  if (chdir("dir") != 0) return 4;
+  int also = openat(AT_FDCWD, "also-missing", O_RDONLY);
+  if (also >= 0 || errno != ENOENT) return 5;
   return 0;
 }
 EOF
@@ -3763,19 +3939,32 @@ check "the tracer preserves a failed call's errno" "$tracer_rc" "0"
 check "openat records the directory-fd-resolved input" \
   "$(grep -F $'R\t'"$WORK/tracer-openat/dir/value" \
       "$WORK/tracer-openat/trace" >/dev/null && echo yes)" "yes"
+openat_p=$(cd "$WORK/tracer-openat" && pwd -P)
+check "a relative absence is recorded under the working directory" \
+  "$(grep -cxF $'M\t'"$openat_p/definitely-missing" "$WORK/tracer-openat/trace")" "1"
+check "and an AT_FDCWD one under the directory changed to since" \
+  "$(grep -cxF $'M\t'"$openat_p/dir/also-missing" "$WORK/tracer-openat/trace")" "1"
 
 # Every name the stat family goes by is traced. A compiler built against glibc
 # before 2.33 calls __xstat and friends, and newer code statx; gcc and clang
 # find a missing -I directory with one such call. The legacy entry points are
 # reached through dlsym, which finds the preloaded tracer first, since glibc
-# 2.33 and later no longer lets a new program link against them. Paths are
-# recorded as the process spelled them.
+# 2.33 and later no longer lets a new program link against them. A relative
+# path is recorded under the working directory.
 cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+/* The __xstat family takes the stat layout version, which glibc 2.33 stopped
+   exporting as _STAT_VER: 1 on x86_64, 0 on the generic layout (aarch64,
+   riscv64). The wrong one fails with EINVAL and probes nothing. */
+#if defined(__x86_64__)
+#define STAT_VER 1
+#else
+#define STAT_VER 0
+#endif
 int main(void) {
   struct stat st;
   struct stat64 st64;
@@ -3783,11 +3972,11 @@ int main(void) {
   int (*xstat)(int, const char *, struct stat *) = dlsym(RTLD_DEFAULT, "__xstat");
   int (*lxstat64)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__lxstat64");
   if (xstat == NULL || lxstat64 == NULL) return 1;
-  if (xstat(1, "absent-xstat", &st) == 0) return 2;
-  if (lxstat64(1, "absent-lxstat64", &st64) == 0) return 3;
+  if (xstat(STAT_VER, "absent-xstat", &st) == 0) return 2;
+  if (lxstat64(STAT_VER, "absent-lxstat64", &st64) == 0) return 3;
   if (stat64("absent-stat64", &st64) == 0) return 4;
   if (statx(AT_FDCWD, "absent-statx", 0, STATX_BASIC_STATS, &stx) == 0) return 5;
-  if (xstat(1, "dir/value", &st) != 0) return 6;
+  if (xstat(STAT_VER, "dir/value", &st) != 0) return 6;
   if (statx(0, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) return 7;
   return 0;
 }
@@ -3798,13 +3987,441 @@ rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
   VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
   LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./stats )
 check "the legacy and statx entry points behave as without the tracer" "$?" "0"
-check "each records the path it found absent" \
-  "$(grep -cE $'^M\t''absent-(xstat|lxstat64|stat64|statx)$' \
-      "$WORK/tracer-openat/trace")" "4"
+absent_recorded=0
+for name in xstat lxstat64 stat64 statx; do
+  absent_recorded=$(( absent_recorded +
+    $(grep -cxF $'M\t'"$openat_p/absent-$name" "$WORK/tracer-openat/trace") ))
+done
+check "each records the path it found absent" "$absent_recorded" "4"
 check "and what it found" \
-  "$(grep -cx $'R\tdir/value' "$WORK/tracer-openat/trace")" "1"
+  "$(grep -cxF $'R\t'"$openat_p/dir/value" "$WORK/tracer-openat/trace")" "1"
 check "a stat of a descriptor, with an empty path, is not a lost record" \
   "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
+
+# gnulib and coreutils probe with euidaccess, and eaccess is a separate symbol
+# for the same call. Each absence is recorded.
+cat > "$WORK/tracer-openat/eaccess.c" <<'EACCEOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+int main(void) {
+  if (euidaccess("absent-euidaccess", F_OK) == 0) return 1;
+  if (eaccess("absent-eaccess", F_OK) == 0) return 2;
+  return 0;
+}
+EACCEOF
+gcc "$WORK/tracer-openat/eaccess.c" -o "$WORK/tracer-openat/eaccess"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./eaccess )
+check "euidaccess and eaccess behave as without the tracer" "$?" "0"
+check "and each records the path it found absent" \
+  "$(grep -cxF -e $'M\t'"$openat_p/absent-euidaccess" -e $'M\t'"$openat_p/absent-eaccess" \
+      "$WORK/tracer-openat/trace")" "2"
+
+# A process that unsets VCACHE_TRACE_LOG after the tracer has started still
+# marks a lost record: the log's name is read once, at startup. A path holding
+# a newline cannot be recorded, so it is a lost record.
+cat > "$WORK/tracer-openat/unsetenv.c" <<'UNSETEOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {
+  if (unsetenv("VCACHE_TRACE_LOG") != 0) return 1;
+  int fd = open("lost\nrecord", O_RDONLY);
+  if (fd >= 0) close(fd);
+  return 0;
+}
+UNSETEOF
+gcc "$WORK/tracer-openat/unsetenv.c" -o "$WORK/tracer-openat/unsetenv"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./unsetenv )
+check "a lost record after unsetenv still marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo marked || echo unmarked)" "marked"
+check "the tracer exports openat2 whatever glibc it was built against" \
+  "$(nm -D --defined-only "$TOP/bin/vcache-fstrace.so" | grep -cw openat2)" "1"
+
+# A record goes out in one write: finishing a short write with a second one can
+# land after another process's record and tear both. A regular file cannot be
+# made to take a short write on demand (past `ulimit -f` the retry fails too),
+# so a shim preloaded ahead of the tracer, whose writes go through syscall(),
+# cuts one record short.
+mkdir -p "$WORK/tracer-short"
+: > "$WORK/tracer-short/short-write-probe"
+cat > "$WORK/tracer-short/shim.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/syscall.h>
+long syscall(long number, ...) {
+  static long (*next)(long, ...);
+  static int cut;
+  if (next == NULL) next = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  long args[6];
+  va_list a;
+  va_start(a, number);
+  for (int i = 0; i < 6; ++i) args[i] = va_arg(a, long);
+  va_end(a);
+  if (number == SYS_write && !cut && args[2] > 4 &&
+      memmem((const void *)args[1], (size_t)args[2], "short-write-probe", 17) != NULL) {
+    cut = 1;
+    args[2] = 4;
+  }
+  return next(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+EOF
+gcc -fPIC -shared -o "$WORK/tracer-short/shim.so" "$WORK/tracer-short/shim.c" -ldl
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$WORK/tracer-short/trace" \
+  LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" cat short-write-probe )
+check "a short write marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-short/trace.incomplete" ]] && echo yes)" "yes"
+check "and the record is not finished by a second write" \
+  "$(grep -c 'short-write-probe$' "$WORK/tracer-short/trace")" "0"
+
+# A torn record has no newline. When the marker then cannot be created, the
+# lost-record line must still stand alone, or the torn prefix and the "!"
+# read as one valid-looking record.
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-short-sealed/log"
+  cat > "$WORK/tracer-short-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("short-write-probe", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-short-sealed/seal.c" -o "$WORK/tracer-short-sealed/seal"
+  : > "$WORK/tracer-short-sealed/short-write-probe"
+  ( cd "$WORK/tracer-short-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-short-sealed/log/trace" \
+    LD_PRELOAD="$WORK/tracer-short/shim.so $TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-short-sealed/log" )
+  check "a torn record followed by a lost-record line keeps the line on its own" \
+    "$(grep -cx '!' "$WORK/tracer-short-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
+# When "<log>.incomplete" cannot be created, the tracer says so in the log
+# itself. A record whose path holds a tab is the dropped record here.
+long_log="$WORK/tracer-long"
+while (( ${#long_log} < 4090 - 250 )); do long_log+="/$(printf 'd%.0s' {1..200})"; done
+mkdir -p "$long_log"
+long_log+="/$(printf 'l%.0s' $(seq $((4090 - ${#long_log} - 1))))"
+( cd "$WORK/tracer-short" && VCACHE_TRACE_LOG="$long_log" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a marker whose name does not fit is a lost-record line in the log" \
+  "$(grep -cx '!' "$long_log")" "1"
+check "and no marker is made under a shortened name" \
+  "$(ls "$(dirname "$long_log")" | grep -c '\.incomplete$')" "0"
+
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/tracer-sealed"
+  cat > "$WORK/tracer-sealed/seal.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  /* The tracer opened the log before main; now its directory refuses the marker. */
+  if (chmod(argv[1], 0500) != 0) return 1;
+  (void)open("tab\tmissing", O_RDONLY);
+  return chmod(argv[1], 0700) != 0;
+}
+EOF
+  gcc "$WORK/tracer-sealed/seal.c" -o "$WORK/tracer-sealed/seal"
+  mkdir -p "$WORK/tracer-sealed/log"
+  ( cd "$WORK/tracer-sealed" && VCACHE_TRACE_LOG="$WORK/tracer-sealed/log/trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./seal "$WORK/tracer-sealed/log" )
+  check "a marker its directory refuses is a lost-record line in the log" \
+    "$(grep -cx '!' "$WORK/tracer-sealed/log/trace")" "1"
+else
+  skipped "root ignores the read-only log directory"
+fi
+
+mkdir -p "$WORK/tracer-relative-log"
+( cd "$WORK/tracer-relative-log" && VCACHE_TRACE_LOG=trace \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat $'tab\tmissing' 2>/dev/null )
+check "a relative trace log is not written, nor its marker" \
+  "$(ls -A "$WORK/tracer-relative-log" | wc -l | tr -d ' ')" "0"
+
+# A directory descriptor whose directory was removed names "<dir> (deleted)",
+# which is not a path any reader can check.
+mkdir -p "$WORK/tracer-removed"
+cat > "$WORK/tracer-removed/check.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  if (mkdir("gone", 0700) != 0) return 1;
+  int dir = open("gone", O_RDONLY | O_DIRECTORY);
+  if (dir < 0) return 2;
+  if (rmdir("gone") != 0) return 3;
+  int fd = openat(dir, "x", O_RDONLY);
+  return fd < 0 && errno == ENOENT ? 0 : 4;
+}
+EOF
+gcc "$WORK/tracer-removed/check.c" -o "$WORK/tracer-removed/check"
+( cd "$WORK/tracer-removed" && VCACHE_TRACE_LOG="$WORK/tracer-removed/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+check "a removed directory's descriptor runs as without the tracer" "$?" "0"
+check "and names no '(deleted)' path in the trace" \
+  "$(grep -c '(deleted)' "$WORK/tracer-removed/trace")" "0"
+check "and marks the trace incomplete instead" \
+  "$([[ -e "$WORK/tracer-removed/trace.incomplete" ]] && echo yes)" "yes"
+
+# ld.so names a shared object found through a relative LD_LIBRARY_PATH entry
+# relatively. It is part of the program all the same.
+mkdir -p "$WORK/tracer-dlpi/lib"
+printf 'int probe(void) { return 7; }\n' > "$WORK/tracer-dlpi/lib/probe.c"
+printf 'int probe(void);\nint main(void) { return probe() == 7 ? 0 : 1; }\n' \
+  > "$WORK/tracer-dlpi/main.c"
+gcc -fPIC -shared -o "$WORK/tracer-dlpi/lib/libprobe.so" "$WORK/tracer-dlpi/lib/probe.c"
+gcc -o "$WORK/tracer-dlpi/main" "$WORK/tracer-dlpi/main.c" -L"$WORK/tracer-dlpi/lib" -lprobe
+( cd "$WORK/tracer-dlpi" && VCACHE_TRACE_LOG="$WORK/tracer-dlpi/trace" LD_LIBRARY_PATH=lib \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./main )
+check "a program loading a library by a relative name runs" "$?" "0"
+check "and the library is an L record by its absolute path" \
+  "$(grep -cxF $'L\t'"$(cd "$WORK/tracer-dlpi" && pwd -P)/lib/libprobe.so" \
+     "$WORK/tracer-dlpi/trace")" "1"
+check "while libc keeps its absolute L record" \
+  "$(grep -cE $'^L\t/.*/libc\\.so' "$WORK/tracer-dlpi/trace")" "1"
+check "and the kernel's vDSO, named relatively too, is no record" \
+  "$(grep -c 'vdso' "$WORK/tracer-dlpi/trace")" "0"
+
+# Every way into a stat is a probe. coreutils calls statx and the LFS names
+# (stat64, fstatat64), Python's os.stat calls stat64, and a binary built against
+# glibc before 2.33 calls __xstat.
+mkdir -p "$WORK/tracer-stat/dir/listed"
+: > "$WORK/tracer-stat/dir/f"
+for f in sx fs64 xs; do : > "$WORK/tracer-stat/dir/$f"; done
+ln -sfn f "$WORK/tracer-stat/dir/link"
+traced_stat() {  # $1 = log name, rest = command run in $WORK/tracer-stat
+  local log="$WORK/tracer-stat/$1.trace"
+  shift
+  ( cd "$WORK/tracer-stat" && VCACHE_TRACE_LOG="$log" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" "$@" ) >/dev/null 2>&1
+}
+stat_p=$(cd "$WORK/tracer-stat" && pwd -P)
+stat_record() {  # $1 = log name, $2 = kind, $3 = path under the fixture
+  grep -cxF "$2"$'\t'"$stat_p/$3" "$WORK/tracer-stat/$1.trace"
+}
+traced_stat coreutils-stat stat dir/f
+check "stat(1) records what it stats" "$(stat_record coreutils-stat R dir/f)" "1"
+traced_stat ls ls -l dir/f
+check "ls -l records what it lists" "$(stat_record ls R dir/f)" "1"
+traced_stat python python3 -c 'import os; os.stat("dir/f")'
+check "Python's os.stat records what it stats" "$(stat_record python R dir/f)" "1"
+traced_stat missing stat dir/missing
+check "and stat(1) of a missing path records its absence" \
+  "$(stat_record missing M dir/missing)" "1"
+cat > "$WORK/tracer-stat/check.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int __xstat(int ver, const char *path, struct stat *st);
+int main(void) {
+  struct statx sx;
+  if (statx(AT_FDCWD, "dir/sx", 0, STATX_BASIC_STATS, &sx) != 0) return 1;
+  struct stat64 st64;
+  if (fstatat64(AT_FDCWD, "dir/fs64", &st64, 0) != 0) return 2;
+  int dir = open("dir", O_RDONLY | O_DIRECTORY);
+  char target[16];
+  if (dir < 0 || readlinkat(dir, "link", target, sizeof target) != 1) return 3;
+  DIR *listing = fdopendir(open("dir/listed", O_RDONLY | O_DIRECTORY));
+  if (listing == NULL) return 4;
+  closedir(listing);
+#ifdef __x86_64__
+  const int stat_ver = 1;
+#else
+  const int stat_ver = 0;
+#endif
+  struct stat st;
+  if (__xstat(stat_ver, "dir/xs", &st) != 0) return 5;
+  /* What Rust's File::metadata does. */
+  int f = open("dir/f", O_RDONLY);
+  if (f < 0 || statx(f, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx) != 0) return 6;
+  /* Newer kernels take a NULL path with AT_EMPTY_PATH; older ones refuse it.
+     Either way it is a descriptor stat, not a lost record. */
+  (void)statx(f, NULL, AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+  /* An empty path without AT_EMPTY_PATH is ENOENT by definition: nothing to
+     record, nothing lost. */
+  if (openat(dir, "", O_RDONLY) >= 0) return 7;
+  /* An absence probed through a directory descriptor is an M record. */
+  if (openat(dir, "nope", O_RDONLY) >= 0) return 8;
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-stat/check.c" -o "$WORK/tracer-stat/check"
+( cd "$WORK/tracer-stat" && VCACHE_TRACE_LOG="$WORK/tracer-stat/calls.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./check )
+check "the stat-family fixture runs as without the tracer" "$?" "0"
+check "statx records what it stats" "$(stat_record calls R dir/sx)" "1"
+check "fstatat64 records what it stats" "$(stat_record calls R dir/fs64)" "1"
+check "readlinkat records the link under its directory" \
+  "$(grep -cxF $'R\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/link" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+check "fdopendir records the directory it lists" \
+  "$(grep -cxF $'D\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/listed" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+check "__xstat records what it stats" "$(stat_record calls R dir/xs)" "1"
+check "a stat of an open descriptor does not mark the trace incomplete" \
+  "$([[ -e "$WORK/tracer-stat/calls.trace.incomplete" ]] && echo yes || echo no)" "no"
+check "an absence probed through a directory descriptor is an M record" \
+  "$(grep -cxF $'M\t'"$(cd "$WORK/tracer-stat" && pwd -P)/dir/nope" \
+     "$WORK/tracer-stat/calls.trace")" "1"
+
+# Every record is absolute. A relative path names a file in the directory the
+# process is in when it makes the call, which no reader can know: the whole
+# tree appends to one log, and a process may change directory at any time.
+mkdir -p "$WORK/tracer-cwd/x" "$WORK/tracer-cwd/a" "$WORK/tracer-cwd/b"
+for f in x/rel a/rel b/rel; do : > "$WORK/tracer-cwd/$f"; done
+cwd_p=$(cd "$WORK/tracer-cwd" && pwd -P)
+( cd "$WORK/tracer-cwd" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/sh.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" sh -c 'cd x && cat rel' )
+check "a read after cd is recorded under the directory it was made in" \
+  "$(grep -cxF $'R\t'"$cwd_p/x/rel" "$WORK/tracer-cwd/sh.trace")" "1"
+check "and no record is relative" \
+  "$(grep -c $'^.\t[^/]' "$WORK/tracer-cwd/sh.trace")" "0"
+cat > "$WORK/tracer-cwd/chdir.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  int a = open("a", O_RDONLY | O_DIRECTORY);
+  if (a < 0 || chdir("a") != 0) return 1;
+  int fd = open("rel", O_RDONLY);
+  if (fd < 0) return 2;
+  close(fd);
+  if (chdir("../b") != 0) return 3;
+  fd = open("rel", O_RDONLY);
+  if (fd < 0) return 4;
+  close(fd);
+  if (fchdir(a) != 0) return 5;
+  struct stat st;
+  return stat("rel", &st) == 0 ? 0 : 6;
+}
+EOF
+gcc "$WORK/tracer-cwd/chdir.c" -o "$WORK/tracer-cwd/chdir"
+( cd "$WORK/tracer-cwd" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/chdir.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chdir )
+check "a program changing directory runs as without the tracer" "$?" "0"
+check "its reads in the first directory, by chdir and by fchdir, are recorded there" \
+  "$(grep -cxF $'R\t'"$cwd_p/a/rel" "$WORK/tracer-cwd/chdir.trace")" "2"
+check "and its read in the second there" \
+  "$(grep -cxF $'R\t'"$cwd_p/b/rel" "$WORK/tracer-cwd/chdir.trace")" "1"
+
+# A working directory the kernel cannot name leaves the record nothing to be
+# relative to: it is a lost record, never a bare relative one.
+mkdir -p "$WORK/tracer-cwd/gone-run"
+cat > "$WORK/tracer-cwd/gone.c" <<'EOF'
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+  if (mkdir("gone", 0700) != 0 || chdir("gone") != 0 || rmdir("../gone") != 0) return 1;
+  return open("rel", O_RDONLY) < 0 ? 0 : 2;
+}
+EOF
+gcc "$WORK/tracer-cwd/gone.c" -o "$WORK/tracer-cwd/gone"
+( cd "$WORK/tracer-cwd/gone-run" && VCACHE_TRACE_LOG="$WORK/tracer-cwd/gone.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ../gone )
+check "a removed working directory runs as without the tracer" "$?" "0"
+check "and marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-cwd/gone.trace.incomplete" ]] && echo yes)" "yes"
+check "instead of recording the path relatively" \
+  "$(grep -c $'\trel$' "$WORK/tracer-cwd/gone.trace")" "0"
+
+# The working directory counts toward the record's length: a relative path
+# that fits alone but not under the directory is a lost record.
+overflow_dir="$WORK/tracer-overflow/$(printf 'o%.0s' {1..100})"
+mkdir -p "$overflow_dir"
+overflow_component=$(printf 'q%.0s' {1..250})
+overflow_path=$overflow_component
+for _ in {2..16}; do overflow_path+="/$overflow_component"; done
+( cd "$overflow_dir" && VCACHE_TRACE_LOG="$WORK/tracer-overflow/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" cat "$overflow_path" ) 2>/dev/null
+check "a relative path too long under the working directory marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-overflow/trace.incomplete" ]] && echo yes)" "yes"
+check "and is not recorded" \
+  "$(grep -c "$overflow_component" "$WORK/tracer-overflow/trace")" "0"
+
+# After a change of root every absolute path names a file inside the new root,
+# which no reader could check, so a successful chroot marks the trace
+# incomplete beside the log; a failed one changes nothing.
+mkdir -p "$WORK/tracer-chroot/jail"
+cat > "$WORK/tracer-chroot/chroot.c" <<'EOF'
+#include <unistd.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  return chroot(argv[1]) == 0 ? 0 : 1;
+}
+EOF
+gcc "$WORK/tracer-chroot/chroot.c" -o "$WORK/tracer-chroot/chroot"
+if [[ "$(id -u)" != 0 ]]; then
+  ( cd "$WORK/tracer-chroot" && VCACHE_TRACE_LOG="$WORK/tracer-chroot/failed.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chroot "$WORK/tracer-chroot/jail" )
+  check "an unprivileged chroot fails as without the tracer" "$?" "1"
+  check "and leaves no marker" \
+    "$([[ -e "$WORK/tracer-chroot/failed.trace.incomplete" ]] && echo yes || echo no)" "no"
+else
+  skipped "root's chroot succeeds"
+fi
+if unshare -r true 2>/dev/null; then
+  ( cd "$WORK/tracer-chroot" && unshare -r env VCACHE_TRACE_LOG="$WORK/tracer-chroot/done.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./chroot "$WORK/tracer-chroot/jail" )
+  check "a chroot in a user namespace succeeds under the tracer" "$?" "0"
+  check "and leaves the marker beside the log" \
+    "$([[ -e "$WORK/tracer-chroot/done.trace.incomplete" ]] && echo yes)" "yes"
+else
+  skipped "a successful chroot: unshare -r is not available"
+fi
+
+# glibc headers before 2.41 declare the path of statx and fstatat nonnull,
+# though the kernel takes NULL with AT_EMPTY_PATH and Rust's File::metadata
+# passes it. At -O2 the compiler then deletes the wrappers' NULL tests and the
+# traced process segfaults (el10, glibc 2.39, gcc 14). The same prototypes
+# forced onto this host's headers reproduce it.
+mkdir -p "$WORK/tracer-nonnull"
+cat > "$WORK/tracer-nonnull/nonnull.h" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/stat.h>
+extern int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st)
+    __attribute__((nonnull(2, 5)));
+extern int fstatat(int dirfd, const char *path, struct stat *st, int flags)
+    __attribute__((nonnull(2, 3)));
+EOF
+cat > "$WORK/tracer-nonnull/probe.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stddef.h>
+#include <sys/stat.h>
+int main(void) {
+  int fd = open("/dev/null", O_RDONLY);
+  struct statx sx;
+  struct stat st;
+  if (fd < 0) return 1;
+  /* Newer kernels accept the NULL path; older ones refuse it. Either way the
+     wrapper must not dereference it. */
+  (void)statx(fd, NULL, AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+  (void)fstatat(fd, NULL, &st, AT_EMPTY_PATH);
+  return 0;
+}
+EOF
+gcc -std=c11 -O2 -fPIC -shared -Wall -Wextra -include "$WORK/tracer-nonnull/nonnull.h" \
+  -o "$WORK/tracer-nonnull/fstrace-nonnull.so" "$TOP/src/trace/fstrace.c" -ldl
+gcc "$WORK/tracer-nonnull/probe.c" -o "$WORK/tracer-nonnull/probe"
+( cd "$WORK/tracer-nonnull" && VCACHE_TRACE_LOG="$WORK/tracer-nonnull/trace" \
+  LD_PRELOAD="$WORK/tracer-nonnull/fstrace-nonnull.so" ./probe )
+check "a NULL path with AT_EMPTY_PATH survives a tracer built against nonnull prototypes" "$?" "0"
 
 make_link_project() {  # $1 = root, $2 = value returned by helper()
   mkdir -p "$1"
@@ -4067,6 +4684,22 @@ __attribute__((constructor)) static void stub(void) {
     if (mfd >= 0) close(mfd);
     return;
   }
+  if (strcmp(mode, "lost-line") == 0) {
+    /* A usable-looking trace that carries the line the tracer writes when it
+       loses a record and cannot create the marker. */
+    const char *text = "P\t/bin/sh\nR\t/etc/hostname\n!\n";
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
+    return;
+  }
+  if (strcmp(mode, "relative") == 0) {
+    /* What a tracer from before records were absolute writes for a process
+       that may have changed directory. */
+    const char *text = "P\t/bin/sh\nR\tmain.c\n";
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { (void)!write(fd, text, strlen(text)); close(fd); }
+    return;
+  }
   if (strcmp(mode, "noprocs") == 0) {
     /* Reads, but never announces a process: the input set may be partial. */
     int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -4088,6 +4721,22 @@ STUBEOF
         "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-np ) 2>/dev/null
     check "a trace naming no processes is not stored" "$(disk_entries)" "0"
     check "and that is counted uncacheable too" "$(uncacheable)" "1"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=lost-line VCACHE_TRACER="$WORK/stub-tracer.so" \
+        VCACHE_LOG="$WORK/lost-line.log" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-lost ) 2>/dev/null
+    check "a trace with the tracer's lost-record line is not stored" "$(disk_entries)" "0"
+    check "and the link says the trace is unusable" \
+      "$(grep -c 'link: no usable trace' "$WORK/lost-line.log")" "1"
+
+    reset_cache
+    ( cd "$WORK/link-one" && STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so" \
+        VCACHE_LOG="$WORK/relative-record.log" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc helper.o main.o -o app-rel ) 2>/dev/null
+    check "a trace with a relative record is not stored" "$(disk_entries)" "0"
+    check "and the link says the trace is unusable" \
+      "$(grep -c 'link: no usable trace' "$WORK/relative-record.log")" "1"
   else
     printf '  \033[33mSKIP\033[0m stub tracer would not compile\n'
   fi
@@ -4243,7 +4892,7 @@ section "precompiled headers"
 make_pch_tree() {
   mkdir -p "$1"
   printf '#define FOO 1\nstruct S { int x; };\n' > "$1/h.h"
-  printf 'int f() { S s{FOO}; return s.x; }\n' > "$1/main.cc"
+  printf 'int f() { S s = {FOO}; return s.x; }\n' > "$1/main.cc"
 }
 
 if command -v clang++ >/dev/null 2>&1; then
@@ -4631,8 +5280,8 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
     "$(cmp -s "$sp/m.o" "$sp/plain.o" && echo same)" "same"
 
   # A .gch that appears after the state was recorded is one gcc probed for.
-  # The object is not compared: the -E run reads the header, not the .gch, so
-  # the preprocessor key cannot tell the two apart either.
+  # The trace must reject the old state before the PCH-aware preprocessor
+  # can derive the key for the new .gch.
   reset_cache
   rm -f "$sp/pch.h.gch"
   mf_stray "$(mf_log stray3)"
@@ -4645,6 +5294,56 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
   check "and runs the preprocessor" "$(grep -c '\] preprocess: ' "$l")" "1"
 else
   skipped "stray .gch: gcc is not installed, or is clang"
+fi
+
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off
+    for manifest in 0 1; do
+      export VCACHE_CXX_MANIFEST=$manifest
+      reset_cache
+      root="$WORK/unkeyed-$manifest"
+      mkdir -p "$root/inc"
+      printf '#define VALUE 1\n' > "$root/inc/value.h"
+      printf '#include <value.h>\nint value = VALUE;\n' > "$root/main.c"
+      ( cd "$root" && "$VCACHE" gcc -O2 -I inc -c main.c -o m.o )
+      for value in 2 3; do
+        printf '#define VALUE %s\n' "$value" > "$root/inc/value.h"
+        ( cd "$root" && gcc -O2 -x c-header inc/value.h -o inc/value.h.gch )
+        printf '#define VALUE 1\n' > "$root/inc/value.h"
+        ( cd "$root" && "$VCACHE" gcc -O2 -I inc -c main.c -o m.o && \
+            gcc -O2 -I inc -c main.c -o plain.o )
+        check "manifest=$manifest follows PCH value $value despite unchanged header" \
+          "$(cmp -s "$root/m.o" "$root/plain.o" && echo same)" "same"
+      done
+    done
+    [[ "$FAIL" == 0 ]]
+  ) && ok "unkeyed PCH cache keys" || bad "unkeyed PCH cache keys"
+fi
+
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang && [[ $(uname -s) == Linux ]]; then
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off VCACHE_CXX_MANIFEST=0
+    reset_cache
+    root="$WORK/pch-incbin"
+    mkdir -p "$root"
+    cd "$root" || exit 1
+    cat > pch.h <<'EOF'
+__asm__(".incbin \"payload.bin\"");
+EOF
+    printf '#include "pch.h"\nint value = 1;\n' > main.c
+    printf 'one' > payload.bin
+    gcc -x c-header pch.h -o pch.h.gch
+    "$VCACHE" gcc -c main.c -o first.o
+    printf 'two' > payload.bin
+    "$VCACHE" gcc -c main.c -o second.o
+    gcc -c main.c -o plain.o
+    check "PCH .incbin follows the changed assembler input" \
+      "$(cmp -s second.o plain.o && echo same)" "same"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "PCH assembler inputs" || bad "PCH assembler inputs"
 fi
 
 # Two compiles of one source with different headers write one manifest. The
@@ -4841,6 +5540,37 @@ for cc in gcc clang; do
     "$(cmp -s "$sh/m.o" "$sh/plain.o" && echo same)" "same"
 done
 
+if command -v clang >/dev/null 2>&1; then
+  (
+    FAIL=0
+    export VCACHE_CXX_MANIFEST=1 VCACHE_CXX_MANIFEST_TRACE=1 VCACHE_DAEMON=off
+    reset_cache
+    sh="$WORK/dotdot"
+    mkdir -p "$sh/first" "$sh/second/sub"
+    printf '#define V 2\n' > "$sh/second/a.h"
+    printf '#include <sub/../a.h>\nint v = V;\n' > "$sh/main.c"
+    for attempt in 1 2 3; do
+      if [[ "$attempt" == 3 ]]; then
+        mkdir -p "$sh/first/sub"
+        printf '#define V 1\n' > "$sh/first/a.h"
+      fi
+      ( cd "$sh" && VCACHE_MAP_CWD=0 VCACHE_ROOTS="$sh=proj" \
+          VCACHE_LOG="$sh/$attempt.log" \
+          "$VCACHE" clang -O2 -I first -I second -c main.c -o m.o )
+    done
+    ( cd "$sh" && clang -O2 -I first -I second -c main.c -o plain.o )
+    check "clang records its initial state from the trace" \
+      "$(grep -c 'recorded from the trace' "$sh/1.log")" "1"
+    check "clang reuses the unchanged state" \
+      "$(grep -c 'preprocessor skipped' "$sh/2.log")" "1"
+    check "clang rejects a state when the parent-directory probe appears" \
+      "$(grep -c 'rejected: .*first/sub.*exists now' "$sh/3.log")" "1"
+    check "clang compiles the newly shadowing header" \
+      "$(cmp -s "$sh/m.o" "$sh/plain.o" && echo same)" "same"
+    [[ "$FAIL" == 0 ]]
+  ) && ok "clang parent-directory probes" || bad "clang parent-directory probes"
+fi
+
 # Absent paths are canonicalised through the roots as files are, so a tree at
 # another path hits a state another recorded, and checks its own include path.
 reset_cache
@@ -4892,7 +5622,8 @@ rm -f "$tl/calls"
 l=$(mf_log trace1); mf_traced "$l"
 check "a miss records from a trace" "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
 check "its compile runs under the tracer" "$(traced_calls)" "1"
-check "and its -E run does not" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
+check "and so does its -E run, for the state a preprocessor hit would record" \
+  "$(grep -c 'vcache-fstrace\.so|.* -E main\.c$' "$tl/calls")" "1"
 check "and leaves no trace behind" \
   "$(find "$VCACHE_DIR" "$tl" -name 'trace*' | wc -l | tr -d ' ')" "0"
 calls_before=$(wc -l < "$tl/calls")
@@ -4906,6 +5637,7 @@ rm -f "$tl/calls"
 l=$(mf_log trace-ro); mf_traced "$l" VCACHE_READONLY=1
 check "a read-only miss compiles untraced" \
   "$(traced_calls)/$(grep -c 'recorded from the trace' "$l" || true)" "0/0"
+check "and preprocesses untraced" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
 
 # A trace that cannot be trusted to be whole is not used; the state comes from
 # the depfile, as it does where there is no tracer.
@@ -4922,6 +5654,12 @@ if [[ -f "$WORK/stub-tracer.so" ]]; then
   mf_traced "$l" STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so"
   check "a trace naming no process falls back to the depfile" \
     "$(grep -c 'the trace names no process; recording from the depfile' "$l")" "1"
+  check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  reset_cache
+  l=$(mf_log trace-rel)
+  mf_traced "$l" STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so"
+  check "a trace with a relative record falls back to the depfile" \
+    "$(grep -c 'the trace did not parse; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   reset_cache
   l=$(mf_log trace-nolog)
@@ -4946,6 +5684,31 @@ l=$(mf_log trace-none); mf_traced "$l" VCACHE_TRACER="$WORK/no-such-tracer.so"
 check "without a tracer the state comes from the depfile" \
   "$(grep -c "no tracer at '$WORK/no-such-tracer.so'; recording from the depfile" "$l")" "1"
 check "and is still recorded" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+
+# Under -working-directory, clang's relative paths are relative to that
+# directory, and joined to the one it runs in they name the decoys here.
+if command -v clang >/dev/null 2>&1; then
+  reset_cache
+  for t in A B; do
+    mkdir -p "$WORK/mf-workdir/$t"
+    printf '#define V 1\n' > "$WORK/mf-workdir/$t/h.h"
+    printf '#include "h.h"\nint v = V;\n' > "$WORK/mf-workdir/$t/main.c"
+  done
+  l=$(mf_log workdir)
+  ( cd "$WORK/mf-workdir/A" && VCACHE_LOG="$l" "$VCACHE" clang \
+      "-working-directory=$WORK/mf-workdir/B" -c main.c -MD -MF m.d -o m.o ) 2>/dev/null
+  check "a compile that changes its working directory records no state" \
+    "$(grep -c 'not recording: the compiler changes its working directory' "$l")" "1"
+  check "and stores none" "$(grep -c 'cxx manifest: stored 1 states' "$l" || true)" "0"
+  l=$(mf_log workdir-pp)
+  ( cd "$WORK/mf-workdir/A" && VCACHE_LOG="$l" "$VCACHE" clang \
+      "-working-directory=$WORK/mf-workdir/B" -c main.c -MD -MF m.d -o m.o ) 2>/dev/null
+  check "nor does its preprocessor hit" \
+    "$(grep -c 'not recording: the compiler changes its working directory' "$l")/$(
+       grep -c 'recorded a state from the preprocessor run' "$l" || true)" "1/0"
+else
+  skipped "-working-directory: clang is not installed"
+fi
 
 # A tracer ld.so would refuse is not preloaded: the refusal would go to the
 # compile's stderr, and from there into the entry and every hit.
@@ -5317,13 +6080,14 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$sf/inc" "$sf/bin"
   printf '#pragma once\n#define BIG 5\n' > "$sf/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$sf/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$sf/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$sf/main.cc"
   ( cd "$sf" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch )
   # Counts real compiles and holds each one long enough for the other to wait.
   cat > "$sf/bin/slowg++" <<EOF
 #!/bin/sh
 case " \$* " in
-  *" -c "*) case " \$* " in *" -E "*) ;; *) echo compile >> "$sf/count"; sleep 2 ;; esac ;;
+  *" -E "*) exit 1 ;;
+  *" -c "*) echo compile >> "$sf/count"; sleep 2 ;;
 esac
 exec g++ "\$@"
 EOF
@@ -5363,7 +6127,7 @@ if command -v clang++ >/dev/null 2>&1; then
   mkdir -p "$pc/inc"
   printf '#pragma once\n#define BIG 5\n' > "$pc/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$pc/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$pc/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$pc/main.cc"
   mf_build_pch() {
     ( cd "$pc" && clang++ -O2 -I inc -x c++-header -c h.h -Xclang -emit-pch -o h.pch )
   }
@@ -5455,7 +6219,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$gp/inc"
   printf '#pragma once\n#define BIG 5\n' > "$gp/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$gp/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$gp/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$gp/main.cc"
   mf_build_gch() { ( cd "$gp" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch ); }
   mf_use_gch() {  # $1 log
     ( cd "$gp" && VCACHE_ROOTS="$gp=proj" VCACHE_LOG="$1" \
@@ -5464,18 +6228,590 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   reset_cache
   mf_build_gch
   l=$(mf_log g1); mf_use_gch "$l"
-  check "gcc: a .gch consumer -E cannot handle compiles and misses" "$(misses)" "1"
-  check "gcc: under a key derived from what it read" "$(grep -c '\] derived key ' "$l")" "1"
+  check "gcc: a .gch consumer compiles and misses" "$(misses)" "1"
+  check "gcc: the preprocessor loads the PCH without its original include path" \
+    "$(grep -c '\] preprocess: .*-fpch-preprocess' "$l")" "1"
   check "gcc: keyed on the .gch" "$(grep -c 'PCH .*h\.h\.gch is bytes' "$l")" "1"
   mf_use_gch "$(mf_log g2)"
-  check "gcc: the next compile hits the derived key" "$(manifest_hits)" "1"
+  check "gcc: the next compile hits through the manifest" "$(manifest_hits)" "1"
   printf '#pragma once\n#define BIG 6\n' > "$gp/inc/big.h"
   mf_build_gch
   mf_use_gch "$(mf_log g3)"
   check "gcc: editing the .gch's header and rebuilding it misses" "$(misses)" "2"
+  # gcc names the PCH in its -E output with %s, unescaped: a backslash in the
+  # directory is the path's own. Included by its absolute name, so the pragma
+  # carries the directory.
+  bs="$WORK/pch-back\\slash"
+  mkdir -p "$bs"
+  printf '#pragma once\n#define BS 3\n' > "$bs/h.h"
+  printf 'int f() { return BS; }\n' > "$bs/main.cc"
+  ( cd "$bs" && g++ -O2 -x c++-header -c h.h -o h.h.gch )
+  reset_cache
+  for i in 1 2; do
+    ( cd "$WORK" && "$VCACHE" g++ -O2 -c -include "$bs/h.h" "$bs/main.cc" -o "$bs/main.o" ) \
+      2>/dev/null
+  done
+  check "gcc: a PCH under a directory holding a backslash is cached" "$(hits)/$(misses)" "1/1"
 else
   skipped "g++ is not installed, or is clang"
 fi
+
+# A preprocessor hit records a state from its -E run, traced and given a
+# depfile as a recording compile is. Editing a comment leaves the preprocessed
+# text as it was and the state's digest stale: the next compile is served by
+# the preprocessor, and the one after it by the manifest.
+mkdir -p "$WORK/mf-pphit"
+mf_pphit() {  # $1 compiler, $2 log, then environment assignments
+  local cc=$1 log=$2; shift 2
+  ( cd "$WORK/mf-pphit" && env "$@" VCACHE_MAP_CWD=0 VCACHE_LOG="$log" \
+      "$VCACHE" "$cc" -O2 -c t.c -o t.o ) 2>/dev/null
+}
+pphit_recorded() { stat_of "pp hits recorded"; }
+printf '#include "h.h"\nint six(void) { return SIX; }\n' > "$WORK/mf-pphit/t.c"
+for cc in gcc clang; do
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    skipped "$cc: not installed"
+    continue
+  fi
+  reset_cache
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log "pphit1-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: the first compile misses and records a state" \
+    "$(misses)/$(grep -c 'cxx manifest: stored 1 states' "$l")" "1/1"
+  check "$cc: a miss records nothing from its -E run" \
+    "$(grep -c 'recorded a state from the preprocessor run' "$l" || true)" "0"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log "pphit2-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: a comment edit misses the manifest" \
+    "$(grep -c 'rejected: .*h\.h changed' "$l")" "1"
+  check "$cc: and hits through the preprocessor" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'preprocessor skipped' "$l" || true)" "1/0"
+  check "$cc: the -E run is given a depfile" \
+    "$(grep -cE '\] preprocess: .* -MD -MF [^ ]*/pp\.d .*-E t\.c$' "$l")" "1"
+  check "$cc: the hit records a state from the -E run" \
+    "$(grep -c 'cxx manifest: recorded a state from the preprocessor run' "$l")" "1"
+  if [[ "$(uname -s)" == Linux ]]; then
+    check "$cc: from its trace, in place of the stale state, which named the same key" \
+      "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+      "1/1"
+  else
+    check "$cc: from its depfile (no tracer here), in place of the stale state" \
+      "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  fi
+  check "$cc: --show-stats counts it" "$(pphit_recorded)" "1"
+  l=$(mf_log "pphit3-$cc"); mf_pphit "$cc" "$l"
+  check "$cc: the next compile skips the preprocessor" \
+    "$(grep -c 'state 1 of 1; preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" \
+    "1/0"
+  check "$cc: and a manifest hit is not counted as recording" "$(pphit_recorded)" "1"
+done
+
+# With tracing off, gcc's -E run records from its depfile alone.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  reset_cache
+  untraced=(VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_CXX_MANIFEST_ABSENT_DEPS=0)
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  mf_pphit gcc "$(mf_log pphit-untraced1)" "${untraced[@]}"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log pphit-untraced2); mf_pphit gcc "$l" "${untraced[@]}"
+  check "gcc untraced: the preprocessor hit records from the depfile" \
+    "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'recorded a state from the preprocessor run' "$l")" \
+    "1/1"
+  check "gcc untraced: and not from a trace" \
+    "$(grep -c 'recorded from the trace' "$l" || true)" "0"
+  l=$(mf_log pphit-untraced3); mf_pphit gcc "$l" "${untraced[@]}"
+  check "gcc untraced: the next compile skips the preprocessor" \
+    "$(grep -c 'preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" "1/0"
+else
+  skipped "gcc is not installed, or is clang"
+fi
+
+# The declines a miss applies hold for the -E run too: a header naming a time
+# macro, and clang told to resolve paths against another directory.
+if command -v gcc >/dev/null 2>&1; then
+  reset_cache
+  printf '/* one: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  mf_pphit gcc "$(mf_log pphit-time1)"
+  printf '/* two: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  l=$(mf_log pphit-time2); mf_pphit gcc "$l"
+  check "a preprocessor hit on a header naming __TIME__ records nothing" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'not recording: .*h\.h uses __TIME__' "$l")/$(grep -c 'stored [0-9] states' "$l" || true)" \
+    "1/1/0"
+fi
+if command -v clang >/dev/null 2>&1; then
+  reset_cache
+  mkdir -p "$WORK/mf-pphit-wd/sub"
+  printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit-wd/sub/h.h"
+  printf '#include "h.h"\nint six(void) { return SIX; }\n' > "$WORK/mf-pphit-wd/sub/t.c"
+  mf_pphit_wd() {  # $1 log
+    ( cd "$WORK/mf-pphit-wd" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
+        "$VCACHE" clang -working-directory=sub -O2 -c "$WORK/mf-pphit-wd/sub/t.c" -o t.o ) \
+      2>/dev/null
+  }
+  mf_pphit_wd "$(mf_log pphit-wd1)"
+  printf '/* two */\n#define SIX 6\n' > "$WORK/mf-pphit-wd/sub/h.h"
+  l=$(mf_log pphit-wd2); mf_pphit_wd "$l"
+  check "clang -working-directory: a preprocessor hit records nothing" \
+    "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'not recording: the compiler changes its working directory' "$l")" \
+    "1/1"
+  check "clang -working-directory: and its -E run gets no depfile" \
+    "$(grep -c '\] preprocess: .*pp\.d' "$l" || true)" "0"
+else
+  skipped "clang: not installed"
+fi
+
+# --------------------------------------------------------------------------
+section "19b. C/C++ manifest from the compiler's absent-path list"
+
+# A gcc or clang built with the absent-deps patch prints `absent-deps-1`
+# (clang `absent-deps-2`, whose
+# list adds its driver's probes) after the version in -v, and given
+# -fabsent-deps=FILE write there every path the preprocessor looked for and did
+# not find. The trace still comes first, since it also sees what the
+# driver reads and probes; where there is no tracer, a state takes its absent
+# paths from that list. Most cases here run with VCACHE_TRACER naming nothing.
+# The stub prints that banner around gcc, writes the lines of $STUB_ABSENT
+# where the flag points and drops the flag; $STUB_DEPS_EXTRA joins the
+# depfile, as the patch names there a header __has_include found and a PCH.
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+  ads="$WORK/mf-absent"
+  mkdir -p "$ads"
+  make_absent_stub() {  # $1 path, $2 banner token
+    cat > "$1" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  gcc -v 2>&1 | sed 's/^\(gcc version .*\)\$/\1 $2/' >&2
+  exit 0
+fi
+printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$ads/calls"
+deps=; prev=
+for a do
+  shift
+  case "\$a" in
+    -fabsent-deps=*) cat "\${STUB_ABSENT:-/dev/null}" > "\${a#-fabsent-deps=}"; continue ;;
+  esac
+  if [ "\$prev" = -MF ]; then deps=\$a; fi
+  prev=\$a
+  set -- "\$@" "\$a"
+done
+gcc "\$@" || exit \$?
+if [ -n "\$deps" ] && [ -n "\${STUB_DEPS_EXTRA:-}" ]; then
+  sed -i "1s|: |: \$STUB_DEPS_EXTRA |" "\$deps"
+fi
+exit 0
+EOF
+    chmod +x "$1"
+  }
+  make_absent_stub "$ads/gcc-ad1" absent-deps-1
+  make_absent_stub "$ads/gcc-ad2" absent-deps-2
+  make_absent_stub "$ads/gcc-ad3" absent-deps-3
+  absent_list() { printf '%s\n' "$@" > "$ads/list"; }
+  absent_run() {  # $1 dir, $2 log, $3 compiler, then compiler arguments
+    local dir=$1 log=$2 cc=$3; shift 3
+    local tracer="$ads/no-such-tracer.so"
+    if [[ "${ABSENT_TRACED:-0}" == 1 ]]; then tracer="$TOP/bin/vcache-fstrace.so"; fi
+    ( cd "$dir" && STUB_ABSENT="$ads/list" VCACHE_TRACER="$tracer" VCACHE_MAP_CWD=0 \
+        VCACHE_LOG="$log" "$VCACHE" "$cc" -O2 "$@" -c main.c -o m.o ) 2>/dev/null
+  }
+  absent_plain() {  # $1 dir, then compiler arguments
+    local dir=$1; shift
+    ( cd "$dir" && gcc -O2 "$@" -c main.c -o plain.o ) 2>/dev/null
+  }
+  same_object() { cmp -s "$1/m.o" "$1/plain.o" && echo same || echo differs; }
+  shadow_tree() {  # $1 dir
+    mkdir -p "$1/first" "$1/second"
+    printf '#define V 2\n' > "$1/second/h.h"
+    printf '#include "h.h"\nint v = V;\n' > "$1/main.c"
+  }
+
+  # The list is opt-in: by default a patched compiler without a tracer is not
+  # asked for it, and records from the depfile alone.
+  reset_cache
+  d="$ads/default-off"
+  shadow_tree "$d"
+  absent_list first/h.h
+  rm -f "$ads/calls"
+  l=$(mf_log ad-default-off); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps lists are off by default" \
+    "$(grep -c "absent-deps lists are off; not asking for the compiler's list" "$l")/$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" \
+    "1/0"
+  check "and --show-config says so" \
+    "$("$VCACHE" --show-config | grep -c 'c/c++ manifest absent-deps lists: off')" "1"
+  # The rest of this section, and the clang-style stub's, turn it on.
+  export VCACHE_CXX_MANIFEST_ABSENT_DEPS=1
+
+  # With a tracer the trace comes first, and the compiler is not asked for
+  # its list.
+  reset_cache
+  d="$ads/traced"
+  shadow_tree "$d"
+  absent_list first/h.h
+  rm -f "$ads/calls"
+  l=$(mf_log ad-traced)
+  ABSENT_TRACED=1 absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1 with a tracer: the state is recorded from the trace" \
+    "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'absent list' "$l" || true)" \
+    "1/0"
+  check "absent-deps-1 with a tracer: the compile runs under it" \
+    "$(grep -c 'vcache-fstrace\.so|.* -o [^ ]*/out main\.c$' "$ads/calls")" "1"
+  check "absent-deps-1 with a tracer: and is given no -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+
+  # A header created earlier on the include path than the one recorded.
+  reset_cache
+  d="$ads/shadow"
+  shadow_tree "$d"
+  absent_list first/h.h
+  rm -f "$ads/calls"
+  l=$(mf_log ad-shadow1); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: without a tracer the state is recorded from the compiler's list" \
+    "$(grep -cE "cxx manifest: recorded from the compiler's absent list: [0-9]+ files, 1 absent paths" "$l")" "1"
+  check "absent-deps-1: and the log says why" \
+    "$(grep -c "no tracer at '.*'; recording from the compiler's absent list" "$l")" "1"
+  check "absent-deps-1: and not from a trace or the depfile alone" \
+    "$(grep -cE 'recorded from the trace|recording from the depfile' "$l" || true)" "0"
+  check "absent-deps-1: the recording compile and the -E run each get their own -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/absent -o [^ ]*/out main\.c$' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/pp-absent -E main\.c$' "$ads/calls")" \
+    "2/1/1"
+  check "absent-deps-1: and nothing runs under LD_PRELOAD" \
+    "$(grep -vc '^none|' "$ads/calls" || true)" "0"
+  absent_run "$d" "$(mf_log ad-shadow2)" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: the next compile hits through the manifest" "$(manifest_hits)" "1"
+  printf '#define V 1\n' > "$d/first/h.h"
+  absent_list
+  l=$(mf_log ad-shadow3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  absent_plain "$d" -I first -I second
+  check "absent-deps-1: a header created at a listed path misses" \
+    "$(grep -c 'rejected: .*first/h\.h exists now' "$l")" "1"
+  check "absent-deps-1: and the object uses the new header" "$(same_object "$d")" "same"
+
+  # __has_include: a probe that found nothing, then a header that appears and
+  # goes again. gcc's __has_include decline does not apply to this compiler.
+  reset_cache
+  d="$ads/hasinc"
+  mkdir -p "$d/inc"
+  printf '#if __has_include("opt.h")\nint have_opt = 1;\n#else\nint have_opt = 0;\n#endif\n' \
+    > "$d/main.c"
+  absent_list opt.h inc/opt.h
+  l=$(mf_log ad-hasinc1); absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: a file probing with __has_include records a state" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 2 absent paths" "$l")" "1"
+  absent_run "$d" "$(mf_log ad-hasinc2)" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: which the next compile hits" "$(manifest_hits)" "1"
+  printf '#pragma once\n' > "$d/inc/opt.h"
+  absent_list opt.h
+  l=$(mf_log ad-hasinc3)
+  STUB_DEPS_EXTRA=inc/opt.h absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  absent_plain "$d" -I inc
+  check "absent-deps-1: the probed header appearing misses" \
+    "$(grep -c 'rejected: .*inc/opt\.h exists now' "$l")" "1"
+  check "absent-deps-1: and the object sees it" "$(same_object "$d")" "same"
+  rm -f "$d/inc/opt.h"
+  absent_list opt.h inc/opt.h
+  l=$(mf_log ad-hasinc4); absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  absent_plain "$d" -I inc
+  check "absent-deps-1: removing it again rejects the state recorded with it" \
+    "$(grep -c 'rejected: .*inc/opt\.h is gone' "$l")" "1"
+  check "absent-deps-1: and hits the first" "$(grep -c 'state 2 of 2; preprocessor skipped' "$l")" "1"
+  check "absent-deps-1: whose object matches the compiler's" "$(same_object "$d")" "same"
+
+  # A .gch appearing beside a header the source includes.
+  reset_cache
+  d="$ads/gch"
+  mkdir -p "$d"
+  printf '#define V 3\n' > "$d/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list h.h.gch
+  absent_run "$d" "$(mf_log ad-gch1)" "$ads/gcc-ad1"
+  absent_run "$d" "$(mf_log ad-gch2)" "$ads/gcc-ad1"
+  check "absent-deps-1: a header without a .gch hits through the manifest" "$(manifest_hits)" "1"
+  ( cd "$d" && gcc -O2 -x c-header -c h.h -o h.h.gch )
+  absent_list
+  l=$(mf_log ad-gch3); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: a .gch appearing beside it misses" \
+    "$(grep -c 'rejected: .*/h\.h\.gch exists now' "$l")" "1"
+  # The depfile names that .gch, which the key does not cover, and not the
+  # header it was built from. A time macro there is out of sight, so the .gch
+  # is scanned like any file the depfile names, and declines the state.
+  reset_cache
+  printf '#define STAMP __TIME__\n' > "$d/h.h"
+  printf '#include "h.h"\nconst char* t = STAMP;\n' > "$d/main.c"
+  ( cd "$d" && gcc -O2 -x c-header -c h.h -o h.h.gch )
+  l=$(mf_log ad-gch-time1); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: an unkeyed .gch whose header uses __TIME__ declines the state" \
+    "$(grep -cE 'not recording: .*/h\.h\.gch uses __(DATE|TIME)__' "$l")" "1"
+  l=$(mf_log ad-gch-time2); STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1"
+  check "absent-deps-1: so the next compile is not a manifest hit" "$(manifest_hits)" "0"
+
+  # This compiler's depfile names the PCH it read. One the key identifies is
+  # left to the key: its bytes can differ between trees with one identity.
+  reset_cache
+  d="$ads/keyed"
+  mkdir -p "$d"
+  printf '#define V 4\n' > "$d/h.h"
+  printf 'int v = V;\n' > "$d/main.c"
+  ( cd "$d" && gcc -O2 -x c-header -c h.h -o h.h.gch )
+  absent_list
+  l=$(mf_log ad-keyed1)
+  STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$l" "$ads/gcc-ad1" -include h.h
+  check "absent-deps-1: a keyed PCH the depfile names records a state" \
+    "$(grep -c "recorded from the compiler's absent list" "$l")" "1"
+  STUB_DEPS_EXTRA=h.h.gch absent_run "$d" "$(mf_log ad-keyed2)" "$ads/gcc-ad1" -include h.h
+  check "absent-deps-1: and the next compile with that PCH hits it" "$(manifest_hits)" "1"
+
+  # An include directory that does not exist, listed as itself.
+  reset_cache
+  d="$ads/gen"
+  mkdir -p "$d/inc"
+  printf '#define V 2\n' > "$d/inc/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list gen
+  l=$(mf_log ad-gen1); absent_run "$d" "$l" "$ads/gcc-ad1" -I gen -I inc
+  check "absent-deps-1: a missing include directory is recorded" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  absent_run "$d" "$(mf_log ad-gen2)" "$ads/gcc-ad1" -I gen -I inc
+  check "absent-deps-1: and the next compile hits" "$(manifest_hits)" "1"
+  mkdir -p "$d/gen"
+  printf '#define V 1\n' > "$d/gen/h.h"
+  absent_list
+  l=$(mf_log ad-gen3); absent_run "$d" "$l" "$ads/gcc-ad1" -I gen -I inc
+  absent_plain "$d" -I gen -I inc
+  check "absent-deps-1: creating it with the header misses" \
+    "$(grep -c 'rejected: .*/gen exists now' "$l")" "1"
+  check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
+
+  # A probe through a regular file fails with ENOTDIR: an earlier include
+  # directory holds a file `sub` where a later one holds `sub/h.h`. Nothing can
+  # appear there until `sub` becomes a directory, so the probe is absent, and
+  # the state recorded with it must be served.
+  reset_cache
+  d="$ads/notdir"
+  mkdir -p "$d/first" "$d/second/sub"
+  printf 'not a directory\n' > "$d/first/sub"
+  printf '#define V 2\n' > "$d/second/sub/h.h"
+  printf '#include "sub/h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list first/sub/h.h
+  l=$(mf_log ad-notdir1); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: a probe through a regular file is recorded" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  l=$(mf_log ad-notdir2); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: and the next compile hits through the manifest" "$(manifest_hits)" "1"
+  rm "$d/first/sub"
+  mkdir -p "$d/first/sub"
+  printf '#define V 1\n' > "$d/first/sub/h.h"
+  absent_list
+  l=$(mf_log ad-notdir3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  absent_plain "$d" -I first -I second
+  check "absent-deps-1: the file becoming a directory with the header misses" \
+    "$(grep -c 'rejected: .*first/sub/h\.h exists now' "$l")" "1"
+  check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
+
+  # A listed path that exists is the compiler's fault: no state is stored.
+  reset_cache
+  d="$ads/exists"
+  mkdir -p "$d/inc"
+  printf '#define V 2\n' > "$d/inc/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list nothing.h inc/h.h
+  l=$(mf_log ad-exists1); absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: a listed path that exists declines the state" \
+    "$(grep -c "cxx manifest: not recording: the compiler listed .*/inc/h\.h as absent but it exists" "$l")" "1"
+  check "absent-deps-1: and stores no manifest" \
+    "$(grep -c 'cxx manifest: stored' "$l" || true)" "0"
+  l=$(mf_log ad-exists2); absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: so the next compile finds no state" \
+    "$(grep -c 'cxx manifest: none stored' "$l")/$(manifest_hits)" "1/0"
+
+  # Tracing off: the list still supplies the absent paths.
+  reset_cache
+  d="$ads/hasinc"
+  absent_list opt.h inc/opt.h
+  l=$(mf_log ad-notrace)
+  VCACHE_CXX_MANIFEST_TRACE=0 absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: VCACHE_CXX_MANIFEST_TRACE=0 records from the list" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 2 absent paths" "$l")" "1"
+  check "absent-deps-1: and the log says tracing is off" \
+    "$(grep -c "tracing is off; recording from the compiler's absent list" "$l")" "1"
+  check "absent-deps-1: with no depfile-only fallback" \
+    "$(grep -cE 'recording from the depfile|uses __has_include' "$l" || true)" "0"
+  # With neither the list nor the trace, the depfile alone cannot show a probe
+  # that found nothing, though this compiler's names a header one found: gcc's
+  # __has_include decline stays.
+  reset_cache
+  l=$(mf_log ad-depfile-only)
+  VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 \
+    absent_run "$d" "$l" "$ads/gcc-ad1" -I inc
+  check "absent-deps-1: from the depfile alone, __has_include declines the state" \
+    "$(grep -c 'tracing is off; recording from the depfile' "$l")/$(grep -c 'not recording: .*main\.c uses __has_include' "$l")" \
+    "1/1"
+
+  # Without a tracer, the switch off, a version vcache does not know, or a
+  # compiler without the patch: the depfile alone.
+  reset_cache
+  rm -f "$ads/calls"
+  d="$ads/off"
+  shadow_tree "$d"
+  absent_list first/h.h
+  l=$(mf_log ad-off)
+  VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 without a tracer records from the depfile" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c "absent-deps lists are off; not asking for the compiler's list" "$l")" \
+    "1/1"
+  check "the switch off passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+  check "VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 shows in --show-config" \
+    "$(VCACHE_CXX_MANIFEST_ABSENT_DEPS=0 "$VCACHE" --show-config | grep -c 'c/c++ manifest absent-deps lists: off')" "1"
+  reset_cache
+  rm -f "$ads/calls"
+  l=$(mf_log ad-v3); absent_run "$d" "$l" "$ads/gcc-ad3" -I first -I second
+  check "absent-deps-3 without a tracer records from the depfile, naming the version" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c 'the compiler reports absent-deps-3, a version this vcache does not read; not asking for its list' "$l")" \
+    "1/1"
+  check "absent-deps-3 passes no -fabsent-deps=" "$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" "0"
+  reset_cache
+  # Version 2 (clang listing its driver's probes too) writes the same list.
+  rm -f "$ads/calls"
+  l=$(mf_log ad-v2); absent_run "$d" "$l" "$ads/gcc-ad2" -I first -I second
+  check "absent-deps-2 without a tracer records from the compiler's list" \
+    "$(grep -c "no tracer at '.*'; recording from the compiler's absent list" "$l")/$(grep -cE "cxx manifest: recorded from the compiler's absent list: [0-9]+ files, 1 absent paths" "$l")" \
+    "1/1"
+  check "absent-deps-2: the recording compile and the -E run each get -fabsent-deps=" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")" "2"
+  reset_cache
+  l=$(mf_log ad-stock); absent_run "$d" "$l" gcc -I first -I second
+  check "a compiler without the marker and without a tracer records from the depfile" \
+    "$(grep -c "no tracer at '.*'; recording from the depfile" "$l")/$(grep -c -- '-fabsent-deps=' "$l" || true)" \
+    "1/0"
+
+  # The caller's own -fabsent-deps= is a second output, and still declined.
+  reset_cache
+  ( cd "$d" && STUB_ABSENT="$ads/list" "$VCACHE" "$ads/gcc-ad1" -O2 -I first -I second \
+      -fabsent-deps=mine.absent -c main.c -o m.o ) 2>/dev/null
+  check "a caller's own -fabsent-deps= is declined" "$(uncacheable)" "1"
+
+  # Absent paths are canonicalised through the roots, so a tree at another
+  # path hits the state another recorded and checks its own include path.
+  reset_cache
+  for t in xa xb; do shadow_tree "$ads/$t"; done
+  absent_tree() {  # $1 tree, $2 log
+    absent_list "$ads/$1/first/h.h"
+    ( cd "$ads/$1" && STUB_ABSENT="$ads/list" VCACHE_TRACER="$ads/no-such-tracer.so" \
+        VCACHE_ROOTS="$ads/$1=proj" VCACHE_LOG="$2" "$VCACHE" "$ads/gcc-ad1" -O2 -I "$ads/$1/first" -I second -c main.c -o m.o ) \
+      2>/dev/null
+  }
+  l=$(mf_log ad-xa1); absent_tree xa "$l"
+  check "absent-deps-1: one tree records from the list" \
+    "$(grep -c "recorded from the compiler's absent list" "$l")" "1"
+  l=$(mf_log ad-xb1); absent_tree xb "$l"
+  check "absent-deps-1: another tree hits that state" "$(grep -c 'preprocessor skipped' "$l")" "1"
+  printf '#define V 1\n' > "$ads/xb/first/h.h"
+  l=$(mf_log ad-xb2); absent_tree xb "$l"
+  ( cd "$ads/xb" && gcc -O2 -I "$ads/xb/first" -I second -c main.c -o plain.o ) 2>/dev/null
+  check "absent-deps-1: a header created on that tree's include path misses there" \
+    "$(grep -c "rejected: $ads/xb/first/h\.h exists now" "$l")" "1"
+  check "absent-deps-1: and its object uses it" "$(same_object "$ads/xb")" "same"
+  l=$(mf_log ad-xa2); absent_tree xa "$l"
+  check "absent-deps-1: while the first tree still hits" "$(grep -c 'preprocessor skipped' "$l")" "1"
+
+  # A preprocessor hit records from the list its -E run wrote.
+  reset_cache
+  d="$ads/pphit"
+  shadow_tree "$d"
+  printf '/* one */\n#define V 2\n' > "$d/second/h.h"
+  absent_list first/h.h
+  absent_run "$d" "$(mf_log ad-pphit1)" "$ads/gcc-ad1" -I first -I second
+  printf '/* two */\n#define V 2\n' > "$d/second/h.h"
+  rm -f "$ads/calls"
+  l=$(mf_log ad-pphit2); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: a preprocessor hit records from its -E run's list" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")/$(grep -c 'recorded a state from the preprocessor run' "$l")" \
+    "1/1"
+  check "absent-deps-1: which only the -E run was given" \
+    "$(grep -c -- '-fabsent-deps=' "$ads/calls")/$(grep -c -- '-fabsent-deps=[^ ]*/pp-absent -E main\.c$' "$ads/calls")" \
+    "1/1"
+  l=$(mf_log ad-pphit3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: the next compile skips the preprocessor" \
+    "$(grep -c 'preprocessor skipped' "$l")" "1"
+  printf '#define V 1\n' > "$d/first/h.h"
+  absent_list
+  l=$(mf_log ad-pphit4); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: and a header created at a path the -E run's list named misses" \
+    "$(grep -c 'rejected: .*first/h\.h exists now' "$l")/$(misses)" "1/2"
+else
+  skipped "absent-deps lists: gcc is not installed, or is clang"
+fi
+
+# The same through a clang-style stub: the banner is clang's, and the list
+# spells a probe relative to the working directory, through `..` where the
+# include path does.
+export VCACHE_CXX_MANIFEST_ABSENT_DEPS=1
+if command -v clang >/dev/null 2>&1; then
+  adc="$WORK/mf-absent-clang"
+  mkdir -p "$adc"
+  cat > "$adc/clang-ad1" <<EOF
+#!/bin/sh
+if [ "\$1" = "-v" ]; then
+  clang -v 2>&1 | sed 's/^\(.*clang version .*\)\$/\1 absent-deps-1/' >&2
+  exit 0
+fi
+printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$adc/calls"
+for a do
+  shift
+  case "\$a" in
+    -fabsent-deps=*) cat "\${STUB_ABSENT:-/dev/null}" > "\${a#-fabsent-deps=}"; continue ;;
+  esac
+  set -- "\$@" "\$a"
+done
+exec clang "\$@"
+EOF
+  chmod +x "$adc/clang-ad1"
+  clang_absent_run() {  # $1 cwd, $2 log, then compiler arguments
+    local dir=$1 log=$2; shift 2
+    ( cd "$dir" && STUB_ABSENT="$adc/list" VCACHE_TRACER="$adc/no-such-tracer.so" \
+        VCACHE_MAP_CWD=0 VCACHE_LOG="$log" "$VCACHE" "$adc/clang-ad1" -O2 "$@" ) 2>/dev/null
+  }
+
+  # Shadowing, from a build directory with `..` include paths.
+  reset_cache
+  d="$adc/shadow"
+  mkdir -p "$d/build" "$d/first" "$d/second"
+  printf '#define V 2\n' > "$d/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  printf '../first/h.h\n' > "$adc/list"
+  l=$(mf_log adc-shadow1)
+  clang_absent_run "$d/build" "$l" -I ../first -I ../second -c ../main.c -o m.o
+  check "clang absent-deps-1: the state is recorded from the compiler's list" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  clang_absent_run "$d/build" "$(mf_log adc-shadow2)" -I ../first -I ../second -c ../main.c -o m.o
+  check "clang absent-deps-1: the next compile hits through the manifest" "$(manifest_hits)" "1"
+  printf '#define V 1\n' > "$d/first/h.h"
+  : > "$adc/list"
+  l=$(mf_log adc-shadow3)
+  clang_absent_run "$d/build" "$l" -I ../first -I ../second -c ../main.c -o m.o
+  ( cd "$d/build" && clang -O2 -I ../first -I ../second -c ../main.c -o plain.o ) 2>/dev/null
+  check "clang absent-deps-1: a header created at a probe spelled through .. misses" \
+    "$(grep -c 'rejected: .*build/\.\./first/h\.h exists now' "$l")" "1"
+  check "clang absent-deps-1: and the object uses it" \
+    "$(cmp -s "$d/build/m.o" "$d/build/plain.o" && echo same || echo differs)" "same"
+
+  # Under -working-directory, clang's relative probes are relative to that
+  # directory, not to where it runs, so its list is not asked for.
+  reset_cache
+  rm -f "$adc/calls"
+  d="$adc/wd"
+  mkdir -p "$d/build" "$d/second"
+  printf '#define V 2\n' > "$d/second/h.h"
+  printf '#include "h.h"\nint v = V;\n' > "$d/main.c"
+  printf 'first/h.h\n' > "$adc/list"
+  l=$(mf_log adc-wd)
+  clang_absent_run "$d/build" "$l" "-working-directory=$d" -I first -I "$d/second" \
+    -c "$d/main.c" -o m.o
+  check "clang absent-deps-1: -working-directory does not ask for the list" \
+    "$(grep -c "working-directory is set; not asking for the compiler's list" "$l")/$(grep -c -- '-fabsent-deps=' "$adc/calls" || true)" \
+    "1/0"
+else
+  skipped "absent-deps lists through a clang-style stub: clang is not installed"
+fi
+unset VCACHE_CXX_MANIFEST_ABSENT_DEPS
 
 # The driver reads some variables before any header: an SDK, a deployment
 # target, clang's CCC_OVERRIDE_OPTIONS. Neither key may ignore them.
@@ -5546,14 +6882,15 @@ if command -v clang >/dev/null 2>&1; then
   mkdir -p "$WORK/ccfg"
   printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
     > "$WORK/ccfg/s.c"
-  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config="$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
+  # Spelled --config FILE: clang before 16 rejects --config=FILE.
+  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config "$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
   reset_cache
   echo '-O0' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   echo '-O2' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   check "preprocessor mode: editing a --config file from -O0 to -O2 misses" "$(misses)" "2"
-  ( cd "$WORK/ccfg" && clang --config="$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
+  ( cd "$WORK/ccfg" && clang --config "$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
   check "and the object is the -O2 one" \
     "$(cmp -s "$WORK/ccfg/s.o" "$WORK/ccfg/ref.o" && echo same)" "same"
   reset_cache
@@ -5576,6 +6913,9 @@ mkdir -p "$WORK/memo"
 printf 'int old_header(void);\n' > "$WORK/memo/h.h"
 printf '#include "h.h"\nint m(void) { return 0; }\n' > "$WORK/memo/m.c"
 perl -e 'utime time - 3600, time - 3600, @ARGV' "$WORK/memo/h.h" "$WORK/memo/m.c"
+# A digest is memoised only once the file's ctime, which nothing can backdate,
+# is two seconds old too (file_memo.cc); a fast host compiles before that.
+sleep 3
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 check "settled files' digests are memoised under filehash/" \
@@ -5667,7 +7007,7 @@ fi
 
 section "10b. Single-flight"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+  run_bounded 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
     > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
   lease_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -5685,7 +7025,7 @@ fi
 
 section "10d. Elastic jobserver"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
+  run_bounded 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
     "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
   elastic_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -5703,7 +7043,7 @@ fi
 
 section "10c. Memory admission"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+  run_bounded 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
     "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
   admission_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -5731,8 +7071,10 @@ printf 'int outer(void) { return 1; }\n' > "$WORK/nested/outer.c"
 printf 'int inner(void) { return 2; }\n' > "$WORK/nested/inner.c"
 cat > "$WORK/nested/cc" << EOF
 #!/bin/sh
+# The preprocessor run and the banner probe are the compiler's own; only the
+# compile proper is wrapped.
 for arg in "\$@"; do
-  if [ "\$arg" = "-E" ]; then exec gcc "\$@"; fi
+  if [ "\$arg" = "-E" ] || [ "\$arg" = "-v" ]; then exec gcc "\$@"; fi
 done
 printf '%s\n' "\${VCACHE_MEMORY_RESERVED:-unset}" > "$WORK/nested/marker"
 VCACHE_LOG="$WORK/nested/inner.log" "$VCACHE" gcc -c "$WORK/nested/inner.c" \

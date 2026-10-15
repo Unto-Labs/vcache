@@ -318,8 +318,10 @@ which sees what the preprocessor looked for and did not find. The trade is
 exactness where the trace is not available (another platform, no tracer, a
 compiler process that does not load it): a depfile names the headers a compile
 read, not the paths it probed, so a header created later earlier on the include
-path is not seen and a stale object can be served. Even traced, a header created
-inside the compiler's own trees outside its include directories is not seen. See
+path is not seen and a stale object can be served; there, a gcc or clang built
+with an absent-deps patch can be asked to list those paths itself
+(`-fabsent-deps=`, opt-in) instead. Even traced, a header created inside the compiler's
+own trees outside its include directories is not seen. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).
 
 Rust follows the same shape, with `--emit=dep-info` standing in for

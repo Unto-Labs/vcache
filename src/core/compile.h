@@ -25,7 +25,21 @@ struct CompilerId {
   // True when the driver is clang. It differs from gcc in ways that change the
   // command line vcache builds, not just the key -- see BuildPreprocessCommand.
   bool is_clang = false;
+
+  // The version the banner's `absent-deps-<n>` token announces, 0 without one.
+  // A gcc or clang built with an out-of-tree patch: `-fabsent-deps=` writes
+  // the paths the compile looked for and did not find. Its objects are the
+  // stock compiler's but its dependency output is not (it names the PCH a
+  // compile read), so the token stays in the fingerprint.
+  int absent_deps_version = 0;
 };
+
+// The version of `banner`'s `absent-deps-<n>` token, 0 when there is none.
+int AbsentDepsVersion(std::string_view banner);
+
+// True for an absent-deps patch version whose -fabsent-deps list and depfile
+// vcache knows the meaning of.
+bool IsReadableAbsentDepsVersion(int absent_deps_version);
 
 // `check_mode` is one of "version" (default), "content" or "mtime":
 //   version -- hash `<compiler> -v` output. Stable across machines, so it is

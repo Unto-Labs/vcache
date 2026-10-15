@@ -65,6 +65,7 @@ hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 cxx_manifest         = false       # see "cxx_manifest"
 cxx_manifest_trace   = true        # see "cxx_manifest"
+cxx_manifest_absent_deps = false   # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -94,6 +95,7 @@ timeout        = 30                # seconds
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
 | `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `false` |
 | `vcache.cxx_manifest_trace` | `VCACHE_CXX_MANIFEST_TRACE` | — | `true` |
+| `vcache.cxx_manifest_absent_deps` | `VCACHE_CXX_MANIFEST_ABSENT_DEPS` | — | `false` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -369,6 +371,7 @@ uncacheable reason:
 | `-MJ FILE` | compilation-database fragment |
 | `-serialize-diagnostics FILE` | `.dia` |
 | `-gen-cdb-fragment-path DIR` | cdb fragments |
+| `-fabsent-deps=FILE` (an out-of-tree gcc and clang patch) | paths probed and not found |
 
 `-gsplit-dwarf=single` is deliberately **not** in that list: it keeps the debug
 sections inside the object, so there is no companion file and nothing to lose.
@@ -868,10 +871,12 @@ text, and for a `-M` run the preprocessor *is* the work. Measured on one
 
 Preprocessing to save preprocessing is a losing trade, so these are cached
 against a **manifest** instead. The key covers the command line — including
-`-I`, `-D` and friends verbatim, since there is no preprocessed text to stand in
+`-I`, `-D` and friends, since there is no preprocessed text to stand in
 for them — plus the compiler, the resolved native target, the roots, any
 `hash_env_vars`, and the source's canonical path and contents. Paths are
-canonicalised through the roots, so per-checkout roots, or the same relative
+canonicalised through the roots, including paths joined to flags such as
+`-I/abs/inc` and `-isystem/abs/inc`; macro values remain as written.
+Per-checkout roots, or the same relative
 path under each checkout's mapped working directory, still share an entry.
 Identical sources at different canonical paths do not, since their includes
 resolve to different files. The entry stores every file the scan read with its
@@ -951,6 +956,18 @@ on stored, and the reverse. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
 `--show-stats` counts it as a hit and again under `manifest hits`.
 
+A lookup the manifest does not answer but the preprocessor key does (a header
+edited only in a comment, a clang PCH rebuilt with other bytes and no side
+file, an entry stored with `cxx_manifest` off) records a state too, so the next
+lookup skips the preprocessor. It comes from the `-E` run, which after a
+manifest miss gets `-MD -MF <scratch>` and the tracer, or a patched compiler's
+`-fabsent-deps=<scratch>`, exactly as a recording compile does; neither changes
+the preprocessed text or a key. The same rules decline it as decline a miss's
+state (below), and clang's `-working-directory` declines it too. The log says
+`cxx manifest: recorded a state from the preprocessor run`, and `--show-stats`
+counts it under `pp hits recorded`. On a preprocessor miss what the `-E` run
+saw is dropped; the compile records the state.
+
 | Setting | Meaning |
 | --- | --- |
 | `true` | Look up and record manifest states. |
@@ -970,40 +987,83 @@ from:
 | Setting | Meaning |
 | --- | --- |
 | `true` *(default)* | The depfile and a trace of the compile. |
-| `false` | The depfile alone, with the gcc rules below and the shadowing hole. |
+| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1` or `absent-deps-2`, the depfile and, with `cxx_manifest_absent_deps` on, that compiler's own list of what it did not find (below). |
 
-A state comes from the depfile alone, with a `cxx manifest: ... recording from
-the depfile` log line that says why, whenever the trace is not available too:
-no `vcache-fstrace.so` beside the binary (or where `VCACHE_TRACER` points), one
-that is not an ELF shared object of vcache's own class and machine, a host
-other than Linux, `LD_PRELOAD` already set, no process that loaded the tracer
-(a statically linked compiler), a trace the tracer marked incomplete or that
-does not parse, a trace in which no compiler front end (`cc1`, `cc1plus`,
-`clang`) ran -- a launcher such as `ccache gcc` serving a hit of its own reads
-every header but probes nothing -- a missing `-I` directory the trace does not
-show being probed, or a trace that does not show every file the depfile names
-being read: a compiler process that did not load the tracer (another ELF class,
-a `-B` wrapper that drops `LD_PRELOAD`) recorded nothing of what it probed. A
-tracer whose path contains a space or a colon is not preloaded either: ld.so
-splits `LD_PRELOAD` there. When
-ld.so refuses to preload the tracer in some process of the compile, its "cannot
-be preloaded" lines naming the tracer are taken out of the compile's stderr, so
-neither the miss nor a later hit prints them, and the state comes from the
-depfile; the entry is stored as usual. A refusal of any other object is the
-build's own and is kept.
+A compiler built with an absent-deps patch prints `absent-deps-1`
+(gcc) or `absent-deps-2` (clang) after its version and, given
+`-fabsent-deps=FILE`, writes there every path the preprocessor looked for and
+did not find. Version 2 also lists what clang's driver probed and did not find
+(its `.cfg` files, the GCC installation candidates, the distro files). Its
+depfile also names a header `__has_include` found and the PCH it read. The
+trace stays the first source for such a compiler too: it also sees what the
+driver reads (and gcc's driver probes, such as its `specs`), which the list does
+not name and leaves to the compiler fingerprint,
+and on `src/daemon/server.cc` recording from the list was not measurably
+cheaper. The list is the second source, with `cxx_manifest_absent_deps` on: where the compile has no tracer (any of
+the reasons below, `cxx_manifest_trace = false` among them), it gets
+`-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says `no
+tracer at '...'; recording from the compiler's absent list` (or `tracing is
+off; ...`) and then `cxx manifest: recorded from the compiler's absent list: N
+files, M absent paths`. With a tracer the flag is not passed. The `-E` run gets
+its own flag on the same terms, for the state a preprocessor hit records. The
+paths are stored as the trace's are, through the roots and as the highest missing
+ancestor, and the gcc `.gch` and `__has_include` rules below do not apply to a
+state from the list, which holds the probes. From the depfile alone they apply
+to a patched compiler too: its depfile names a header `__has_include` found,
+but not a probe that found nothing. A listed path that exists when the state is
+recorded is a compiler fault, and no state is recorded (`not recording: the
+compiler listed <path> as absent but it exists`). A version vcache does not
+know (`absent-deps-3` and up) is never asked for its list, and the log names
+the version; nor is clang under `-working-directory`, whose list is relative to
+that directory, and which records no state at all. To compare the two sources, set `cxx_manifest_trace = false`
+for the list and leave it on for the trace. `cxx_manifest_absent_deps`
+(`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list on. It is off by default:
+stock compilers write no list, and the patch is not published.
 
-Only a traced compile is protected against a header created earlier on the
-include path than the one the state recorded, the hole ccache's depend mode
-also has: a state from the depfile alone, on macOS always and on Linux whenever
-the trace is not used, lists what was read but not what was looked for. Where
-that matters, keep `cxx_manifest` off there.
+
+| Setting | Meaning |
+| --- | --- |
+| `true` | Without a tracer, record a patched compiler's states from its list. |
+| `false` *(default)* | Without a tracer, record them from the depfile alone, with the gcc rules below. |
+
+The caller's own `-fabsent-deps=FILE` is still declined (see
+[Flags that write a second output file](#flags-that-write-a-second-output-file)).
+
+A state comes from the depfile alone (or a patched compiler's list), with a
+`cxx manifest: ... recording from the depfile` log line that says why, whenever
+the trace is not available: no `vcache-fstrace.so` beside the binary (or where
+`VCACHE_TRACER` points), one that is not an ELF shared object of vcache's own
+class and machine, a host other than Linux, `LD_PRELOAD` already set, no
+process that loaded the tracer (a statically linked compiler), a trace the
+tracer marked incomplete or that does not parse, a trace in which no compiler
+front end (`cc1`, `cc1plus`, `clang`) ran -- a launcher such as `ccache gcc`
+serving a hit of its own reads every header but probes nothing -- a missing
+`-I` directory the trace does not show being probed, or a trace that does not
+show every file the depfile names being read: a compiler process that did not load
+the tracer (another ELF class, a `-B` wrapper that drops `LD_PRELOAD`) recorded
+nothing of what it probed. When ld.so refuses to preload the tracer in some
+process of the compile, its "cannot be preloaded" lines naming the tracer are
+taken out of the compile's stderr, so neither the miss nor a later hit prints
+them, and the state comes from the depfile; the entry is stored as usual. A
+refusal of any other object is the build's own and is kept. A trace found
+unusable only after the compile gives the depfile alone, since the list was not
+asked for.
+
+A tracer whose path contains a space or a colon is not preloaded either: ld.so
+splits `LD_PRELOAD` there.
+
+Only a traced compile, or one that listed its probes, is protected against a
+header created earlier on the include path than the one the state recorded, the
+hole ccache's depend mode also has: a state from the depfile alone, on macOS
+always and on Linux whenever neither is used, lists what was read but not what
+was looked for. Where that matters, keep `cxx_manifest` off there.
 
 The tracer runs inside every process of the compile. A compiler that cannot
 have a library preloaded ahead of its own runtime -- one built with the shared
 AddressSanitizer runtime aborts with "ASan runtime does not come first in
 initial library list" -- fails under it. Set `cxx_manifest_trace = false`
 (`VCACHE_CXX_MANIFEST_TRACE=0`) for such a compiler; its states then come from
-the depfile.
+the depfile, or from its list.
 
 Some compiles keep to the preprocessor, with a `cxx manifest:` log line that
 says why:
@@ -1014,6 +1074,9 @@ says why:
   writes that file from the preprocessor, which a manifest hit does not run.
 - `__DATE__`, `__TIME__` or `__TIMESTAMP__` on the command line, or in a file
   the depfile names: the digest stays the same while the expansion does not.
+  A `.gch` or `.pch` a patched compiler's depfile names, other than one the key
+  identifies, declines too: every PCH holds the name `__DATE__`, and the header
+  it was built from, whose time macros matter, is not in the depfile.
 - A file that changed after the compile started, which may not be the version
   the compile read.
 - A file the compiler read, by the trace, that is gone by the time the state
@@ -1137,10 +1200,14 @@ How the toolchain is identified:
 | --- | --- |
 | `version` *(default)* | Hash of `<compiler> -v` output — version, target triple, configure flags. Machine-independent, so entries are shareable through S3. Memoised in the cache directory, so the extra process runs once per toolchain, not once per compilation. |
 | `content` | Hash the compiler driver binary. Differs between machines even for identical toolchains. |
-| `mtime` | Path, size and mtime only -- no probe, no banner. Fastest, least safe. |
+| `mtime` | Path, size and mtime only. Fastest, least safe. |
 
 `version` is the default precisely because a shared remote cache is a first-class
-use case and mtimes never agree across machines.
+use case and mtimes never agree across machines. An `absent-deps-<n>` token in
+the banner is hashed with the rest: a compiler built with that local patch
+produces the stock compiler's objects but not its depfiles, so the two do not
+share entries. `content` and `mtime` still run `-v`, memoised the same way, to read that
+token's version, but do not hash the banner.
 
 ## Logging and diagnostics
 
@@ -1188,7 +1255,9 @@ source path.
 `--show-stats` lists *manifest hits* under the two hit rows: the hits a
 manifest answered, without running the preprocessor for C and C++ or the
 dep-info run for Rust. They are part of the hit counts above them, not added
-to them.
+to them. *pp hits recorded* follows: the C and C++ hits the preprocessor key
+answered that recorded a manifest state from the `-E` run, also part of the
+hit counts.
 
 `--show-stats` lists the reasons behind *uncacheable* and *preprocess failed*
 indented under each, plus a *passthrough* row for runs that fell back to the

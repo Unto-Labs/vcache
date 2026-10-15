@@ -319,7 +319,7 @@ exactness where the trace is not available (another platform, no tracer, a
 compiler process that does not load it): a depfile names the headers a compile
 read, not the paths it probed, so a header created later earlier on the include
 path is not seen and a stale object can be served; there, a gcc or clang built
-with the devtools absent-deps patch is asked to list those paths itself
+with an absent-deps patch is asked to list those paths itself
 (`-fabsent-deps=`) instead. Even traced, a header created inside the compiler's
 own trees outside its include directories is not seen. See
 [`cxx_manifest`](docs/configuration.md#cxx_manifest).

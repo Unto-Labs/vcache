@@ -371,7 +371,7 @@ uncacheable reason:
 | `-MJ FILE` | compilation-database fragment |
 | `-serialize-diagnostics FILE` | `.dia` |
 | `-gen-cdb-fragment-path DIR` | cdb fragments |
-| `-fabsent-deps=FILE` (devtools gcc and clang patch) | paths probed and not found |
+| `-fabsent-deps=FILE` (an out-of-tree gcc and clang patch) | paths probed and not found |
 
 `-gsplit-dwarf=single` is deliberately **not** in that list: it keeps the debug
 sections inside the object, so there is no companion file and nothing to lose.
@@ -989,7 +989,7 @@ from:
 | `true` *(default)* | The depfile and a trace of the compile. |
 | `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1` or `absent-deps-2`, the depfile and that compiler's own list of what it did not find (below). |
 
-A compiler built with the devtools absent-deps patch prints `absent-deps-1`
+A compiler built with an absent-deps patch prints `absent-deps-1`
 (gcc) or `absent-deps-2` (clang) after its version and, given
 `-fabsent-deps=FILE`, writes there every path the preprocessor looked for and
 did not find. Version 2 also lists what clang's driver probed and did not find

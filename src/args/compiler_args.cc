@@ -77,7 +77,7 @@ bool IsSideOutputFlag(std::string_view arg) {
   }
   // gcc: -aux-info FILE writes a listing of every declaration seen.
   if (arg == "-aux-info") return true;
-  // The devtools gcc and clang patch: -fabsent-deps=FILE lists the paths the
+  // An out-of-tree gcc and clang patch: -fabsent-deps=FILE lists the paths the
   // compile looked for and did not find.
   if (StartsWith(arg, "-fabsent-deps=")) return true;
   // clang, value-taking: a compilation-database fragment, a serialized

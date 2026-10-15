@@ -240,7 +240,7 @@ void AddCxxTraceInputs(const CxxTraceInputs& trace, const RootMap& roots, const 
                        int64_t started_ns, const std::string& memo_dir,
                        RecordedInputs* recorded);
 
-// What a compiler's `-fabsent-deps=FILE` list says: the devtools gcc and clang
+// What a compiler's `-fabsent-deps=FILE` list says: an out-of-tree gcc and clang
 // patch writes every path the preprocessor looked for and did not find, one
 // per line, relative ones against the compile's working directory.
 struct CxxAbsentList {

@@ -27,7 +27,7 @@ struct CompilerId {
   bool is_clang = false;
 
   // The version the banner's `absent-deps-<n>` token announces, 0 without one.
-  // The devtools gcc and clang carry that local patch: `-fabsent-deps=` writes
+  // A gcc or clang built with an out-of-tree patch: `-fabsent-deps=` writes
   // the paths the compile looked for and did not find. Its objects are the
   // stock compiler's but its dependency output is not (it names the PCH a
   // compile read), so the token stays in the fingerprint.

@@ -238,7 +238,7 @@ whole: they come from preloading it, and an entry would replay them on every
 hit. A refusal of any other object is the build's own and stays. The entry is
 stored as usual.
 
-**The compiler's own list.** The devtools gcc and clang carry a patch that ends
+**The compiler's own list.** A gcc or clang built with an out-of-tree patch ends
 the version line of `-v` with `absent-deps-1` (gcc) or `absent-deps-2` (clang).
 Given `-fabsent-deps=FILE` such a compiler writes there every path the
 preprocessor looked for and did not find: each search directory tried before
@@ -320,7 +320,7 @@ it hit, so the next lookup skips the preprocessor. It is recorded from the
 the `-E` run gets `-MD -MF <scratch>/pp.d` (no `-MT`; the file is not kept),
 and `vcache-fstrace.so` preloaded or, without a tracer, a patched compiler's
 `-fabsent-deps=<scratch>/pp-absent`. Neither changes the preprocessed text,
-and neither enters a key; the devtools gcc and clang honour `-fabsent-deps=`
+and neither enters a key; patched gcc and clang honour `-fabsent-deps=`
 under `-E`, and gcc's list under `-fpch-preprocess` names the same `.gch`
 probes as the compile's. The depfile, the trace and the list go through the
 same reading as a miss's, with the same declines: a time macro, a file changed
@@ -769,7 +769,7 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 - **A probe that fails for a reason other than `ENOENT` records nothing.** The
   tracer records a successful open or probe as an input (`R`) and an `ENOENT`
   failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other
-  failure leave no record. A compile, a link or a test traced by sunbird's
+  failure leave no record. A compile, a link or a test traced by an external
   audit whose behaviour depends on such a refusal is keyed as if the probe had
   not happened, and a later change to that path's permissions or file type
   does not invalidate the entry. This is a documented limit, not a new record

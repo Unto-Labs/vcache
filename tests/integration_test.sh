@@ -3802,7 +3802,8 @@ check "and it did not report a hit" "$(hits)" "0"
 
 # --------------------------------------------------------------------------
 section "a compiler with the absent-deps patch does not share the stock entries"
-# The devtools gcc and clang print `absent-deps-<n>` after the version in -v.
+# A gcc or clang built with the absent-deps patch prints `absent-deps-<n>`
+# after the version in -v.
 # Their objects are the stock compiler's, but their dependency output is not:
 # it names the PCH a compile read. The stub patches the stock output the same
 # way, so an entry served across the two would replay the stock depfile. It
@@ -6284,7 +6285,8 @@ fi
 # --------------------------------------------------------------------------
 section "19b. C/C++ manifest from the compiler's absent-path list"
 
-# The devtools gcc and clang print `absent-deps-1` (clang `absent-deps-2`, whose
+# A gcc or clang built with the absent-deps patch prints `absent-deps-1`
+# (clang `absent-deps-2`, whose
 # list adds its driver's probes) after the version in -v, and given
 # -fabsent-deps=FILE write there every path the preprocessor looked for and did
 # not find. The trace still comes first, since it also sees what the

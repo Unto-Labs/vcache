@@ -5950,7 +5950,8 @@ void TestCxxAbsentList() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string proj = *scratch + "/proj";
+  // macOS's TMPDIR ends in a slash; the parser drops the doubled one.
+  const std::string proj = core::WithoutDotSegments(*scratch) + "/proj";
   util::MakeDirs(proj + "/inc");
 
   const core::CxxAbsentList listed =

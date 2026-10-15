@@ -60,6 +60,9 @@ bool IsIgnoredPath(const std::string& path) {
 bool ReadTraceRecords(const std::string& log_path, TraceRecords* out) {
   auto text = util::ReadFile(log_path);
   if (!text) return false;
+  // Every record ends in a newline. A log that does not was cut off mid-write
+  // (ENOSPC, RLIMIT_FSIZE) and its last line may be a prefix of a path.
+  if (!text->empty() && text->back() != '\n') return false;
   for (const std::string& line : util::Split(*text, '\n', /*skip_empty=*/true)) {
     // The tracer's own word that it lost a record, when it could not create
     // the marker that TraceMarkedIncomplete looks for.

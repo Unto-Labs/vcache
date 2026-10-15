@@ -3980,6 +3980,52 @@ check "and what it found" \
 check "a stat of a descriptor, with an empty path, is not a lost record" \
   "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
 
+# gnulib and coreutils probe with euidaccess, and eaccess is a separate symbol
+# for the same call. Each absence is recorded.
+cat > "$WORK/tracer-openat/eaccess.c" <<'EACCEOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+int main(void) {
+  if (euidaccess("absent-euidaccess", F_OK) == 0) return 1;
+  if (eaccess("absent-eaccess", F_OK) == 0) return 2;
+  return 0;
+}
+EACCEOF
+gcc "$WORK/tracer-openat/eaccess.c" -o "$WORK/tracer-openat/eaccess"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./eaccess )
+check "euidaccess and eaccess behave as without the tracer" "$?" "0"
+check "and each records the path it found absent" \
+  "$(grep -cxF -e $'M\t'"$openat_p/absent-euidaccess" -e $'M\t'"$openat_p/absent-eaccess" \
+      "$WORK/tracer-openat/trace")" "2"
+
+# A process that unsets VCACHE_TRACE_LOG after the tracer has started still
+# marks a lost record: the log's name is read once, at startup. A path holding
+# a newline cannot be recorded, so it is a lost record.
+cat > "$WORK/tracer-openat/unsetenv.c" <<'UNSETEOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {
+  if (unsetenv("VCACHE_TRACE_LOG") != 0) return 1;
+  int fd = open("lost\nrecord", O_RDONLY);
+  if (fd >= 0) close(fd);
+  return 0;
+}
+UNSETEOF
+gcc "$WORK/tracer-openat/unsetenv.c" -o "$WORK/tracer-openat/unsetenv"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./unsetenv )
+check "a lost record after unsetenv still marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo marked || echo unmarked)" "marked"
+check "the tracer exports openat2 whatever glibc it was built against" \
+  "$(nm -D --defined-only "$TOP/bin/vcache-fstrace.so" | grep -cw openat2)" "1"
+
 # A record goes out in one write: finishing a short write with a second one can
 # land after another process's record and tear both. A regular file cannot be
 # made to take a short write on demand (past `ulimit -f` the retry fails too),

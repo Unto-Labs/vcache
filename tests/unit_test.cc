@@ -361,6 +361,14 @@ void TestLinkTraceClassification() {
   core::TraceRecords lost;
   Check(!core::ReadTraceRecords(log, &lost),
         "a trace carrying the tracer's lost-record line is refused");
+  // A write cut short (ENOSPC, RLIMIT_FSIZE) leaves a prefix of a path with
+  // no newline after it, which would read as a record of another path.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nM\t/usr/inc");
+  core::TraceRecords cut;
+  Check(!core::ReadTraceRecords(log, &cut), "a trace whose last record has no newline is refused");
+  util::WriteFileAtomic(log, "");
+  core::TraceRecords empty;
+  Check(core::ReadTraceRecords(log, &empty), "an empty trace still reads");
   // An older tracer wrote paths as the process spelled them, relative to a
   // directory the process may have left.
   util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\ta.o\n");

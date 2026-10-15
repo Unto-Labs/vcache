@@ -57,10 +57,24 @@ static int log_fd = -1;
 
 /* VCACHE_TRACE_LOG, or NULL when tracing is off. A relative name counts as
    unset: the log and its marker would land in whatever directory each process
-   of the tree is in when it first records. */
+   of the tree is in when it first records. Read once, by the constructor's P
+   record, and kept: a process that later unsets or clears its environment
+   must still be able to mark its trace incomplete. */
+static char log_name[PATH_MAX];
+static int log_name_state;  /* 0 unread, 1 in log_name, 2 tracing off */
+
 static const char *log_path(void) {
-  const char *p = getenv("VCACHE_TRACE_LOG");
-  return p != NULL && p[0] == '/' ? p : NULL;
+  if (log_name_state == 0) {
+    const char *p = getenv("VCACHE_TRACE_LOG");
+    size_t n = p != NULL ? strlen(p) : 0;
+    if (p != NULL && p[0] == '/' && n < sizeof log_name) {
+      memcpy(log_name, p, n + 1);
+      log_name_state = 1;
+    } else {
+      log_name_state = 2;
+    }
+  }
+  return log_name_state == 1 ? log_name : NULL;
 }
 
 static void mark_incomplete(void);
@@ -480,6 +494,23 @@ int access(const char *path, int mode) {
   return r;
 }
 
+/* gnulib and coreutils probe with these; eaccess is a separate symbol. */
+int euidaccess(const char *path, int mode) {
+  int r = NEXT(euidaccess)(path, mode);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
+int eaccess(const char *path, int mode) {
+  int r = NEXT(eaccess)(path, mode);
+  int saved = errno;
+  emit_result(path, r != 0, saved);
+  errno = saved;
+  return r;
+}
+
 int faccessat(int dirfd, const char *path, int mode, int flags) {
   struct at_path at;
   at_path_begin(&at, dirfd, path);
@@ -544,7 +575,9 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
   return r;
 }
 
-#ifdef STATX_BASIC_STATS
+/* statx is what newer libstdc++ and LLVM reach for. Forward-declared, so the
+   hook builds against a glibc whose headers predate it (2.28) too. */
+struct statx;
 int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *st) {
   if (stats_descriptor(path, flags)) return NEXT(statx)(dirfd, path, flags, mask, st);
   struct at_path at;
@@ -555,7 +588,6 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
   errno = saved;
   return r;
 }
-#endif
 
 /* Binaries built against glibc before 2.33 call these for stat, lstat and
    fstatat: their headers redirected those names here, with a struct layout
@@ -685,17 +717,26 @@ int chroot(const char *path) {
   return r;
 }
 
-/* glibc has had a wrapper since 2.43; before it, a call is a raw syscall. */
-#if defined(__GLIBC_PREREQ)
-#if __GLIBC_PREREQ(2, 43)
+/* glibc has had a wrapper since 2.43; before it, a call is a raw syscall.
+   Defined whatever headers the tracer is built against: a tracer built on an
+   older glibc is still loaded into programs linked against a newer one, which
+   would otherwise open files through it unseen. struct open_how is declared
+   only from 2.43, so it is forward-declared and its first member, the u64
+   open flags (the kernel's ABI), is read directly. */
+struct open_how;
+int openat2(int dirfd, const char *path, const struct open_how *how, size_t size);
 int openat2(int dirfd, const char *path, const struct open_how *how, size_t size) {
+  if (NEXT(openat2) == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
   struct at_path at;
   at_path_begin(&at, dirfd, path);
   int r = NEXT(openat2)(dirfd, path, how, size);
   int saved = errno;
-  emit_at_result(&at, path, r < 0, saved, r >= 0 && (how->flags & O_ACCMODE) == O_WRONLY);
+  uint64_t flags = 0;
+  if (r >= 0 && how != NULL && size >= sizeof flags) memcpy(&flags, how, sizeof flags);
+  emit_at_result(&at, path, r < 0, saved, r >= 0 && (flags & O_ACCMODE) == O_WRONLY);
   errno = saved;
   return r;
 }
-#endif
-#endif

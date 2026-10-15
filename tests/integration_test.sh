@@ -98,6 +98,16 @@ sed_inplace() {
 # True when the C compiler called `gcc` is really clang, as it is on macOS.
 # Some expectations differ between the two and are not about vcache being wrong.
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
+# GNU timeout is not on stock macOS. perl's alarm survives exec and kills the
+# command with SIGALRM when the bound passes.
+run_bounded() {  # $1 seconds, then the command
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$secs" "$@"
+  fi
+}
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # Releases a manifest-pause fifo. The write happens only when the compile is
@@ -4882,7 +4892,7 @@ section "precompiled headers"
 make_pch_tree() {
   mkdir -p "$1"
   printf '#define FOO 1\nstruct S { int x; };\n' > "$1/h.h"
-  printf 'int f() { S s{FOO}; return s.x; }\n' > "$1/main.cc"
+  printf 'int f() { S s = {FOO}; return s.x; }\n' > "$1/main.cc"
 }
 
 if command -v clang++ >/dev/null 2>&1; then
@@ -6070,7 +6080,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$sf/inc" "$sf/bin"
   printf '#pragma once\n#define BIG 5\n' > "$sf/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$sf/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$sf/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$sf/main.cc"
   ( cd "$sf" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch )
   # Counts real compiles and holds each one long enough for the other to wait.
   cat > "$sf/bin/slowg++" <<EOF
@@ -6117,7 +6127,7 @@ if command -v clang++ >/dev/null 2>&1; then
   mkdir -p "$pc/inc"
   printf '#pragma once\n#define BIG 5\n' > "$pc/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$pc/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$pc/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$pc/main.cc"
   mf_build_pch() {
     ( cd "$pc" && clang++ -O2 -I inc -x c++-header -c h.h -Xclang -emit-pch -o h.pch )
   }
@@ -6209,7 +6219,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$gp/inc"
   printf '#pragma once\n#define BIG 5\n' > "$gp/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$gp/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$gp/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$gp/main.cc"
   mf_build_gch() { ( cd "$gp" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch ); }
   mf_use_gch() {  # $1 log
     ( cd "$gp" && VCACHE_ROOTS="$gp=proj" VCACHE_LOG="$1" \
@@ -6903,6 +6913,9 @@ mkdir -p "$WORK/memo"
 printf 'int old_header(void);\n' > "$WORK/memo/h.h"
 printf '#include "h.h"\nint m(void) { return 0; }\n' > "$WORK/memo/m.c"
 perl -e 'utime time - 3600, time - 3600, @ARGV' "$WORK/memo/h.h" "$WORK/memo/m.c"
+# A digest is memoised only once the file's ctime, which nothing can backdate,
+# is two seconds old too (file_memo.cc); a fast host compiles before that.
+sleep 3
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 check "settled files' digests are memoised under filehash/" \
@@ -6994,7 +7007,7 @@ fi
 
 section "10b. Single-flight"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+  run_bounded 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
     > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
   lease_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -7012,7 +7025,7 @@ fi
 
 section "10d. Elastic jobserver"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
+  run_bounded 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
     "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
   elastic_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -7030,7 +7043,7 @@ fi
 
 section "10c. Memory admission"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+  run_bounded 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
     "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
   admission_test_exit=$?
   while IFS='|' read -r outcome message; do

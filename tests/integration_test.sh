@@ -3807,10 +3807,11 @@ section "a compiler with the absent-deps patch does not share the stock entries"
 # it names the PCH a compile read. The stub patches the stock output the same
 # way, so an entry served across the two would replay the stock depfile. It
 # takes -fabsent-deps= as the patched compiler does, with nothing to list.
-reset_cache
 ad="$WORK/absent-deps"
 mkdir -p "$ad"
 printf 'int f(void) { return 1; }\n' > "$ad/s.c"
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+reset_cache
 cat > "$ad/patched-gcc" <<EOF
 #!/bin/sh
 if [ "\$1" = "-v" ]; then
@@ -3854,6 +3855,9 @@ ad_scan "$ad/patched-gcc" patched.M
 check "the patched compiler's dependency scan misses on the stock one" \
   "$(hits)/$(misses)" "0/2"
 check "and its output names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.M")" "1"
+else
+  skipped "the absent-deps fingerprint stub wraps gcc, which is not installed or is clang"
+fi
 
 # The banner is hashed as printed. A token that starts a line must not take the
 # line break with it: these two banners then read the same.
@@ -6207,9 +6211,14 @@ for cc in gcc clang; do
     "$(grep -cE '\] preprocess: .* -MD -MF [^ ]*/pp\.d .*-E t\.c$' "$l")" "1"
   check "$cc: the hit records a state from the -E run" \
     "$(grep -c 'cxx manifest: recorded a state from the preprocessor run' "$l")" "1"
-  check "$cc: from its trace, in place of the stale state, which named the same key" \
-    "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
-    "1/1"
+  if [[ "$(uname -s)" == Linux ]]; then
+    check "$cc: from its trace, in place of the stale state, which named the same key" \
+      "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+      "1/1"
+  else
+    check "$cc: from its depfile (no tracer here), in place of the stale state" \
+      "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  fi
   check "$cc: --show-stats counts it" "$(pphit_recorded)" "1"
   l=$(mf_log "pphit3-$cc"); mf_pphit "$cc" "$l"
   check "$cc: the next compile skips the preprocessor" \
@@ -6618,7 +6627,7 @@ if command -v clang >/dev/null 2>&1; then
   cat > "$adc/clang-ad1" <<EOF
 #!/bin/sh
 if [ "\$1" = "-v" ]; then
-  clang -v 2>&1 | sed 's/^\(clang version .*\)\$/\1 absent-deps-1/' >&2
+  clang -v 2>&1 | sed 's/^\(.*clang version .*\)\$/\1 absent-deps-1/' >&2
   exit 0
 fi
 printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$adc/calls"

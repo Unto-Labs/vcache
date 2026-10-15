@@ -6220,6 +6220,20 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mf_build_gch
   mf_use_gch "$(mf_log g3)"
   check "gcc: editing the .gch's header and rebuilding it misses" "$(misses)" "2"
+  # gcc names the PCH in its -E output with %s, unescaped: a backslash in the
+  # directory is the path's own. Included by its absolute name, so the pragma
+  # carries the directory.
+  bs="$WORK/pch-back\\slash"
+  mkdir -p "$bs"
+  printf '#pragma once\n#define BS 3\n' > "$bs/h.h"
+  printf 'int f() { return BS; }\n' > "$bs/main.cc"
+  ( cd "$bs" && g++ -O2 -x c++-header -c h.h -o h.h.gch )
+  reset_cache
+  for i in 1 2; do
+    ( cd "$WORK" && "$VCACHE" g++ -O2 -c -include "$bs/h.h" "$bs/main.cc" -o "$bs/main.o" ) \
+      2>/dev/null
+  done
+  check "gcc: a PCH under a directory holding a backslash is cached" "$(hits)/$(misses)" "1/1"
 else
   skipped "g++ is not installed, or is clang"
 fi

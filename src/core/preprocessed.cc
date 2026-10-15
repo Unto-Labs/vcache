@@ -140,8 +140,10 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
         ok = false;
         return;
       }
-      const std::string pch = Unescape(std::string(
-          line.substr(kPchPragma.size(), line.size() - kPchPragma.size() - 1)));
+      // gcc prints the name with %s, unescaped: a backslash in it is the
+      // path's own, and unescaping would name another file.
+      const std::string pch(
+          line.substr(kPchPragma.size(), line.size() - kPchPragma.size() - 1));
       pch_paths->push_back(pch);
       emit(kPchPragma);
       emit(Escape(roots.Canonicalize(pch)));

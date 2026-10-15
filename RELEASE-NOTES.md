@@ -6,8 +6,7 @@ Each release is also described in its annotated tag (`git tag -n99 vX.Y.Z`).
 
 A major release, because every cache key moved: entries written by 1.3.0 and
 earlier are not read, and the first build after upgrading misses. New
-behaviour beyond correctness fixes is off unless configured. Most of this
-release was written by Richard Geary and ported from his fork.
+behaviour beyond correctness fixes is off unless configured.
 
 Breaking:
 

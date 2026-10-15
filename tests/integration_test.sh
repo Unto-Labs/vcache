@@ -3947,6 +3947,14 @@ cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+/* The __xstat family takes the stat layout version, which glibc 2.33 stopped
+   exporting as _STAT_VER: 1 on x86_64, 0 on the generic layout (aarch64,
+   riscv64). The wrong one fails with EINVAL and probes nothing. */
+#if defined(__x86_64__)
+#define STAT_VER 1
+#else
+#define STAT_VER 0
+#endif
 int main(void) {
   struct stat st;
   struct stat64 st64;
@@ -3954,11 +3962,11 @@ int main(void) {
   int (*xstat)(int, const char *, struct stat *) = dlsym(RTLD_DEFAULT, "__xstat");
   int (*lxstat64)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__lxstat64");
   if (xstat == NULL || lxstat64 == NULL) return 1;
-  if (xstat(1, "absent-xstat", &st) == 0) return 2;
-  if (lxstat64(1, "absent-lxstat64", &st64) == 0) return 3;
+  if (xstat(STAT_VER, "absent-xstat", &st) == 0) return 2;
+  if (lxstat64(STAT_VER, "absent-lxstat64", &st64) == 0) return 3;
   if (stat64("absent-stat64", &st64) == 0) return 4;
   if (statx(AT_FDCWD, "absent-statx", 0, STATX_BASIC_STATS, &stx) == 0) return 5;
-  if (xstat(1, "dir/value", &st) != 0) return 6;
+  if (xstat(STAT_VER, "dir/value", &st) != 0) return 6;
   if (statx(0, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) return 7;
   return 0;
 }
@@ -6864,14 +6872,15 @@ if command -v clang >/dev/null 2>&1; then
   mkdir -p "$WORK/ccfg"
   printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
     > "$WORK/ccfg/s.c"
-  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config="$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
+  # Spelled --config FILE: clang before 16 rejects --config=FILE.
+  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config "$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
   reset_cache
   echo '-O0' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   echo '-O2' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   check "preprocessor mode: editing a --config file from -O0 to -O2 misses" "$(misses)" "2"
-  ( cd "$WORK/ccfg" && clang --config="$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
+  ( cd "$WORK/ccfg" && clang --config "$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
   check "and the object is the -O2 one" \
     "$(cmp -s "$WORK/ccfg/s.o" "$WORK/ccfg/ref.o" && echo same)" "same"
   reset_cache

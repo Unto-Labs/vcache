@@ -343,7 +343,7 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 # under util::Run so wait4 has a child whose peak RSS is known.
 $(BINDIR)/vcache_test_alloc: $(TOP)/tests/vcache_test_alloc.cc
 	@mkdir -p $(BINDIR)
-	$(CXX) -O2 -o $@ $<
+	$(CXX) -std=c++20 -O2 -o $@ $<
 
 test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test

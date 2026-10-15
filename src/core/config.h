@@ -188,8 +188,9 @@ struct Config {
   // compiler's own list of the paths it probed and did not find, when its
   // banner says it writes one (`absent-deps-1` or `-2`, an out-of-tree gcc and
   // clang patch). The trace comes first either way. Off, a compile without a tracer
-  // records from the depfile alone.
-  bool cxx_manifest_absent_deps = true;
+  // records from the depfile alone. Off by default: stock compilers write no
+  // list, and the patch is not published.
+  bool cxx_manifest_absent_deps = false;
 
   bool disabled = false;   // VCACHE_DISABLE: run the compiler, skip the cache
   bool read_only = false;  // look up but never store

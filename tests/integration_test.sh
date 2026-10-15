@@ -6346,6 +6346,22 @@ EOF
     printf '#include "h.h"\nint v = V;\n' > "$1/main.c"
   }
 
+  # The list is opt-in: by default a patched compiler without a tracer is not
+  # asked for it, and records from the depfile alone.
+  reset_cache
+  d="$ads/default-off"
+  shadow_tree "$d"
+  absent_list first/h.h
+  rm -f "$ads/calls"
+  l=$(mf_log ad-default-off); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps lists are off by default" \
+    "$(grep -c "absent-deps lists are off; not asking for the compiler's list" "$l")/$(grep -c -- '-fabsent-deps=' "$ads/calls" || true)" \
+    "1/0"
+  check "and --show-config says so" \
+    "$("$VCACHE" --show-config | grep -c 'c/c++ manifest absent-deps lists: off')" "1"
+  # The rest of this section, and the clang-style stub's, turn it on.
+  export VCACHE_CXX_MANIFEST_ABSENT_DEPS=1
+
   # With a tracer the trace comes first, and the compiler is not asked for
   # its list.
   reset_cache
@@ -6649,6 +6665,7 @@ fi
 # The same through a clang-style stub: the banner is clang's, and the list
 # spells a probe relative to the working directory, through `..` where the
 # include path does.
+export VCACHE_CXX_MANIFEST_ABSENT_DEPS=1
 if command -v clang >/dev/null 2>&1; then
   adc="$WORK/mf-absent-clang"
   mkdir -p "$adc"
@@ -6716,6 +6733,7 @@ EOF
 else
   skipped "absent-deps lists through a clang-style stub: clang is not installed"
 fi
+unset VCACHE_CXX_MANIFEST_ABSENT_DEPS
 
 # The driver reads some variables before any header: an SDK, a deployment
 # target, clang's CCC_OVERRIDE_OPTIONS. Neither key may ignore them.

@@ -65,7 +65,7 @@ hash_env_vars        = []
 rust_path_env_vars   = []          # e.g. ["OUT_DIR"]; see "rust_path_env_vars"
 cxx_manifest         = false       # see "cxx_manifest"
 cxx_manifest_trace   = true        # see "cxx_manifest"
-cxx_manifest_absent_deps = true    # see "cxx_manifest"
+cxx_manifest_absent_deps = false   # see "cxx_manifest"
 
 [cache.disk]
 enabled = true
@@ -95,7 +95,7 @@ timeout        = 30                # seconds
 | `vcache.dep_scan` | `VCACHE_DEP_SCAN` | — | `manifest` |
 | `vcache.cxx_manifest` | `VCACHE_CXX_MANIFEST` | — | `false` |
 | `vcache.cxx_manifest_trace` | `VCACHE_CXX_MANIFEST_TRACE` | — | `true` |
-| `vcache.cxx_manifest_absent_deps` | `VCACHE_CXX_MANIFEST_ABSENT_DEPS` | — | `true` |
+| `vcache.cxx_manifest_absent_deps` | `VCACHE_CXX_MANIFEST_ABSENT_DEPS` | — | `false` |
 | `vcache.rust_dep_info` | `VCACHE_RUST_DEP_INFO` | — | `manifest` |
 | `vcache.read_only` | `VCACHE_READONLY` | — | `false` |
 | `vcache.error_on_cache_media_failure` | `VCACHE_ERROR_ON_CACHE_MEDIA_FAILURE` | `--error-on-cache-media-failure` | `false` |
@@ -987,7 +987,7 @@ from:
 | Setting | Meaning |
 | --- | --- |
 | `true` *(default)* | The depfile and a trace of the compile. |
-| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1` or `absent-deps-2`, the depfile and that compiler's own list of what it did not find (below). |
+| `false` | The depfile alone, with the gcc rules below and the shadowing hole; with a compiler whose `-v` ends in `absent-deps-1` or `absent-deps-2`, the depfile and, with `cxx_manifest_absent_deps` on, that compiler's own list of what it did not find (below). |
 
 A compiler built with an absent-deps patch prints `absent-deps-1`
 (gcc) or `absent-deps-2` (clang) after its version and, given
@@ -999,7 +999,7 @@ trace stays the first source for such a compiler too: it also sees what the
 driver reads (and gcc's driver probes, such as its `specs`), which the list does
 not name and leaves to the compiler fingerprint,
 and on `src/daemon/server.cc` recording from the list was not measurably
-cheaper. The list is the second source: where the compile has no tracer (any of
+cheaper. The list is the second source, with `cxx_manifest_absent_deps` on: where the compile has no tracer (any of
 the reasons below, `cxx_manifest_trace = false` among them), it gets
 `-fabsent-deps=<scratch>` beside the `-MD` vcache adds, and the log says `no
 tracer at '...'; recording from the compiler's absent list` (or `tracing is
@@ -1017,12 +1017,14 @@ know (`absent-deps-3` and up) is never asked for its list, and the log names
 the version; nor is clang under `-working-directory`, whose list is relative to
 that directory, and which records no state at all. To compare the two sources, set `cxx_manifest_trace = false`
 for the list and leave it on for the trace. `cxx_manifest_absent_deps`
-(`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list off:
+(`VCACHE_CXX_MANIFEST_ABSENT_DEPS`) turns the list on. It is off by default:
+stock compilers write no list, and the patch is not published.
+
 
 | Setting | Meaning |
 | --- | --- |
-| `true` *(default)* | Without a tracer, record a patched compiler's states from its list. |
-| `false` | Without a tracer, record them from the depfile alone, with the gcc rules below. |
+| `true` | Without a tracer, record a patched compiler's states from its list. |
+| `false` *(default)* | Without a tracer, record them from the depfile alone, with the gcc rules below. |
 
 The caller's own `-fabsent-deps=FILE` is still declined (see
 [Flags that write a second output file](#flags-that-write-a-second-output-file)).

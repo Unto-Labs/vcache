@@ -399,7 +399,10 @@ class Server {
   bool HandleHello(const std::string& request, std::string* reply);
   // `after` reads a layer name too and asks only the layers after it (kGetAfter).
   void HandleGet(Reader* in, Writer* out, bool after = false);
-  std::shared_ptr<CacheFetch> FetchKey(const std::string& key);
+  // `backfill_disk` false leaves the disk copy alone: a kGetAfter asks for S3's
+  // copy because the disk's did not serve, and replacing the disk's with it
+  // would drop the states only the disk has.
+  std::shared_ptr<CacheFetch> FetchKey(const std::string& key, bool backfill_disk = true);
   void HandlePut(Reader* in, Writer* out, pid_t peer_pid);
   bool AwaitTestPut(const std::string& key);
   void HandleLeaseAcquire(Reader* in, Writer* out,
@@ -1230,7 +1233,7 @@ void Server::TickJobserver() {
   }
 }
 
-std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
+std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key, bool backfill_disk) {
   std::shared_ptr<CacheFetch> fetch;
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -1257,7 +1260,7 @@ std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
   auto s3 = AcquireS3();
   fetch->hit = s3->Get(key, &fetch->value);
   if (!fetch->hit && s3->failed()) fetch->errors.push_back("s3: " + s3->last_error());
-  if (fetch->hit) {
+  if (fetch->hit && backfill_disk) {
     auto disk = MakeDisk();
     if (disk && disk->writable() && !disk->Put(key, fetch->value) && disk->failed()) {
       fetch->errors.push_back("disk: " + disk->last_error());
@@ -1318,7 +1321,7 @@ void Server::HandleGet(Reader* in, Writer* out, bool after) {
     }
   }
   if (layer.empty() && skip < 3 && s3_enabled_) {
-    const auto fetch = FetchKey(key);
+    const auto fetch = FetchKey(key, /*backfill_disk=*/!after);
     if (!fetch->done) {
       out->U8(static_cast<uint8_t>(Status::kError));
       out->Str("daemon shutting down");

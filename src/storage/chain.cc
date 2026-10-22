@@ -283,6 +283,11 @@ PutResult CacheChain::PutBefore(const std::string& key, const std::string& value
                                 const std::string& layer) {
   PutResult result;
   if (remote_ != nullptr) return result;
+  // A name no layer has (a daemon's "memory" after falling back, say) would
+  // otherwise make every layer "faster", S3 included.
+  const bool known = std::any_of(layers_.begin(), layers_.end(),
+                                 [&](const auto& l) { return l->Name() == layer; });
+  if (!known) return result;
   for (auto& faster : layers_) {
     if (faster->Name() == layer) break;
     if (!faster->writable()) continue;

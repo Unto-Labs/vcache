@@ -996,14 +996,20 @@ int RunRustCompile(const std::vector<std::string>& argv,
       if (config.read_only) return 0;
       if (manifest_copy.layer != manifest_first_layer) {
         // Matched in a slower layer's copy: the faster layers get the merged
-        // manifest, so the next lookup stops at the first.
-        media_failed |= core::ReportCacheMediaErrors(
-            cache->PutBefore(manifest_key,
-                             SerializeManifest(core::PrependManifestState(
-                                 states[i], states, &RustManifestState::key)),
-                             manifest_copy.layer)
-                .errors,
-            cache_dir);
+        // manifest, so the next lookup stops at the first. Re-read first, as
+        // a store does, to keep a concurrent build's state.
+        if (!cache->remote()) {
+          storage::GetResult local = cache->GetLocal(manifest_key);
+          media_failed |= core::ReportCacheMediaErrors(local.errors, cache_dir);
+          media_failed |= core::ReportCacheMediaErrors(
+              cache->PutBefore(manifest_key,
+                               SerializeManifest(core::MergeManifestStates(
+                                   states[i], ManifestStates(local, false), states,
+                                   &RustManifestState::key)),
+                               manifest_copy.layer)
+                  .errors,
+              cache_dir);
+        }
       } else if (i > 0) {
         StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }

@@ -818,9 +818,13 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
                                                       : Counter::kHitDisk);
         // Matched in a slower layer's copy: give the faster layers the
         // merged manifest, so the next lookup stops at the first.
-        if (got.layer != first_layer && !config.read_only) {
-          const std::vector<DepManifestEntry> merged = PrependManifestState(
-              entry, entries, &DepManifestEntry::result_key);
+        // Re-read first, as a store does, to keep what a concurrent build on
+        // this machine stored since the lookup.
+        if (got.layer != first_layer && !config.read_only && !cache->remote()) {
+          storage::GetResult local = cache->GetLocal(key);
+          media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
+          const std::vector<DepManifestEntry> merged = MergeManifestStates(
+              entry, DepManifestEntries(local), entries, &DepManifestEntry::result_key);
           media_failed |= ReportCacheMediaErrors(
               cache->PutBefore(key, SerializeDepManifest(merged), got.layer).errors,
               cache_dir);
@@ -1876,15 +1880,20 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         if (config.read_only) return true;
         if (manifest_copy.layer != manifest_first_layer) {
           // Matched in a slower layer's copy: the faster layers get the
-          // merged manifest, so the next lookup stops at the first.
-          media_failed |= ReportCacheMediaErrors(
-              cache->PutBefore(manifest_key,
-                               SerializeCxxManifest(PrependManifestState(
-                                   manifest_states[i], manifest_states,
-                                   &CxxManifestState::result_key)),
-                               manifest_copy.layer)
-                  .errors,
-              cache_dir);
+          // merged manifest, so the next lookup stops at the first. Re-read
+          // first, as a store does, to keep a concurrent build's state.
+          if (!cache->remote()) {
+            storage::GetResult local = cache->GetLocal(manifest_key);
+            media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
+            media_failed |= ReportCacheMediaErrors(
+                cache->PutBefore(manifest_key,
+                                 SerializeCxxManifest(MergeManifestStates(
+                                     manifest_states[i], CxxManifestStates(local, false),
+                                     manifest_states, &CxxManifestState::result_key)),
+                                 manifest_copy.layer)
+                    .errors,
+                cache_dir);
+          }
         } else if (i > 0) {
           StoreCxxManifest(cache, manifest_key, manifest_states[i], manifest_states, cache_dir,
                            &media_failed);

@@ -421,6 +421,16 @@ bool DaemonClient::GetAfter(const std::string& key, const std::string& after,
   req.Str(after);
   std::string reply;
   if (!RoundTrip(req.data(), &reply, kReplyTimeoutSeconds)) return false;
+  // A daemon older than kGetAfter refuses it and carries on serving. That is
+  // a miss, not a daemon that stopped answering: the build keeps the daemon.
+  Reader in(reply);
+  uint8_t status = 0;
+  std::string reason;
+  if (in.U8(&status) && status == static_cast<uint8_t>(Status::kError) && in.Str(&reason) &&
+      reason == "unknown request") {
+    VCACHE_LOG("daemon predates kGetAfter; treating the slower layers as a miss");
+    return true;
+  }
   return ParseGetReply(reply, result);
 }
 

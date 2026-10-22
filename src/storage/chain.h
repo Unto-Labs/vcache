@@ -91,8 +91,9 @@ class CacheChain {
   GetResult GetAfter(const std::string& key, const std::string& after);
 
   // Writes only to the writable layers faster than `layer`, so a manifest
-  // merged with a slower layer's copy is found first next time. A daemon
-  // chain stores nothing here; the daemon owns its layers.
+  // merged with a slower layer's copy is found first next time. Stores nothing
+  // for a layer name the chain does not have, or for a daemon chain: the
+  // daemon owns its layers.
   PutResult PutBefore(const std::string& key, const std::string& value,
                       const std::string& layer);
 

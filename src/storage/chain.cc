@@ -253,6 +253,48 @@ GetResult CacheChain::GetLocal(const std::string& key) {
   return result;
 }
 
+GetResult CacheChain::GetAfter(const std::string& key, const std::string& after) {
+  GetResult result;
+  if (remote_ != nullptr) {
+    if (remote_->GetAfter(key, after, &result)) return result;
+    result = GetResult();
+    FallBackToLocal();
+  }
+  bool past = false;
+  for (auto& layer : layers_) {
+    if (!past) {
+      past = layer->Name() == after;
+      continue;
+    }
+    std::string value;
+    if (!layer->Get(key, &value)) {
+      if (layer->failed()) result.errors.push_back(layer->Name() + ": " + layer->last_error());
+      continue;
+    }
+    result.hit = true;
+    result.value = std::move(value);
+    result.layer = layer->Name();
+    return result;
+  }
+  return result;
+}
+
+PutResult CacheChain::PutBefore(const std::string& key, const std::string& value,
+                                const std::string& layer) {
+  PutResult result;
+  if (remote_ != nullptr) return result;
+  for (auto& faster : layers_) {
+    if (faster->Name() == layer) break;
+    if (!faster->writable()) continue;
+    if (faster->Put(key, value)) {
+      result.stored = true;
+    } else if (faster->failed()) {
+      result.errors.push_back(faster->Name() + ": " + faster->last_error());
+    }
+  }
+  return result;
+}
+
 PutResult CacheChain::Put(const std::string& key, const std::string& value) {
   PutResult result;
   if (remote_ != nullptr) {

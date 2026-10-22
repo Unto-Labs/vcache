@@ -322,23 +322,42 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   bool media_failed = false;
   std::vector<LinkManifestEntry> entries;
-  const auto load_entries = [&]() {
-    if (cache == nullptr) return;
-    storage::GetResult got = cache->Get(pre_key);
-    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
+  // The copy `entries` last grew from, and the layer of the first.
+  storage::GetResult manifest_copy;
+  std::string manifest_first_layer;
+  const auto entries_of = [](const storage::GetResult& got) {
+    std::vector<LinkManifestEntry> parsed_entries;
     storage::Blob manifest_blob;
     if (got.hit && storage::DeserializeBlob(got.value, &manifest_blob) &&
         manifest_blob.has_dep_manifest &&
-        !ParseLinkManifest(manifest_blob.dep_manifest, &entries)) {
+        !ParseLinkManifest(manifest_blob.dep_manifest, &parsed_entries)) {
       VCACHE_LOG("link: manifest did not parse; starting a new one");
-      entries.clear();
+      parsed_entries.clear();
     }
+    return parsed_entries;
+  };
+  const auto load_entries = [&]() {
+    if (cache == nullptr) return;
+    manifest_copy = cache->Get(pre_key);
+    media_failed |= ReportCacheMediaErrors(manifest_copy.errors, cache_dir);
+    manifest_first_layer = manifest_copy.layer;
+    entries = entries_of(manifest_copy);
   };
   load_entries();
 
   const auto try_link_hit = [&]() {
     if (cache == nullptr) return false;
-    for (const LinkManifestEntry& e : entries) {
+    for (size_t i = 0;; ++i) {
+      while (i == entries.size()) {
+        // Every entry so far is ruled out; a slower layer may hold more.
+        storage::GetResult next = NextManifestCopy(cache, pre_key, manifest_copy);
+        media_failed |= ReportCacheMediaErrors(next.errors, cache_dir);
+        if (!next.hit) return false;
+        manifest_copy = std::move(next);
+        AppendManifestStates(&entries, entries_of(manifest_copy),
+                             &LinkManifestEntry::result_key);
+      }
+      const LinkManifestEntry& e = entries[i];
       if (!LinkManifestStillHolds(e, roots)) continue;
       storage::GetResult result = cache->Get(e.result_key);
       media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
@@ -354,6 +373,19 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       VCACHE_LOG("link hit on " + result.layer);
       RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
                                                     : Counter::kHitDisk);
+      if (manifest_copy.layer != manifest_first_layer && !config.read_only) {
+        // Matched in a slower layer's copy: the faster layers get the merged
+        // manifest, so the next lookup stops at the first.
+        storage::Blob manifest_blob;
+        manifest_blob.dep_manifest = RenderLinkManifest(
+            PrependManifestState(e, entries, &LinkManifestEntry::result_key));
+        manifest_blob.has_dep_manifest = true;
+        media_failed |= ReportCacheMediaErrors(
+            cache->PutBefore(pre_key, storage::SerializeBlob(manifest_blob),
+                             manifest_copy.layer)
+                .errors,
+            cache_dir);
+      }
       return true;
     }
     return false;

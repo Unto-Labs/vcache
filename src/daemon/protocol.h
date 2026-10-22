@@ -26,7 +26,7 @@ namespace vcache::daemon {
 // Bumped on any incompatible change to a frame. A mismatch is refused at
 // kHello, which makes a client and daemon from different releases fall back
 // cleanly instead of misparsing each other.
-constexpr uint64_t kProtocolVersion = 2;
+constexpr uint64_t kProtocolVersion = 3;
 constexpr int kReplyTimeoutSeconds = 300;
 constexpr uint64_t kMemoryWaitBoundMs = 600000;
 // Opt-in estimate replies preserve the wire format expected by older v2 clients.
@@ -43,6 +43,7 @@ enum class Op : uint8_t {
   kLeaseRelease = 8,  // str key, u8 outcome (stored = 0, failed = 1)
   kMemoryReserve = 9,  // str cost_key, u64 estimate_kb, u64 bound_ms, optional u8 reply fields
   kCompilerSpawned = 10,  // u64 compiler pid
+  kGetAfter = 11,  // str key, str layer; as kGet, from the layers after that one
 };
 
 enum class LeaseOutcome : uint8_t { kGranted = 0, kStored = 1, kCompile = 2 };

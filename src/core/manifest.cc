@@ -52,6 +52,17 @@ std::string RenderManifestFile(const ManifestFile& file) {
   return out;
 }
 
+storage::GetResult NextManifestCopy(storage::CacheChain* cache, const std::string& key,
+                                    const storage::GetResult& got) {
+  if (cache == nullptr || !got.hit || got.layer.empty()) return {};
+  storage::GetResult next = cache->GetAfter(key, got.layer);
+  if (next.hit) {
+    VCACHE_LOG("manifest: no state on " + got.layer + " holds; trying the copy on " +
+               next.layer);
+  }
+  return next;
+}
+
 void PauseBeforeManifestPut() {
   const char* path = std::getenv("VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT");
   if (path == nullptr || *path == '\0') return;

@@ -383,13 +383,10 @@ bool DaemonClient::RoundTrip(const std::string& request, std::string* reply,
   return ok;
 }
 
-bool DaemonClient::Get(const std::string& key, storage::GetResult* result) {
-  Writer req;
-  req.U8(static_cast<uint8_t>(Op::kGet));
-  req.Str(key);
-  std::string reply;
-  if (!RoundTrip(req.data(), &reply, kReplyTimeoutSeconds)) return false;
+namespace {
 
+// A kGet or kGetAfter reply: a miss with its errors, or a hit with its layer.
+bool ParseGetReply(const std::string& reply, storage::GetResult* result) {
   Reader in(reply);
   uint8_t status = 0;
   if (!in.U8(&status)) return false;
@@ -403,6 +400,28 @@ bool DaemonClient::Get(const std::string& key, storage::GetResult* result) {
   }
   result->hit = true;
   return true;
+}
+
+}  // namespace
+
+bool DaemonClient::Get(const std::string& key, storage::GetResult* result) {
+  Writer req;
+  req.U8(static_cast<uint8_t>(Op::kGet));
+  req.Str(key);
+  std::string reply;
+  if (!RoundTrip(req.data(), &reply, kReplyTimeoutSeconds)) return false;
+  return ParseGetReply(reply, result);
+}
+
+bool DaemonClient::GetAfter(const std::string& key, const std::string& after,
+                            storage::GetResult* result) {
+  Writer req;
+  req.U8(static_cast<uint8_t>(Op::kGetAfter));
+  req.Str(key);
+  req.Str(after);
+  std::string reply;
+  if (!RoundTrip(req.data(), &reply, kReplyTimeoutSeconds)) return false;
+  return ParseGetReply(reply, result);
 }
 
 bool DaemonClient::Put(const std::string& key, const std::string& value,

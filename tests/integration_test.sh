@@ -3394,6 +3394,100 @@ check "header 3 hits through the dep-scan manifest" \
 check "header 3 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog3" || true)" "0"
 
 # --------------------------------------------------------------------------
+section "14c. A stale manifest on disk does not hide the copy in S3"
+
+# CI runners start from a disk cache baked from an older tree, next to the
+# shared S3 layer. Once a header those manifests list changes, every state in
+# the baked copy is stale, while S3 holds the state each build records. A
+# lookup that stopped at the first copy missed on every run.
+if command -v python3 >/dev/null 2>&1; then
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/s3-shadow"
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
+  saved_vcache_dir="$VCACHE_DIR"
+  ds_tree "$WORK/shadow" 1
+  shadow_run() {  # $1 cache dir, $2 log, then the compiler arguments
+    local dir=$1 log=$2
+    shift 2
+    ( cd "$WORK/shadow" && VCACHE_DIR="$dir" VCACHE_ROOTS="$WORK/shadow=proj" \
+        VCACHE_DAEMON=off VCACHE_LOG="$log" "$VCACHE" "$@" ) >/dev/null 2>&1
+  }
+  with_s3() {
+    AWS_ACCESS_KEY_ID=AKIDEXAMPLE \
+    AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
+    VCACHE_S3_BUCKET=testbucket VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT" \
+    VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 "$@"
+  }
+  shadow_stat() { VCACHE_DIR="$1" "$VCACHE" --show-stats | grep -F "$2" | awk '{print $NF}'; }
+
+  for mode in dep-scan cxx-manifest; do
+    if [[ "$mode" == dep-scan ]]; then
+      cmd=(gcc -M -MP main.c -o "$WORK/shadow/out.d")
+    else
+      cmd=(gcc -c main.c -o "$WORK/shadow/main.o")
+    fi
+    rm -rf "$WORK/shadow-baked" "$WORK/shadow-r"* "$S3DIR"/*
+    printf '#define V 1\n' > "$WORK/shadow/x.h"
+
+    # The bake: disk only, with the header as it was.
+    VCACHE_CXX_MANIFEST=1 shadow_run "$WORK/shadow-baked" "$WORK/shadow-bake.log" "${cmd[@]}"
+
+    # The header changes; a runner with a fresh disk records the new state in S3.
+    printf '#define V 2\n' > "$WORK/shadow/x.h"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r1" "$WORK/shadow-r1.log" "${cmd[@]}"
+
+    # A runner starting from the baked disk must find that state in S3.
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r2"
+    VCACHE_DIR="$WORK/shadow-r2" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    log="$WORK/shadow-$mode-r2.log"
+    rm -f "$log"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+    check "$mode: the stale disk copy sends the lookup on to S3" \
+      "$(grep -c 'no state on disk holds; trying the copy on s3' "$log")" "1"
+    check "$mode: and the state recorded there is a hit" \
+      "$(shadow_stat "$WORK/shadow-r2" 'cache miss')" "0"
+    if [[ "$mode" == cxx-manifest ]]; then
+      check "$mode: answered by the manifest, without preprocessing" \
+        "$(grep -c '^.* preprocess: ' "$log")" "0"
+    fi
+
+    # The merged manifest was promoted: the next lookup stops at the disk.
+    log="$WORK/shadow-$mode-r2b.log"
+    rm -f "$log"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+    check "$mode: the promoted disk copy answers the next lookup" \
+      "$(grep -c 'trying the copy on s3' "$log")" "0"
+
+    # A real miss from a baked disk must not drop the states S3 holds: the
+    # store merges every copy the lookup saw.
+    printf '#define V 3\n' > "$WORK/shadow/x.h"
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r3"
+    VCACHE_DIR="$WORK/shadow-r3" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r3" "$WORK/shadow-r3.log" "${cmd[@]}"
+    printf '#define V 2\n' > "$WORK/shadow/x.h"
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r4"
+    VCACHE_DIR="$WORK/shadow-r4" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r4" "$WORK/shadow-r4.log" "${cmd[@]}"
+    check "$mode: a miss in between kept the other state in S3" \
+      "$(shadow_stat "$WORK/shadow-r4" 'cache miss')" "0"
+  done
+
+  export VCACHE_DIR="$saved_vcache_dir"
+  stop_s3
+fi
+
+# --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"
 
 # The dangerous shape: the object comes back correct from the cache and the

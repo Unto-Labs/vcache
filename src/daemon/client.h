@@ -66,6 +66,8 @@ class DaemonClient : public storage::RemoteCache {
   bool Get(const std::string& key, storage::GetResult* result) override;
   bool Put(const std::string& key, const std::string& value,
            storage::PutResult* result) override;
+  bool GetAfter(const std::string& key, const std::string& after,
+                storage::GetResult* result) override;
 
   bool Status(std::string* text);
 

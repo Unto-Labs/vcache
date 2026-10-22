@@ -397,7 +397,8 @@ class Server {
 
   void Serve(int fd);
   bool HandleHello(const std::string& request, std::string* reply);
-  void HandleGet(Reader* in, Writer* out);
+  // `after` reads a layer name too and asks only the layers after it (kGetAfter).
+  void HandleGet(Reader* in, Writer* out, bool after = false);
   std::shared_ptr<CacheFetch> FetchKey(const std::string& key);
   void HandlePut(Reader* in, Writer* out, pid_t peer_pid);
   bool AwaitTestPut(const std::string& key);
@@ -1276,16 +1277,25 @@ std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
   return fetch;
 }
 
-void Server::HandleGet(Reader* in, Writer* out) {
+void Server::HandleGet(Reader* in, Writer* out, bool after) {
   std::string key;
-  if (!in->Str(&key) || !ValidKey(key)) {
+  std::string after_layer;
+  if (!in->Str(&key) || !ValidKey(key) || (after && !in->Str(&after_layer))) {
     out->U8(static_cast<uint8_t>(Status::kError));
     out->Str("invalid key");
     return;
   }
-  counters_.lookups++;
+  // The layers in lookup order are disk, uploads still held in memory, then
+  // S3; kGetAfter skips through the one named. A continuation is part of an
+  // earlier lookup, so it adds no lookup and no miss of its own.
+  int skip = 0;
+  if (after) {
+    skip = after_layer == "disk" ? 1 : after_layer == HeldHitLayerName() ? 2 : 3;
+  } else {
+    counters_.lookups++;
+  }
   std::vector<std::string> errors;
-  auto disk = MakeDisk();
+  auto disk = skip < 1 ? MakeDisk() : nullptr;
 
   std::string value;
   std::string layer;
@@ -1297,7 +1307,7 @@ void Server::HandleGet(Reader* in, Writer* out) {
       errors.push_back("disk: " + disk->last_error());
     }
   }
-  if (layer.empty()) {
+  if (layer.empty() && skip < 2) {
     // Stored moments ago, still waiting for its upload, and no disk layer to
     // have put it in. Serving it is what makes the queue invisible to builds.
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1307,7 +1317,7 @@ void Server::HandleGet(Reader* in, Writer* out) {
       counters_.hits_memory++;
     }
   }
-  if (layer.empty() && s3_enabled_) {
+  if (layer.empty() && skip < 3 && s3_enabled_) {
     const auto fetch = FetchKey(key);
     if (!fetch->done) {
       out->U8(static_cast<uint8_t>(Status::kError));
@@ -1323,7 +1333,7 @@ void Server::HandleGet(Reader* in, Writer* out) {
   }
 
   if (layer.empty()) {
-    counters_.misses++;
+    if (!after) counters_.misses++;
     out->U8(static_cast<uint8_t>(Status::kMiss));
     out->StrList(errors);
     return;
@@ -1653,6 +1663,7 @@ void Server::Serve(int fd) {
         break;
       }
       case Op::kGet: HandleGet(&in, &out); break;
+      case Op::kGetAfter: HandleGet(&in, &out, /*after=*/true); break;
       case Op::kPut: HandlePut(&in, &out, peer_pid); break;
       case Op::kLeaseAcquire: HandleLeaseAcquire(&in, &out, compile_session); break;
       case Op::kLeaseRelease: HandleLeaseRelease(&in, &out, compile_session); break;

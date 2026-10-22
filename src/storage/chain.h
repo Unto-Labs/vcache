@@ -49,6 +49,11 @@ class RemoteCache {
   virtual bool Get(const std::string& key, GetResult* result) = 0;
   virtual bool Put(const std::string& key, const std::string& value,
                    PutResult* result) = 0;
+
+  // As Get, but from the layers slower than `after`. Returning true with no
+  // hit is an answer; false means the remote stopped answering.
+  virtual bool GetAfter(const std::string& key, const std::string& after,
+                        GetResult* result) = 0;
 };
 
 class CacheChain {
@@ -74,6 +79,22 @@ class CacheChain {
   // add a round trip to every miss. A daemon chain is asked as usual: the
   // daemon answers from its own layers.
   GetResult GetLocal(const std::string& key);
+
+  // As Get, but asks only the layers slower than `after` -- the layer an
+  // earlier lookup of the same key answered from -- and backfills nothing.
+  //
+  // A manifest lookup uses it when no state in the copy it found still holds.
+  // A faster layer's copy is not necessarily the newest: a disk cache baked
+  // from an older tree keeps a manifest whose states all name headers that
+  // have since changed, while S3 holds the state this tree records on every
+  // build. Stopping at the first copy found misses on every one of them.
+  GetResult GetAfter(const std::string& key, const std::string& after);
+
+  // Writes only to the writable layers faster than `layer`, so a manifest
+  // merged with a slower layer's copy is found first next time. A daemon
+  // chain stores nothing here; the daemon owns its layers.
+  PutResult PutBefore(const std::string& key, const std::string& value,
+                      const std::string& layer);
 
   // Writes to every writable layer. Reports success if at least one took it,
   // and separately reports every layer that failed -- a store that reached

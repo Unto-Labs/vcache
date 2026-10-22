@@ -18,8 +18,8 @@ Fixes:
     overwriting S3's states with the disk's.
   - A lookup answered by the first copy costs nothing extra.
   - CI runners starting from a disk cache baked from an older tree hit this on
-    every build: thru-net's gcc asan lanes re-ran about 165 dependency scans
-    per job.
+    every build: in one large C/C++ build, about 165 dependency scans re-ran
+    in each job.
 - **Daemon `get after`.** A new op lets a daemon chain do the same, without
   replacing the daemon's disk copy with S3's. A 2.0.0 daemon answers it
   "unknown request", which a 2.0.1 client treats as a miss.

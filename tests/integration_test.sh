@@ -3394,6 +3394,131 @@ check "header 3 hits through the dep-scan manifest" \
 check "header 3 does not re-run the scan" "$(grep -c 'dep scan:' "$dblog3" || true)" "0"
 
 # --------------------------------------------------------------------------
+section "14c. A stale manifest on disk does not hide the copy in S3"
+
+# CI runners start from a disk cache baked from an older tree, next to the
+# shared S3 layer. Once a header those manifests list changes, every state in
+# the baked copy is stale, while S3 holds the state each build records. A
+# lookup that stopped at the first copy missed on every run.
+if command -v python3 >/dev/null 2>&1; then
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/s3-shadow"
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
+  saved_vcache_dir="$VCACHE_DIR"
+  ds_tree "$WORK/shadow" 1
+  shadow_run() {  # $1 cache dir, $2 log, then the compiler arguments
+    local dir=$1 log=$2
+    shift 2
+    ( cd "$WORK/shadow" && VCACHE_DIR="$dir" VCACHE_ROOTS="$WORK/shadow=proj" \
+        VCACHE_DAEMON="${SHADOW_DAEMON:-off}" VCACHE_DAEMON_IDLE_TIMEOUT=60 \
+        VCACHE_LOG="$log" "$VCACHE" "$@" ) >/dev/null 2>&1
+  }
+  with_s3() {
+    AWS_ACCESS_KEY_ID=AKIDEXAMPLE \
+    AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
+    VCACHE_S3_BUCKET=testbucket VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT" \
+    VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1 "$@"
+  }
+  shadow_stat() { VCACHE_DIR="$1" "$VCACHE" --show-stats | grep -F "$2" | awk '{print $NF}'; }
+
+  for mode in dep-scan cxx-manifest; do
+    if [[ "$mode" == dep-scan ]]; then
+      cmd=(gcc -M -MP main.c -o "$WORK/shadow/out.d")
+    else
+      cmd=(gcc -c main.c -o "$WORK/shadow/main.o")
+    fi
+    rm -rf "$WORK/shadow-baked" "$WORK/shadow-r"* "$S3DIR"/*
+    printf '#define V 1\n' > "$WORK/shadow/x.h"
+
+    # The bake: disk only, with the header as it was.
+    VCACHE_CXX_MANIFEST=1 shadow_run "$WORK/shadow-baked" "$WORK/shadow-bake.log" "${cmd[@]}"
+
+    # The header changes; a runner with a fresh disk records the new state in S3.
+    printf '#define V 2\n' > "$WORK/shadow/x.h"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r1" "$WORK/shadow-r1.log" "${cmd[@]}"
+
+    # A runner starting from the baked disk must find that state in S3.
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r2"
+    VCACHE_DIR="$WORK/shadow-r2" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    log="$WORK/shadow-$mode-r2.log"
+    rm -f "$log"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+    check "$mode: the stale disk copy sends the lookup on to S3" \
+      "$(grep -c 'no state on disk holds; trying the copy on s3' "$log")" "1"
+    check "$mode: and the state recorded there is a hit" \
+      "$(shadow_stat "$WORK/shadow-r2" 'cache miss')" "0"
+    if [[ "$mode" == cxx-manifest ]]; then
+      check "$mode: answered by the manifest, without preprocessing" \
+        "$(grep -c '^.* preprocess: ' "$log")" "0"
+    fi
+
+    # The merged manifest was promoted: the next lookup stops at the disk.
+    log="$WORK/shadow-$mode-r2b.log"
+    rm -f "$log"
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+    check "$mode: the promoted disk copy answers the next lookup" \
+      "$(grep -c 'trying the copy on s3' "$log")" "0"
+    check "$mode: and serves it" "$(shadow_stat "$WORK/shadow-r2" 'cache miss')" "0"
+
+    # A real miss from a baked disk must not drop the states S3 holds: the
+    # store merges every copy the lookup saw.
+    printf '#define V 3\n' > "$WORK/shadow/x.h"
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r3"
+    VCACHE_DIR="$WORK/shadow-r3" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r3" "$WORK/shadow-r3.log" "${cmd[@]}"
+    printf '#define V 2\n' > "$WORK/shadow/x.h"
+    cp -R "$WORK/shadow-baked" "$WORK/shadow-r4"
+    VCACHE_DIR="$WORK/shadow-r4" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+    VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r4" "$WORK/shadow-r4.log" "${cmd[@]}"
+    check "$mode: a miss in between kept the other state in S3" \
+      "$(shadow_stat "$WORK/shadow-r4" 'cache miss')" "0"
+  done
+
+  # The same through a daemon: the continuation is its kGetAfter, and the
+  # daemon must not replace its disk copy with S3's while answering it, or
+  # the states only the disk has are lost.
+  cmd=(gcc -M -MP main.c -o "$WORK/shadow/out.d")
+  rm -rf "$WORK/shadow-baked" "$WORK/shadow-r"* "$S3DIR"/*
+  printf '#define V 1\n' > "$WORK/shadow/x.h"
+  shadow_run "$WORK/shadow-baked" "$WORK/shadow-bake.log" "${cmd[@]}"
+  printf '#define V 2\n' > "$WORK/shadow/x.h"
+  with_s3 shadow_run "$WORK/shadow-r1" "$WORK/shadow-r1.log" "${cmd[@]}"
+  cp -R "$WORK/shadow-baked" "$WORK/shadow-r2"
+  VCACHE_DIR="$WORK/shadow-r2" "$VCACHE" --zero-stats >/dev/null
+  log="$WORK/shadow-daemon-r2.log"
+  rm -f "$log"
+  SHADOW_DAEMON=auto with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+  check "daemon: the lookup went through the daemon" \
+    "$(grep -c 'started daemon' "$log")" "1"
+  check "daemon: its stale disk copy sends the lookup on to S3" \
+    "$(grep -c 'no state on disk holds; trying the copy on s3' "$log")" "1"
+  check "daemon: and the state recorded there is a hit" \
+    "$(shadow_stat "$WORK/shadow-r2" 'cache miss')" "0"
+  ( cd "$WORK/shadow" && VCACHE_DIR="$WORK/shadow-r2" VCACHE_ROOTS="$WORK/shadow=proj" \
+      with_s3 "$VCACHE" --stop-daemon ) >/dev/null 2>&1
+  # The disk still holds the baked state: header 1 hits from disk alone.
+  printf '#define V 1\n' > "$WORK/shadow/x.h"
+  VCACHE_DIR="$WORK/shadow-r2" "$VCACHE" --zero-stats >/dev/null
+  shadow_run "$WORK/shadow-r2" "$WORK/shadow-daemon-r2c.log" "${cmd[@]}"
+  check "daemon: the answer did not replace the disk copy" \
+    "$(shadow_stat "$WORK/shadow-r2" 'cache miss')" "0"
+
+  export VCACHE_DIR="$saved_vcache_dir"
+  stop_s3
+fi
+
+# --------------------------------------------------------------------------
 section "15. flags that write a second output file are declined"
 
 # The dangerous shape: the object comes back correct from the cache and the
@@ -4480,6 +4605,107 @@ cp "$WORK/ldsearch/early-libval.a" "$WORK/ldsearch/early/libval.a"
 check "a library appearing in an earlier -L directory is not served the old entry" \
   "$(link_val)" "999"
 check "and that was a miss, not a hit" "$(misses)" "2"
+
+# The link manifest has the same layering as the compile ones (section 14c): a
+# disk copy can name only library states that have since changed, while S3
+# holds the state a later link recorded. The lookup has to move on to S3's copy
+# rather than miss. The objects are on the command line and so in the pre-key;
+# only the library -lval resolves to varies between states.
+#
+# A link's output stays on the disk that linked it (a .linkout sidecar; S3
+# carries only its digest), so S3's state can serve only where that file is
+# present. Each runner below therefore starts from the baked disk plus the
+# outputs an earlier link left on it: a disk whose manifest copy went stale
+# while its outputs survived.
+if command -v python3 >/dev/null 2>&1; then
+  S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  S3DIR="$WORK/s3-link-shadow"
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
+  ls_root="$WORK/link-shadow"
+  mkdir -p "$ls_root/lib" "$ls_root/proj"
+  ( cd "$ls_root/proj"
+    cat > m.c <<'LSEOF'
+#include <stdio.h>
+int value(void);
+int main(void) { printf("%d\n", value()); return 0; }
+LSEOF
+    gcc -c m.c -o m.o
+    for v in 1 2 3; do
+      printf 'int value(void){ return %s; }\n' "$v" > "v$v.c"
+      gcc -c "v$v.c" -o "v$v.o" && ar rcs "$ls_root/libval-v$v.a" "v$v.o"
+    done ) 2>/dev/null
+  use_libval() { cp "$ls_root/libval-v$1.a" "$ls_root/lib/libval.a"; }
+  # $1 cache dir, $2 log, $3 "s3" to add the S3 layer. Prints what the app says.
+  link_shadow() {
+    local s3_env=()
+    if [[ "$3" == s3 ]]; then
+      s3_env=(AWS_ACCESS_KEY_ID=AKIDEXAMPLE
+              AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY
+              VCACHE_S3_BUCKET=testbucket VCACHE_S3_ENDPOINT="http://127.0.0.1:$S3PORT"
+              VCACHE_S3_PATH_STYLE=1 VCACHE_S3_REGION=us-east-1)
+    fi
+    ( cd "$ls_root/proj" && rm -f app && \
+      env "${s3_env[@]}" VCACHE_DIR="$1" VCACHE_DAEMON=off VCACHE_LOG="$2" \
+        "$VCACHE" --vcache-root="$PWD=proj" gcc m.o -L"$ls_root/lib" -lval -o app && \
+      ./app ) 2>/dev/null
+  }
+  ls_stat() { VCACHE_DIR="$1" "$VCACHE" --show-stats | grep -F "$2" | awk '{print $NF}'; }
+  fresh_from_bake() {  # $1 new cache dir; $2, if given, a cache whose outputs it keeps
+    rm -rf "$1"
+    cp -R "$ls_root/baked" "$1"
+    if [[ -n "${2:-}" ]]; then
+      ( cd "$2" && find . -name '*.linkout' -exec cp --parents {} "$1" \; )
+    fi
+    VCACHE_DIR="$1" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+  }
+
+  # The bake: disk only, against the library as it was.
+  use_libval 1
+  link_shadow "$ls_root/baked" "$ls_root/bake.log" disk >/dev/null
+  # The library changes; a runner with a fresh disk records the new state in S3.
+  use_libval 2
+  link_shadow "$ls_root/r1" "$ls_root/r1.log" s3 >/dev/null
+
+  # A disk with the baked manifest and r1's output must find r1's state in S3.
+  fresh_from_bake "$ls_root/r2" "$ls_root/r1"
+  check "link: the stale disk copy sends the lookup on to S3" \
+    "$(grep -c 'no state on disk holds; trying the copy on s3' \
+        <(link_shadow "$ls_root/r2" "$ls_root/r2.log" s3 >/dev/null; cat "$ls_root/r2.log"))" "1"
+  check "link: and the state recorded there is a hit" \
+    "$(ls_stat "$ls_root/r2" 'cache miss')" "0"
+  check "link: the binary it serves links the current library" \
+    "$(link_shadow "$ls_root/r2" "$ls_root/r2b.log" s3)" "2"
+  # That second link ran against the promoted disk copy.
+  check "link: the promoted disk copy answers the next lookup" \
+    "$(grep -c 'trying the copy on s3' "$ls_root/r2b.log")" "0"
+  check "link: and serves it from disk" \
+    "$(grep -c 'link hit on disk' "$ls_root/r2b.log")" "1"
+
+  # A real miss from a baked disk must not drop the state S3 holds.
+  use_libval 3
+  fresh_from_bake "$ls_root/r3"
+  check "link: a third library state is a miss" \
+    "$(link_shadow "$ls_root/r3" "$ls_root/r3.log" s3; ls_stat "$ls_root/r3" 'cache miss')" \
+    "$(printf '3\n1')"
+  use_libval 2
+  fresh_from_bake "$ls_root/r4" "$ls_root/r1"
+  check "link: a miss in between kept the other state in S3" \
+    "$(link_shadow "$ls_root/r4" "$ls_root/r4.log" s3; ls_stat "$ls_root/r4" 'cache miss')" \
+    "$(printf '2\n0')"
+
+  stop_s3
+fi
 
 # A changed input must not be served either, which the pre-key handles because
 # the objects are named on the command line.

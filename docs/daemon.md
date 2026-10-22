@@ -645,6 +645,7 @@ are 8-byte integers and length-prefixed strings, in a fixed order per op
 | --- | --- | --- |
 | hello | version, fingerprint | ok + daemon pid, or refused + reason |
 | get | key | ok + layer + errors + blob, or miss + errors |
+| get after | key, layer | as get, asking only the layers after that one (disk, then held uploads, then S3); an S3 hit does not backfill the disk |
 | put | key, blob | ok + stored flag + errors |
 | status | — | ok + text |
 | shutdown | — | ok + failed-upload count + summary, once uploads have drained |
@@ -687,9 +688,16 @@ sessions alongside its cache requests. A client that never sends another message
 keeps one server thread until its socket closes. Sessions are memory-only and
 are dropped on restart.
 
-A new op, distributed compilation for example, is a version bump. Clients and
-daemons that disagree on the version refuse each other at hello and fall back
-cleanly. Version 1 and version 2 refuse each other with both versions in the reason.
+A new op that an older daemon cannot safely answer "unknown request" to,
+distributed compilation for example, is a version bump. Clients and daemons
+that disagree on the version refuse each other at hello and fall back cleanly.
+Version 1 and version 2 refuse each other with both versions in the reason.
+
+`get after` (2.0.1) was added without one. A 2.0.0 daemon answers it with
+`error + "unknown request"` and keeps the connection, and the client reads that
+as a miss in the slower layers. A manifest lookup through an old daemon simply
+does not look past a stale disk copy. Old clients never send the op. So 2.0.0
+and 2.0.1 clients and daemons serve each other.
 
 ## Not done yet
 

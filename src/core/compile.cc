@@ -672,6 +672,15 @@ bool ParseManifest(const std::string& text, std::vector<DepManifestEntry>* entri
   return true;
 }
 
+// A dependency-scan manifest blob holding `entries`, ready to store.
+std::string SerializeDepManifest(const std::vector<DepManifestEntry>& entries) {
+  storage::Blob blob;
+  blob.dep_manifest = RenderManifest(entries);
+  blob.has_dep_manifest = true;
+  blob.meta = "dependency-scan manifest\nstates: " + std::to_string(entries.size()) + "\n";
+  return storage::SerializeBlob(blob);
+}
+
 // The list a manifest blob holds, or empty when there is none or it does not
 // parse. Lookup and the re-read before a store share this so a corrupt
 // manifest is dropped the same way in both places.
@@ -769,36 +778,64 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   };
 
   std::vector<DepManifestEntry> entries;
+  storage::GetResult got;
   if (cache != nullptr) {
-    storage::GetResult got = cache->Get(key);
+    got = cache->Get(key);
     media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
     entries = DepManifestEntries(got);
   }
 
   if (!config.recache && cache != nullptr) {
-    for (const DepManifestEntry& entry : entries) {
-      // A file that has been deleted, changed or replaced rules the entry out,
-      // which is the whole guarantee behind this mode.
-      if (auto stale = FindStaleManifestFile(entry.files, roots)) {
-        VCACHE_LOG("dep manifest: " + *stale);
-        continue;
+    const std::string first_layer = got.layer;
+    size_t checked = 0;
+    bool emit_failed = false;
+    while (!emit_failed) {
+      for (; checked < entries.size(); ++checked) {
+        const DepManifestEntry& entry = entries[checked];
+        // A file that has been deleted, changed or replaced rules the entry
+        // out, which is the whole guarantee behind this mode.
+        if (auto stale = FindStaleManifestFile(entry.files, roots)) {
+          VCACHE_LOG("dep manifest: " + *stale);
+          continue;
+        }
+        storage::GetResult result = cache->Get(entry.result_key);
+        media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
+        storage::Blob blob;
+        if (!result.hit || !storage::DeserializeBlob(result.value, &blob) ||
+            !blob.has_depfile) {
+          VCACHE_LOG("dep scan: manifest entry matched but its result is gone");
+          continue;
+        }
+        auto dep = ParseDepFile(blob.depfile);
+        if (!dep) continue;
+        RemapDepFile(&*dep, roots, MapDirection::kLocalize);
+        if (!EmitDepOutput(parsed.depfile, RenderDepFile(*dep))) {
+          emit_failed = true;
+          break;
+        }
+        VCACHE_LOG("dep scan hit on " + result.layer);
+        RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
+                                                      : Counter::kHitDisk);
+        // Matched in a slower layer's copy: give the faster layers the
+        // merged manifest, so the next lookup stops at the first.
+        // Re-read first, as a store does, to keep what a concurrent build on
+        // this machine stored since the lookup.
+        if (got.layer != first_layer && !config.read_only && !cache->remote()) {
+          storage::GetResult local = cache->GetLocal(key);
+          media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
+          const std::vector<DepManifestEntry> merged = MergeManifestStates(
+              entry, DepManifestEntries(local), entries, &DepManifestEntry::result_key);
+          media_failed |= ReportCacheMediaErrors(
+              cache->PutBefore(key, SerializeDepManifest(merged), got.layer).errors,
+              cache_dir);
+        }
+        return media_fail_exit();
       }
-      storage::GetResult result = cache->Get(entry.result_key);
-      media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
-      storage::Blob blob;
-      if (!result.hit || !storage::DeserializeBlob(result.value, &blob) ||
-          !blob.has_depfile) {
-        VCACHE_LOG("dep scan: manifest entry matched but its result is gone");
-        continue;
-      }
-      auto dep = ParseDepFile(blob.depfile);
-      if (!dep) continue;
-      RemapDepFile(&*dep, roots, MapDirection::kLocalize);
-      if (!EmitDepOutput(parsed.depfile, RenderDepFile(*dep))) break;
-      VCACHE_LOG("dep scan hit on " + result.layer);
-      RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
-                                                    : Counter::kHitDisk);
-      return media_fail_exit();
+      if (emit_failed) break;
+      got = NextManifestCopy(cache, key, got);
+      media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
+      if (!got.hit) break;
+      AppendManifestStates(&entries, DepManifestEntries(got), &DepManifestEntry::result_key);
     }
   }
   RecordCounter(cache_dir, Counter::kMiss);
@@ -927,14 +964,7 @@ int RunDepScan(const std::vector<std::string>& argv, const Config& config,
   const std::vector<DepManifestEntry> updated = MergeManifestStates(
       std::move(fresh), std::move(reread), entries, &DepManifestEntry::result_key);
 
-  storage::Blob manifest_blob;
-  manifest_blob.dep_manifest = RenderManifest(updated);
-  manifest_blob.has_dep_manifest = true;
-  manifest_blob.meta = "dependency-scan manifest\nstates: " +
-                       std::to_string(updated.size()) + "\n";
-
-  const storage::PutResult manifest_put =
-      cache->Put(key, storage::SerializeBlob(manifest_blob));
+  const storage::PutResult manifest_put = cache->Put(key, SerializeDepManifest(updated));
   media_failed |= ReportCacheMediaErrors(manifest_put.errors, cache_dir, !reread_failed);
   if (manifest_put.stored) {
     RecordCounter(cache_dir, Counter::kStored);
@@ -1126,16 +1156,11 @@ std::string DeriveCxxResultKey(const std::string& manifest_key,
   return hasher.Hex();
 }
 
-std::vector<CxxManifestState> LoadCxxManifest(storage::CacheChain* cache,
-                                              const std::string& manifest_key,
-                                              const std::string& cache_dir,
-                                              bool* media_failed, bool log_if_absent,
-                                              bool* get_failed) {
+// The states one copy of a C/C++ manifest holds; empty when there is no copy
+// or it does not parse.
+std::vector<CxxManifestState> CxxManifestStates(const storage::GetResult& got,
+                                                bool log_if_absent) {
   std::vector<CxxManifestState> states;
-  storage::GetResult got = cache->Get(manifest_key);
-  const bool failed = ReportCacheMediaErrors(got.errors, cache_dir);
-  *media_failed |= failed;
-  if (get_failed != nullptr) *get_failed = failed;
   storage::Blob blob;
   if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
     if (log_if_absent) VCACHE_LOG("cxx manifest: none stored");
@@ -1148,6 +1173,31 @@ std::vector<CxxManifestState> LoadCxxManifest(storage::CacheChain* cache,
   return states;
 }
 
+// `got`, when given, receives the copy the states came from, so a lookup can
+// move on to a slower layer's copy (NextManifestCopy).
+std::vector<CxxManifestState> LoadCxxManifest(storage::CacheChain* cache,
+                                              const std::string& manifest_key,
+                                              const std::string& cache_dir,
+                                              bool* media_failed, bool log_if_absent,
+                                              bool* get_failed,
+                                              storage::GetResult* got = nullptr) {
+  storage::GetResult copy = cache->Get(manifest_key);
+  const bool failed = ReportCacheMediaErrors(copy.errors, cache_dir);
+  *media_failed |= failed;
+  if (get_failed != nullptr) *get_failed = failed;
+  std::vector<CxxManifestState> states = CxxManifestStates(copy, log_if_absent);
+  if (got != nullptr) *got = std::move(copy);
+  return states;
+}
+
+std::string SerializeCxxManifest(const std::vector<CxxManifestState>& states) {
+  storage::Blob blob;
+  blob.dep_manifest = RenderCxxManifest(states);
+  blob.has_dep_manifest = true;
+  blob.meta = "c/c++ manifest\nstates: " + std::to_string(states.size()) + "\n";
+  return storage::SerializeBlob(blob);
+}
+
 bool StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_key,
                       CxxManifestState fresh, const std::vector<CxxManifestState>& loaded,
                       const std::string& cache_dir, bool* media_failed) {
@@ -1157,11 +1207,7 @@ bool StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
       LoadCxxManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
   const std::vector<CxxManifestState> states = MergeManifestStates(
       std::move(fresh), reread, loaded, &CxxManifestState::result_key);
-  storage::Blob blob;
-  blob.dep_manifest = RenderCxxManifest(states);
-  blob.has_dep_manifest = true;
-  blob.meta = "c/c++ manifest\nstates: " + std::to_string(states.size()) + "\n";
-  const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
+  const storage::PutResult put = cache->Put(manifest_key, SerializeCxxManifest(states));
   *media_failed |= ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "cxx manifest: stored " + std::to_string(states.size()) + " states"
                         : std::string("cxx manifest: could not store"));
@@ -1792,13 +1838,17 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   std::string manifest_key;
   std::vector<std::string> keyed_pchs;
   std::vector<CxxManifestState> manifest_states;
+  // The copy manifest_states last grew from, and the layer of the first.
+  storage::GetResult manifest_copy;
+  std::string manifest_first_layer;
   if (config.cxx_manifest && cache != nullptr) {
     manifest_key = ComputeCxxManifestKey(parsed, roots, compiler_id, config, native_target,
                                          cwd, memo_dir, &keyed_pchs);
     if (!manifest_key.empty()) {
       VCACHE_LOG("cxx manifest key " + manifest_key + " for " + parsed.source);
-      manifest_states =
-          LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr);
+      manifest_states = LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, true,
+                                        nullptr, &manifest_copy);
+      manifest_first_layer = manifest_copy.layer;
     }
   }
 
@@ -1806,7 +1856,16 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // usually arrives at the same key, and asking again would only repeat why.
   std::string manifest_unserved_key;
   const auto try_manifest_hit = [&]() {
-    for (size_t i = 0; i < manifest_states.size(); ++i) {
+    for (size_t i = 0;; ++i) {
+      while (i == manifest_states.size()) {
+        // Every state so far is ruled out; a slower layer may hold more.
+        storage::GetResult next = NextManifestCopy(cache, manifest_key, manifest_copy);
+        media_failed |= ReportCacheMediaErrors(next.errors, cache_dir);
+        if (!next.hit) return false;
+        manifest_copy = std::move(next);
+        AppendManifestStates(&manifest_states, CxxManifestStates(manifest_copy, false),
+                             &CxxManifestState::result_key);
+      }
       const std::string which = manifest_key.substr(0, 16) + " state " + std::to_string(i + 1) +
                                 " of " + std::to_string(manifest_states.size());
       if (auto stale = FindStaleManifestFile(manifest_states[i].files, roots, memo_dir)) {
@@ -1818,7 +1877,24 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         continue;
       }
       if (try_hit(manifest_states[i].result_key, which)) {
-        if (i > 0 && !config.read_only) {
+        if (config.read_only) return true;
+        if (manifest_copy.layer != manifest_first_layer) {
+          // Matched in a slower layer's copy: the faster layers get the
+          // merged manifest, so the next lookup stops at the first. Re-read
+          // first, as a store does, to keep a concurrent build's state.
+          if (!cache->remote()) {
+            storage::GetResult local = cache->GetLocal(manifest_key);
+            media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
+            media_failed |= ReportCacheMediaErrors(
+                cache->PutBefore(manifest_key,
+                                 SerializeCxxManifest(MergeManifestStates(
+                                     manifest_states[i], CxxManifestStates(local, false),
+                                     manifest_states, &CxxManifestState::result_key)),
+                                 manifest_copy.layer)
+                    .errors,
+                cache_dir);
+          }
+        } else if (i > 0) {
           StoreCxxManifest(cache, manifest_key, manifest_states[i], manifest_states, cache_dir,
                            &media_failed);
         }
@@ -1827,7 +1903,6 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       manifest_unserved_key = manifest_states[i].result_key;
       VCACHE_LOG("cxx manifest: " + which + " matched but its entry did not serve");
     }
-    return false;
   };
   if (!config.recache && try_manifest_hit()) {
     return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
@@ -1934,8 +2009,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     if (outcome != daemon::LeaseOutcome::kCompile) {
       bool served = false;
       if (derive_key) {
-        manifest_states =
-            LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, false, nullptr);
+        manifest_states = LoadCxxManifest(cache, manifest_key, cache_dir, &media_failed, false,
+                                          nullptr, &manifest_copy);
+        manifest_first_layer = manifest_copy.layer;
         served = try_manifest_hit();
       } else {
         served = try_hit(key, "");

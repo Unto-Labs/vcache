@@ -43,6 +43,10 @@ enum class Op : uint8_t {
   kLeaseRelease = 8,  // str key, u8 outcome (stored = 0, failed = 1)
   kMemoryReserve = 9,  // str cost_key, u64 estimate_kb, u64 bound_ms, optional u8 reply fields
   kCompilerSpawned = 10,  // u64 compiler pid
+  // str key, str layer; as kGet, from the layers after that one. Added without
+  // a version bump: a daemon that predates it answers kError "unknown request",
+  // which the client reads as a miss.
+  kGetAfter = 11,
 };
 
 enum class LeaseOutcome : uint8_t { kGranted = 0, kStored = 1, kCompile = 2 };

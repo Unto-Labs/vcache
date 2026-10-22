@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/roots.h"
+#include "storage/chain.h"
 
 namespace vcache::core {
 
@@ -66,6 +67,33 @@ std::vector<State> PrependManifestState(State fresh, std::vector<State> older,
   }
   return updated;
 }
+
+// Appends each state of `more` whose `key` member `states` does not hold yet,
+// keeping the order: a lookup that moves on to a slower layer's copy checks
+// the faster copy's states first and those it adds after them.
+template <typename State>
+void AppendManifestStates(std::vector<State>* states, std::vector<State> more,
+                          std::string State::*key) {
+  for (State& state : more) {
+    bool seen = false;
+    for (const State& have : *states) {
+      if (have.*key == state.*key) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) states->push_back(std::move(state));
+  }
+}
+
+// The copy of a manifest in the next layer slower than the one `got` came
+// from, or a miss. A lookup asks for it once no state of the copies it has
+// holds. The fastest copy is not necessarily the useful one: a disk cache
+// baked from an older tree keeps a manifest whose states all name headers
+// that have since changed, while S3 holds the state this tree records on every
+// build, and stopping at the first copy found misses every time.
+storage::GetResult NextManifestCopy(storage::CacheChain* cache, const std::string& key,
+                                    const storage::GetResult& got);
 
 // Re-read wins over the list loaded at lookup. `fresh` is first, then the
 // re-read order, then states that existed only in the loaded list. One copy

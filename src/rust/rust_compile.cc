@@ -277,17 +277,11 @@ std::string ComputeManifestKey(const args::RustcArgs& parsed, const RootMap& roo
   return hasher.Hex();
 }
 
-std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
-                                            const std::string& manifest_key,
-                                            const std::string& cache_dir,
-                                            bool* media_failed, bool log_if_absent,
-                                            bool* get_failed, bool local_only = false) {
+// The states one copy of a Rust manifest holds; empty when there is no copy or
+// it does not parse.
+std::vector<RustManifestState> ManifestStates(const storage::GetResult& got,
+                                              bool log_if_absent) {
   std::vector<RustManifestState> states;
-  storage::GetResult got =
-      local_only ? cache->GetLocal(manifest_key) : cache->Get(manifest_key);
-  const bool failed = core::ReportCacheMediaErrors(got.errors, cache_dir);
-  *media_failed |= failed;
-  if (get_failed != nullptr) *get_failed = failed;
   storage::Blob blob;
   if (!got.hit || !storage::DeserializeBlob(got.value, &blob) || !blob.has_dep_manifest) {
     // The store re-reads just before its put. Logging there as well would
@@ -302,6 +296,32 @@ std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
   return states;
 }
 
+// `got`, when given, receives the copy the states came from, so a lookup can
+// move on to a slower layer's copy (NextManifestCopy).
+std::vector<RustManifestState> LoadManifest(storage::CacheChain* cache,
+                                            const std::string& manifest_key,
+                                            const std::string& cache_dir,
+                                            bool* media_failed, bool log_if_absent,
+                                            bool* get_failed, bool local_only = false,
+                                            storage::GetResult* got = nullptr) {
+  storage::GetResult copy =
+      local_only ? cache->GetLocal(manifest_key) : cache->Get(manifest_key);
+  const bool failed = core::ReportCacheMediaErrors(copy.errors, cache_dir);
+  *media_failed |= failed;
+  if (get_failed != nullptr) *get_failed = failed;
+  std::vector<RustManifestState> states = ManifestStates(copy, log_if_absent);
+  if (got != nullptr) *got = std::move(copy);
+  return states;
+}
+
+std::string SerializeManifest(const std::vector<RustManifestState>& states) {
+  storage::Blob blob;
+  blob.dep_manifest = RenderRustManifest(states);
+  blob.has_dep_manifest = true;
+  blob.meta = "rust dep-info manifest\nstates: " + std::to_string(states.size()) + "\n";
+  return storage::SerializeBlob(blob);
+}
+
 void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
                    RustManifestState fresh, const std::vector<RustManifestState>& loaded,
                    const std::string& cache_dir, bool* media_failed) {
@@ -312,11 +332,7 @@ void StoreManifest(storage::CacheChain* cache, const std::string& manifest_key,
                    /*local_only=*/true);
   const std::vector<RustManifestState> states = core::MergeManifestStates(
       std::move(fresh), reread, loaded, &RustManifestState::key);
-  storage::Blob blob;
-  blob.dep_manifest = RenderRustManifest(states);
-  blob.has_dep_manifest = true;
-  blob.meta = "rust dep-info manifest\nstates: " + std::to_string(states.size()) + "\n";
-  const storage::PutResult put = cache->Put(manifest_key, storage::SerializeBlob(blob));
+  const storage::PutResult put = cache->Put(manifest_key, SerializeManifest(states));
   *media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "rust manifest: stored " + std::to_string(states.size()) + " states"
                         : std::string("rust manifest: could not store"));
@@ -924,18 +940,33 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   std::string manifest_key;
   std::vector<RustManifestState> states;
+  // The copy `states` last grew from, and the layer of the first.
+  storage::GetResult manifest_copy;
+  std::string manifest_first_layer;
   if (config.rust_dep_info_policy == core::RustDepInfoPolicy::kManifest &&
       cache != nullptr) {
     if (auto source_digest = hash::HashFile(parsed.source)) {
       manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, config,
                                         *source_digest, *externs);
       VCACHE_LOG("rust manifest key " + manifest_key + " for " + parsed.source);
-      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr);
+      states = LoadManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr,
+                            /*local_only=*/false, &manifest_copy);
+      manifest_first_layer = manifest_copy.layer;
     }
   }
 
   if (!config.recache && !manifest_key.empty()) {
-    for (size_t i = 0; i < states.size(); ++i) {
+    for (size_t i = 0;; ++i) {
+      while (i == states.size()) {
+        // Every state so far is ruled out; a slower layer may hold more.
+        storage::GetResult next = core::NextManifestCopy(cache, manifest_key, manifest_copy);
+        media_failed |= core::ReportCacheMediaErrors(next.errors, cache_dir);
+        if (!next.hit) break;
+        manifest_copy = std::move(next);
+        core::AppendManifestStates(&states, ManifestStates(manifest_copy, false),
+                                   &RustManifestState::key);
+      }
+      if (i == states.size()) break;
       const std::string which =
           "state " + std::to_string(i + 1) + " of " + std::to_string(states.size());
       if (auto mismatch = FindRustStateMismatch(states[i], *externs, roots,
@@ -962,7 +993,24 @@ int RunRustCompile(const std::vector<std::string>& argv,
       VCACHE_LOG("rust key " + states[i].key + " for " + parsed.source);
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
       core::RecordCounters(cache_dir, HitCounter(got), core::Counter::kManifestHit);
-      if (i > 0 && !config.read_only) {
+      if (config.read_only) return 0;
+      if (manifest_copy.layer != manifest_first_layer) {
+        // Matched in a slower layer's copy: the faster layers get the merged
+        // manifest, so the next lookup stops at the first. Re-read first, as
+        // a store does, to keep a concurrent build's state.
+        if (!cache->remote()) {
+          storage::GetResult local = cache->GetLocal(manifest_key);
+          media_failed |= core::ReportCacheMediaErrors(local.errors, cache_dir);
+          media_failed |= core::ReportCacheMediaErrors(
+              cache->PutBefore(manifest_key,
+                               SerializeManifest(core::MergeManifestStates(
+                                   states[i], ManifestStates(local, false), states,
+                                   &RustManifestState::key)),
+                               manifest_copy.layer)
+                  .errors,
+              cache_dir);
+        }
+      } else if (i > 0) {
         StoreManifest(cache, manifest_key, states[i], states, cache_dir, &media_failed);
       }
       return 0;

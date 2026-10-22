@@ -223,9 +223,13 @@ bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
   return true;
 }
 
-bool MaterializeOutputs(const storage::Blob& blob,
-                        const std::vector<std::string>& outputs,
-                        storage::DiskStorage* disk) {
+// kUnusable: nothing was placed, so the next manifest entry may still serve.
+// kFailed: an output may already have been replaced; only a link fixes that.
+enum class Materialized { kPlaced, kUnusable, kFailed };
+
+Materialized MaterializeOutputs(const storage::Blob& blob,
+                                const std::vector<std::string>& outputs,
+                                storage::DiskStorage* disk) {
   std::vector<std::string> expected = outputs;
   std::vector<std::string> stored_names;
   stored_names.reserve(blob.files.size());
@@ -234,15 +238,17 @@ bool MaterializeOutputs(const storage::Blob& blob,
   std::sort(stored_names.begin(), stored_names.end());
   if (expected != stored_names) {
     VCACHE_LOG("link hit: cached output set does not match this invocation");
-    return false;
+    return Materialized::kUnusable;
   }
 
+  std::vector<std::string> stored_paths;
+  stored_paths.reserve(blob.files.size());
   for (const storage::BlobFile& f : blob.files) {
     const auto it = std::find(outputs.begin(), outputs.end(), f.name);
     if (it == outputs.end()) {
       VCACHE_LOG("link hit: entry names an output this run did not ask for: " +
                  f.name);
-      return false;
+      return Materialized::kUnusable;
     }
     // `contents` carries the digest, not the bytes. Link outputs are far too
     // large to move through a blob: a 2.2 GB shared library took 37 s to replay
@@ -256,20 +262,31 @@ bool MaterializeOutputs(const storage::Blob& blob,
         });
     if (!valid_digest) {
       VCACHE_LOG("link hit: cached output has an invalid content digest");
-      return false;
+      return Materialized::kUnusable;
     }
     // The disk cache evicts oldest-mtime-first across every file in its shards,
     // and DiskStorage::Get refreshes only the entry. GetFile refreshes the
     // output too, or a hot output ages out before its entry and every later
     // hit fails verification and relinks.
-    const auto stored = disk->GetFile(f.contents, kLinkOutputSuffix);
+    //
+    // Every output is found before any is placed, so an entry whose output
+    // is not on this disk -- one recorded by another machine, whose S3 copy
+    // carries only the digest -- places nothing and leaves the next entry free
+    // to serve.
+    auto stored = disk->GetFile(f.contents, kLinkOutputSuffix);
     if (!stored) {
       VCACHE_LOG("link hit: stored output is gone: " + f.contents);
-      return false;
+      return Materialized::kUnusable;
     }
-    if (!PlaceVerifiedClone(*stored, f.contents, f.name, f.executable)) return false;
+    stored_paths.push_back(std::move(*stored));
   }
-  return true;
+  for (size_t i = 0; i < blob.files.size(); ++i) {
+    const storage::BlobFile& f = blob.files[i];
+    if (!PlaceVerifiedClone(stored_paths[i], f.contents, f.name, f.executable)) {
+      return Materialized::kFailed;
+    }
+  }
+  return Materialized::kPlaced;
 }
 
 }  // namespace
@@ -322,23 +339,42 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   bool media_failed = false;
   std::vector<LinkManifestEntry> entries;
-  const auto load_entries = [&]() {
-    if (cache == nullptr) return;
-    storage::GetResult got = cache->Get(pre_key);
-    media_failed |= ReportCacheMediaErrors(got.errors, cache_dir);
+  // The copy `entries` last grew from, and the layer of the first.
+  storage::GetResult manifest_copy;
+  std::string manifest_first_layer;
+  const auto entries_of = [](const storage::GetResult& got) {
+    std::vector<LinkManifestEntry> parsed_entries;
     storage::Blob manifest_blob;
     if (got.hit && storage::DeserializeBlob(got.value, &manifest_blob) &&
         manifest_blob.has_dep_manifest &&
-        !ParseLinkManifest(manifest_blob.dep_manifest, &entries)) {
+        !ParseLinkManifest(manifest_blob.dep_manifest, &parsed_entries)) {
       VCACHE_LOG("link: manifest did not parse; starting a new one");
-      entries.clear();
+      parsed_entries.clear();
     }
+    return parsed_entries;
+  };
+  const auto load_entries = [&]() {
+    if (cache == nullptr) return;
+    manifest_copy = cache->Get(pre_key);
+    media_failed |= ReportCacheMediaErrors(manifest_copy.errors, cache_dir);
+    manifest_first_layer = manifest_copy.layer;
+    entries = entries_of(manifest_copy);
   };
   load_entries();
 
   const auto try_link_hit = [&]() {
     if (cache == nullptr) return false;
-    for (const LinkManifestEntry& e : entries) {
+    for (size_t i = 0;; ++i) {
+      while (i == entries.size()) {
+        // Every entry so far is ruled out; a slower layer may hold more.
+        storage::GetResult next = NextManifestCopy(cache, pre_key, manifest_copy);
+        media_failed |= ReportCacheMediaErrors(next.errors, cache_dir);
+        if (!next.hit) return false;
+        manifest_copy = std::move(next);
+        AppendManifestStates(&entries, entries_of(manifest_copy),
+                             &LinkManifestEntry::result_key);
+      }
+      const LinkManifestEntry& e = entries[i];
       if (!LinkManifestStillHolds(e, roots)) continue;
       storage::GetResult result = cache->Get(e.result_key);
       media_failed |= ReportCacheMediaErrors(result.errors, cache_dir);
@@ -347,13 +383,32 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("link: manifest entry matched but its result is gone");
         continue;
       }
-      if (!MaterializeOutputs(blob, outputs, &disk)) break;
+      const Materialized placed = MaterializeOutputs(blob, outputs, &disk);
+      if (placed == Materialized::kUnusable) continue;
+      if (placed == Materialized::kFailed) break;
       if (!blob.stderr_text.empty()) {
         ::fputs(roots.LocalizeText(blob.stderr_text).c_str(), stderr);
       }
       VCACHE_LOG("link hit on " + result.layer);
       RecordCounter(cache_dir, result.layer == "s3" ? Counter::kHitS3
                                                     : Counter::kHitDisk);
+      if (manifest_copy.layer != manifest_first_layer && !config.read_only &&
+          !cache->remote()) {
+        // Matched in a slower layer's copy: the faster layers get the merged
+        // manifest, so the next lookup stops at the first. Re-read first, as
+        // a store does, to keep a concurrent build's state.
+        storage::GetResult local = cache->GetLocal(pre_key);
+        media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
+        storage::Blob manifest_blob;
+        manifest_blob.dep_manifest = RenderLinkManifest(MergeManifestStates(
+            e, entries_of(local), entries, &LinkManifestEntry::result_key));
+        manifest_blob.has_dep_manifest = true;
+        media_failed |= ReportCacheMediaErrors(
+            cache->PutBefore(pre_key, storage::SerializeBlob(manifest_blob),
+                             manifest_copy.layer)
+                .errors,
+            cache_dir);
+      }
       return true;
     }
     return false;

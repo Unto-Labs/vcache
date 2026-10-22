@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "vcache 2.0.0";
+constexpr const char* kVersion = "vcache 2.0.1";
 
 // Masquerade hops through vcache within one compiler's process chain. A real
 // chain is short (rustc running a masqueraded linker is two); a cycle is not.

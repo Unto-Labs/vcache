@@ -2,6 +2,30 @@
 
 Each release is also described in its annotated tag (`git tag -n99 vX.Y.Z`).
 
+## 2.0.1
+
+A patch release. Cache keys are unchanged, so 2.0.0 entries keep serving. The
+daemon protocol stays at version 2, so 2.0.0 and 2.0.1 clients and daemons
+serve each other.
+
+Fixes:
+
+- **Manifests across cache layers.** A dependency-scan, C/C++, Rust or link
+  manifest lookup stopped at the first layer holding a copy. When every state
+  in that copy was stale, it missed, even if S3 held a state that matched.
+  - It now moves on to the next layer's copy and promotes a match into the
+    faster layers. A store merges every copy the lookup saw instead of
+    overwriting S3's states with the disk's.
+  - A lookup answered by the first copy costs nothing extra.
+  - CI runners starting from a disk cache baked from an older tree hit this on
+    every build: thru-net's gcc asan lanes re-ran about 165 dependency scans
+    per job.
+- **Daemon `get after`.** A new op lets a daemon chain do the same, without
+  replacing the daemon's disk copy with S3's. A 2.0.0 daemon answers it
+  "unknown request", which a 2.0.1 client treats as a miss.
+- **Link hits.** An entry whose output is not on this disk now lets the next
+  entry serve, instead of ending the lookup.
+
 ## 2.0.0
 
 A major release, because every cache key moved: entries written by 1.3.0 and

@@ -1411,6 +1411,40 @@ class FakeStorage : public storage::Storage {
 void TestCacheChain() {
   Section("storage::CacheChain");
 
+  // GetAfter continues a lookup past the layer that answered it, which is how a
+  // manifest lookup reaches a slower layer's copy when the faster one is stale.
+  // PutBefore promotes into the faster layers only.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    FakeStorage* disk_ptr = disk.get();
+    FakeStorage* s3_ptr = s3.get();
+    disk_ptr->Seed("abcdef", "stale");
+    s3_ptr->Seed("abcdef", "fresh");
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    const storage::GetResult first = chain.Get("abcdef");
+    CheckEq(first.value, "stale", "Get stops at the fastest copy");
+    const storage::GetResult next = chain.GetAfter("abcdef", first.layer);
+    Check(next.hit && next.layer == "s3", "GetAfter answers from the next layer");
+    CheckEq(next.value, "fresh", "and with that layer's copy");
+    Check(!chain.GetAfter("abcdef", "s3").hit, "nothing is slower than the last layer");
+    Check(!chain.GetAfter("abcdef", "nonesuch").hit, "an unknown layer answers nothing");
+
+    const int s3_puts = s3_ptr->puts;
+    Check(chain.PutBefore("abcdef", "merged", "s3").stored,
+          "PutBefore stores into the faster layer");
+    std::string value;
+    disk_ptr->Get("abcdef", &value);
+    CheckEq(value, "merged", "the faster layer now holds the merged copy");
+    Check(s3_ptr->puts == s3_puts, "PutBefore leaves the layer it names alone");
+    Check(!chain.PutBefore("abcdef", "x", "disk").stored,
+          "nothing is faster than the first layer");
+  }
+
   // A store must reach every writable layer. This is what makes a compile on
   // one machine visible to every other one: there is no later promotion step
   // that would move a local-only entry up to the shared layer.
@@ -1581,6 +1615,10 @@ class FakeRemote : public storage::RemoteCache {
     entries_[key] = value;
     result->stored = true;
     return true;
+  }
+  bool GetAfter(const std::string& /*key*/, const std::string& /*after*/,
+                storage::GetResult* /*result*/) override {
+    return !*broken_;  // one layer: nothing after it
   }
 
  private:
@@ -1906,8 +1944,9 @@ void TestCompileSessions() {
   Check(fd >= 0 && refused.U8(&status) &&
             status == static_cast<uint8_t>(daemon::Status::kRefused) &&
             refused.Str(&reason) && reason.find("version 1") != std::string::npos &&
-            reason.find("speaks 2") != std::string::npos,
-        "v1 hello is refused and names client version 1 and daemon version 2");
+            reason.find("speaks " + std::to_string(daemon::kProtocolVersion)) !=
+                std::string::npos,
+        "v1 hello is refused and names client version 1 and the daemon's version");
   if (fd >= 0) ::close(fd);
 
   fd = server.Open(&reply);

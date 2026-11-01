@@ -2,6 +2,32 @@
 
 Each release is also described in its annotated tag (`git tag -n99 vX.Y.Z`).
 
+## 2.0.2
+
+A patch release. Cache keys are unchanged, so 2.0.0 and 2.0.1 entries keep
+serving. The daemon protocol stays at version 2 and the daemon handshake is
+unchanged, so 2.0.0, 2.0.1 and 2.0.2 clients and daemons serve each other.
+
+Fixes:
+
+- **S3 entries in use no longer expire.** An object's age is its
+  `Last-Modified`, which reading it never changes, so the TTL and a bucket
+  lifecycle rule both counted from when an entry was written. An entry served
+  to every build still expired `ttl_days` after it was stored, and a cache
+  filled in one warm-up expired all on the same day.
+  - A hit on an entry at least `refresh_days` old now copies the object onto
+    itself on the server. Nothing is re-uploaded; `Last-Modified`, and a
+    lifecycle rule's clock, restart.
+  - `refresh_days` (`VCACHE_S3_REFRESH_DAYS`) defaults to half of `ttl_days`.
+    `0` disables it. With `ttl_days = 0` there is no default, but an explicit
+    value still applies.
+  - The refresh never changes a hit: a copy that fails is logged and the entry
+    ages as before. Expired entries are not revived, and read-only clients do
+    not refresh.
+  - It needs `s3:PutObject`, which stores already require.
+  - A 2.0.0 or 2.0.1 daemon serving 2.0.2 clients does not refresh; restart it
+    to pick this up.
+
 ## 2.0.1
 
 A patch release. Cache keys are unchanged, so 2.0.0 entries keep serving. The

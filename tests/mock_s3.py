@@ -4,10 +4,18 @@
 """A minimal S3-compatible object store, used to exercise vcache's S3 layer.
 
 It implements just enough for the cache: PUT, GET and DELETE of a single
-object, ListObjectsV2 with continuation, plus 404 on a missing key. Requests
-must carry a SigV4 Authorization header and the x-amz-content-sha256 payload
-hash, and the payload hash is verified, so a malformed request fails the test
-rather than silently passing.
+object, CopyObject (a PUT carrying x-amz-copy-source), ListObjectsV2 with
+continuation, plus 404 on a missing key. Requests must carry a SigV4
+Authorization header and the x-amz-content-sha256 payload hash, and the payload
+hash is verified, so a malformed request fails the test rather than silently
+passing.
+
+CopyObject follows S3 where vcache depends on it: x-amz-* headers must be
+signed, a copy of an object onto itself needs x-amz-metadata-directive:
+REPLACE, and the result is a new object with a new Last-Modified.
+MOCK_S3_COPY_LOG names a file that gets one line per completed copy.
+MOCK_S3_DENY_COPY=1 answers copies with 403, and MOCK_S3_COPY_ERROR_200=1 with
+the 200-plus-<Error> body S3 can send when a copy fails late.
 
 Signature *validity* is covered by known-answer tests in the unit suite; this
 server checks request shape and round-tripping.
@@ -30,7 +38,7 @@ import socket
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 STORAGE = None
 TRANSIENT_PUTS = {}
@@ -195,10 +203,65 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _copy(self, path):
+        source = self.headers["x-amz-copy-source"]
+        signed = self.headers["Authorization"].split("SignedHeaders=", 1)[1].split(",", 1)[0]
+        # Real S3: "There were headers present in the request which were not
+        # signed". A signer that forgets the copy headers fails here.
+        for h in ("x-amz-copy-source", "x-amz-metadata-directive"):
+            if h in self.headers and h not in signed.split(";"):
+                self.send_error(403, f"{h} not signed")
+                return
+        if os.environ.get("MOCK_S3_DENY_COPY") == "1":
+            self.send_error(403, "AccessDenied")
+            return
+        src_bucket_key = unquote(source).lstrip("/").split("/", 1)
+        if len(src_bucket_key) != 2:
+            self.send_error(400, "bad copy source")
+            return
+        src = os.path.join(STORAGE, src_bucket_key[1].replace("..", "_").replace("/", "__"))
+        if src == path and self.headers.get("x-amz-metadata-directive") != "REPLACE":
+            self.send_error(400, "InvalidRequest: copy onto itself without changing anything")
+            return
+        if not os.path.exists(src):
+            self.send_error(404, "NoSuchKey")
+            return
+        if os.environ.get("MOCK_S3_COPY_ERROR_200") == "1":
+            payload = (b'<?xml version="1.0" encoding="UTF-8"?>'
+                       b"<Error><Code>InternalError</Code>"
+                       b"<Message>We encountered an internal error.</Message></Error>")
+        else:
+            with open(src, "rb") as f:
+                data = f.read()
+            tmp = path + ".copying"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)  # a new object: Last-Modified is now
+            when = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                       f"<CopyObjectResult><LastModified>{when}</LastModified>"
+                       '<ETag>"0"</ETag></CopyObjectResult>').encode()
+            log = os.environ.get("MOCK_S3_COPY_LOG")
+            if log:
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(urlparse(self.path).path + "\n")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_PUT(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         if not self._check_headers(body):
+            return
+        if "x-amz-copy-source" in self.headers:
+            path = self._object_path()
+            if path is None:
+                self.send_error(400, "bad key")
+                return
+            self._copy(path)
             return
         # 403 is a miss with no error string. A refused synchronous put must
         # still count as a failed upload.

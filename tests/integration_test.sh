@@ -2067,6 +2067,111 @@ BACKDATE
       "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/s7.o" ) 2>/dev/null
   check "ttl=0 disables expiry" "$(stat_of 'cache hit (s3)')" "1"
 
+  # --- refresh on hit -------------------------------------------------------
+  #
+  # Reads never move Last-Modified, so an entry hit every day would still
+  # expire a ttl after it was written. A hit on an entry past the refresh age
+  # (half the ttl by default) copies it onto itself, which resets that age.
+  # Age of the oldest object in the bucket, in whole days.
+  s3_age_days() {
+    python3 - "$S3DIR" <<'AGE'
+import os, sys, time
+paths = [os.path.join(d, n) for d, _, ns in os.walk(sys.argv[1]) for n in ns]
+print(int((time.time() - min(os.stat(p).st_mtime for p in paths)) // 86400))
+AGE
+  }
+  s3_hit_b() {
+    ( cd "$WORK/checkout-b" && VCACHE_ROOTS="$WORK/checkout-b=proj" "$@" \
+        "$VCACHE" g++ -g -O2 -c -I include src/lib.cc -o "$WORK/sr.o" ) 2>/dev/null
+  }
+
+  reset_cache
+  backdate "$((20 * day))"
+  s3_hit_b env VCACHE_LOG="$WORK/refresh.log"
+  check "an entry past the refresh age still serves" "$(stat_of 'cache hit (s3)')" "1"
+  check "and is refreshed: its age starts again" "$(s3_age_days)" "0"
+  check "the refresh is logged" "$(grep -c 'days old; refreshed' "$WORK/refresh.log")" "1"
+  check "a refresh is not a cache media error" "$(stat_of 'cache media errors')" "0"
+  check "a refresh adds no object" "$(find "$S3DIR" -type f | wc -l | tr -d " ")" "1"
+
+  reset_cache
+  backdate "$((5 * day))"
+  s3_hit_b
+  check "a young entry serves" "$(stat_of 'cache hit (s3)')" "1"
+  check "and is left alone" "$(s3_age_days)" "5"
+
+  reset_cache
+  s3_hit_b env VCACHE_S3_REFRESH_DAYS=3
+  check "an explicit refresh age applies" "$(s3_age_days)" "0"
+
+  reset_cache
+  backdate "$((20 * day))"
+  s3_hit_b env VCACHE_S3_REFRESH_DAYS=0
+  check "refresh_days=0 disables refreshing" "$(s3_age_days)" "20"
+
+  # With no ttl the default refresh age is "never", but an explicit one still
+  # works: it is how to keep a bucket lifecycle rule from expiring live entries.
+  reset_cache
+  s3_hit_b env VCACHE_S3_TTL_DAYS=0
+  check "no ttl means no default refresh" "$(s3_age_days)" "20"
+  reset_cache
+  s3_hit_b env VCACHE_S3_TTL_DAYS=0 VCACHE_S3_REFRESH_DAYS=10
+  check "an explicit refresh age works without a ttl" "$(s3_age_days)" "0"
+
+  # An expired entry is a miss and must not be revived by a refresh.
+  reset_cache
+  backdate "$((40 * day))"
+  s3_hit_b
+  check "an expired entry is not refreshed" "$(stat_of 'cache hit (s3)')" "0"
+
+  # A read-only client never writes, refreshes included.
+  reset_cache
+  backdate "$((20 * day))"
+  s3_hit_b env VCACHE_READONLY=1
+  check "a read-only client serves the hit" "$(stat_of 'cache hit (s3)')" "1"
+  check "but does not refresh it" "$(s3_age_days)" "20"
+
+  check "a refresh age past the ttl is warned about" \
+        "$(VCACHE_S3_REFRESH_DAYS=30 "$VCACHE" --show-config 2>&1 | grep -c 'entries expire before they are refreshed')" "1"
+  check "show-config reports the refresh age" \
+        "$("$VCACHE" --show-config | grep -c 'refresh: *entries at least 15 days old')" "1"
+
+  # A refused copy, and one S3 fails after answering 200, both leave the hit
+  # standing and the entry as it was.
+  for mode in MOCK_S3_DENY_COPY MOCK_S3_COPY_ERROR_200; do
+    stop_s3
+    env "$mode=1" python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+    S3PID=$!
+    for _ in $(seq 1 50); do
+      python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+      sleep 0.1
+    done
+    reset_cache
+    backdate "$((20 * day))"
+    s3_hit_b env VCACHE_LOG="$WORK/refresh-$mode.log"
+    check "$mode: the hit still serves" "$(stat_of 'cache hit (s3)')" "1"
+    check "$mode: the entry keeps its age" "$(s3_age_days)" "20"
+    check "$mode: no cache media error" "$(stat_of 'cache media errors')" "0"
+    check "$mode: the failure is logged" "$(grep -c 'refresh failed' "$WORK/refresh-$mode.log")" "1"
+  done
+  stop_s3
+  python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  S3PID=$!
+  for _ in $(seq 1 50); do
+    python3 -c "
+import socket,sys
+s=socket.socket()
+try: s.connect(('127.0.0.1',$S3PORT)); sys.exit(0)
+except Exception: sys.exit(1)
+" 2>/dev/null && break
+    sleep 0.1
+  done
+
   # --- trim -----------------------------------------------------------------
 
   before=$(find "$S3DIR" -type f | wc -l | tr -d " ")
@@ -2465,6 +2570,15 @@ except Exception: sys.exit(1)
   else
     bad "the object from s3 via the daemon is byte-identical"
   fi
+  "$VCACHE" --stop-daemon >/dev/null
+
+  # The daemon performs the s3 read, so it is the daemon that refreshes.
+  reset_cache
+  backdate "$((20 * day))"
+  "$VCACHE" --start-daemon >/dev/null
+  compile_b "$WORK/ds-refresh.o"
+  check "the daemon serves an old s3 entry" "$(stat_of 'cache hit (s3)')" "1"
+  check "and refreshes it" "$(s3_age_days)" "0"
   "$VCACHE" --stop-daemon >/dev/null
 
   # A journalled upload left by a daemon that died is sent by the next one.

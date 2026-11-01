@@ -117,7 +117,9 @@ protocol version and every setting that decides *where entries live*:
 - a digest of the S3 access key id
 
 The daemon refuses a client that differs in any of them and logs which setting
-differed. The client then runs in-process. A build with a different
+differed. The S3 refresh age is deliberately not among them: it decides when an
+old entry is rewritten, not where entries live, and the daemon applies its own
+setting to the reads it performs. The client then runs in-process. A build with a different
 `VCACHE_DIR` or bucket is therefore never served from someone else's cache.
 The access key itself never crosses the socket.
 

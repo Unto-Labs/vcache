@@ -114,6 +114,7 @@ timeout        = 30                # seconds
 | `cache.s3.timeout` | *(none)* | — | `30` |
 | `cache.s3.assume_no_list_bucket` | *(none)* | — | `false` |
 | `cache.s3.ttl_days` | `VCACHE_S3_TTL_DAYS` | — | `30` |
+| `cache.s3.refresh_days` | `VCACHE_S3_REFRESH_DAYS` | — | half of `ttl_days` |
 | `cache.s3.size` | `VCACHE_S3_CACHE_SIZE` | — | `0` (uncapped) |
 | `daemon.mode` | `VCACHE_DAEMON` | — | `off` |
 | `daemon.idle_timeout` | `VCACHE_DAEMON_IDLE_TIMEOUT` | — | `900` |
@@ -616,8 +617,9 @@ installed, vcache prints one warning and continues with the local cache.
 
 ```toml
 [cache.s3]
-ttl_days = 30      # 0 disables expiry
-size     = "500G"  # 0, the default, means no cap
+ttl_days     = 30      # 0 disables expiry
+refresh_days = 15      # the default: half of ttl_days; 0 disables refreshing
+size         = "500G"  # 0, the default, means no cap
 ```
 
 `ttl_days` is enforced **on read**, not only by `--trim`: an object older than
@@ -627,6 +629,32 @@ to trim, or on a bucket rule being present and correctly scoped. Age comes from
 the object's `Last-Modified`; if that header is missing or unparseable the entry
 is served rather than refused, because losing a good cache to a header quirk is
 worse than serving something slightly stale.
+
+Reading an object does not change its `Last-Modified`, so on its own the TTL
+measures time since an entry was **written**, not since it was last used. An
+entry hit by every build would still expire `ttl_days` after it was stored,
+and everything stored in one warm-up would expire on the same day. So a hit on
+an entry at least `refresh_days` old also **refreshes** it: vcache copies the
+object onto itself on the server (`CopyObject` with
+`x-amz-metadata-directive: REPLACE`), which gives it a new `Last-Modified`
+without uploading it again. That also restarts a bucket lifecycle rule's clock,
+which counts from the same write.
+
+- The default, half the TTL, keeps an entry in use from ever expiring while
+  costing one extra request per entry per half-TTL. Entries nobody reads still
+  expire on schedule.
+- With `ttl_days = 0` there is no default refresh age, but an explicit
+  `refresh_days` still applies; that is how to keep a bucket's own lifecycle
+  rule from expiring entries in use. A `refresh_days` at or above `ttl_days`
+  can never fire, and vcache warns about it.
+- The copy is a write: it needs `s3:PutObject` (as stores already do), and a
+  read-only client (`VCACHE_READONLY`, `no_credentials`) never refreshes.
+- It happens after the hit has been served and never changes the outcome: a
+  copy that fails is logged (`VCACHE_LOG`) and the entry simply ages as
+  before. An entry already past the TTL is a miss and is not revived.
+- Several machines hitting the same old entry at once may each copy it. That is
+  harmless: the copies are idempotent, and the first one to land resets the age
+  the others then see.
 
 `size` is a byte budget for this layer, and unlike the disk budget it is
 enforced **only** by `vcache --trim`, never during a compile. Two reasons:
@@ -647,7 +675,10 @@ quietly doing nothing is visible.
 A bucket lifecycle rule remains the better primary mechanism where you control
 the bucket: it costs nothing, runs server-side, and cannot be skipped. vcache's
 TTL is the belt to that braces — it bounds what a build can be handed
-regardless of what the bucket is configured to do.
+regardless of what the bucket is configured to do. Keep the rule's expiration
+at least as long as `ttl_days`: refreshing keeps live entries younger than
+`refresh_days`, which only protects them from a rule that waits longer than
+that.
 
 ### Auto-disable rules
 

@@ -137,6 +137,9 @@ void ApplyTomlFile(const std::string& path, Config* config) {
     if (auto v = TomlInt(*s3, "ttl_days")) {
       if (*v >= 0) config->s3.ttl_days = static_cast<int>(*v);
     }
+    if (auto v = TomlInt(*s3, "refresh_days")) {
+      if (*v >= 0) config->s3.refresh_days = static_cast<int>(*v);
+    }
     if (auto v = TomlString(*s3, "size")) {
       uint64_t bytes = 0;
       if (util::ParseSize(*v, &bytes)) {
@@ -280,6 +283,21 @@ void ApplyEnvironment(Config* config) {
     } else {
       config->warnings.push_back("VCACHE_S3_TTL_DAYS: not a day count '" + *v + "'");
     }
+  }
+  if (auto v = Env("VCACHE_S3_REFRESH_DAYS")) {
+    char* end = nullptr;
+    const long days = std::strtol(v->c_str(), &end, 10);
+    if (end != v->c_str() && *end == '\0' && days >= 0) {
+      config->s3.refresh_days = static_cast<int>(days);
+    } else {
+      config->warnings.push_back("VCACHE_S3_REFRESH_DAYS: not a day count '" + *v + "'");
+    }
+  }
+  if (config->s3.ttl_days > 0 && config->s3.refresh_days >= config->s3.ttl_days) {
+    config->warnings.push_back(
+        "cache.s3.refresh_days (" + std::to_string(config->s3.refresh_days) +
+        ") is not below ttl_days (" + std::to_string(config->s3.ttl_days) +
+        "): entries expire before they are refreshed");
   }
   if (auto v = Env("VCACHE_S3_CACHE_SIZE")) {
     uint64_t bytes = 0;
@@ -556,6 +574,12 @@ std::string DescribeConfig(const Config& config) {
       out << config.s3.ttl_days << " days\n";
     } else {
       out << "none\n";
+    }
+    out << "  refresh:        ";
+    if (config.s3.RefreshDays() > 0) {
+      out << "entries at least " << config.s3.RefreshDays() << " days old, on a hit\n";
+    } else {
+      out << "never\n";
     }
     out << "  max size:       ";
     if (config.s3.max_size > 0) {

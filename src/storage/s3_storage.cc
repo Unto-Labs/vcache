@@ -63,15 +63,42 @@ std::string BuildAuthorization(const std::string& method,
                                const std::string& region,
                                const std::string& access_key,
                                const std::string& secret_key) {
-  // Canonical headers must be sorted by lowercase name; the set below is
-  // already in order (host, x-amz-content-sha256, x-amz-date, x-amz-security-token).
-  std::string canonical_headers = "host:" + host + "\n" +
-                                  "x-amz-content-sha256:" + payload_hash + "\n" +
-                                  "x-amz-date:" + amz_date + "\n";
-  std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
-  if (!session_token.empty()) {
-    canonical_headers += "x-amz-security-token:" + session_token + "\n";
-    signed_headers += ";x-amz-security-token";
+  return BuildAuthorization(method, canonical_uri, query, host, amz_date,
+                            date_stamp, payload_hash, session_token, region,
+                            access_key, secret_key, /*extra_headers=*/{});
+}
+
+std::string BuildAuthorization(const std::string& method,
+                               const std::string& canonical_uri,
+                               const std::string& query,
+                               const std::string& host,
+                               const std::string& amz_date,
+                               const std::string& date_stamp,
+                               const std::string& payload_hash,
+                               const std::string& session_token,
+                               const std::string& region,
+                               const std::string& access_key,
+                               const std::string& secret_key,
+                               const std::vector<Header>& extra_headers) {
+  // Canonical headers must be sorted by lowercase name. S3 refuses a request
+  // that carries an x-amz-* header it was not asked to sign, so every extra
+  // header is signed too, merged into the same order.
+  std::vector<Header> headers = {
+      {"host", host},
+      {"x-amz-content-sha256", payload_hash},
+      {"x-amz-date", amz_date},
+  };
+  if (!session_token.empty()) headers.push_back({"x-amz-security-token", session_token});
+  headers.insert(headers.end(), extra_headers.begin(), extra_headers.end());
+  std::sort(headers.begin(), headers.end(),
+            [](const Header& a, const Header& b) { return a.first < b.first; });
+
+  std::string canonical_headers;
+  std::string signed_headers;
+  for (const Header& h : headers) {
+    canonical_headers += h.first + ":" + h.second + "\n";
+    if (!signed_headers.empty()) signed_headers += ";";
+    signed_headers += h.first;
   }
 
   // The canonical query string must already be sorted by key and encoded; the
@@ -367,11 +394,12 @@ bool S3Storage::Request(const std::string& method,
                         const std::string& canonical_uri_path,
                         const std::string& query, const std::string& payload,
                         std::string* response_body,
-                        std::time_t* last_modified) {
+                        std::time_t* last_modified,
+                        const std::vector<sigv4::Header>& extra_headers) {
   int backoff_ms = kFirstBackoffMs;
   for (int attempt = 1;; ++attempt) {
     if (RequestOnce(method, canonical_uri_path, query, payload, response_body,
-                    last_modified)) {
+                    last_modified, extra_headers)) {
       return true;
     }
     // A 404/403 miss is not transient, and neither is a signing or connection
@@ -394,7 +422,8 @@ bool S3Storage::RequestOnce(const std::string& method,
                             const std::string& canonical_uri_path,
                             const std::string& query, const std::string& payload,
                             std::string* response_body,
-                            std::time_t* last_modified) {
+                            std::time_t* last_modified,
+                            const std::vector<sigv4::Header>& extra_headers) {
   if (curl_ == nullptr) {  // libcurl unavailable; behave as a miss
     SetError("libcurl is not available: " + load_error_);
     return false;
@@ -428,11 +457,14 @@ bool S3Storage::RequestOnce(const std::string& method,
     headers = curl_->slist_append(
         headers, ("x-amz-security-token: " + config_.session_token).c_str());
   }
+  for (const sigv4::Header& h : extra_headers) {
+    headers = curl_->slist_append(headers, (h.first + ": " + h.second).c_str());
+  }
   if (!config_.no_credentials) {
     const std::string authorization = sigv4::BuildAuthorization(
         method, canonical_uri, query, host, amz_date, date_stamp, payload_hash,
         config_.session_token, config_.region, config_.access_key,
-        config_.secret_key);
+        config_.secret_key, extra_headers);
     headers = curl_->slist_append(headers, ("Authorization: " + authorization).c_str());
   }
   // S3 rejects the Expect: 100-continue that curl adds for larger PUTs.
@@ -514,19 +546,60 @@ bool S3Storage::Get(const std::string& key, std::string* value) {
   // unparseable, which is treated as "unknown age" and allowed through: losing
   // a good cache to a header quirk would be a worse failure than serving an
   // entry slightly past its window.
-  if (config_.ttl_days > 0 && last_modified > 0) {
+  if (last_modified > 0) {
     const std::time_t age = std::time(nullptr) - last_modified;
     const std::time_t ttl =
         static_cast<std::time_t>(config_.ttl_days) * 24 * 60 * 60;
-    if (age > ttl) {
+    if (config_.ttl_days > 0 && age > ttl) {
       VCACHE_LOG("s3: " + ObjectKey(key) + " is " + std::to_string(age / 86400) +
                  " days old, past the " + std::to_string(config_.ttl_days) +
                  "-day ttl; treating as a miss");
       return false;
     }
+    // Still good, but old enough that it would expire while in use, by the ttl
+    // or by a bucket lifecycle rule, which counts from the same write. Refresh
+    // it now, after the ttl check so an expired entry is never revived. The
+    // hit stands whether or not this works, and its failure is not this
+    // lookup's error: the entry was served.
+    const std::time_t refresh =
+        static_cast<std::time_t>(config_.RefreshDays()) * 24 * 60 * 60;
+    if (refresh > 0 && age >= refresh && !read_only_) {
+      const bool refreshed = Refresh(key);
+      VCACHE_LOG("s3: " + ObjectKey(key) + " is " + std::to_string(age / 86400) +
+                 " days old; " + (refreshed ? "refreshed" : "refresh failed: " + last_error()));
+      ClearError();
+    }
   }
 
   *value = std::move(body);
+  return true;
+}
+
+bool S3Storage::Refresh(const std::string& key) {
+  const std::string object_key = ObjectKey(key);
+  // REPLACE is what makes a copy onto itself legal: S3 refuses one that would
+  // change nothing. vcache stores no user metadata, so replacing it with none
+  // loses nothing. The source is "/<bucket>/<key>", URL-encoded, in every
+  // addressing style.
+  const std::vector<sigv4::Header> headers = {
+      {"x-amz-copy-source",
+       "/" + config_.bucket + "/" + sigv4::UriEncode(object_key, /*keep_slash=*/true)},
+      {"x-amz-metadata-directive", "REPLACE"},
+  };
+  std::string response;
+  if (!Request("PUT", object_key, /*query=*/"", /*payload=*/"", &response,
+               nullptr, headers)) {
+    // A refused copy (403) is not recorded as an error by the request path,
+    // which reads 403 as a miss; say what happened.
+    if (!failed()) SetError("PUT " + object_key + " (copy): HTTP " + std::to_string(last_status_));
+    return false;
+  }
+  // A copy can fail after S3 has already answered 200, in which case the body
+  // is an <Error> document rather than a <CopyObjectResult>.
+  if (response.find("<CopyObjectResult") == std::string::npos) {
+    SetError("PUT " + object_key + " (copy): " + response.substr(0, 200));
+    return false;
+  }
   return true;
 }
 

@@ -42,6 +42,21 @@ struct S3CacheConfig {
   // changed must not be able to hand a build a six-month-old object.
   int ttl_days = 30;
 
+  // Entries at least this old are rewritten in place when they serve a hit, so
+  // an entry in steady use never reaches the ttl or a bucket lifecycle rule,
+  // both of which count from the object's last write. Reading an object does
+  // not reset its age; without this, everything stored in one warm-up expires
+  // together a ttl later. Negative means half of ttl_days, and with no ttl,
+  // never. Zero disables refreshing. See RefreshDays().
+  int refresh_days = -1;
+
+  // The refresh age in effect: refresh_days when set, otherwise half the ttl,
+  // and 0 (never) when neither applies.
+  int RefreshDays() const {
+    if (refresh_days >= 0) return refresh_days;
+    return ttl_days > 0 ? ttl_days / 2 : 0;
+  }
+
   // Set when the bucket is known not to grant ListBucket and that is accepted.
   // Deliberately config-file only, with no environment or command-line form:
   // it silences a correctness diagnostic, so it should be a recorded decision

@@ -4,9 +4,10 @@
 //
 // Requests are signed with AWS Signature Version 4 over libcurl, avoiding a
 // dependency on the AWS SDK; SHA-256/HMAC come from hash/sha256.h rather than
-// OpenSSL. A compile only ever issues GET and PUT of a single object. Trim()
-// additionally lists and deletes, which is why it is confined to `vcache
-// --trim` and never runs on the compile path.
+// OpenSSL. A compile issues GET and PUT of a single object, plus a server-side
+// copy of an object onto itself when a hit finds it old enough to refresh.
+// Trim() additionally lists and deletes, which is why it is confined to
+// `vcache --trim` and never runs on the compile path.
 //
 // libcurl is loaded with dlopen() on construction rather than linked, so a
 // disk-only build never maps it. Any transport or authentication failure --
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <ctime>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/config.h"
@@ -24,6 +26,11 @@
 #include "storage/storage.h"
 
 namespace vcache::storage {
+
+namespace sigv4 {
+// A request header as SigV4 signs it: lowercase name, trimmed value.
+using Header = std::pair<std::string, std::string>;
+}  // namespace sigv4
 
 // One entry as ListObjectsV2 describes it.
 struct S3Object {
@@ -81,15 +88,25 @@ class S3Storage : public Storage {
   // `query` is the already-sorted canonical query string ("a=1&b=2"), empty for
   // ordinary object operations. When `last_modified` is non-null the response's
   // Last-Modified header is parsed into it, leaving it at 0 if absent.
-  // Request() retries transient S3 answers; RequestOnce() is a single
-  // round trip and is what the retry loop drives.
+  // `extra_headers` are sent and signed (lowercase names). Request() retries
+  // transient S3 answers; RequestOnce() is a single round trip and is what the
+  // retry loop drives.
   bool RequestOnce(const std::string& method,
                    const std::string& canonical_uri_path,
                    const std::string& query, const std::string& payload,
-                   std::string* response_body, std::time_t* last_modified);
+                   std::string* response_body, std::time_t* last_modified,
+                   const std::vector<sigv4::Header>& extra_headers);
   bool Request(const std::string& method, const std::string& canonical_uri_path,
                const std::string& query, const std::string& payload,
-               std::string* response_body, std::time_t* last_modified);
+               std::string* response_body, std::time_t* last_modified,
+               const std::vector<sigv4::Header>& extra_headers = {});
+
+  // Resets an object's age by copying it onto itself on the server, so no
+  // bytes are re-uploaded. S3 has no way to touch an object: Last-Modified, and
+  // the clock a lifecycle rule counts from, only move when an object is
+  // written, and this is the cheapest write there is. Returns false if the
+  // copy did not happen; the caller has already served the hit either way.
+  bool Refresh(const std::string& key);
 
   // Convenience wrapper for the single-object case: builds the object key from
   // a cache key and issues an unqueried request.
@@ -155,6 +172,7 @@ bool ParseListObjectsV2(const std::string& xml, std::vector<S3Object>* out,
 // Exposed for unit testing: AWS SigV4 primitives.
 namespace sigv4 {
 
+
 std::string Sha256Hex(const std::string& data);
 std::string HmacSha256(const std::string& key, const std::string& data);
 std::string HmacSha256Hex(const std::string& key, const std::string& data);
@@ -175,6 +193,21 @@ std::string BuildAuthorization(const std::string& method,
                                const std::string& region,
                                const std::string& access_key,
                                const std::string& secret_key);
+
+// As above, also signing `extra_headers` (x-amz-copy-source and the like),
+// which the request must then send exactly as given.
+std::string BuildAuthorization(const std::string& method,
+                               const std::string& canonical_uri,
+                               const std::string& query,
+                               const std::string& host,
+                               const std::string& amz_date,
+                               const std::string& date_stamp,
+                               const std::string& payload_hash,
+                               const std::string& session_token,
+                               const std::string& region,
+                               const std::string& access_key,
+                               const std::string& secret_key,
+                               const std::vector<Header>& extra_headers);
 
 }  // namespace sigv4
 

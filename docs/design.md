@@ -537,6 +537,17 @@ AWS SDK keeps the dependency footprint small; the signing code is ~60 lines and
 is covered by known-answer tests. `403` is treated the same as `404`, since
 buckets without `ListBucket` permission return it for a missing key.
 
+An object's age is its `Last-Modified`, which a read never moves, so expiry by
+age alone would retire entries that are in constant use, and retire a whole
+warm-up's worth of them on one day. A hit on an entry at least `refresh_days`
+old (half the TTL by default) therefore copies the object onto itself
+(`CopyObject`, `x-amz-metadata-directive: REPLACE`), a server-side write that
+resets `Last-Modified` and a lifecycle rule's clock without re-uploading. The
+copy carries two `x-amz-*` headers, and S3 refuses unsigned ones, so the signer
+takes extra headers and merges them into its sorted canonical set. It runs
+after the TTL check, so an expired entry is never revived, and its failure is
+logged but does not touch the hit.
+
 **Chain.** First hit wins; the hit is written back into every faster layer it
 passed through. Any backend error is reported as a miss.
 

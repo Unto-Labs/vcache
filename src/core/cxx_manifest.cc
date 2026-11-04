@@ -67,6 +67,13 @@ std::string CanonicalizeArg(const std::string& arg, const RootMap& roots) {
 
 }  // namespace
 
+std::vector<CxxManifestState> MergeCxxManifestStates(CxxManifestState fresh,
+                                                     std::vector<CxxManifestState> reread,
+                                                     const std::vector<CxxManifestState>& loaded) {
+  return MergeManifestStates(std::move(fresh), std::move(reread), loaded,
+                             CxxManifestRecordedInputs);
+}
+
 // A header line, then per state a "state <result key>" line followed by one
 // RenderManifestFile line per file and one "absent <path>" line per absent
 // path. A file line starts with a digest, so the two cannot be confused.

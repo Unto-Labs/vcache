@@ -993,6 +993,44 @@ void TestManifestMerge() {
   Check(dep_merged.size() == 2 && dep_merged[0].result_key == "F" &&
             dep_merged[1].result_key == "L",
         "a dep-scan merge keeps a loaded-only state");
+
+  // A comment edit to a header preprocesses to the same text, so the state
+  // recorded after it names the same result key as the one before it.
+  const auto cxx_state = [](const std::string& header_digest,
+                            std::vector<std::string> absent = {}) {
+    return core::CxxManifestState{
+        "K", {{"/vcache/proj/t.c", "c0"}, {"/vcache/proj/h.h", header_digest}},
+        std::move(absent)};
+  };
+  const auto cxx_show = [](const std::vector<core::CxxManifestState>& states) {
+    std::string out;
+    for (const core::CxxManifestState& state : states) {
+      if (!out.empty()) out.push_back(' ');
+      out += state.result_key + ":" + state.files.back().second;
+      for (const std::string& path : state.absent) out += "-" + path;
+    }
+    return out;
+  };
+  CheckEq(cxx_show(core::MergeCxxManifestStates(cxx_state("edited"), {cxx_state("orig")}, {})),
+          "K:edited K:orig", "cxx: an edit's state keeps the state with the same result key");
+  CheckEq(cxx_show(core::MergeCxxManifestStates(cxx_state("edited"), {},
+                                                {cxx_state("orig")})),
+          "K:edited K:orig", "cxx: and so does a merge with the loaded list");
+  CheckEq(cxx_show(core::MergeCxxManifestStates(cxx_state("orig", {"/vcache/proj/a.h"}),
+                                                {cxx_state("orig")}, {})),
+          "K:orig-/vcache/proj/a.h K:orig", "cxx: states differing only in absent paths both stay");
+  core::CxxManifestState same_inputs = cxx_state("orig");
+  same_inputs.result_key = "K2";
+  CheckEq(cxx_show(core::MergeCxxManifestStates(same_inputs, {cxx_state("orig")},
+                                                {cxx_state("orig")})),
+          "K2:orig", "cxx: the same inputs recorded again are one state, the newest");
+  std::vector<core::CxxManifestState> cxx_states;
+  for (int i = 1; i <= 9; ++i) {
+    cxx_states = core::MergeCxxManifestStates(cxx_state("v" + std::to_string(i)),
+                                              cxx_states, cxx_states);
+  }
+  CheckEq(cxx_show(cxx_states), "K:v9 K:v8 K:v7 K:v6 K:v5 K:v4 K:v3 K:v2",
+          "cxx: nine variants of one result key keep the newest eight");
 }
 
 void TestManifestMediaCount() {

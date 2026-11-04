@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "args/compiler_args.h"
@@ -39,6 +40,19 @@ struct CxxManifestState {
   // one would shadow a recorded file, or answer a __has_include differently.
   std::vector<std::string> absent;
 };
+
+// The identity of a C/C++ state: what it recorded, not its result key.
+inline auto CxxManifestRecordedInputs(const CxxManifestState& state) {
+  return std::tie(state.files, state.absent);
+}
+
+// MergeManifestStates for C/C++ states, which are told apart by what they
+// record, not by their result key. Many sets of header contents preprocess to
+// one text: after a comment edit and its revert the state from before the edit
+// is the one that matches again, so it must survive the edit's state.
+std::vector<CxxManifestState> MergeCxxManifestStates(CxxManifestState fresh,
+                                                     std::vector<CxxManifestState> reread,
+                                                     const std::vector<CxxManifestState>& loaded);
 
 std::string RenderCxxManifest(const std::vector<CxxManifestState>& states);
 

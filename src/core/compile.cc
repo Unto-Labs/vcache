@@ -1205,8 +1205,8 @@ bool StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
   bool reread_failed = false;
   const std::vector<CxxManifestState> reread =
       LoadCxxManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
-  const std::vector<CxxManifestState> states = MergeManifestStates(
-      std::move(fresh), reread, loaded, &CxxManifestState::result_key);
+  const std::vector<CxxManifestState> states =
+      MergeCxxManifestStates(std::move(fresh), reread, loaded);
   const storage::PutResult put = cache->Put(manifest_key, SerializeCxxManifest(states));
   *media_failed |= ReportCacheMediaErrors(put.errors, cache_dir, !reread_failed);
   VCACHE_LOG(put.stored ? "cxx manifest: stored " + std::to_string(states.size()) + " states"
@@ -1864,7 +1864,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         if (!next.hit) return false;
         manifest_copy = std::move(next);
         AppendManifestStates(&manifest_states, CxxManifestStates(manifest_copy, false),
-                             &CxxManifestState::result_key);
+                             CxxManifestRecordedInputs);
       }
       const std::string which = manifest_key.substr(0, 16) + " state " + std::to_string(i + 1) +
                                 " of " + std::to_string(manifest_states.size());
@@ -1887,9 +1887,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
             media_failed |= ReportCacheMediaErrors(local.errors, cache_dir);
             media_failed |= ReportCacheMediaErrors(
                 cache->PutBefore(manifest_key,
-                                 SerializeCxxManifest(MergeManifestStates(
+                                 SerializeCxxManifest(MergeCxxManifestStates(
                                      manifest_states[i], CxxManifestStates(local, false),
-                                     manifest_states, &CxxManifestState::result_key)),
+                                     manifest_states)),
                                  manifest_copy.layer)
                     .errors,
                 cache_dir);

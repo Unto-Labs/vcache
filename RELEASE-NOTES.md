@@ -2,6 +2,28 @@
 
 Each release is also described in its annotated tag (`git tag -n99 vX.Y.Z`).
 
+## 2.0.3
+
+A patch release. Cache keys and the manifest format are unchanged, so 2.0.0
+through 2.0.2 entries keep serving. The daemon protocol stays at version 2 and
+the daemon handshake is unchanged, so 2.0.x clients and daemons serve each
+other.
+
+Fixes:
+
+- **A reverted header hits the C/C++ manifest again.** States in a C/C++
+  manifest were told apart by their result key. A header edit that changes only
+  a comment preprocesses to the same text, so the state recorded after the edit
+  replaced the one from before it, and restoring the header ran the
+  preprocessor again. States are now told apart by the files, digests and
+  absent paths they recorded. A state recorded again with the same inputs still
+  replaces its older copy, and a manifest still keeps at most eight states.
+  - The same rule applied when a lookup moved on to a slower layer: a state in
+    S3 was skipped when the disk copy held a different state under the same
+    key. It is now tried.
+  - Only `cxx_manifest` is affected, which is off by default. Dependency-scan,
+    link and Rust manifests already name their inputs in their result keys.
+
 ## 2.0.2
 
 A patch release. Cache keys are unchanged, so 2.0.0 and 2.0.1 entries keep

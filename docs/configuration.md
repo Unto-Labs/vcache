@@ -966,7 +966,10 @@ state and checks its absent paths are still absent, and serves the first state t
 matches in full; an unchanged file costs a `stat` and a read of its memo,
 because digests are memoised by device, inode, size, mtime and ctime, and an
 absent path one `lstat`. Nothing is trusted on mtime alone. A manifest keeps up
-to eight states.
+to eight states, newest first. A state recorded again with the same files,
+digests and absent paths replaces its older copy; states that differ in those
+stay apart even when they name the same key, so a header edited only in a
+comment and then restored still finds the state from before the edit.
 
 On a miss the compile records the state from its own depfile and from a trace
 of it. A command with `-MD` already writes a depfile; a command with no

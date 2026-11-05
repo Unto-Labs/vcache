@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -52,32 +53,37 @@ std::string RenderManifestFile(const ManifestFile& file);
 bool ParseManifestFile(std::string_view line, ManifestFile* file);
 
 // Puts `fresh` first and keeps the older states behind it, dropping any that
-// `fresh` supersedes (same `key` member) and anything past the cap. Newest
+// `fresh` supersedes (same `identity`) and anything past the cap. Newest
 // first, so the states in active use stay ahead of the tail that gets dropped,
 // and lookup checks the likely match before hashing for others.
-template <typename State>
+//
+// `identity` projects a state onto what tells it apart, a member pointer or a
+// function, compared with ==. It must cover everything a lookup verifies: two
+// states that one result key serves but that record different file contents
+// are both answers, and dropping either makes switching back to it miss.
+template <typename State, typename Identity>
 std::vector<State> PrependManifestState(State fresh, std::vector<State> older,
-                                        std::string State::*key) {
+                                        const Identity& identity) {
   std::vector<State> updated;
   updated.push_back(std::move(fresh));
   for (State& state : older) {
-    if (state.*key == updated.front().*key) continue;
+    if (std::invoke(identity, state) == std::invoke(identity, updated.front())) continue;
     if (updated.size() >= kMaxManifestStates) break;
     updated.push_back(std::move(state));
   }
   return updated;
 }
 
-// Appends each state of `more` whose `key` member `states` does not hold yet,
+// Appends each state of `more` whose identity `states` does not hold yet,
 // keeping the order: a lookup that moves on to a slower layer's copy checks
 // the faster copy's states first and those it adds after them.
-template <typename State>
+template <typename State, typename Identity>
 void AppendManifestStates(std::vector<State>* states, std::vector<State> more,
-                          std::string State::*key) {
+                          const Identity& identity) {
   for (State& state : more) {
     bool seen = false;
     for (const State& have : *states) {
-      if (have.*key == state.*key) {
+      if (std::invoke(identity, have) == std::invoke(identity, state)) {
         seen = true;
         break;
       }
@@ -97,23 +103,23 @@ storage::GetResult NextManifestCopy(storage::CacheChain* cache, const std::strin
 
 // Re-read wins over the list loaded at lookup. `fresh` is first, then the
 // re-read order, then states that existed only in the loaded list. One copy
-// of each key. The cap is the same one PrependManifestState applies.
-template <typename State>
+// of each identity. The cap is the same one PrependManifestState applies.
+template <typename State, typename Identity>
 std::vector<State> MergeManifestStates(State fresh, std::vector<State> reread,
                                        const std::vector<State>& loaded,
-                                       std::string State::*key) {
+                                       const Identity& identity) {
   for (const State& state : loaded) {
-    if (state.*key == fresh.*key) continue;
+    if (std::invoke(identity, state) == std::invoke(identity, fresh)) continue;
     bool seen = false;
     for (const State& have : reread) {
-      if (have.*key == state.*key) {
+      if (std::invoke(identity, have) == std::invoke(identity, state)) {
         seen = true;
         break;
       }
     }
     if (!seen) reread.push_back(state);
   }
-  return PrependManifestState(std::move(fresh), std::move(reread), key);
+  return PrependManifestState(std::move(fresh), std::move(reread), identity);
 }
 
 // Blocks on the fifo in VCACHE_TEST_PAUSE_BEFORE_MANIFEST_PUT when that
